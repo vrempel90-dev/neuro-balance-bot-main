@@ -659,8 +659,8 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
         session["escalated"] = True
         return _tr(
             session,
-            "Сейчас не получается проверить свободные окошки. Передам координатору, она подберёт время вручную 🌿",
-            "Қазір бос уақыттарды тексере алмадым. Координаторға жіберемін, ол уақытты қолмен таңдап береді 🌿",
+            "Сейчас не получается проверить свободные окошки автоматически. Я оформлю заявку на консультацию, координатор закрепит удобное время вручную 🌿",
+            "Қазір бос уақыттарды автоматты түрде тексере алмадым. Консультацияға өтінім қалдырамын, координатор ыңғайлы уақытты қолмен бекітеді 🌿",
         )
 
     if not slots:
@@ -700,7 +700,12 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
             doctor_name=slot.get("doctor_name") or slot.get("doctorName") or None,
             date=slot.get("date") or session.get("preferred_date"),
             time_start=slot.get("time") or slot.get("timeStart"),
-            notes=f"Жалоба: {session.get('complaint') or ''}; возраст: {session.get('age') or ''}",
+            notes=(
+                f"Жалоба: {session.get('complaint') or ''}; "
+                f"возраст: {session.get('age') or ''}; "
+                f"противопоказания/ограничения: {session.get('contraindications_raw') or ''}; "
+                f"важно для врача: {'да' if session.get('doctor_note_required') else 'нет'}"
+            ),
         )
         session["booked"] = True
         session["appointment"] = booked
@@ -722,8 +727,8 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         session["escalated"] = True
         return _tr(
             session,
-            "Не получилось автоматически создать запись. Передам администратору, он закрепит удобное время вручную 🌿",
-            "Жазбаны автоматты түрде жасай алмадым. Әкімшіге жіберемін, ол ыңғайлы уақытты қолмен бекітеді 🌿",
+            "Не получилось автоматически создать запись в CRM. Я оформлю заявку, чтобы координатор закрепил удобное время вручную 🌿",
+            "CRM-де жазбаны автоматты түрде жасай алмадым. Өтінім қалдырамын, координатор ыңғайлы уақытты қолмен бекітеді 🌿",
         )
 
 
@@ -1112,38 +1117,34 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
         if _contra_has_hard_stop(text):
             session["contraindications_ok"] = False
-            session["contraindications_verdict"] = "escalate"
-            session["step"] = "escalated"
-            session["escalated"] = True
-            return _finalize(
-                chat_id,
+            session["contraindications_verdict"] = "doctor_note"
+            session["doctor_note_required"] = True
+            session["step"] = "date"
+            answer = _tr(
                 session,
-                _tr(
-                    session,
-                    "Спасибо, что уточнили 🙏 Это важная информация, врач обязательно учтёт её на консультации. На первичную консультацию можно записаться, а врач после осмотра подскажет безопасный дальнейший план.",
-                    "Нақтылағаныңызға рақмет 🙏 Бұл маңызды ақпарат, дәрігер консультацияда міндетті түрде ескереді. Алғашқы консультацияға жазылуға болады, дәрігер қарап, қауіпсіз әрі дұрыс жоспарды түсіндіреді.",
-                ),
-            )
+                "Спасибо, что уточнили 🙏 Это важная информация, врач обязательно учтёт её на консультации. На первичную консультацию можно записаться, а врач после осмотра подскажет безопасный дальнейший план.",
+                "Нақтылағаныңызға рақмет 🙏 Бұл маңызды ақпарат, дәрігер консультацияда міндетті түрде ескереді. Алғашқы консультацияға жазылуға болады, дәрігер қарап, қауіпсіз әрі дұрыс жоспарды түсіндіреді.",
+            ) + "\n\n" + _ask_date(session)
+            return _finalize(chat_id, session, answer)
 
         # Если пациент написал симптомы вместо ответа по противопоказаниям — не считаем это противопоказанием.
         if _has_complaint(text):
             return _finalize(chat_id, session, _ask_contra(session))
 
-        # Любой явный "есть/бар" без деталей — эскалация, чтобы не рисковать.
+        # Если пациент написал просто "есть/бар" без деталей — не останавливаем запись.
+        # Сохраняем как важную заметку врачу и продолжаем к дате.
         if any(w in _low(text) for w in YES_WORDS):
             session["contraindications_ok"] = False
-            session["contraindications_verdict"] = "escalate"
-            session["step"] = "escalated"
-            session["escalated"] = True
-            return _finalize(
-                chat_id,
+            session["contraindications_verdict"] = "doctor_note"
+            session["doctor_note_required"] = True
+            session["contraindications_raw"] = text or "Есть ограничения/противопоказания, детали не указаны"
+            session["step"] = "date"
+            answer = _tr(
                 session,
-                _tr(
-                    session,
-                    "Поняла Вас 🙏 Чтобы не подсказать неверно, передам информацию администратору — он уточнит детали и подскажет по записи 🌿",
-                    "Түсіндім 🙏 Қате ақпарат бермеу үшін әкімшіге жіберемін — ол нақтылап, жазылу бойынша көмектеседі 🌿",
-                ),
-            )
+                "Поняла Вас 🙏 Это важно, врач обязательно уточнит детали на консультации. На первичную консультацию можно записаться.",
+                "Түсіндім 🙏 Бұл маңызды, дәрігер консультацияда нақтылап сұрайды. Алғашқы консультацияға жазылуға болады.",
+            ) + "\n\n" + _ask_date(session)
+            return _finalize(chat_id, session, answer)
 
         return _finalize(chat_id, session, _ask_contra(session))
 
