@@ -229,25 +229,33 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
 def _extract_age(text: str, step: str = "") -> int | None:
     low = _low(text)
 
-    # Не путать длительность боли с возрастом: "3 день болит" не возраст.
-    if re.search(r"\b\d{1,2}\s*(день|дня|дней|недел|неделя|месяц|месяцев|сутки)\b", low):
-        if not any(w in low for w in ["лет", "год", "жас", "жастамын", "мне"]):
-            return None
-
+    # Не путать время с возрастом: "10:30" не возраст.
     if re.search(r"\b\d{1,2}[:.]\d{2}\b", low):
         return None
 
-    m = re.search(r"\b(?:мне\s*)?(\d{1,2})\s*(?:лет|года|год|жас|жастамын)\b", low)
-    if m:
-        return int(m.group(1))
+    # Прямые формы возраста RU/KZ.
+    patterns = [
+        r"\bмне\s*(\d{1,2})\s*(?:лет|года|год)?\b",
+        r"\bмен\s*(\d{1,2})\s*(?:жастамын|жаста|жас)?\b",
+        r"\b(\d{1,2})\s*(?:лет|года|год|жас|жастамын|жаста)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, low)
+        if m:
+            age = int(m.group(1))
+            if 1 <= age <= 99:
+                return age
 
-    m = re.search(r"\bмне\s*(\d{1,2})\b", low)
-    if m:
-        return int(m.group(1))
+    # Не путать длительность боли с возрастом: "3 день болит" не возраст.
+    if re.search(r"\b\d{1,2}\s*(день|дня|дней|недел|неделя|месяц|месяцев|сутки)\b", low):
+        return None
 
+    # Если мы явно ждём возраст — можно принять просто число.
     nums = re.findall(r"\b(\d{1,2})\b", low)
     if nums and step == "age":
-        return int(nums[0])
+        age = int(nums[0])
+        if 1 <= age <= 99:
+            return age
 
     return None
 
@@ -689,12 +697,76 @@ def _is_cancel(text: str) -> bool:
 
 
 def _contra_has_hard_stop(text: str) -> bool:
-    return _has_any(text, HARD_CONTRA_WORDS)
+    low = _low(text)
+
+    neg_words = ["нет", "нету", "не было", "жоқ", "жок", "емес"]
+
+    for word in HARD_CONTRA_WORDS:
+        pattern = re.escape(word)
+        for m in re.finditer(pattern, low):
+            before = low[max(0, m.start() - 14):m.start()]
+            after = low[m.end():m.end() + 14]
+
+            # "нет кардиостимулятора", "кардиостимулятора нет",
+            # "онкологии нет", "температуры нет" — это НЕ hard-stop.
+            if any(n in before for n in neg_words) or any(n in after for n in neg_words):
+                continue
+
+            return True
+
+    return False
 
 
 def _contra_is_clear_no(text: str) -> bool:
     low = _low(text)
     return any(w == low or w in low for w in NO_CONTRA_WORDS)
+
+
+async def _continue_after_collected_age(chat_id: str, session: dict[str, Any], text: str, age: int) -> str:
+    """Продолжение сценария, если возраст уже есть в этом же сообщении.
+
+    Нужно для сложных сообщений:
+    "мне 56, болит поясница, кардиостимулятора нет, завтра можно?"
+    """
+    if _contra_has_hard_stop(text):
+        session["contraindications_raw"] = text
+        session["contraindications_ok"] = False
+        session["contraindications_verdict"] = "escalate"
+        session["step"] = "escalated"
+        session["escalated"] = True
+        return _tr(
+            session,
+            "Спасибо, что уточнили 🙏 Эта ситуация требует проверки у координатора. Я передам информацию администратору, чтобы Вам подсказали корректно 🌿",
+            "Нақтылағаныңызға рақмет 🙏 Бұл жағдайды координатормен нақтылау керек. Қате ақпарат бермеу үшін әкімшіге жіберемін 🌿",
+        )
+
+    # Если пациент сразу написал, что противопоказаний нет — не спрашиваем это повторно.
+    if _contra_is_clear_no(text):
+        session["contraindications_raw"] = text
+        session["contraindications_ok"] = True
+        session["contraindications_verdict"] = "proceed"
+
+        date_iso = _parse_date(text)
+        if date_iso:
+            return await _show_slots(chat_id, session, date_iso)
+
+        session["step"] = "date"
+        return _ask_date(session)
+
+    # Если противопоказания ещё не ясны — задаём обязательный вопрос.
+    session["step"] = "contraindications"
+    session["questionnaire_step"] = "contra"
+
+    if age > 74:
+        session["senior_patient"] = True
+        return _senior_contra_intro(session)
+
+    stop = _age_stop_text(age, session)
+    if age < 18:
+        session["minor_parent_required"] = True
+        return stop + "\n\n" + _ask_contra(session)
+
+    return _ask_contra(session)
 
 
 async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
@@ -732,6 +804,24 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         )
         return _finalize(chat_id, session, answer)
 
+    # 2.5) Суперсложный сценарий: жалоба + возраст + противопоказания/дата в одном сообщении.
+    # Важно: этот блок стоит ДО FAQ и ДО обычной анкеты.
+    # Примеры:
+    # "Мне 78 лет, болит спина, противопоказаний нет"
+    # "Мне 45, грыжа поясницы, но есть кардиостимулятор"
+    # "Мен 62 жастамын, белім ауырады, ертең келуге бола ма?"
+    inline_age = _extract_age(text, step="age")
+    if (
+        inline_age
+        and _has_complaint(text)
+        and session.get("contraindications_ok") is not True
+        and not session.get("contraindications_verdict")
+    ):
+        session["complaint"] = session.get("complaint") or text
+        session["age"] = inline_age
+        answer = await _continue_after_collected_age(chat_id, session, text, inline_age)
+        return _finalize(chat_id, session, answer)
+
     # 3) Типовые вопросы.
     # Если в сообщении есть жалоба, жалоба важнее FAQ.
     # Например "Белім ауырады, похоже протрузия" нельзя ошибочно трактовать как вопрос про УЗИ.
@@ -751,20 +841,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # ЖЁСТКИЙ ГЕЙТ: если жалоба уже есть и пациент прислал возраст,
     # нельзя перейти к дате, пока не закрыты противопоказания.
     if age and session.get("complaint") and session.get("contraindications_ok") is not True and not session.get("contraindications_verdict"):
-        stop = _age_stop_text(age, session)
-        if age > 74:
-            session["senior_patient"] = True
-            session["step"] = "contraindications"
-            session["questionnaire_step"] = "contra"
-            return _finalize(chat_id, session, _senior_contra_intro(session))
-        if age < 18:
-            session["minor_parent_required"] = True
-            session["step"] = "contraindications"
-            session["questionnaire_step"] = "contra"
-            return _finalize(chat_id, session, stop + "\n\n" + _ask_contra(session))
-        session["step"] = "contraindications"
-        session["questionnaire_step"] = "contra"
-        return _finalize(chat_id, session, _ask_contra(session))
+        answer = await _continue_after_collected_age(chat_id, session, text, age)
+        return _finalize(chat_id, session, answer)
 
     # 5) Старт / выясняем жалобу.
     if step in ("start", "", None):
@@ -781,6 +859,13 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
         if _has_complaint(text):
             session["complaint"] = text
+
+            # Если возраст уже есть в этом же сообщении — не спрашиваем его повторно.
+            # Сразу проверяем противопоказания/дату.
+            if session.get("age"):
+                answer = await _continue_after_collected_age(chat_id, session, text, int(session["age"]))
+                return _finalize(chat_id, session, answer)
+
             session["step"] = "age"
             return _finalize(chat_id, session, _ask_age_contextual(session, text))
 
@@ -832,6 +917,13 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return _finalize(chat_id, session, _tr(session, "Хорошо 🌿 Подскажите, пожалуйста, сколько Вам лет?", "Жақсы 🌿 Жасыңыз нешеде?"))
         if _has_complaint(text):
             session["complaint"] = text
+
+            # Если возраст уже есть в этом же сообщении — не спрашиваем его повторно.
+            # Сразу проверяем противопоказания/дату.
+            if session.get("age"):
+                answer = await _continue_after_collected_age(chat_id, session, text, int(session["age"]))
+                return _finalize(chat_id, session, answer)
+
             session["step"] = "age"
             return _finalize(chat_id, session, _ask_age_contextual(session, text))
         session["step"] = "escalated"
