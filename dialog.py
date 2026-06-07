@@ -493,7 +493,8 @@ async def _execute_tool(chat_id: str, phone: str, name: str, raw_args: str) -> s
             return "OUTCOME_LOGGED: out_of_scope"
 
         if name == "get_clinic_info":
-            text = get_clinic_info(str(args.get("topic") or ""))
+            lang = session.get("language") or "ru"
+            text = get_clinic_info(str(args.get("topic") or ""), lang)
             return text or "NO_TEMPLATE_FOUND"
 
         return f"UNKNOWN_TOOL: {name}"
@@ -616,7 +617,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if session.get("mobility_check_pending") and _is_no_answer(user_text):
         session["mobility_check_pending"] = False
         state.save_session(chat_id, session)
-        answer = get_clinic_info("immobility_refuse") or "К сожалению, в таком случае лечение в клинике может быть затруднительным. Передам администратору для проверки."
+        answer = get_clinic_info("immobility_refuse", session.get("language") or "ru") or "К сожалению, в таком случае лечение в клинике может быть затруднительным. Передам администратору для проверки."
         answer = _finalize_answer(chat_id, user_text, answer, session)
         state.add_message(chat_id, "assistant", answer)
         return answer
