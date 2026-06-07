@@ -8,6 +8,7 @@ import crm
 import state
 from clinic_info import get_clinic_info
 from phone import sanitize_kz_phone
+from language_guard import detect_language
 
 
 CANCEL_WORDS = [
@@ -139,6 +140,7 @@ async def pre_handle_message(chat_id: str, phone: str, user_text: str, session: 
     - перенос — не создаём дубль, а ведём к переносу/оператору.
     """
     normalized = sanitize_kz_phone(phone) or sanitize_kz_phone(session.get("phone") or "") or phone
+    lang = detect_language(user_text, session.get("language") or "ru")
 
     booking_intent = is_booking_intent(user_text)
 
@@ -207,11 +209,11 @@ async def pre_handle_message(chat_id: str, phone: str, user_text: str, session: 
     if is_side_info_intent(user_text) and appt:
         low = _low(user_text)
         if "адрес" in low or "где" in low or "2gis" in low or "2 гис" in low:
-            return (get_clinic_info("address") or "Адрес клиники: Кабанбай батыра 28, Астана 🌿") + f"\n\nВаша запись: {appointment_human(appt)} 🌿"
+            return (get_clinic_info("address", lang) or "Адрес клиники: Кабанбай батыра 28, Астана 🌿") + f"\n\nВаша запись: {appointment_human(appt)} 🌿"
         if "график" in low or "работаете" in low:
-            return (get_clinic_info("schedule") or "Приём ведётся по записи 🌿") + f"\n\nВаша запись: {appointment_human(appt)} 🌿"
+            return (get_clinic_info("schedule", lang) or "Приём ведётся по записи 🌿") + f"\n\nВаша запись: {appointment_human(appt)} 🌿"
         if "стоимость" in low or "цена" in low or "сколько стоит" in low:
-            return (get_clinic_info("price_first_visit") or "Первичная консультация стоит 5 000 тг 🌿") + f"\n\nВаша запись: {appointment_human(appt)} 🌿"
+            return (get_clinic_info("price_first_visit", lang) or "Первичная консультация стоит 5 000 тг 🌿") + f"\n\nВаша запись: {appointment_human(appt)} 🌿"
 
 
     if is_reschedule_intent(user_text) and appt:
