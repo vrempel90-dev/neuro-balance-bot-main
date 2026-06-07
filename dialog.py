@@ -213,13 +213,6 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
             )
 
     # Никогда не возвращаем пустой ответ: если ответ совпал, мягко уточняем.
-    if session.get("last_assistant_answer") == answer:
-        answer = _tr(
-            session,
-            "Напишите, пожалуйста, ответ одним сообщением 🌿",
-            "Жауапты бір хабарламамен жазыңызшы 🌿",
-        )
-
     session["last_assistant_answer"] = answer
     _safe_save(chat_id, session)
     _safe_add_message(chat_id, "assistant", answer)
@@ -733,6 +726,7 @@ async def _continue_after_collected_age(chat_id: str, session: dict[str, Any], t
         session["contraindications_ok"] = False
         session["contraindications_verdict"] = "doctor_note"
         session["doctor_note_required"] = True
+        session["contraindications_ok"] = False
 
         date_iso = _parse_date(text)
         prefix = _tr(
