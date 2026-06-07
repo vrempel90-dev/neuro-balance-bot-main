@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 from language_guard import detect_language
+from clinic_info import get_clinic_info
 
 
 GENERIC_BOOKING_WORDS = [
@@ -118,6 +119,28 @@ def validate_answer(chat_id: str, user_text: str, answer: str, session: dict[str
     user_low = _low(user_text)
     ans_low = _low(answer)
     user_lang = detect_language(user_text, session.get("language") or "ru")
+
+    # v33: если пациент пишет по-казахски, нельзя отдавать русский шаблон
+    # и затем добавлять казахский хвост. Для типовых вопросов возвращаем
+    # полностью казахский ответ.
+    if user_lang == "kk":
+        kk_triggered = False
+        if "прием в нашей клинике" in ans_low or "приём в нашей клинике" in ans_low or "стоимость" in ans_low or "первичная консультация" in ans_low:
+            kk_triggered = True
+            base = get_clinic_info("price_first_visit", "kk") or "Алғашқы консультация 5 000 тг 🌿"
+        elif "адрес" in ans_low or "кабанбай" in ans_low or "2gis" in ans_low:
+            kk_triggered = True
+            base = get_clinic_info("address", "kk") or "Мекенжай: Қабанбай батыр 28, Астана 🌿"
+        elif "график" in ans_low or "понедельник" in ans_low or "воскресенье" in ans_low:
+            kk_triggered = True
+            base = get_clinic_info("schedule", "kk") or "Қабылдау тек алдын ала жазылу арқылы жүргізіледі 🌿"
+        if kk_triggered:
+            violations.append("wrong_language_ru_template_on_kk")
+            if not session.get("complaint"):
+                return base + "\n\nАйтыңызшы, Сізді не мазалайды?", violations
+            if not session.get("age"):
+                return base + "\n\nЖасыңыз нешеде?", violations
+            return base, violations
 
     # v28: если пациент пишет по-русски, финальный ответ не должен внезапно
     # переходить на казахский. Для опасных автопереключений отдаём безопасный RU-ответ.
