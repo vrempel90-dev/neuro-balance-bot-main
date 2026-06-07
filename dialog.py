@@ -56,12 +56,22 @@ BOOKING_WORDS = [
 COMPLAINT_WORDS = [
     "болит", "боль", "ноет", "тянет", "ломит", "хрустит", "онем",
     "мурашк", "защем", "грыж", "грыжа", "протруз", "протрузия",
-    "отдает", "отдаёт", "стреляет", "прострел", "нога", "ногу", "рука", "руку",
+    "отдает", "отдаёт", "стреляет", "прострел", "нога", "ногу", "ноге",
+    "рука", "руку", "руке", "бедро", "таз", "лопат", "ребр",
     "спина", "спине", "спину", "поясниц", "шея", "шей", "сустав",
     "колен", "плеч", "голова", "артроз", "артрит", "остеохонд", "травм",
-    "ауырады", "ауырып", "ауыр", "аурат", "belim", "белім", "белим",
-    "бел", "арқа", "аркам", "арқам", "аяқ", "аяғым", "аягым",
-    "мойын", "мойным", "буын", "тізе", "иық", "қол",
+    "ауырады", "ауырып", "ауыр", "аурат", "қатты", "катты", "береді", "береди",
+    "belim", "белім", "белим", "бел", "арқа", "аркам", "арқам",
+    "аяқ", "аяққа", "аяк", "аякка", "аяғым", "аягым",
+    "мойын", "мойным", "буын", "тізе", "тизе", "иық", "иык", "қол", "кол",
+]
+
+NO_COMPLAINT_WORDS = [
+    "ничего", "ничего не беспокоит", "не беспокоит", "ничего не болит",
+    "просто консультация", "просто осмотр", "профилактика",
+    "профилактический осмотр", "для профилактики", "не знаю",
+    "ештеңе", "ештене", "мазаламайды", "ауырмайды",
+    "білмеймін", "билмеймин", "жай консультация", "профилактика үшін",
 ]
 
 PRICE_WORDS = [
@@ -202,10 +212,13 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
                 "Сізді не мазалайды? 🌿",
             )
 
-    # Не глушим важные разные шаги, но одинаковый дубль подряд не отправляем.
+    # Никогда не возвращаем пустой ответ: если ответ совпал, мягко уточняем.
     if session.get("last_assistant_answer") == answer:
-        _safe_save(chat_id, session)
-        return ""
+        answer = _tr(
+            session,
+            "Напишите, пожалуйста, ответ одним сообщением 🌿",
+            "Жауапты бір хабарламамен жазыңызшы 🌿",
+        )
 
     session["last_assistant_answer"] = answer
     _safe_save(chat_id, session)
@@ -246,12 +259,8 @@ def _age_stop_text(age: int, session: dict[str, Any]) -> str:
             "Так как Вам нет 18 лет, на консультацию нужно прийти с родителем или законным представителем 🌿",
             "18 жасқа толмағандықтан, консультацияға ата-анаңызбен немесе заңды өкіліңізбен келу керек 🌿",
         )
-    if age > 74:
-        return _tr(
-            session,
-            "Спасибо. По возрасту я передам информацию администратору, чтобы не подсказать неверно 🌿",
-            "Рақмет. Жасыңыз бойынша қате ақпарат бермеу үшін әкімшіге жіберемін 🌿",
-        )
+    # 75+ НЕ останавливаем автоматически: аккуратно продолжаем запись,
+    # но обязательно собираем противопоказания перед датой.
     return ""
 
 
@@ -261,6 +270,18 @@ def _has_booking_intent(text: str) -> bool:
 
 def _has_complaint(text: str) -> bool:
     return _has_any(text, COMPLAINT_WORDS)
+
+
+def _has_no_complaint(text: str) -> bool:
+    return _has_any(text, NO_COMPLAINT_WORDS)
+
+
+def _is_positive_confirm(text: str) -> bool:
+    low = _low(text)
+    return any(w in low for w in [
+        "да", "хочу", "запишите", "можно", "ок", "окей", "давайте",
+        "иә", "ия", "жаз", "жазылы", "болады", "келісемін", "келисемин",
+    ])
 
 
 def _is_greeting_only(text: str) -> bool:
@@ -471,6 +492,32 @@ def _ask_age(session: dict[str, Any]) -> str:
         session,
         "Понимаю Вас 🙏 С такой жалобой можно прийти на первичную консультацию. Врач осмотрит и подскажет дальнейший план.\nПодскажите, пожалуйста, сколько Вам лет?",
         "Түсіндім 🙏 Мұндай шағыммен алғашқы консультацияға келуге болады. Дәрігер қарап, әрі қарай не істеу керегін айтады.\nЖасыңыз нешеде?",
+    )
+
+
+def _ask_age_contextual(session: dict[str, Any], text: str) -> str:
+    parts_ru: list[str] = []
+    parts_kk: list[str] = []
+
+    if _has_any(text, PRICE_WORDS):
+        parts_ru.append("Приём в нашей клинике — 5 000 тг 🌿 В стоимость входит осмотр врача и консультация.")
+        parts_kk.append("Біздің клиникада алғашқы қабылдау — 5 000 тг 🌿 Құнына дәрігердің қарауы және консультация кіреді.")
+
+    if _has_mri_question(text):
+        parts_ru.append("МРТ заранее делать не обязательно. Врач на консультации осмотрит Вас и подскажет, нужно ли МРТ/КТ или другое обследование.")
+        parts_kk.append("МРТ-ны алдын ала жасау міндетті емес. Дәрігер консультацияда қарап, МРТ/КТ немесе басқа тексеріс керек пе — соны айтады.")
+
+    parts_ru.append("Понимаю Вас 🙏 С такой жалобой можно прийти на первичную консультацию. Подскажите, пожалуйста, сколько Вам лет?")
+    parts_kk.append("Түсіндім 🙏 Мұндай шағыммен алғашқы консультацияға келуге болады. Жасыңыз нешеде?")
+
+    return _tr(session, "\n\n".join(parts_ru), "\n\n".join(parts_kk))
+
+
+def _senior_contra_intro(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Спасибо 🌿 Перед записью уточню важный момент: есть ли у Вас противопоказания или ограничения по здоровью?\n\nНапример: онкология, высокая температура, острое воспаление, свежие травмы/переломы, кардиостимулятор?",
+        "Рақмет 🌿 Жазылар алдында маңызды сұрақты нақтылайын. Жазбас бұрын қарсы көрсетілімдер немесе денсаулық бойынша шектеулерді нақтылау маңызды.\n\nМысалы: онкология, жоғары температура, жедел қабыну, жаңа жарақат/сыну, кардиостимулятор?",
     )
 
 
@@ -701,12 +748,41 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if age and not session.get("age"):
         session["age"] = age
 
+    # ЖЁСТКИЙ ГЕЙТ: если жалоба уже есть и пациент прислал возраст,
+    # нельзя перейти к дате, пока не закрыты противопоказания.
+    if age and session.get("complaint") and session.get("contraindications_ok") is not True and not session.get("contraindications_verdict"):
+        stop = _age_stop_text(age, session)
+        if age > 74:
+            session["senior_patient"] = True
+            session["step"] = "contraindications"
+            session["questionnaire_step"] = "contra"
+            return _finalize(chat_id, session, _senior_contra_intro(session))
+        if age < 18:
+            session["minor_parent_required"] = True
+            session["step"] = "contraindications"
+            session["questionnaire_step"] = "contra"
+            return _finalize(chat_id, session, stop + "\n\n" + _ask_contra(session))
+        session["step"] = "contraindications"
+        session["questionnaire_step"] = "contra"
+        return _finalize(chat_id, session, _ask_contra(session))
+
     # 5) Старт / выясняем жалобу.
     if step in ("start", "", None):
+        if _has_no_complaint(text):
+            count = int(session.get("no_complaint_count") or 0) + 1
+            session["no_complaint_count"] = count
+            session["step"] = "complaint_no_confirm"
+            answer = _tr(
+                session,
+                "Поняла 🌿 Если конкретной жалобы нет, можно прийти на первичную консультацию для профилактического осмотра. Хотите записаться на консультацию?",
+                "Түсіндім 🌿 Егер нақты шағым болмаса, профилактикалық қаралу үшін алғашқы консультацияға келуге болады. Консультацияға жазылайын ба?",
+            )
+            return _finalize(chat_id, session, answer)
+
         if _has_complaint(text):
             session["complaint"] = text
             session["step"] = "age"
-            return _finalize(chat_id, session, _ask_age(session))
+            return _finalize(chat_id, session, _ask_age_contextual(session, text))
 
         if _has_booking_intent(text) or _is_greeting_only(text):
             session["step"] = "complaint"
@@ -721,15 +797,46 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _finalize(chat_id, session, _ask_complaint(session))
 
     if step == "complaint":
+        if _has_no_complaint(text):
+            count = int(session.get("no_complaint_count") or 0) + 1
+            session["no_complaint_count"] = count
+            if count == 1:
+                session["step"] = "complaint_no_confirm"
+                answer = _tr(
+                    session,
+                    "Поняла 🌿 Если конкретной жалобы нет, можно прийти на первичную консультацию для профилактического осмотра. Хотите записаться на консультацию?",
+                    "Түсіндім 🌿 Егер нақты шағым болмаса, профилактикалық қаралу үшін алғашқы консультацияға келуге болады. Консультацияға жазылайын ба?",
+                )
+                return _finalize(chat_id, session, answer)
+            session["step"] = "escalated"
+            session["escalated"] = True
+            return _finalize(chat_id, session, _tr(session, "Поняла Вас 🌿 Передам администратору, чтобы он помог с записью и подсказал, какая консультация подойдёт.", "Түсіндім 🌿 Әкімшіге жіберемін, ол жазылуға көмектесіп, қандай консультация қолайлы екенін айтады."))
+
         if not _has_complaint(text):
             if _has_booking_intent(text) or _is_greeting_only(text):
                 return _finalize(chat_id, session, _ask_complaint(session))
-            # Нейтральный ответ типа "ничего" — уточняем, не повторяем одно и то же бесконечно.
             return _finalize(chat_id, session, _ask_complaint(session))
 
         session["complaint"] = text
         session["step"] = "age"
-        return _finalize(chat_id, session, _ask_age(session))
+        return _finalize(chat_id, session, _ask_age_contextual(session, text))
+
+    if step == "complaint_no_confirm":
+        if _has_no_complaint(text):
+            session["step"] = "escalated"
+            session["escalated"] = True
+            return _finalize(chat_id, session, _tr(session, "Поняла Вас 🌿 Передам администратору, чтобы он помог с записью и подсказал, какая консультация подойдёт.", "Түсіндім 🌿 Әкімшіге жіберемін, ол жазылуға көмектесіп, қандай консультация қолайлы екенін айтады."))
+        if _is_positive_confirm(text) or _has_booking_intent(text):
+            session["complaint"] = "Профилактическая консультация, без конкретной жалобы"
+            session["step"] = "age"
+            return _finalize(chat_id, session, _tr(session, "Хорошо 🌿 Подскажите, пожалуйста, сколько Вам лет?", "Жақсы 🌿 Жасыңыз нешеде?"))
+        if _has_complaint(text):
+            session["complaint"] = text
+            session["step"] = "age"
+            return _finalize(chat_id, session, _ask_age_contextual(session, text))
+        session["step"] = "escalated"
+        session["escalated"] = True
+        return _finalize(chat_id, session, _tr(session, "Поняла Вас 🌿 Передам администратору, чтобы он помог сориентироваться.", "Түсіндім 🌿 Әкімшіге жіберемін, ол нақтылап көмектеседі."))
 
     # 6) Возраст: после возраста ВСЕГДА спрашиваем противопоказания.
     if step == "age":
@@ -739,10 +846,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
         session["age"] = age
         stop = _age_stop_text(age, session)
-        if stop and age > 74:
-            session["step"] = "escalated"
-            session["escalated"] = True
-            return _finalize(chat_id, session, stop)
+        if age > 74:
+            session["senior_patient"] = True
+            session["step"] = "contraindications"
+            session["questionnaire_step"] = "contra"
+            return _finalize(chat_id, session, _senior_contra_intro(session))
 
         # Для младше 18 не останавливаем насовсем, но фиксируем необходимость родителя.
         if age < 18:
