@@ -692,23 +692,43 @@ def _is_cancel(text: str) -> bool:
 def _contra_has_hard_stop(text: str) -> bool:
     low = _low(text)
 
-    neg_words = ["нет", "нету", "не было", "жоқ", "жок", "емес"]
+    # Негативные конструкции считаем только если "нет/жоқ" относится прямо к этому слову.
+    # Важно:
+    # "кардиостимулятора нет" -> НЕ важная заметка
+    # "нет кардиостимулятора" -> НЕ важная заметка
+    # "онкологии нет, но есть кардиостимулятор" -> важная заметка для врача, запись продолжаем
+    direct_neg_patterns = [
+        r"(?:нет|нету|жоқ|жок)\s+(?:у\s+меня\s+)?{word}",
+        r"{word}\s+(?:у\s+меня\s+)?(?:нет|нету|жоқ|жок)",
+        r"{word}\s+жоқ",
+        r"{word}\s+жок",
+    ]
 
     for word in HARD_CONTRA_WORDS:
-        pattern = re.escape(word)
-        for m in re.finditer(pattern, low):
-            before = low[max(0, m.start() - 14):m.start()]
-            after = low[m.end():m.end() + 14]
+        w = re.escape(word)
 
-            # "нет кардиостимулятора", "кардиостимулятора нет",
-            # "онкологии нет", "температуры нет" — это НЕ hard-stop.
-            if any(n in before for n in neg_words) or any(n in after for n in neg_words):
-                continue
+        if not re.search(w, low):
+            continue
 
+        negated = False
+        for pat in direct_neg_patterns:
+            if re.search(pat.format(word=w), low):
+                negated = True
+                break
+
+        if negated:
+            continue
+
+        # "есть кардиостимулятор", "кардиостимулятор есть", "бар" — важная заметка врачу.
+        if re.search(r"(?:есть|имеется|бар)\s+(?:у\s+меня\s+)?[^.!?,]{0,25}" + w, low):
+            return True
+        if re.search(w + r"[^.!?,]{0,25}(?:есть|имеется|бар)", low):
             return True
 
-    return False
+        # Если слово есть без отрицания — считаем важной заметкой врачу, но запись НЕ останавливаем.
+        return True
 
+    return False
 
 def _contra_is_clear_no(text: str) -> bool:
     low = _low(text)
@@ -726,7 +746,6 @@ async def _continue_after_collected_age(chat_id: str, session: dict[str, Any], t
         session["contraindications_ok"] = False
         session["contraindications_verdict"] = "doctor_note"
         session["doctor_note_required"] = True
-        session["contraindications_ok"] = False
 
         date_iso = _parse_date(text)
         prefix = _tr(
@@ -740,6 +759,7 @@ async def _continue_after_collected_age(chat_id: str, session: dict[str, Any], t
             return prefix + "\n\n" + slots_answer
 
         session["step"] = "date"
+        session["questionnaire_step"] = "date"
         return prefix + "\n\n" + _ask_date(session)
 
     # Если пациент сразу написал, что противопоказаний нет — не спрашиваем это повторно.
