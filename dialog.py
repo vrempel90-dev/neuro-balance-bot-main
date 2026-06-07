@@ -55,9 +55,10 @@ BOOKING_WORDS = [
 
 COMPLAINT_WORDS = [
     "болит", "боль", "ноет", "тянет", "ломит", "хрустит", "онем",
-    "мурашк", "защем", "грыж", "протруз", "спина", "спине", "спину",
-    "поясниц", "шея", "шей", "сустав", "колен", "плеч", "голова",
-    "артроз", "артрит", "остеохонд", "травм",
+    "мурашк", "защем", "грыж", "грыжа", "протруз", "протрузия",
+    "отдает", "отдаёт", "стреляет", "прострел", "нога", "ногу", "рука", "руку",
+    "спина", "спине", "спину", "поясниц", "шея", "шей", "сустав",
+    "колен", "плеч", "голова", "артроз", "артрит", "остеохонд", "травм",
     "ауырады", "ауырып", "ауыр", "аурат", "belim", "белім", "белим",
     "бел", "арқа", "аркам", "арқам", "аяқ", "аяғым", "аягым",
     "мойын", "мойным", "буын", "тізе", "иық", "қол",
@@ -129,6 +130,17 @@ def _has_any(text: str, words: list[str]) -> bool:
     return any(w in low for w in words)
 
 
+def _has_mri_question(text: str) -> bool:
+    low = _low(text)
+    # ВАЖНО: "узи" проверяем только как отдельное слово.
+    # Иначе слово "протрузия" содержит "узи" внутри и ошибочно включает ответ про УЗИ/МРТ.
+    if re.search(r"\b(мрт|кт|рентген|снимок|снимки|томография|диагностика|диагностик)\b", low):
+        return True
+    if re.search(r"(?<![а-яa-z])узи(?![а-яa-z])", low):
+        return True
+    return False
+
+
 def _detect_lang(text: str, session: dict[str, Any]) -> str:
     current = session.get("language") or "ru"
     if detect_message_language:
@@ -181,8 +193,14 @@ def _safe_log(chat_id: str, event: str, payload: dict[str, Any]) -> None:
 def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     answer = _clean(answer)
     if not answer:
-        _safe_save(chat_id, session)
-        return ""
+        if session.get("complaint") and not session.get("age"):
+            answer = _ask_age(session)
+        else:
+            answer = _tr(
+                session,
+                "Подскажите, пожалуйста, что Вас беспокоит? 🌿",
+                "Сізді не мазалайды? 🌿",
+            )
 
     # Не глушим важные разные шаги, но одинаковый дубль подряд не отправляем.
     if session.get("last_assistant_answer") == answer:
@@ -430,7 +448,7 @@ def _clinic_answer(text: str, session: dict[str, Any]) -> str | None:
             "Алдын ала жазылу бойынша жұмыс істейміз 🌿 Қай күн ыңғайлы екенін жазыңыз — бос уақытты тексеремін.",
         )
 
-    if _has_any(text, MRI_WORDS):
+    if _has_mri_question(text):
         return _tr(
             lang,
             "Снимки и МРТ у нас не делают. Но заранее делать обследование не обязательно 🌿 Врач на консультации осмотрит Вас и подскажет, нужно ли МРТ/КТ или другое обследование.\n\nПодскажите, пожалуйста, что Вас беспокоит?",
@@ -668,7 +686,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _finalize(chat_id, session, answer)
 
     # 3) Типовые вопросы.
-    info = _clinic_answer(text, session)
+    # Если в сообщении есть жалоба, жалоба важнее FAQ.
+    # Например "Белім ауырады, похоже протрузия" нельзя ошибочно трактовать как вопрос про УЗИ.
+    info = None if _has_complaint(text) else _clinic_answer(text, session)
     if info and not session.get("complaint"):
         session["step"] = "complaint"
         return _finalize(chat_id, session, info)
