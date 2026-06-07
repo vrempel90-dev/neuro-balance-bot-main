@@ -1,0 +1,882 @@
+[
+  {
+    "name": "first_message_booking_intent",
+    "messages": [
+      "Здравствуйте! Хочу записаться на консультацию по акции 50%"
+    ],
+    "must_contain": [
+      "можно записаться",
+      "что Вас беспокоит"
+    ],
+    "must_not_contain": [
+      "координатор",
+      "с такой жалобой",
+      "сколько Вам лет"
+    ]
+  },
+  {
+    "name": "all_fields_out_of_order",
+    "messages": [
+      "Здравствуйте, болит спина, мне 35, хочу завтра в 10:00"
+    ],
+    "must_contain": [
+      "10:00",
+      "противопоказания"
+    ],
+    "must_not_contain": [
+      "сколько Вам лет",
+      "какой день",
+      "координатор"
+    ]
+  },
+  {
+    "name": "normal_full_booking_flow",
+    "messages": [
+      "Хочу записаться по акции",
+      "Болит поясница",
+      "35",
+      "завтра",
+      "10:00",
+      "нет",
+      "Алия"
+    ],
+    "must_contain": [
+      "записаны",
+      "10:00"
+    ],
+    "must_not_contain": [
+      "координатор"
+    ]
+  },
+  {
+    "name": "minor_parent_required",
+    "messages": [
+      "Хочу записаться, болит колено, мне 16"
+    ],
+    "must_contain": [
+      "нет 18",
+      "родителем"
+    ],
+    "must_not_contain": [
+      "координатор"
+    ]
+  },
+  {
+    "name": "minor_parent_question",
+    "messages": [
+      "Хочу записаться, болит колено, мне 16",
+      "с родителем приходить?"
+    ],
+    "must_contain": [
+      "Да",
+      "родителем"
+    ],
+    "must_not_contain": [
+      "противопоказания",
+      "координатор"
+    ]
+  },
+  {
+    "name": "symptom_is_not_contraindication",
+    "preset_session": {
+      "complaint": "болит поясница",
+      "can_help": true,
+      "age": 35,
+      "preferred_date": "2099-01-01",
+      "selected_date": "2099-01-01",
+      "selected_time": "10:00",
+      "selected_doctor_login": "doctor1",
+      "selected_doctor_name": "Тестовый врач",
+      "questionnaire_step": "contra"
+    },
+    "messages": [
+      "У меня сильно болит, может грыжа"
+    ],
+    "must_contain": [
+      "не на противопоказание",
+      "противопоказания"
+    ],
+    "must_not_contain": [
+      "координатор",
+      "записаны"
+    ]
+  },
+  {
+    "name": "no_contra_answer_moves_to_name",
+    "preset_session": {
+      "complaint": "болит поясница",
+      "can_help": true,
+      "age": 35,
+      "preferred_date": "2099-01-01",
+      "selected_date": "2099-01-01",
+      "selected_time": "10:00",
+      "selected_doctor_login": "doctor1",
+      "selected_doctor_name": "Тестовый врач",
+      "questionnaire_step": "contra"
+    },
+    "messages": [
+      "до этого не было"
+    ],
+    "must_contain": [
+      "имя для записи"
+    ],
+    "must_not_contain": [
+      "какие именно",
+      "координатор"
+    ]
+  },
+  {
+    "name": "mobility_yes_continues",
+    "preset_session": {
+      "complaint": "поясницу ломит, ходить не могу",
+      "can_help": true,
+      "age": 68,
+      "mobility_check_pending": true,
+      "questionnaire_step": "day"
+    },
+    "messages": [
+      "да, смогу"
+    ],
+    "must_contain": [
+      "На какой день",
+      "удобно"
+    ],
+    "must_not_contain": [
+      "К сожалению",
+      "лестниц",
+      "координатор"
+    ]
+  },
+  {
+    "name": "kazakh_language",
+    "messages": [
+      "Сәлеметсіз бе, жазылғым келеді"
+    ],
+    "must_contain": [
+      "Сәлеметсіз бе",
+      "не мазалайды"
+    ],
+    "must_not_contain": [
+      "что Вас беспокоит",
+      "координатор"
+    ]
+  },
+  {
+    "name": "old_prompt_must_not_ask_name_first",
+    "messages": [
+      "Здравствуйте, хочу записаться"
+    ],
+    "must_contain": [
+      "что Вас беспокоит"
+    ],
+    "must_not_contain": [
+      "как могу к Вам обращаться",
+      "как Вас зовут",
+      "имя",
+      "координатор"
+    ]
+  },
+  {
+    "name": "short_contra_not_long_checklist",
+    "preset_session": {
+      "complaint": "болит спина",
+      "can_help": true,
+      "age": 35,
+      "preferred_date": "2099-01-01",
+      "selected_date": "2099-01-01",
+      "selected_time": "10:00",
+      "selected_doctor_login": "doctor1",
+      "selected_doctor_name": "Тестовый врач",
+      "questionnaire_step": "contra"
+    },
+    "messages": [
+      "10:00"
+    ],
+    "must_contain": [
+      "противопоказания"
+    ],
+    "must_not_contain": [
+      "кардиостимулятор",
+      "дефибриллятор",
+      "тромбофлебит",
+      "эпилепсия",
+      "беременность"
+    ]
+  },
+  {
+    "name": "no_name_addressing_after_booking",
+    "messages": [
+      "Хочу записаться",
+      "Болит поясница",
+      "35",
+      "завтра",
+      "10:00",
+      "нет",
+      "Виктор"
+    ],
+    "must_contain": [
+      "записаны",
+      "10:00"
+    ],
+    "must_not_contain": [
+      "Виктор,",
+      "Здравствуйте, Виктор",
+      "Добрый день, Виктор"
+    ]
+  },
+  {
+    "name": "engine_cancel_existing_appointment",
+    "engine": true,
+    "messages": [
+      "Просто отмените запись"
+    ],
+    "must_contain": [
+      "запись отменили"
+    ],
+    "must_not_contain": [
+      "какой день",
+      "что Вас беспокоит",
+      "координатор"
+    ]
+  },
+  {
+    "name": "engine_when_existing_appointment",
+    "engine": true,
+    "messages": [
+      "во сколько мне приходить?"
+    ],
+    "must_contain": [
+      "Вы уже записаны",
+      "10:00"
+    ],
+    "must_not_contain": [
+      "что Вас беспокоит",
+      "имя для записи"
+    ]
+  },
+  {
+    "name": "engine_reschedule_existing_appointment",
+    "engine": true,
+    "messages": [
+      "не получается подойти, надо перенести"
+    ],
+    "must_contain": [
+      "другой день",
+      "перенести"
+    ],
+    "must_not_contain": [
+      "создана",
+      "записаны",
+      "что Вас беспокоит"
+    ]
+  },
+  {
+    "name": "guard_rewrites_coordinator_on_booking",
+    "guard": true,
+    "user_text": "Здравствуйте, хочу записаться по акции",
+    "bad_answer": "Передам ваш вопрос координатору, она ответит вам в ближайшее время.",
+    "session": {
+      "language": "ru"
+    },
+    "must_contain": [
+      "можно записаться",
+      "что Вас беспокоит"
+    ],
+    "must_not_contain": [
+      "координатор",
+      "сколько Вам лет",
+      "имя"
+    ]
+  },
+  {
+    "name": "guard_blocks_name_before_time",
+    "guard": true,
+    "user_text": "Болит спина",
+    "bad_answer": "Подскажите Ваше имя для записи?",
+    "session": {
+      "language": "ru",
+      "complaint": "Болит спина",
+      "age": 0
+    },
+    "must_contain": [
+      "сколько Вам лет"
+    ],
+    "must_not_contain": [
+      "имя"
+    ]
+  },
+  {
+    "name": "guard_removes_name_addressing",
+    "guard": true,
+    "user_text": "Здравствуйте",
+    "bad_answer": "Здравствуйте, Виктор! Чем могу помочь?",
+    "session": {
+      "language": "ru",
+      "patient_name": "Виктор Ремпель"
+    },
+    "must_contain": [
+      "Здравствуйте"
+    ],
+    "must_not_contain": [
+      "Виктор",
+      "Ремпель"
+    ]
+  },
+  {
+    "name": "language_russian_medical_words_stay_ru",
+    "messages": [
+      "Здравствуйте хочу записаться на диагностику",
+      "Плечо, грыжа, протрузия"
+    ],
+    "must_contain": [
+      "Понимаю",
+      "сколько Вам лет"
+    ],
+    "must_not_contain": [
+      "Түсіндім",
+      "Жасыңыз",
+      "нешеде"
+    ]
+  },
+  {
+    "name": "language_russian_glyzha_single_message_stay_ru",
+    "messages": [
+      "Плечо болит, грыжа, протрузия, мне 35"
+    ],
+    "must_contain": [
+      "На какой день"
+    ],
+    "must_not_contain": [
+      "Қай күн",
+      "Жасыңыз"
+    ]
+  },
+  {
+    "name": "no_complaint_nothing_does_not_loop",
+    "messages": [
+      "Здравствуйте! Хочу записаться на консультацию по акции 50%",
+      "Ничего"
+    ],
+    "must_contain": [
+      "нужно понимать",
+      "что хотите проверить"
+    ],
+    "must_not_contain": [
+      "Подскажите, пожалуйста, что Вас беспокоит?"
+    ]
+  },
+  {
+    "name": "minor_asks_what_to_bring_answer_then_continue",
+    "messages": [
+      "Здравствуйте",
+      "Болит спина",
+      "16",
+      "Хорошо, нужно ли мне с собой что-либо брать?"
+    ],
+    "must_contain": [
+      "родителем",
+      "удостоверение",
+      "На какой день"
+    ],
+    "must_not_contain": [
+      "Түсіндім",
+      "Жасыңыз",
+      "только",
+      "координатор"
+    ]
+  },
+  {
+    "name": "treatment_question_after_date_answer_then_slots",
+    "messages": [
+      "Хожу у боль",
+      "Мне 37",
+      "Завтра есть",
+      "А у вас какое лечение вообще"
+    ],
+    "must_contain": [
+      "лечение подбирает врач",
+      "магнитотерапия",
+      "Какое время из вариантов выше"
+    ],
+    "must_not_contain": [
+      "координатор",
+      "сначала",
+      "не знаю",
+      "На понедельник есть свободное время",
+      "09:20",
+      "10:00"
+    ]
+  },
+  {
+    "name": "treatment_question_before_complaint_answer_then_complaint",
+    "messages": [
+      "А у вас какое лечение вообще?"
+    ],
+    "must_contain": [
+      "лечение подбирает врач",
+      "Подскажите",
+      "что Вас беспокоит"
+    ],
+    "must_not_contain": [
+      "На какой день",
+      "сколько Вам лет"
+    ]
+  },
+  {
+    "name": "schedule_question_after_slots_answer_not_repeat_slots",
+    "preset_session": {
+      "complaint": "Хожу у боль",
+      "age": 37,
+      "preferred_date": "2099-01-01",
+      "last_slots": [
+        {
+          "date": "2099-01-01",
+          "time": "09:20",
+          "doctor_name": "Резерв",
+          "doctor_login": "doctor1"
+        }
+      ],
+      "questionnaire_step": "time"
+    },
+    "messages": [
+      "А завтра вы не работаете"
+    ],
+    "must_contain": [
+      "График",
+      "Какое время из вариантов выше"
+    ],
+    "must_not_contain": [
+      "09:20",
+      "10:00",
+      "12:00",
+      "На понедельник есть свободное время"
+    ]
+  },
+  {
+    "name": "address_question_after_slots_answer_not_repeat_slots",
+    "preset_session": {
+      "complaint": "Хожу у боль",
+      "age": 37,
+      "preferred_date": "2099-01-01",
+      "last_slots": [
+        {
+          "date": "2099-01-01",
+          "time": "09:20",
+          "doctor_name": "Резерв",
+          "doctor_login": "doctor1"
+        }
+      ],
+      "questionnaire_step": "time"
+    },
+    "messages": [
+      "А какой у вас адрес скажите пожалуйста"
+    ],
+    "must_contain": [
+      "Кабанбай батыра 28",
+      "Какое время из вариантов выше"
+    ],
+    "must_not_contain": [
+      "На понедельник есть свободное время",
+      "09:20 —",
+      "10:00 —"
+    ]
+  },
+  {
+    "name": "sunday_primary_redirects_to_monday_slots",
+    "preset_session": {
+      "complaint": "болит спина",
+      "age": 35,
+      "questionnaire_step": "day"
+    },
+    "messages": [
+      "Воскресенье"
+    ],
+    "must_contain": [
+      "В воскресенье",
+      "только на процедуры",
+      "понедельник",
+      "свободное время"
+    ],
+    "must_not_contain": [
+      "На воскресенье есть свободное время",
+      "координатор"
+    ]
+  },
+  {
+    "name": "sunday_with_requested_time_redirects_to_monday",
+    "preset_session": {
+      "complaint": "болит спина",
+      "age": 35,
+      "questionnaire_step": "day"
+    },
+    "messages": [
+      "В воскресенье в 10:00"
+    ],
+    "must_contain": [
+      "В воскресенье",
+      "первичных пациентов не принимаем",
+      "понедельник",
+      "10:00",
+      "противопоказания"
+    ],
+    "must_not_contain": [
+      "На воскресенье в 10:00",
+      "координатор"
+    ]
+  },
+  {
+    "name": "diagnosis_protrusion_is_complaint",
+    "messages": [
+      "Здравствуйте хочу записаться на диагностику",
+      "Протрузия"
+    ],
+    "must_contain": [
+      "С такой жалобой",
+      "сколько Вам лет"
+    ],
+    "must_not_contain": [
+      "что Вас беспокоит",
+      "координатор"
+    ]
+  },
+  {
+    "name": "duration_three_days_not_age",
+    "messages": [
+      "Здравствуйте хочу записаться на диагностику",
+      "3 день поясница"
+    ],
+    "must_contain": [
+      "сколько Вам лет"
+    ],
+    "must_not_contain": [
+      "по возрасту",
+      "администратору",
+      "не подсказать"
+    ]
+  },
+  {
+    "name": "age_after_duration_is_accepted",
+    "messages": [
+      "Здравствуйте хочу записаться на диагностику",
+      "3 день поясница",
+      "53"
+    ],
+    "must_contain": [
+      "На какой день"
+    ],
+    "must_not_contain": [
+      "по возрасту",
+      "администратору",
+      "не подсказать"
+    ]
+  },
+  {
+    "name": "date_time_before_complaint_saved_then_used",
+    "messages": [
+      "Здравствуйте хочу записаться на диагностику",
+      "На завтра можно?",
+      "16.00",
+      "Протрузия",
+      "33 года"
+    ],
+    "must_contain": [
+      "16:00",
+      "противопоказания"
+    ],
+    "must_not_contain": [
+      "На какой день",
+      "Какое время",
+      "по возрасту"
+    ]
+  },
+  {
+    "name": "doctor_router_spine_uses_spine_doctor",
+    "messages": [
+      "Хочу записаться",
+      "Болит поясница, грыжа",
+      "35",
+      "понедельник"
+    ],
+    "must_contain": [
+      "Врач по позвоночнику",
+      "свободное время"
+    ],
+    "must_not_contain": [
+      "координатор"
+    ],
+    "expected_doctor_login": "spine_doc"
+  },
+  {
+    "name": "cancel_intent_i_wont_come_uses_crm",
+    "engine": true,
+    "messages": [
+      "я не приду отмените запись"
+    ],
+    "must_contain": [
+      "запись отменили"
+    ],
+    "must_not_contain": [
+      "что Вас беспокоит",
+      "На какой день"
+    ]
+  },
+  {
+    "name": "existing_appointment_blocks_new_booking",
+    "engine": true,
+    "messages": [
+      "Здравствуйте, хочу записаться еще раз"
+    ],
+    "must_contain": [
+      "Вы уже записаны",
+      "10:00",
+      "Тестовый врач"
+    ],
+    "must_not_contain": [
+      "что Вас беспокоит",
+      "На какой день",
+      "имя для записи"
+    ]
+  },
+  {
+    "name": "existing_appointment_blocks_consultation_intent",
+    "engine": true,
+    "messages": [
+      "Можно на консультацию по акции?"
+    ],
+    "must_contain": [
+      "Вы уже записаны",
+      "10:00"
+    ],
+    "must_not_contain": [
+      "что Вас беспокоит",
+      "сколько Вам лет"
+    ]
+  },
+  {
+    "name": "guard_no_active_phrase_on_booking_rewritten",
+    "guard": true,
+    "user_text": "Здравствуйте хочу записаться на диагностику",
+    "bad_answer": "Здравствуйте! У вас нет активной записи. Хотите записаться на диагностику?",
+    "session": {
+      "language": "ru"
+    },
+    "must_contain": [
+      "можно записаться",
+      "что Вас беспокоит"
+    ],
+    "must_not_contain": [
+      "нет активной записи",
+      "диагностику?",
+      "координатор"
+    ]
+  },
+  {
+    "name": "guard_wrong_kazakh_on_russian_address_rewritten",
+    "guard": true,
+    "user_text": "Вы в Астане находитесь и сколько стоит лечебная процедура?",
+    "bad_answer": "📍 Біз Астанадамыз. Адрес: Кабанбай батыра 28, ішкі двор.",
+    "session": {
+      "language": "kk"
+    },
+    "must_contain": [
+      "Кабанбай батыра 28",
+      "Астана"
+    ],
+    "must_not_contain": [
+      "Біз",
+      "ішкі",
+      "Астанадамыз"
+    ]
+  },
+  {
+    "name": "price_question_russian_stays_russian",
+    "messages": [
+      "Вы в Астане находитесь и сколько стоит лечебная процедура?"
+    ],
+    "must_contain": [
+      "Стоимость лечения",
+      "индивидуально"
+    ],
+    "must_not_contain": [
+      "Біз",
+      "ішкі",
+      "Қай",
+      "Жасыңыз"
+    ]
+  },
+  {
+    "name": "mobility_yes_continues_not_refuse",
+    "preset_session": {
+      "complaint": "нога после перелома",
+      "age": 68,
+      "selected_date": "2099-01-01",
+      "selected_time": "10:00",
+      "selected_doctor_login": "doctor1",
+      "selected_doctor_name": "Тестовый врач",
+      "questionnaire_step": "contra",
+      "mobility_check_pending": true
+    },
+    "messages": [
+      "да"
+    ],
+    "must_contain": [
+      "Хорошо",
+      "противопоказания"
+    ],
+    "must_not_contain": [
+      "не сможем",
+      "затруднительным",
+      "администратору",
+      "координатор"
+    ]
+  },
+  {
+    "name": "mobility_no_soft_escalation",
+    "preset_session": {
+      "complaint": "нога после перелома",
+      "age": 68,
+      "questionnaire_step": "day",
+      "mobility_check_pending": true
+    },
+    "messages": [
+      "нет, не смогу"
+    ],
+    "must_contain": [
+      "передам информацию администратору",
+      "лестницы"
+    ],
+    "must_not_contain": [
+      "не сможем взять пациента",
+      "К сожалению, в вашем случае"
+    ]
+  },
+  {
+    "name": "no_complaint_twice_does_not_loop",
+    "messages": [
+      "Здравствуйте! Хочу записаться на консультацию по акции",
+      "ничего",
+      "ничего"
+    ],
+    "must_contain": [
+      "профилактическую",
+      "сколько Вам лет"
+    ],
+    "must_not_contain": [
+      "что Вас беспокоит"
+    ]
+  },
+  {
+    "name": "isolated_protrusion_is_complaint",
+    "messages": [
+      "Здравствуйте хочу записаться",
+      "Протрузия"
+    ],
+    "must_contain": [
+      "С такой жалобой",
+      "сколько Вам лет"
+    ],
+    "must_not_contain": [
+      "что Вас беспокоит",
+      "координатор"
+    ]
+  },
+  {
+    "name": "treatment_question_after_slots_does_not_repeat_slots",
+    "preset_session": {
+      "complaint": "болит спина",
+      "age": 37,
+      "preferred_date": "2099-01-01",
+      "last_slots": [
+        {
+          "date": "2099-01-01",
+          "time": "09:20",
+          "doctor_login": "doctor1",
+          "doctor_name": "Резерв"
+        },
+        {
+          "date": "2099-01-01",
+          "time": "10:00",
+          "doctor_login": "doctor1",
+          "doctor_name": "Резерв"
+        }
+      ],
+      "questionnaire_step": "time"
+    },
+    "messages": [
+      "А у вас какое лечение вообще"
+    ],
+    "must_contain": [
+      "магнитотерап",
+      "Какое время из вариантов выше"
+    ],
+    "must_not_contain": [
+      "На понедельник есть свободное время",
+      "09:20",
+      "10:00"
+    ]
+  },
+  {
+    "name": "price_question_after_day_returns_to_time_without_slot_repeat",
+    "preset_session": {
+      "complaint": "болит спина",
+      "age": 37,
+      "preferred_date": "2099-01-01",
+      "last_slots": [
+        {
+          "date": "2099-01-01",
+          "time": "09:20",
+          "doctor_login": "doctor1",
+          "doctor_name": "Резерв"
+        }
+      ],
+      "questionnaire_step": "time"
+    },
+    "messages": [
+      "консультацию 5000 тг ма?"
+    ],
+    "must_contain": [
+      "5 000",
+      "Какое время из вариантов выше"
+    ],
+    "must_not_contain": [
+      "Қай күн",
+      "На какой день",
+      "09:20"
+    ]
+  },
+  {
+    "name": "stop_booking_kerek_emes_stops",
+    "preset_session": {
+      "complaint": "бұрнан ауырады",
+      "age": 30,
+      "questionnaire_step": "day"
+    },
+    "messages": [
+      "Керек емес"
+    ],
+    "must_contain": [
+      "жазбаймын"
+    ],
+    "must_not_contain": [
+      "Қай күн",
+      "На какой день"
+    ]
+  },
+  {
+    "name": "guard_wrong_refusal_on_hernia_rewritten",
+    "guard": true,
+    "user_text": "аяғым қатты ауырып тұр бел омыртқа жарығы грыжа болуы мүмкін",
+    "bad_answer": "Понимаю вас. Однако, в связи с вашими симптомами, я не могу записать вас на консультацию. Рекомендуем обратиться на очную консультацию к врачу.",
+    "session": {
+      "language": "ru"
+    },
+    "must_contain": [
+      "С такой жалобой",
+      "сколько Вам лет"
+    ],
+    "must_not_contain": [
+      "не могу записать",
+      "Рекомендуем обратиться"
+    ]
+  }
+]
