@@ -179,6 +179,22 @@ def _tr(session_or_lang: dict[str, Any] | str, ru: str, kk: str) -> str:
     return kk if lang == "kk" else ru
 
 
+def _price_short_text(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Приём в нашей клинике — 5 000 тг 🌿",
+        "Біздің клиникада алғашқы қабылдау — 5 000 тг 🌿",
+    )
+
+
+def _prepend_price_if_needed(text: str, session: dict[str, Any], answer: str) -> str:
+    if _has_any(text, PRICE_WORDS):
+        price = _price_short_text(session)
+        if price not in answer:
+            return price + "\n\n" + answer
+    return answer
+
+
 def _safe_save(chat_id: str, session: dict[str, Any]) -> None:
     try:
         state.save_session(chat_id, session)
@@ -606,7 +622,7 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
 
     if not slot:
         session["step"] = "date"
-        return _ask_date(session)
+        return _prepend_price_if_needed(text, session, _ask_date(session))
 
     try:
         booked = await crm.book_appointment(
@@ -643,7 +659,7 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         )
 
 
-async def _handle_existing_lookup(chat_id: str, phone: str, session: dict[str, Any]) -> str:
+async def _handle_existing_lookup(chat_id: str, phone: str, session: dict[str, Any], text: str = "") -> str:
     normalized = sanitize_kz_phone(phone or session.get("phone") or "") or phone
     try:
         lookup = await crm.patient_lookup(normalized)
@@ -666,14 +682,37 @@ async def _handle_existing_lookup(chat_id: str, phone: str, session: dict[str, A
     except Exception as exc:
         _safe_log(chat_id, "patient_lookup_error", {"error": str(exc)[:500]})
 
+    low = _low(text)
+    wants_move = _is_cancel(text) or any(w in low for w in [
+        "перенести", "перенес", "поменять время", "на завтра", "завтра",
+        "ауыстыр", "басқа уақыт", "ертең", "ертен"
+    ])
+    has_contra_note = _contra_has_hard_stop(text) or any(w in low for w in ["кардиостимулятор", "кардиостимулятор бар"])
+
     session["step"] = "escalated"
     session["escalated"] = True
-    return _tr(
-        session,
-        "Поняла Вас. Я передам администратору, чтобы он проверил Вашу запись и напомнил дату и время 🌿",
-        "Түсіндім. Жазбаңызды тексеріп, күні мен уақытын еске салу үшін әкімшіге жіберемін 🌿",
-    )
 
+    if wants_move:
+        answer = _tr(
+            session,
+            "Поняла Вас. Передам администратору, чтобы он проверил Вашу запись, напомнил дату и время и помог перенести на удобное время 🌿",
+            "Түсіндім. Әкімшіге жіберемін, ол жазбаңызды тексеріп, күні мен уақытын еске салып, ыңғайлы уақытқа ауыстыруға көмектеседі 🌿",
+        )
+    else:
+        answer = _tr(
+            session,
+            "Поняла Вас. Я передам администратору, чтобы он проверил Вашу запись и напомнил дату и время 🌿",
+            "Түсіндім. Жазбаңызды тексеріп, күні мен уақытын еске салу үшін әкімшіге жіберемін 🌿",
+        )
+
+    if has_contra_note:
+        answer += "\n\n" + _tr(
+            session,
+            "Информацию про кардиостимулятор обязательно передадим врачу.",
+            "Кардиостимулятор туралы ақпаратты дәрігерге міндетті түрде жеткіземіз.",
+        )
+
+    return answer
 
 def _wants_existing_lookup(text: str) -> bool:
     low = _low(text)
@@ -756,11 +795,11 @@ async def _continue_after_collected_age(chat_id: str, session: dict[str, Any], t
 
         if date_iso:
             slots_answer = await _show_slots(chat_id, session, date_iso)
-            return prefix + "\n\n" + slots_answer
+            return _prepend_price_if_needed(text, session, prefix + "\n\n" + slots_answer)
 
         session["step"] = "date"
         session["questionnaire_step"] = "date"
-        return prefix + "\n\n" + _ask_date(session)
+        return _prepend_price_if_needed(text, session, prefix + "\n\n" + _ask_date(session))
 
     # Если пациент сразу написал, что противопоказаний нет — не спрашиваем это повторно.
     if _contra_is_clear_no(text):
@@ -770,7 +809,8 @@ async def _continue_after_collected_age(chat_id: str, session: dict[str, Any], t
 
         date_iso = _parse_date(text)
         if date_iso:
-            return await _show_slots(chat_id, session, date_iso)
+            slots_answer = await _show_slots(chat_id, session, date_iso)
+            return _prepend_price_if_needed(text, session, slots_answer)
 
         session["step"] = "date"
         return _ask_date(session)
@@ -812,7 +852,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     # 1) Уже записан / напомнить запись — не запускаем новую запись.
     if _wants_existing_lookup(text):
-        answer = await _handle_existing_lookup(chat_id, phone, session)
+        answer = await _handle_existing_lookup(chat_id, phone, session, text)
         return _finalize(chat_id, session, answer)
 
     # 2) Отмена/перенос — не запускаем новую запись.
@@ -821,9 +861,15 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["escalated"] = True
         answer = _tr(
             session,
-            "Поняла Вас 🌿 Передам администратору, он поможет отменить или перенести запись.",
-            "Түсіндім 🌿 Әкімшіге жіберемін, ол жазбаны тоқтатуға немесе ауыстыруға көмектеседі.",
+            "Поняла Вас 🌿 Передам администратору, он проверит Вашу запись и поможет отменить или перенести её на удобное время.",
+            "Түсіндім 🌿 Әкімшіге жіберемін, ол жазбаңызды тексеріп, тоқтатуға немесе ыңғайлы уақытқа ауыстыруға көмектеседі.",
         )
+        if _contra_has_hard_stop(text) or "кардиостимулятор" in _low(text):
+            answer += "\n\n" + _tr(
+                session,
+                "Информацию про кардиостимулятор обязательно передадим врачу.",
+                "Кардиостимулятор туралы ақпаратты дәрігерге міндетті түрде жеткіземіз.",
+            )
         return _finalize(chat_id, session, answer)
 
     # 2.5) Суперсложный сценарий: жалоба + возраст + противопоказания/дата в одном сообщении.
