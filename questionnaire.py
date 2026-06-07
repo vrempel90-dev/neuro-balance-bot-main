@@ -160,10 +160,10 @@ def _safe_continue(lang: str, session: dict[str, Any]) -> str:
 def _price_answer(lang: str, text: str) -> str:
     low = _clean(text)
     if "лечеб" in low or "процедур" in low or "лечение" in low:
-        return get_clinic_info("price_course") or (
+        return get_clinic_info("price_course", lang) or (
             "Стоимость лечения подбирается индивидуально после консультации врача, потому что зависит от диагноза и количества процедур 🌿"
         )
-    return get_clinic_info("price_first_visit") or "Первичная консультация стоит 5 000 тг 🌿"
+    return get_clinic_info("price_first_visit", lang) or ("Алғашқы консультация 5 000 тг 🌿" if lang == "kk" else "Первичная консультация стоит 5 000 тг 🌿")
 
 
 def _continue_current_step(lang: str, session: dict[str, Any]) -> str:
@@ -604,7 +604,7 @@ async def handle_questionnaire(chat_id: str, phone: str, user_text: str, session
     # v23: вопросы про график/адрес нельзя игнорировать и нельзя вместо ответа
     # повторять список свободного времени.
     if _asks_schedule(text):
-        info = get_clinic_info("schedule") or (
+        info = get_clinic_info("schedule", lang) or (
             "Врачи принимают с понедельника по пятницу 08:00–20:00, в субботу 09:00–18:00, воскресенье выходной 🌿"
         )
         cont = _safe_continue(lang, session)
@@ -612,7 +612,7 @@ async def handle_questionnaire(chat_id: str, phone: str, user_text: str, session
         return info + (("\n\n" + cont) if cont else "")
 
     if _asks_address(text):
-        info = get_clinic_info("address") or (
+        info = get_clinic_info("address", lang) or (
             "Адрес клиники: Кабанбай батыра 28, внутренний двор, подъезд 3, Астана 🌿"
         )
         cont = _safe_continue(lang, session)
