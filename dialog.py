@@ -195,6 +195,74 @@ def _prepend_price_if_needed(text: str, session: dict[str, Any], answer: str) ->
     return answer
 
 
+def _is_relative_new_booking_request(text: str) -> bool:
+    low = _low(text)
+
+    relatives = [
+        "маму", "мама", "папу", "папа", "отца", "отец", "сына", "сын",
+        "дочь", "дочку", "дочери", "мужа", "жену", "брата", "сестру",
+        "анамды", "анама", "әкемді", "әкем", "баламды", "балам",
+        "ұлымды", "қызымды", "жолдасымды", "ағамды", "інімді", "әпкемді",
+    ]
+
+    booking_words = [
+        "записать", "записаться", "запишите", "хочу записать", "хочу записаться",
+        "жазу", "жазғым", "жазыл", "жазып", "жазайын",
+    ]
+
+    existing_words = [
+        "уже записан", "уже записана", "я записан", "я записана", "был записан",
+        "была записана", "бұрын жазылған", "жазылған едім",
+        "отмените", "отменить", "перенести", "перенесите",
+        "басқа уақыт", "ауыстыру", "ауыстырыңыз",
+    ]
+
+    return (
+        any(w in low for w in relatives)
+        and any(w in low for w in booking_words)
+        and any(w in low for w in existing_words)
+    )
+
+
+def _relative_dual_task_answer(session: dict[str, Any], text: str) -> str:
+    low = _low(text)
+
+    details = []
+    age_match = _extract_age(text, step="age")
+    if age_match:
+        details.append(f"возраст: {age_match}")
+
+    if any(w in low for w in ["шея", "мойын"]):
+        details.append("жалоба: шея")
+    elif any(w in low for w in ["спина", "поясница", "бел"]):
+        details.append("жалоба: спина/поясница")
+    elif any(w in low for w in ["колено", "тізе"]):
+        details.append("жалоба: колено")
+    elif any(w in low for w in ["нога", "аяқ"]):
+        details.append("жалоба: нога")
+
+    if _contra_is_clear_no(text):
+        details.append("противопоказаний нет")
+    elif _contra_has_hard_stop(text):
+        details.append("есть важные ограничения — передать врачу")
+
+    if any(w in low for w in ["завтра", "ертең", "ертен"]):
+        details.append("желательная дата: завтра")
+
+    details_text_ru = ""
+    details_text_kk = ""
+    if details:
+        joined = "; ".join(details)
+        details_text_ru = f"\n\nПо новой записи передам данные: {joined}."
+        details_text_kk = f"\n\nЖаңа жазба бойынша мәліметтерді жіберемін: {joined}."
+
+    return _tr(
+        session,
+        "Поняла Вас. Передам администратору, чтобы он проверил Вашу запись и помог отменить или перенести её 🌿\n\nТакже администратор отдельно поможет записать родственника на консультацию.",
+        "Түсіндім. Әкімшіге жіберемін, ол Сіздің жазбаңызды тексеріп, тоқтатуға немесе ауыстыруға көмектеседі 🌿\n\nСонымен қатар әкімші туысыңызды консультацияға бөлек жазуға көмектеседі.",
+    ) + _tr(session, details_text_ru, details_text_kk)
+
+
 def _safe_save(chat_id: str, session: dict[str, Any]) -> None:
     try:
         state.save_session(chat_id, session)
@@ -846,6 +914,15 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     session["phone"] = phone or session.get("phone") or ""
     session["language"] = _detect_lang(text, session)
+
+    # 0.5) Две задачи в одном сообщении:
+    # "я уже записан/отмените/перенести" + "маму/папу/сына хочу записать".
+    # Не запускаем обычную анкету, чтобы не перепутать пациентов.
+    if _is_relative_new_booking_request(text):
+        session["step"] = "escalated"
+        session["escalated"] = True
+        answer = _relative_dual_task_answer(session, text)
+        return _finalize(chat_id, session, answer)
 
     if not text:
         return _finalize(chat_id, session, _tr(session, "Напишите, пожалуйста, что Вас беспокоит 🌿", "Сізді не мазалайды? 🌿"))
