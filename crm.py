@@ -15,7 +15,13 @@ def _client() -> httpx.AsyncClient:
 
 def _headers() -> dict[str, str]:
     settings = get_settings()
-    return {"x-bot-secret": settings.crm_bot_secret}
+    secret = (
+        getattr(settings, "crm_bot_secret", "")
+        or getattr(settings, "external_booking_api_secret", "")
+        or getattr(settings, "bot_api_secret", "")
+        or ""
+    )
+    return {"x-bot-secret": secret}
 
 def _url(path: str) -> str:
     settings = get_settings()
@@ -89,12 +95,33 @@ async def check_slots(date: str, doctor_login: str | None = None) -> dict[str, A
     _SLOTS_CACHE[cache_key] = (now, data)
     return data
 
-async def book_appointment(*, patient_name: str, phone: str, doctor_login: str, date: str, time_start: str, doctor_name: str | None = None, notes: str | None = None) -> dict[str, Any]:
-    payload: dict[str, Any] = {"patientName": patient_name, "phone": phone, "doctorLogin": doctor_login, "date": date, "timeStart": time_start}
+async def book_appointment(
+    *,
+    patient_name: str,
+    phone: str,
+    doctor_login: str,
+    date: str,
+    time_start: str,
+    doctor_name: str | None = None,
+    notes: str | None = None,
+    conversation_id: str | int | None = None,
+    lead_id: str | int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "patientName": patient_name,
+        "phone": phone,
+        "doctorLogin": doctor_login,
+        "date": date,
+        "timeStart": time_start,
+    }
     if doctor_name:
         payload["doctorName"] = doctor_name
     if notes:
         payload["notes"] = notes
+    if conversation_id:
+        payload["conversationId"] = conversation_id
+    if lead_id:
+        payload["leadId"] = lead_id
     response = await _client().post(_url("/api/bot/book"), json=payload, headers={**_headers(), "Content-Type": "application/json"})
     _raise_for_crm(response, "book")
     for key in list(_SLOTS_CACHE.keys()):
