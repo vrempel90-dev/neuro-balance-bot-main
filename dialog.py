@@ -59,7 +59,7 @@ COMPLAINT_WORDS = [
     "отдает", "отдаёт", "стреляет", "прострел", "нога", "ногу", "ноге",
     "рука", "руку", "руке", "бедро", "таз", "лопат", "ребр",
     "спина", "спине", "спину", "поясниц", "шея", "шей", "сустав",
-    "колен", "плеч", "голова", "артроз", "артрит", "остеохонд", "травм",
+    "колен", "плеч", "артроз", "артрит", "остеохонд", "травм",
     "ауырады", "ауырып", "ауыр", "аурат", "қатты", "катты", "береді", "береди",
     "belim", "белім", "белим", "бел", "арқа", "аркам", "арқам",
     "аяқ", "аяққа", "аяк", "аякка", "аяғым", "аягым",
@@ -359,6 +359,26 @@ def _has_booking_intent(text: str) -> bool:
 
 def _has_complaint(text: str) -> bool:
     return _has_any(text, COMPLAINT_WORDS)
+
+
+def _has_in_scope_complaint(text: str) -> bool:
+    return _has_any(text, IN_SCOPE_WORDS)
+
+
+def _is_out_of_scope_only(text: str) -> bool:
+    # Если есть профильная зона — не считаем вне профиля.
+    # Пример: "болит голова и шея" — можно уточнить шею.
+    if _has_in_scope_complaint(text):
+        return False
+    return _has_any(text, OUT_OF_SCOPE_WORDS)
+
+
+def _out_of_scope_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Понимаю Вас 🙏 Наша клиника занимается суставами, спиной, шеей и опорно-двигательным аппаратом. Головные боли и другие непрофильные жалобы мы не лечим.\n\nЕсли у Вас есть боль в суставах, спине, шее, руках или ногах — напишите, пожалуйста, что именно беспокоит, и я помогу с записью.",
+        "Түсіндім 🙏 Біздің клиника буындар, арқа, мойын және тірек-қимыл аппараты бойынша жұмыс істейді. Бас ауруы және басқа профильге жатпайтын шағымдарды емдемейміз.\n\nЕгер буын, арқа, мойын, қол немесе аяқ ауырса — нақты не мазалайтынын жазыңыз, жазылуға көмектесемін.",
+    )
 
 
 def _has_no_complaint(text: str) -> bool:
@@ -939,6 +959,13 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if not text:
         return _finalize(chat_id, session, _tr(session, "Напишите, пожалуйста, что Вас беспокоит 🌿", "Сізді не мазалайды? 🌿"))
 
+    # 0.7) Фильтр профиля клиники.
+    # Если человек пишет только про головную боль/давление/живот и т.п.,
+    # не ведём в запись, потому что клиника этим не занимается.
+    if _is_out_of_scope_only(text):
+        session["step"] = "out_of_scope"
+        return _finalize(chat_id, session, _out_of_scope_answer(session))
+
     # 1) Уже записан / напомнить запись — не запускаем новую запись.
     if _wants_existing_lookup(text):
         answer = await _handle_existing_lookup(chat_id, phone, session, text)
@@ -1003,6 +1030,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     # 5) Старт / выясняем жалобу.
     if step in ("start", "", None):
+        if _is_out_of_scope_only(text):
+            session["step"] = "out_of_scope"
+            return _finalize(chat_id, session, _out_of_scope_answer(session))
+
         if _has_no_complaint(text):
             count = int(session.get("no_complaint_count") or 0) + 1
             session["no_complaint_count"] = count
@@ -1182,6 +1213,13 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["patient_name"] = name
         answer = await _book(chat_id, session, phone)
         return _finalize(chat_id, session, answer)
+
+    if step == "out_of_scope":
+        if _has_in_scope_complaint(text):
+            session["complaint"] = text
+            session["step"] = "age"
+            return _finalize(chat_id, session, _ask_age(session))
+        return _finalize(chat_id, session, _out_of_scope_answer(session))
 
     # 11) После записи короткие сообщения не запускают новую анкету.
     if step == "done" or session.get("booked"):
