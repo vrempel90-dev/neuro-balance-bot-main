@@ -1,139 +1,265 @@
 from __future__ import annotations
 
 from typing import Any
-import time
+
 import httpx
-from functools import lru_cache
+
 from config import get_settings
 
-class CRMError(Exception):
-    pass
 
-@lru_cache(maxsize=1)
-def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=3.0))
+def _base_url() -> str:
+    settings = get_settings()
+    return (getattr(settings, "crm_base_url", "") or "").rstrip("/")
+
+
+def _secret() -> str:
+    settings = get_settings()
+    return (
+        getattr(settings, "crm_bot_secret", "")
+        or getattr(settings, "external_booking_api_secret", "")
+        or getattr(settings, "bot_api_secret", "")
+        or ""
+    )
+
 
 def _headers() -> dict[str, str]:
-    settings = get_settings()
-    return {"x-bot-secret": settings.crm_bot_secret}
+    secret = _secret()
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    if secret:
+        headers["x-bot-secret"] = secret
+    return headers
 
-def _url(path: str) -> str:
-    settings = get_settings()
-    return f"{settings.crm_base_url.rstrip('/')}{path}"
 
-def _raise_for_crm(response: httpx.Response, label: str) -> None:
-    if response.status_code == 401:
-        raise CRMError("CRM вернула 401: неверный CRM_BOT_SECRET")
-    if response.status_code == 403:
-        raise CRMError(f"CRM {label} error 403: запись не принадлежит этому телефону")
-    if response.status_code == 404:
-        raise CRMError(f"CRM {label} error 404: запись не найдена")
-    if response.status_code == 409:
-        raise CRMError(f"CRM {label} error 409: слот уже занят")
-    if response.status_code == 410:
-        raise CRMError(f"CRM {label} error 410: запись уже отменена")
-    if response.status_code == 429:
-        try:
-            retry = response.json().get("retryAfterSec")
-        except Exception:
-            retry = None
-        raise CRMError(f"CRM {label} error 429: превышен лимит" + (f", повтор через {retry} сек" if retry else ""))
-    if response.status_code >= 400:
-        raise CRMError(f"CRM {label} error {response.status_code}: {response.text}")
+def _timeout() -> httpx.Timeout:
+    return httpx.Timeout(connect=8.0, read=20.0, write=20.0, pool=8.0)
 
-_SLOTS_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
-_SLOTS_CACHE_TTL = 25.0
-_DOCTORS_CACHE: tuple[float, dict[str, Any]] | None = None
-_SERVICES_CACHE: tuple[float, dict[str, Any]] | None = None
-_META_CACHE_TTL = 300.0
 
-async def patient_lookup(phone: str) -> dict[str, Any]:
-    response = await _client().get(_url("/api/bot/patient-lookup"), params={"phone": phone}, headers=_headers())
-    _raise_for_crm(response, "patient-lookup")
-    return response.json()
+async def check_slots(date: str, doctor_login: str | None = None, doctor: str | None = None) -> dict[str, Any]:
+    """
+    Official CRM contract.
 
-async def get_doctors(force: bool = False) -> dict[str, Any]:
-    global _DOCTORS_CACHE
-    now = time.monotonic()
-    if not force and _DOCTORS_CACHE and now - _DOCTORS_CACHE[0] < _META_CACHE_TTL:
-        return _DOCTORS_CACHE[1]
-    response = await _client().get(_url("/api/bot/doctors"), headers=_headers())
-    _raise_for_crm(response, "doctors")
-    data = response.json()
-    _DOCTORS_CACHE = (now, data)
-    return data
+    GET /api/bot/check-slots?date=YYYY-MM-DD&doctor=<login>
+    Header: x-bot-secret: <key>
 
-async def get_services(force: bool = False) -> dict[str, Any]:
-    global _SERVICES_CACHE
-    now = time.monotonic()
-    if not force and _SERVICES_CACHE and now - _SERVICES_CACHE[0] < _META_CACHE_TTL:
-        return _SERVICES_CACHE[1]
-    response = await _client().get(_url("/api/bot/services"), headers=_headers())
-    _raise_for_crm(response, "services")
-    data = response.json()
-    _SERVICES_CACHE = (now, data)
-    return data
+    Response:
+    {
+      "availability": [
+        {
+          "doctorLogin": "...",
+          "doctorName": "...",
+          "date": "YYYY-MM-DD",
+          "availableSlots": ["10:00", "12:30"]
+        }
+      ]
+    }
 
-async def check_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
+    doctor is optional.
+    """
+    base = _base_url()
+    if not base:
+        raise RuntimeError("CRM_BASE_URL is not configured")
+
     params: dict[str, str] = {"date": date}
-    if doctor_login:
-        params["doctor"] = doctor_login
-    cache_key = (date, doctor_login or "")
-    cached = _SLOTS_CACHE.get(cache_key)
-    now = time.monotonic()
-    if cached and now - cached[0] < _SLOTS_CACHE_TTL:
-        return cached[1]
-    response = await _client().get(_url("/api/bot/check-slots"), params=params, headers=_headers())
-    _raise_for_crm(response, "check-slots")
+    selected_doctor = doctor_login or doctor
+    if selected_doctor:
+        params["doctor"] = selected_doctor
+
+    url = f"{base}/api/bot/check-slots"
+
+    async with httpx.AsyncClient(timeout=_timeout()) as client:
+        response = await client.get(url, params=params, headers=_headers())
+
+    response.raise_for_status()
+
     data = response.json()
-    _SLOTS_CACHE[cache_key] = (now, data)
+    if not isinstance(data, dict):
+        raise RuntimeError("CRM check-slots returned non-object JSON")
+
+    availability = data.get("availability")
+    if availability is None:
+        data["availability"] = []
+    elif not isinstance(availability, list):
+        raise RuntimeError("CRM check-slots field 'availability' must be a list")
+
     return data
 
-async def book_appointment(*, patient_name: str, phone: str, doctor_login: str, date: str, time_start: str, doctor_name: str | None = None, notes: str | None = None) -> dict[str, Any]:
-    payload: dict[str, Any] = {"patientName": patient_name, "phone": phone, "doctorLogin": doctor_login, "date": date, "timeStart": time_start}
+
+async def book_appointment(
+    patient_name: str,
+    phone: str,
+    doctor_login: str,
+    date: str,
+    time_start: str,
+    doctor_name: str | None = None,
+    notes: str | None = None,
+    conversation_id: str | None = None,
+    lead_id: str | None = None,
+    **_: Any,
+) -> dict[str, Any]:
+    """
+    Official CRM contract.
+
+    POST /api/bot/book
+    Header: x-bot-secret: <key>
+
+    Required body:
+    {
+      "patientName": "...",
+      "phone": "77011234567",
+      "doctorLogin": "...",
+      "date": "YYYY-MM-DD",
+      "timeStart": "10:00"
+    }
+
+    Optional:
+    doctorName, notes, conversationId, leadId
+
+    Success response status: 201
+    {
+      "appointmentId": 123,
+      "doctorName": "...",
+      "date": "YYYY-MM-DD",
+      "timeStart": "10:00",
+      "timeEnd": "10:30"
+    }
+    """
+    base = _base_url()
+    if not base:
+        raise RuntimeError("CRM_BASE_URL is not configured")
+
+    if not patient_name:
+        raise ValueError("patient_name is required")
+    if not phone:
+        raise ValueError("phone is required")
+    if not doctor_login:
+        raise ValueError("doctor_login is required")
+    if not date:
+        raise ValueError("date is required")
+    if not time_start:
+        raise ValueError("time_start is required")
+
+    payload: dict[str, Any] = {
+        "patientName": patient_name,
+        "phone": phone,
+        "doctorLogin": doctor_login,
+        "date": date,
+        "timeStart": time_start,
+    }
+
     if doctor_name:
         payload["doctorName"] = doctor_name
     if notes:
         payload["notes"] = notes
-    response = await _client().post(_url("/api/bot/book"), json=payload, headers={**_headers(), "Content-Type": "application/json"})
-    _raise_for_crm(response, "book")
-    for key in list(_SLOTS_CACHE.keys()):
-        if key[0] == date:
-            _SLOTS_CACHE.pop(key, None)
-    return response.json()
-
-async def cancel_appointment(*, phone: str, appointment_id: int | None = None, reason: str = "") -> dict[str, Any]:
-    payload: dict[str, Any] = {"phone": phone, "reason": reason or "отмена через бота"}
-    if appointment_id:
-        payload["appointmentId"] = appointment_id
-    response = await _client().post(_url("/api/bot/appointment/cancel"), json=payload, headers={**_headers(), "Content-Type": "application/json"})
-    _raise_for_crm(response, "appointment/cancel")
-    return response.json()
-
-async def reschedule_appointment(*, phone: str, new_date: str, new_time_start: str, appointment_id: int | None = None, reason: str = "") -> dict[str, Any]:
-    payload: dict[str, Any] = {"phone": phone, "newDate": new_date, "newTimeStart": new_time_start, "reason": reason or "перенос через бота"}
-    if appointment_id:
-        payload["appointmentId"] = appointment_id
-    response = await _client().post(_url("/api/bot/appointment/reschedule"), json=payload, headers={**_headers(), "Content-Type": "application/json"})
-    _raise_for_crm(response, "appointment/reschedule")
-    return response.json()
-
-async def escalate_to_operator(*, phone: str | None = None, conversation_id: int | str | None = None, reason: str = "") -> dict[str, Any]:
-    payload: dict[str, Any] = {"reason": reason or "нужен живой оператор"}
-    if phone:
-        payload["phone"] = phone
     if conversation_id:
         payload["conversationId"] = conversation_id
-    response = await _client().post(_url("/api/bot/escalate"), json=payload, headers={**_headers(), "Content-Type": "application/json"})
-    _raise_for_crm(response, "escalate")
-    return response.json()
+    if lead_id:
+        payload["leadId"] = lead_id
 
-async def log_outcome(*, phone: str | None = None, conversation_id: int | str | None = None, outcome: str, appointment_id: int | None = None, note: str = "") -> dict[str, Any]:
-    payload: dict[str, Any] = {"outcome": outcome, "appointmentId": appointment_id, "note": note}
-    if phone:
-        payload["phone"] = phone
+    url = f"{base}/api/bot/book"
+
+    async with httpx.AsyncClient(timeout=_timeout()) as client:
+        response = await client.post(url, json=payload, headers=_headers())
+
+    # Official success is 201, but accept any 2xx to avoid false failures
+    # if CRM returns 200 in staging.
+    if response.status_code < 200 or response.status_code >= 300:
+        response.raise_for_status()
+
+    data = response.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("CRM book returned non-object JSON")
+
+    return data
+
+
+async def patient_lookup(phone: str) -> dict[str, Any]:
+    """
+    Optional helper for "I am already booked, remind me the time".
+
+    If CRM later provides this endpoint, we will use:
+    GET /api/bot/patient-lookup?phone=77011234567
+
+    If the endpoint is missing, this function safely returns no active appointment.
+    This prevents the bot from crashing and lets dialog.py fallback to admin/coordinator.
+    """
+    base = _base_url()
+    if not base:
+        return {"hasActiveAppointment": False}
+
+    url = f"{base}/api/bot/patient-lookup"
+    params = {"phone": phone}
+
+    try:
+        async with httpx.AsyncClient(timeout=_timeout()) as client:
+            response = await client.get(url, params=params, headers=_headers())
+
+        if response.status_code == 404:
+            return {"hasActiveAppointment": False}
+
+        response.raise_for_status()
+        data = response.json()
+
+        if isinstance(data, dict):
+            return data
+
+        return {"hasActiveAppointment": False}
+
+    except Exception:
+        return {"hasActiveAppointment": False}
+
+
+async def create_fallback_lead(
+    phone: str,
+    text: str,
+    notes: str | None = None,
+    conversation_id: str | None = None,
+    lead_id: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
+    """
+    Optional fallback endpoint.
+
+    If CRM later provides a fallback/task endpoint, this can create a manual task:
+    POST /api/bot/fallback-lead
+
+    Current dialog can work without this. If endpoint is missing, return ok=false.
+    """
+    base = _base_url()
+    if not base:
+        return {"ok": False, "reason": "CRM_BASE_URL is not configured"}
+
+    payload: dict[str, Any] = {
+        "phone": phone,
+        "text": text,
+    }
+
+    if notes:
+        payload["notes"] = notes
     if conversation_id:
         payload["conversationId"] = conversation_id
-    response = await _client().post(_url("/api/bot/outcome"), json=payload, headers={**_headers(), "Content-Type": "application/json"})
-    _raise_for_crm(response, "outcome")
-    return response.json()
+    if lead_id:
+        payload["leadId"] = lead_id
+    payload.update(extra)
+
+    url = f"{base}/api/bot/fallback-lead"
+
+    try:
+        async with httpx.AsyncClient(timeout=_timeout()) as client:
+            response = await client.post(url, json=payload, headers=_headers())
+
+        if response.status_code == 404:
+            return {"ok": False, "reason": "fallback endpoint not found"}
+
+        response.raise_for_status()
+        data = response.json()
+
+        if isinstance(data, dict):
+            return data
+
+        return {"ok": True}
+
+    except Exception as exc:
+        return {"ok": False, "reason": str(exc)}
