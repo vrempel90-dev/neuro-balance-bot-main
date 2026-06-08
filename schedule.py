@@ -33,24 +33,3 @@ def is_bot_work_time(now: datetime | None = None) -> bool:
 def daytime_handoff_text() -> str:
     settings = get_settings()
     return settings.daytime_handoff_message
-
-
-def active_window_id(now: datetime | None = None) -> str:
-    """ID текущего ночного окна работы бота.
-
-    Нужно, чтобы бот НЕ продолжал дневной диалог админов.
-    На первое сообщение пациента в новом ночном окне история этого чата очищается,
-    дальше в пределах этой же ночи бот помнит только ночную переписку.
-    """
-    settings = get_settings()
-    now = now or astana_now()
-    start = settings.bot_active_from_hour
-    end = settings.bot_active_until_hour
-
-    # Если интервал через полночь, например 20:00–08:00,
-    # то сообщения после 00:00 относятся к ночному окну предыдущей даты.
-    window_date = now.date()
-    if start > end and now.hour < end:
-        window_date = (now - timedelta(days=1)).date()
-
-    return f"{window_date.isoformat()}_{start:02d}-{end:02d}"

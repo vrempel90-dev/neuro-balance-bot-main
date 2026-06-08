@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from functools import lru_cache
 try:
     from openai import AsyncOpenAI
@@ -62,10 +63,9 @@ HUMAN_ACK_PROMPT = """
 - Если пациент спрашивает «занимаетесь?», «лечите?», «можно к вам?» — сначала ответь по сути, что можно прийти на первичную консультацию, если это похоже на профиль клиники.
 - Если жалоба непрофильная (горло, зубы, ЛОР, кожа, высокая температура и т.п.) — мягко скажи, что основной профиль клиники спина/суставы/неврология, и лучше уточнит администратор.
 - Не используй слово «окошки». Говори «свободное время для записи».
-- Не меняй язык: если пациент написал на русском, отвечай на русском; русские слова «грыжа/протрузия» не являются казахским.
-- Не спрашивай имя, возраст, дату, время, телефон и противопоказания. Python-сценарий добавит следующий вопрос сам.
+- Не спрашивай возраст, дату, время, телефон и противопоказания. Python-сценарий добавит следующий вопрос сам.
 - Не пиши длинно. 1–2 коротких предложения.
-- Не отправляй к координатору на обычную запись по акции.
+- Никогда не обращайся к пациенту по имени. Не используй «Очень приятно, ...», «Здравствуйте, ...», «Спасибо, ...».
 - Не используй сухие шаблоны типа «Подберём свободное время» без ответа по жалобе.
 
 Стиль:
@@ -87,20 +87,8 @@ HUMAN_ACK_PROMPT = """
 """.strip()
 
 
-
-def _is_generic_booking_without_complaint(text: str) -> bool:
-    low = (text or "").lower()
-    intent_words = ["хочу записаться", "записаться", "консультац", "по акции", "акция", "50%", "instagram", "ссылка", "здравствуйте"]
-    complaint_words = ["болит", "боль", "спина", "шея", "поясница", "сустав", "колено", "плечо", "нога", "рука", "грыжа", "артроз", "ауырады", "бел", "буын"]
-    return any(w in low for w in intent_words) and not any(w in low for w in complaint_words)
-
-
 def _fallback_ack(text: str, lang: str = "ru") -> str:
     low = (text or "").lower()
-    if _is_generic_booking_without_complaint(text):
-        if lang == "kk":
-            return "Сәлеметсіз бе! Иә, акция бойынша консультацияға жазылуға болады 🌿 Айтыңызшы, Сізді не мазалайды?"
-        return "Здравствуйте! Да, можно записаться на консультацию по акции 🌿 Подскажите, пожалуйста, что Вас беспокоит?"
     if lang == "kk":
         if any(w in low for w in ["иық", "iyk", "плеч", "сіңір", "синир", "байлам"]):
             return "Иә, иық буыны, сіңір немесе байлам бойынша шағыммен алғашқы консультацияға келуге болады 🌿 Дәрігер қарап, қандай ем бағыты сәйкес келетінін айтады."
@@ -146,8 +134,8 @@ async def generate_complaint_ack(text: str, lang: str = "ru") -> str:
         language_name = "казахский" if lang == "kk" else "русский"
         response = await client.chat.completions.create(
             model=settings.openai_model,
-            temperature=getattr(settings, 'openai_humanize_temperature', 0.25),
-            max_tokens=220,
+            temperature=0.45,
+            max_tokens=170,
             messages=[
                 {"role": "system", "content": HUMAN_ACK_PROMPT.format(lang=language_name)},
                 {"role": "user", "content": text or "жалоба пациента"},
@@ -167,13 +155,13 @@ HUMANIZE_REPLY_PROMPT = """
 - НЕ меняй смысл и медицинскую безопасность.
 - НЕ добавляй диагнозы и обещания результата.
 - НЕ удаляй обязательный следующий вопрос, если он есть в черновике.
-- НЕ меняй даты, время, имя врача, имя пациента, номер варианта и факты CRM. Но не добавляй обращение к пациенту по имени в текст ответа.
+- НЕ меняй даты, время, имя врача, имя пациента, номер варианта и факты CRM.
 - НЕ используй слово «окошки» — только «свободное время для записи».
-- НЕ обращайся к пациенту по имени в приветствиях и обычных ответах. Имя можно оставить только если черновик явно спрашивает имя для записи на финальном этапе.
 - Ответ короткий, WhatsApp-стиль, без канцелярита.
 - Если пациент задал вопрос, сначала ответь по сути, потом мягко продолжи запись.
 - Если в черновике есть разделитель --- — можно сделать сообщение более плавным, но не теряй обязательные части.
 - Не пиши markdown.
+- Никогда не обращайся к пациенту по имени. Не используй «Очень приятно, ...», «Здравствуйте, ...», «Спасибо, ...».
 
 Язык ответа: {lang}.
 Текущий шаг: {step}.
@@ -189,8 +177,15 @@ HUMANIZE_REPLY_PROMPT = """
 def _fallback_humanize(draft: str) -> str:
     text = (draft or "").strip()
     text = text.replace("окошки", "свободное время для записи")
+    text = text.replace("окошко", "свободное время для записи")
     text = text.replace("Ок", "Хорошо")
-    return text
+    for pat in [
+        r"^\s*(очень\s+приятно|приятно\s+познакомиться)\s*,?\s*[^.!?\n]{1,40}[.!?]?(\s+|$)",
+        r"^\s*(здравствуйте|добрый\s+день|добрый\s+вечер|сәлеметсіз\s+бе)\s*,\s*[^.!?\n]{1,40}[.!?]?(\s+|$)",
+        r"^\s*(спасибо|рахмет)\s*,\s*[^.!?\n]{1,40}[.!?]?(\s+|$)",
+    ]:
+        text = re.sub(pat, "", text, flags=re.IGNORECASE | re.UNICODE).strip()
+    return text or "Спасибо 🌿 Подскажите, пожалуйста, чем можем помочь?"
 
 
 async def generate_human_message(draft: str, user_text: str = "", lang: str = "ru", step: str = "") -> str:
@@ -213,8 +208,8 @@ async def generate_human_message(draft: str, user_text: str = "", lang: str = "r
         language_name = "казахский" if lang == "kk" else "русский"
         response = await client.chat.completions.create(
             model=settings.openai_model,
-            temperature=getattr(settings, 'openai_humanize_temperature', 0.25),
-            max_tokens=260,
+            temperature=0.55,
+            max_tokens=240,
             messages=[
                 {"role": "system", "content": HUMANIZE_REPLY_PROMPT.format(lang=language_name, step=step or "", user_text=user_text or "", draft=draft)},
             ],

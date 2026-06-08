@@ -31,8 +31,6 @@ class VoiceTranscript:
     filename: str
     content_type: str | None = None
     source: str = "voice"
-    ok: bool = True
-    error: str = ""
 
 
 def filename_from_content_type(content_type: str | None, fallback: str = "voice.ogg") -> str:
@@ -54,7 +52,7 @@ async def transcribe_bytes(
     Работает для Wazzup, debug endpoint и любого будущего провайдера.
     """
     if not data:
-        return VoiceTranscript(text="", filename=filename, ok=False, error="empty_audio")
+        return VoiceTranscript(text="", filename=filename)
 
     settings = get_settings()
     client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -72,9 +70,7 @@ async def transcribe_bytes(
                 file=f,
                 language=language,
             )
-        return VoiceTranscript(text=(result.text or "").strip(), filename=filename, ok=True)
-    except Exception as exc:
-        return VoiceTranscript(text="", filename=filename, ok=False, error=str(exc)[:500])
+        return VoiceTranscript(text=(result.text or "").strip(), filename=filename)
     finally:
         try:
             os.remove(tmp_path)
@@ -97,11 +93,7 @@ async def transcribe_wazzup_voice(message: dict[str, Any], language: str = "ru")
     file_id = message.get("file_id") or None
     filename = message.get("filename") or "voice.ogg"
 
-    try:
-        data, content_type = await download_media(media_url=media_url, file_id=file_id)
-    except Exception as exc:
-        return VoiceTranscript(text="", filename=filename, ok=False, error=str(exc)[:500])
-
+    data, content_type = await download_media(media_url=media_url, file_id=file_id)
     if (not filename or filename == "voice.ogg") and content_type:
         filename = filename_from_content_type(content_type, fallback="voice.ogg")
 
@@ -115,5 +107,5 @@ def voice_text_for_bot(transcript: str) -> str:
     """Как передавать голосовое в основной AI-сценарий."""
     clean = (transcript or "").strip()
     if not clean:
-        return ""
+        return "[Голосовое сообщение]: аудио не удалось распознать. Попроси пациента написать текстом."
     return f"[Голосовое сообщение, расшифровка]: {clean}"

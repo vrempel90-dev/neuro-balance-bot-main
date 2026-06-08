@@ -3,10 +3,10 @@ import asyncio
 import uuid
 import state
 from dialog import handle_message
-from wazzup import extract_incoming_messages, extract_dialog_messages, send_text
+from wazzup import extract_incoming_messages, send_text
 from voice import transcribe_wazzup_voice, transcribe_bytes, transcribe_upload, voice_text_for_bot
 from config import get_settings
-from schedule import is_bot_work_time, daytime_handoff_text, active_window_id
+from schedule import is_bot_work_time, daytime_handoff_text
 
 app = FastAPI(title="Neuro Balance Hybrid WhatsApp Booking Bot")
 
@@ -23,7 +23,7 @@ def startup() -> None:
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True, "mode": "gpt-night-new-messages-only-with-admin-style-memory", "bot_work_time_now": is_bot_work_time(), "daytime_memory_enabled": get_settings().learn_admin_dialogs_enabled}
+    return {"ok": True, "mode": "gpt4o-mini-night-only", "bot_work_time_now": is_bot_work_time()}
 
 
 async def _build_answer_for_message(message: dict[str, str]) -> str:
@@ -31,21 +31,13 @@ async def _build_answer_for_message(message: dict[str, str]) -> str:
     phone = message.get("phone") or chat_id
     kind = message.get("kind") or "text"
 
-    # В рабочее время администраторов бот молчит: только запоминает переписку.
+    # Вне рабочего времени бот полностью молчит.
     if not is_bot_work_time():
-        state.log_event(chat_id, "silent_daytime_admin_mode", {"kind": kind})
+        state.log_event(chat_id, "silent_outside_work_time", {"kind": kind})
         return ""
-
-    # Ночью бот отвечает только на сообщения, которые пришли в ночное окно.
-    # На первое сообщение в новом ночном окне очищаем историю этого чата,
-    # чтобы GPT НЕ продолжал дневной диалог админов и не путался.
-    state.reset_chat_for_active_window(chat_id, active_window_id())
 
     if kind == "voice":
         transcript = await transcribe_wazzup_voice(message, language="ru")
-        if not transcript.text.strip():
-            state.log_event(chat_id, "voice_transcription_empty", {"error": transcript.error, "filename": transcript.filename})
-            return "Не смогла разобрать голосовое 🙏🏻 Напишите, пожалуйста, текстом, что Вас беспокоит?"
         user_text = voice_text_for_bot(transcript.text)
     else:
         user_text = message.get("text") or ""
@@ -66,7 +58,7 @@ async def _debounced_process_and_send(message: dict[str, str]) -> None:
 
     try:
         if not is_bot_work_time():
-            state.log_event(chat_id, "silent_daytime_admin_mode", {"kind": kind})
+            state.log_event(chat_id, "silent_outside_work_time", {"kind": kind})
             return
 
         settings = get_settings()
@@ -111,21 +103,6 @@ async def wazzup_webhook(request: Request, authorization: str | None = Header(de
             raise HTTPException(status_code=401, detail="Bad webhook secret")
 
     payload = await request.json()
-
-    # Днём бот молчит. Он НЕ сохраняет дневной диалог как историю конкретного пациента,
-    # чтобы ночью GPT не продолжал переписку админа и не путался.
-    # Сохраняем только исходящие ответы админов как обезличенные примеры стиля.
-    if get_settings().learn_admin_dialogs_enabled and not is_bot_work_time():
-        for dialog_message in extract_dialog_messages(payload):
-            memory_key = "memory:" + (dialog_message.get("message_key") or "")
-            if memory_key and not state.is_processed_message(memory_key):
-                state.mark_processed_message(memory_key, dialog_message["chat_id"])
-                if (dialog_message.get("role") or "") == "assistant":
-                    state.add_admin_style_example(
-                        dialog_message["chat_id"],
-                        dialog_message.get("text") or "",
-                    )
-
     messages = extract_incoming_messages(payload)
 
     accepted = 0
