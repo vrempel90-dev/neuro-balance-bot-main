@@ -94,8 +94,20 @@ async def _debounced_process_and_send(message: dict[str, str]) -> None:
             pass
 
 
-@app.post("/webhook/wazzup")
-async def wazzup_webhook(request: Request, authorization: str | None = Header(default=None)) -> dict:
+@app.get("/webhook/wazzup")
+async def wazzup_webhook_check() -> dict:
+    # Wazzup/CRM sometimes checks webhook availability with GET.
+    # Real incoming messages must still be sent with POST.
+    return {"ok": True, "webhook": "wazzup", "method": "GET check only"}
+
+
+@app.get("/api/bot/hook")
+async def api_bot_hook_check() -> dict:
+    # Compatibility check endpoint.
+    return {"ok": True, "webhook": "api-bot-hook", "method": "GET check only"}
+
+
+async def _process_wazzup_payload(request: Request, authorization: str | None = None) -> dict:
     settings = get_settings()
     if settings.webhook_secret:
         expected = f"Bearer {settings.webhook_secret}"
@@ -120,6 +132,17 @@ async def wazzup_webhook(request: Request, authorization: str | None = Header(de
 
     # Возвращаем ответ сразу. Сам бот ответит клиенту в фоне после debounce-паузы.
     return {"ok": True, "accepted": accepted, "skipped": skipped}
+
+
+@app.post("/webhook/wazzup")
+async def wazzup_webhook(request: Request, authorization: str | None = Header(default=None)) -> dict:
+    return await _process_wazzup_payload(request, authorization)
+
+
+@app.post("/api/bot/hook")
+async def api_bot_hook(request: Request, authorization: str | None = Header(default=None)) -> dict:
+    # Alias for CRM/WhatsApp default webhook.
+    return await _process_wazzup_payload(request, authorization)
 
 
 @app.post("/debug/chat")
