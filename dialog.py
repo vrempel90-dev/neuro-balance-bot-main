@@ -117,9 +117,11 @@ YES_WORDS = [
 ]
 
 HARD_CONTRA_WORDS = [
-    "кардиостимулятор", "имплант", "беремен", "жүктілік", "жукцилик",
-    "онколог", "рак", "эпилеп", "тромб", "кровотеч", "қан кет",
-    "температура", "инфекц", "острое воспал", "жүрек", "сердеч",
+    "кардиостимулятор", "имплант", "металл", "метал", "металлоконструк",
+    "беремен", "беременность", "жүктілік", "жукцилик",
+    "онколог", "онкология", "рак", "эпилеп", "эпилепсия",
+    "коляск", "костыл", "костыли", "ограниченная подвижность", "ограниченной подвижностью",
+    "мүгедек арба", "арбамен", "таяқ", "балдақ",
 ]
 
 NAME_BANNED_WORDS = set(
@@ -338,14 +340,16 @@ def _extract_age(text: str, step: str = "") -> int | None:
 
 
 def _age_stop_text(age: int, session: dict[str, Any]) -> str:
-    if age < 18:
+    if age < 16:
+        return _stop_booking_text(session, "under_16")
+    if 16 <= age < 18:
         return _tr(
             session,
             "Так как Вам нет 18 лет, на консультацию нужно прийти с родителем или законным представителем 🌿",
             "18 жасқа толмағандықтан, консультацияға ата-анаңызбен немесе заңды өкіліңізбен келу керек 🌿",
         )
-    # 75+ НЕ останавливаем автоматически: аккуратно продолжаем запись,
-    # но обязательно собираем противопоказания перед датой.
+    if age > 75:
+        return _stop_booking_text(session, "over_75")
     return ""
 
 
@@ -599,19 +603,14 @@ def _ask_age_contextual(session: dict[str, Any], text: str) -> str:
 
 
 def _senior_contra_intro(session: dict[str, Any]) -> str:
-    return _tr(
-        session,
-        "Спасибо 🌿 Перед записью уточню важный момент: есть ли у Вас противопоказания или ограничения по здоровью?\n\nНапример: онкология, высокая температура, острое воспаление, свежие травмы/переломы, кардиостимулятор?",
-        "Рақмет 🌿 Жазылар алдында маңызды сұрақты нақтылайын. Жазбас бұрын қарсы көрсетілімдер немесе денсаулық бойынша шектеулерді нақтылау маңызды.\n\nМысалы: онкология, жоғары температура, жедел қабыну, жаңа жарақат/сыну, кардиостимулятор?",
-    )
+    return _stop_booking_text(session, "over_75")
 
 
 def _ask_contra(session: dict[str, Any]) -> str:
-    # Универсальный текст без беременности, чтобы не писать это мужчинам.
     return _tr(
         session,
-        "Спасибо 🌿 Перед записью уточню: есть ли у Вас противопоказания или ограничения по здоровью?\n\nНапример: онкология, высокая температура, острое воспаление, свежие травмы/переломы, кардиостимулятор?",
-        "Рақмет 🌿 Жазбас бұрын нақтылайын: Сізде қарсы көрсетілімдер немесе денсаулық бойынша шектеулер бар ма?\n\nМысалы: онкология, жоғары температура, жедел қабыну, жаңа жарақат/сыну, кардиостимулятор?",
+        "Перед записью нужно подтвердить: нет ли у Вас противопоказаний — кардиостимулятор, беременность, онкология, металл в зоне лечения, эпилепсия, возраст до 16 или более 75 лет?\n\nТакже обращаем Ваше внимание: для обеспечения безопасности и эффективности лечения приём не проводится пациентам с ограниченной подвижностью — коляски, костыли.\n\nЛицам от 16 до 18 лет — только в сопровождении родителей или законного представителя.\n\nПодтвердите, пожалуйста: противопоказаний нет?",
+        "Жазылмас бұрын нақтылау қажет: Сізде қарсы көрсетілімдер жоқ па — кардиостимулятор, жүктілік, онкология, емдеу аймағындағы металл, эпилепсия, 16 жасқа дейін немесе 75 жастан жоғары жас?\n\nҚауіпсіздік пен емнің тиімділігі үшін қозғалысы шектеулі пациенттерге — арба, балдақ/костыль — қабылдау жүргізілмейді.\n\n16–18 жас аралығындағы пациенттер тек ата-анасымен немесе заңды өкілімен келе алады.\n\nРастап жазыңызшы: қарсы көрсетілімдер жоқ па?",
     )
 
 
@@ -804,11 +803,7 @@ def _is_cancel(text: str) -> bool:
 def _contra_has_hard_stop(text: str) -> bool:
     low = _low(text)
 
-    # Негативные конструкции считаем только если "нет/жоқ" относится прямо к этому слову.
-    # Важно:
-    # "кардиостимулятора нет" -> НЕ важная заметка
-    # "нет кардиостимулятора" -> НЕ важная заметка
-    # "онкологии нет, но есть кардиостимулятор" -> важная заметка для врача, запись продолжаем
+    # Отрицания считаем только если "нет/жоқ" стоит рядом с конкретным словом.
     direct_neg_patterns = [
         r"(?:нет|нету|жоқ|жок)\s+(?:у\s+меня\s+)?{word}",
         r"{word}\s+(?:у\s+меня\s+)?(?:нет|нету|жоқ|жок)",
@@ -818,7 +813,6 @@ def _contra_has_hard_stop(text: str) -> bool:
 
     for word in HARD_CONTRA_WORDS:
         w = re.escape(word)
-
         if not re.search(w, low):
             continue
 
@@ -827,20 +821,43 @@ def _contra_has_hard_stop(text: str) -> bool:
             if re.search(pat.format(word=w), low):
                 negated = True
                 break
-
         if negated:
             continue
 
-        # "есть кардиостимулятор", "кардиостимулятор есть", "бар" — важная заметка врачу.
-        if re.search(r"(?:есть|имеется|бар)\s+(?:у\s+меня\s+)?[^.!?,]{0,25}" + w, low):
-            return True
-        if re.search(w + r"[^.!?,]{0,25}(?:есть|имеется|бар)", low):
-            return True
-
-        # Если слово есть без отрицания — считаем важной заметкой врачу, но запись НЕ останавливаем.
         return True
 
     return False
+
+
+def _age_block_reason(age: int | None) -> str | None:
+    if age is None:
+        return None
+    if age < 16:
+        return "under_16"
+    if age > 75:
+        return "over_75"
+    return None
+
+
+def _stop_booking_text(session: dict[str, Any], reason: str = "contra") -> str:
+    if reason == "under_16":
+        return _tr(
+            session,
+            "К сожалению, по правилам клиники приём не проводится пациентам младше 16 лет. Запись оформить не смогу.",
+            "Өкінішке қарай, клиника ережесі бойынша 16 жасқа дейінгі пациенттерге қабылдау жүргізілмейді. Жазба рәсімдей алмаймын.",
+        )
+    if reason == "over_75":
+        return _tr(
+            session,
+            "Спасибо, что уточнили 🌿 По правилам клиники пациентам старше 75 лет запись автоматически не оформляется. Я передам Ваши данные администратору клиники, он свяжется с Вами и подскажет, как лучше поступить.",
+            "Нақтылағаныңызға рақмет 🌿 Клиника ережесі бойынша 75 жастан асқан пациенттерге жазба автоматты түрде рәсімделмейді. Деректеріңізді клиника әкімшісіне жіберемін, ол Сізбен байланысып, қалай дұрыс жасау керегін түсіндіреді.",
+        )
+
+    return _tr(
+        session,
+        "Спасибо, что уточнили. По правилам клиники при наличии таких противопоказаний запись на приём не оформляется: кардиостимулятор, беременность, онкология, металл в зоне лечения, эпилепсия, возраст до 16 или более 75 лет, а также ограниченная подвижность. Для безопасности приём проводить нельзя.",
+        "Нақтылағаныңызға рақмет. Клиника ережесі бойынша мұндай қарсы көрсетілімдер болса, қабылдауға жазу рәсімделмейді: кардиостимулятор, жүктілік, онкология, емдеу аймағындағы металл, эпилепсия, 16 жасқа дейін немесе 75 жастан жоғары жас, сондай-ақ қозғалыстың шектелуі. Қауіпсіздік үшін қабылдау жүргізілмейді.",
+    )
 
 def _contra_is_clear_no(text: str) -> bool:
     low = _low(text)
@@ -848,31 +865,21 @@ def _contra_is_clear_no(text: str) -> bool:
 
 
 async def _continue_after_collected_age(chat_id: str, session: dict[str, Any], text: str, age: int) -> str:
-    """Продолжение сценария, если возраст уже есть в этом же сообщении.
+    """Продолжение сценария, если возраст уже есть в этом же сообщении."""
+    age_reason = _age_block_reason(age)
+    if age_reason:
+        session["contraindications_raw"] = text
+        session["contraindications_ok"] = False
+        session["contraindications_verdict"] = "stop"
+        session["step"] = "stopped"
+        return _prepend_price_if_needed(text, session, _stop_booking_text(session, age_reason))
 
-    Нужно для сложных сообщений:
-    "мне 56, болит поясница, кардиостимулятора нет, завтра можно?"
-    """
     if _contra_has_hard_stop(text):
         session["contraindications_raw"] = text
         session["contraindications_ok"] = False
-        session["contraindications_verdict"] = "doctor_note"
-        session["doctor_note_required"] = True
-
-        date_iso = _parse_date(text)
-        prefix = _tr(
-            session,
-            "Спасибо, что уточнили 🙏 Это важная информация, врач обязательно учтёт её на консультации. На первичную консультацию можно записаться, а врач после осмотра подскажет безопасный дальнейший план.",
-            "Нақтылағаныңызға рақмет 🙏 Бұл маңызды ақпарат, дәрігер консультацияда міндетті түрде ескереді. Алғашқы консультацияға жазылуға болады, дәрігер қарап, қауіпсіз әрі дұрыс жоспарды түсіндіреді.",
-        )
-
-        if date_iso:
-            slots_answer = await _show_slots(chat_id, session, date_iso)
-            return _prepend_price_if_needed(text, session, prefix + "\n\n" + slots_answer)
-
-        session["step"] = "date"
-        session["questionnaire_step"] = "date"
-        return _prepend_price_if_needed(text, session, prefix + "\n\n" + _ask_date(session))
+        session["contraindications_verdict"] = "stop"
+        session["step"] = "stopped"
+        return _prepend_price_if_needed(text, session, _stop_booking_text(session, "contra"))
 
     # Если пациент сразу написал, что противопоказаний нет — не спрашиваем это повторно.
     if _contra_is_clear_no(text):
@@ -1088,13 +1095,13 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
         session["age"] = age
         stop = _age_stop_text(age, session)
-        if age > 74:
-            session["senior_patient"] = True
-            session["step"] = "contraindications"
-            session["questionnaire_step"] = "contra"
-            return _finalize(chat_id, session, _senior_contra_intro(session))
+        if age < 16 or age > 75:
+            session["contraindications_ok"] = False
+            session["contraindications_verdict"] = "stop"
+            session["step"] = "stopped"
+            return _finalize(chat_id, session, stop)
 
-        # Для младше 18 не останавливаем насовсем, но фиксируем необходимость родителя.
+        # 16–18: не стоп, но только с родителем/законным представителем.
         if age < 18:
             session["minor_parent_required"] = True
             session["step"] = "contraindications"
@@ -1117,33 +1124,25 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
         if _contra_has_hard_stop(text):
             session["contraindications_ok"] = False
-            session["contraindications_verdict"] = "doctor_note"
-            session["doctor_note_required"] = True
-            session["step"] = "date"
-            answer = _tr(
-                session,
-                "Спасибо, что уточнили 🙏 Это важная информация, врач обязательно учтёт её на консультации. На первичную консультацию можно записаться, а врач после осмотра подскажет безопасный дальнейший план.",
-                "Нақтылағаныңызға рақмет 🙏 Бұл маңызды ақпарат, дәрігер консультацияда міндетті түрде ескереді. Алғашқы консультацияға жазылуға болады, дәрігер қарап, қауіпсіз әрі дұрыс жоспарды түсіндіреді.",
-            ) + "\n\n" + _ask_date(session)
-            return _finalize(chat_id, session, answer)
+            session["contraindications_verdict"] = "stop"
+            session["step"] = "stopped"
+            return _finalize(chat_id, session, _stop_booking_text(session, "contra"))
 
         # Если пациент написал симптомы вместо ответа по противопоказаниям — не считаем это противопоказанием.
         if _has_complaint(text):
             return _finalize(chat_id, session, _ask_contra(session))
 
-        # Если пациент написал просто "есть/бар" без деталей — не останавливаем запись.
-        # Сохраняем как важную заметку врачу и продолжаем к дате.
+        # Если пациент написал просто "есть/да/бар" без деталей — запись не продолжаем.
+        # Просим уточнить, какое именно противопоказание, потому что при наличии противопоказаний приём не проводится.
         if any(w in _low(text) for w in YES_WORDS):
             session["contraindications_ok"] = False
-            session["contraindications_verdict"] = "doctor_note"
-            session["doctor_note_required"] = True
-            session["contraindications_raw"] = text or "Есть ограничения/противопоказания, детали не указаны"
-            session["step"] = "date"
+            session["contraindications_verdict"] = "need_details"
+            session["step"] = "contraindications"
             answer = _tr(
                 session,
-                "Поняла Вас 🙏 Это важно, врач обязательно уточнит детали на консультации. На первичную консультацию можно записаться.",
-                "Түсіндім 🙏 Бұл маңызды, дәрігер консультацияда нақтылап сұрайды. Алғашқы консультацияға жазылуға болады.",
-            ) + "\n\n" + _ask_date(session)
+                "Поняла Вас. Уточните, пожалуйста, какое именно противопоказание есть: кардиостимулятор, беременность, онкология, металл в зоне лечения, эпилепсия, возраст до 16 или более 75 лет, ограниченная подвижность? Если что-то из этого есть — запись оформить нельзя.",
+                "Түсіндім. Қай қарсы көрсетілім бар екенін нақтылап жазыңызшы: кардиостимулятор, жүктілік, онкология, емдеу аймағындағы металл, эпилепсия, 16 жасқа дейін немесе 75 жастан жоғары жас, қозғалыстың шектелуі? Егер осының бірі болса — жазба рәсімделмейді.",
+            )
             return _finalize(chat_id, session, answer)
 
         return _finalize(chat_id, session, _ask_contra(session))
@@ -1195,6 +1194,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             )
             return _finalize(chat_id, session, answer)
         return _finalize(chat_id, session, _tr(session, "Хорошо, приняли 🌿 Будем ждать Вас!", "Жақсы, қабылдадық 🌿 Күтеміз!"))
+
+    # 11.5) Запись остановлена из-за противопоказаний/возраста.
+    if step == "stopped":
+        return _finalize(chat_id, session, _stop_booking_text(session, "contra"))
 
     # 12) Если состояние непонятное — безопасно продолжаем с ближайшего обязательного шага.
     if not session.get("complaint"):
