@@ -443,14 +443,18 @@ def _parse_date(text: str) -> str | None:
                 delta = 7
             return (today + timedelta(days=delta)).isoformat()
 
-    m = re.search(r"\b(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?\b", low)
+    # Даты вида 17.06, 17/06/2026, 17-06-26, а также 17 06.
+    m = re.search(r"\b(\d{1,2})[.\-/\s]+(\d{1,2})(?:[.\-/\s]+(\d{2,4}))?\b", low)
     if m:
         d, mo, y = m.groups()
         year = int(y) if y else today.year
         if year < 100:
             year += 2000
         try:
-            return datetime(year, int(mo), int(d)).date().isoformat()
+            parsed = datetime(year, int(mo), int(d)).date()
+            if parsed < today:
+                return "__PAST_DATE__"
+            return parsed.isoformat()
         except ValueError:
             return None
 
@@ -1212,6 +1216,14 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _finalize(chat_id, session, _ask_contra(session))
 
     # 7) Противопоказания — обязательный гейт перед датой.
+    if step == "contraindications" and _is_short_ok_answer(text):
+        session["step"] = "contraindications"
+        return _finalize(chat_id, session, _tr(
+            session,
+            "Спасибо 🌿 Подтвердите, пожалуйста, коротко: противопоказаний нет?",
+            "Рақмет 🌿 Қысқаша растап жазыңызшы: қарсы көрсетілімдер жоқ па?",
+        ))
+
     if step == "contraindications" and _is_short_no_answer(text):
         session["contraindications_ok"] = True
         session["contraindications_verdict"] = "ok"
@@ -1260,8 +1272,20 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # 8) Дата.
     if step in ("date", "preferred_time"):
         date_iso = _parse_date(text)
+
+        if date_iso == "__PAST_DATE__":
+            return _finalize(chat_id, session, _tr(
+                session,
+                "Эта дата уже прошла. Напишите, пожалуйста, будущую дату, например: 17.06 или завтра 🌿",
+                "Бұл күн өтіп кеткен. Болашақ күнді жазыңызшы, мысалы: 17.06 немесе ертең 🌿",
+            ))
+
         if not date_iso:
-            return _finalize(chat_id, session, _ask_date(session))
+            return _finalize(chat_id, session, _tr(
+                session,
+                "Напишите, пожалуйста, дату в формате день.месяц, например: 17.06 🌿",
+                "Күнді күн.ай форматында жазыңызшы, мысалы: 17.06 🌿",
+            ))
 
         answer = await _show_slots(chat_id, session, date_iso)
         return _finalize(chat_id, session, answer)
