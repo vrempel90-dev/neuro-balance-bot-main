@@ -261,6 +261,28 @@ def _has_mri_question(text: str) -> bool:
     return False
 
 
+def _explicit_language_request(text: str) -> str | None:
+    low = _low(text)
+    if not low:
+        return None
+
+    # Клиент явно просит язык.
+    ru_patterns = [
+        "на русском", "по русски", "по-русски", "русский язык",
+        "пишите на русском", "говорите на русском", "можно на русском",
+    ]
+    kk_patterns = [
+        "қазақша", "казакша", "на казахском", "по казахски", "по-казахски",
+        "қазақ тілінде", "казахский язык", "пишите на казахском",
+    ]
+
+    if any(p in low for p in ru_patterns):
+        return "ru"
+    if any(p in low for p in kk_patterns):
+        return "kk"
+    return None
+
+
 def _detect_lang(text: str, session: dict[str, Any]) -> str:
     current = session.get("language") or "ru"
     low = _low(text)
@@ -537,6 +559,7 @@ def _strip_quoted_bot_text(text: str) -> str:
         "қаи күн ыңғайлы",
         "қай күн ыңғайлы",
         "сізді не мазалайды",
+        "сейчас не получается проверить свободные окошки",
     ]
 
     cleaned_lines: list[str] = []
@@ -584,6 +607,38 @@ def _is_doctor_can_treat_question(text: str) -> bool:
         "этот сможет", "это сможет", "по фото", "по снимку", "по документу",
         "осы емдей", "емдей аласыз",
     ])
+
+
+def _avoid_repeating_same_question(answer: str, session: dict[str, Any]) -> str:
+    """Не повторять один и тот же вопрос подряд, если пользователь уже дал ответ/отложил.
+
+    Это не заменяет антидубль webhook, но защищает диалог от зацикливания.
+    """
+    if not answer:
+        return answer
+
+    last = _clean(str(session.get("last_bot_answer") or ""))
+    current = _clean(answer)
+
+    if not last or last != current:
+        return answer
+
+    # Если ответ полностью совпал с прошлым, даём мягкую альтернативу.
+    if "на какой день" in _low(current) or "қай күн" in _low(current):
+        return _tr(
+            session,
+            "Когда определитесь с удобным днём и временем — напишите сюда, я продолжу запись 🌿",
+            "Қай күн мен уақыт ыңғайлы екенін анықтағанда осында жазыңыз, жазылуды жалғастырамын 🌿",
+        )
+
+    if "что вас беспокоит" in _low(current) or "сізді не мазалайды" in _low(current):
+        return _tr(
+            session,
+            "Опишите, пожалуйста, жалобу одним сообщением: что болит или что беспокоит 🌿",
+            "Шағымыңызды бір хабарламада жазыңызшы: қай жеріңіз ауырады немесе не мазалайды 🌿",
+        )
+
+    return answer
 
 
 def _remove_name_addressing(answer: str, session: dict[str, Any]) -> str:
@@ -1255,6 +1310,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     await handle_message(chat_id=chat_id, phone=phone, user_text=text)
     """
     text = _clean(user_text)
+    text = _strip_quoted_bot_text(text)
+    text = _clean(text)
     _safe_add_message(chat_id, "user", text)
 
     session = state.get_session(chat_id)
@@ -1263,6 +1320,17 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     session["phone"] = phone or session.get("phone") or ""
     session["language"] = _detect_lang(text, session)
+
+    # explicit_language_switch_guard:
+    # Если клиент просит отвечать на другом языке — переключаем язык и подтверждаем.
+    lang_request = _explicit_language_request(text)
+    if lang_request:
+        session["language"] = lang_request
+        return _finalize(
+            chat_id,
+            session,
+            _tr(session, "Хорошо, буду отвечать на русском 🌿", "Жақсы, қазақша жауап беремін 🌿"),
+        )
 
     # 0.5) Две задачи в одном сообщении:
     # "я уже записан/отмените/перенести" + "маму/папу/сына хочу записать".
@@ -1327,6 +1395,15 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     step = session.get("step") or "start"
 
+    # contra_no_answer_final_guard:
+    # "Нет/Жоқ" на этапе противопоказаний = противопоказаний нет.
+    if step == "contraindications" and _is_no_contra_answer(text):
+        session["contraindications_ok"] = True
+        session["contraindications_raw"] = "нет"
+        session["step"] = "date"
+        session["questionnaire_step"] = "date"
+        return _finalize(chat_id, session, _ask_date(session))
+
     # doctor_can_treat_question_guard:
     # Если пациент отправил фото/документ и спрашивает "это сможет лечить?",
     # не обещаем лечение и не повторяем вопрос про дату.
@@ -1373,6 +1450,26 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
                 session,
                 "Спасибо, зафиксировала пожелание по дню. Так как точное время пока не выбрано, передам заявку координатору клиники — он свяжется с Вами и закрепит удобное время вручную 🌿",
                 "Рақмет, күн бойынша қалауыңызды белгіледім. Нақты уақыт әлі таңдалмағандықтан, өтінімді клиника координаторына жіберемін — ол Сізбен байланысып, ыңғайлы уақытты қолмен бекітеді 🌿",
+            ),
+        )
+
+    # post_done_new_booking_guard_final:
+    # После завершения/передачи не начинаем новый сценарий от коротких сообщений,
+    # но если человек явно снова просит записаться с новой жалобой — начинаем аккуратно.
+    if step in ("done", "booked", "stopped", "escalated") and _has_booking_intent(text) and _profile_status(text) == "profile":
+        session.clear()
+        session["phone"] = phone or ""
+        session["language"] = _detect_lang(text, session)
+        session["complaint"] = text
+        session["profile_status"] = "profile"
+        session["step"] = "age"
+        return _finalize(
+            chat_id,
+            session,
+            _tr(
+                session,
+                "Понимаем Вас 🙏 Это относится к профилю нашей клиники. Подскажите, пожалуйста, возраст пациента?",
+                "Түсінеміз 🙏 Бұл біздің клиниканың бағытына жатады. Пациенттің жасы нешеде?",
             ),
         )
 
@@ -1561,6 +1658,19 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     # 6) Возраст: после возраста ВСЕГДА спрашиваем противопоказания.
     if step == "age":
+        # age_unknown_answer_guard:
+        # Если пациент не готов назвать возраст, не перескакиваем и не путаемся.
+        if any(p in _low(text) for p in ["не знаю", "позже", "потом", "уточню", "білмеймін", "билмеймин"]):
+            return _finalize(
+                chat_id,
+                session,
+                _tr(
+                    session,
+                    "Хорошо 🌿 Для записи возраст всё равно понадобится. Когда сможете — напишите, пожалуйста, возраст пациента.",
+                    "Жақсы 🌿 Жазылу үшін жас бәрібір қажет болады. Мүмкін болғанда пациенттің жасын жазыңызшы.",
+                ),
+            )
+
         age = _extract_age(text, step="age")
         if not age:
             return _finalize(chat_id, session, _tr(session, "Подскажите, пожалуйста, сколько Вам лет?", "Жасыңыз нешеде?"))
