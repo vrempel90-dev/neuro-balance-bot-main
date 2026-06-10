@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -40,7 +39,10 @@ KZ_MARKERS = [
     "бүгін", "бугин", "жоқ", "жок", "joq", "ия", "иә",
     "қарсы", "карсы", "көрсетілім", "корсетилим",
     "жазыл", "жазылғым", "келеді", "жас", "жастамын",
-    "аяқ", "аяг", "қол", "кол", "омыртқа", "жарық",
+    "аяқ", "аяг", "аяғым", "аягым", "аяғымнан", "аягымнан",
+    "қол", "кол", "омыртқа", "омыртка", "жарық", "жарык",
+    "оң", "он ая", "сол аяқ", "сол ая", "қысқа", "кыска",
+    "емдей", "емдей аласыз", "емдей аласыздар", "аласыздар ма",
 ]
 
 RU_MARKERS = [
@@ -156,21 +158,31 @@ def _has_mri_question(text: str) -> bool:
 
 def _detect_lang(text: str, session: dict[str, Any]) -> str:
     current = session.get("language") or "ru"
+    low = _low(text)
+
+    # ЖЁСТКИЙ приоритет казахского:
+    # если пациент пишет с казахскими буквами/фразами, отвечаем на казахском,
+    # даже если раньше в этом чате была русская фраза типа "Здравствуйте".
+    strong_kz = (
+        bool(re.search(r"[әғқңөұүһіӘҒҚҢӨҰҮҺІ]", text or ""))
+        or any(w in low for w in KZ_MARKERS)
+        or bool(re.search(r"(емдей\s+аласыз|емдей\s+аласыздар|аласыздар\s+ма)", low))
+    )
+    if strong_kz:
+        return "kk"
+
     if detect_message_language:
         try:
-            return detect_message_language(text, current)
+            detected = detect_message_language(text, current)
+            if detected in ("ru", "kk"):
+                return detected
         except Exception:
             pass
 
-    low = _low(text)
-    has_kz = any(w in low for w in KZ_MARKERS) or bool(re.search(r"[әғқңөұүһіӘҒҚҢӨҰҮҺІ]", text or ""))
     has_ru = any(w in low for w in RU_MARKERS)
-
-    # Если есть русская основа и одно казахское слово типа "бел" — оставляем русский.
     if has_ru:
         return "ru"
-    if has_kz:
-        return "kk"
+
     return current if current in ("ru", "kk") else "ru"
 
 
@@ -180,169 +192,6 @@ def _tr(session_or_lang: dict[str, Any] | str, ru: str, kk: str) -> str:
     else:
         lang = session_or_lang or "ru"
     return kk if lang == "kk" else ru
-
-
-def _is_month_range_request(text: str) -> bool:
-    low = _low(text)
-    return any(x in low for x in [
-        "в этом месяце", "на этот месяц", "на месяц", "в течение месяца",
-        "ближайшее свободное", "ближайшие свободные", "подберите ближайшее",
-        "подберите время", "любая дата", "любое время",
-        "осы ай", "бір ай", "бир ай", "жақын бос", "жакын бос"
-    ])
-
-
-def _get_setting_int(env_name: str, attr_name: str, default: int) -> int:
-    try:
-        raw = os.getenv(env_name)
-        if raw not in (None, ""):
-            return max(1, int(raw))
-    except Exception:
-        pass
-
-    if get_settings:
-        try:
-            value = getattr(get_settings(), attr_name, None)
-            if value not in (None, ""):
-                return max(1, int(value))
-        except Exception:
-            pass
-
-    return default
-
-
-def _range_start_and_days(text: str) -> tuple[datetime.date, int]:
-    today = (datetime.now(timezone.utc) + timedelta(hours=5)).date()
-    search_days = _get_setting_int("SLOT_SEARCH_DAYS", "slot_search_days", 30)
-
-    if _is_next_week_request(text):
-        # Следующая неделя = ближайший следующий понедельник + 7 дней.
-        days_until_monday = (7 - today.weekday()) % 7
-        if days_until_monday == 0:
-            days_until_monday = 7
-        return today + timedelta(days=days_until_monday), min(7, search_days)
-
-    return today + timedelta(days=1), search_days
-
-
-async def _show_slots_range(chat_id: str, session: dict[str, Any], start_date, days: int) -> str:
-    lang = session.get("language") or "ru"
-    max_slots = _get_setting_int("MAX_SLOTS_TO_SHOW", "max_slots_to_show", 5)
-    slots: list[dict[str, str]] = []
-    errors: list[str] = []
-
-    for offset in range(max(1, days)):
-        date_iso = (start_date + timedelta(days=offset)).isoformat()
-        try:
-            data = await crm.check_slots(date_iso)
-            found = _format_slots(data, max_count=max_slots - len(slots))
-            if found:
-                slots.extend(found)
-                if len(slots) >= max_slots:
-                    break
-        except Exception as exc:
-            errors.append(str(exc)[:120])
-            _safe_log(chat_id, "crm_check_slots_range_error", {"date": date_iso, "error": str(exc)[:500]})
-            continue
-
-    if slots:
-        session["last_slots"] = slots
-        session["preferred_date"] = slots[0].get("date") or ""
-        session["step"] = "time"
-        return _tr(
-            session,
-            "Нашла ближайшие свободные окошки:\n" + _slots_text(slots, lang) + "\n\nКакое время Вам удобно? Можно ответить номером варианта.",
-            "Жақын бос уақыттарды таптым:\n" + _slots_text(slots, lang) + "\n\nҚай уақыт ыңғайлы? Нұсқа нөмірімен жауап беруге болады.",
-        )
-
-    session["step"] = "escalated"
-    session["escalated"] = True
-    return _tr(
-        session,
-        f"Сейчас не получилось автоматически найти свободные окна в ближайшие {days} дней. Я передам администратору клиники, чтобы он подобрал удобное время вручную 🌿",
-        f"Қазір жақын {days} күнге бос уақытты автоматты түрде таба алмадым. Клиника әкімшісіне жіберемін, ол ыңғайлы уақытты қолмен таңдайды 🌿",
-    )
-
-
-async def _handle_range_slot_request(chat_id: str, session: dict[str, Any], text: str) -> str:
-    # Сначала обязательный сценарий: жалоба -> возраст -> противопоказания.
-    if not session.get("complaint"):
-        session["step"] = "complaint"
-        return _finalize(chat_id, session, _tr(
-            session,
-            "Да, можем подобрать время 🌿 Подскажите, пожалуйста, что именно Вас беспокоит?",
-            "Иә, уақыт таңдай аламыз 🌿 Нақты не мазалайды?",
-        ))
-
-    if not session.get("age"):
-        session["step"] = "age"
-        return _finalize(chat_id, session, _tr(
-            session,
-            "Поняла Вас 🌿 Перед подбором времени подскажите, пожалуйста, сколько Вам лет?",
-            "Түсіндім 🌿 Уақыт таңдамас бұрын жасыңызды айтыңызшы?",
-        ))
-
-    try:
-        age_int = int(session.get("age") or 0)
-    except Exception:
-        age_int = 0
-
-    reason = _age_block_reason(age_int)
-    if reason:
-        session["step"] = "stopped"
-        session["contraindications_verdict"] = "stop"
-        return _finalize(chat_id, session, _stop_booking_text(session, reason))
-
-    if session.get("contraindications_ok") is not True:
-        session["step"] = "contraindications"
-        return _finalize(chat_id, session, _ask_contra(session))
-
-    start_date, days = _range_start_and_days(text)
-    answer = await _show_slots_range(chat_id, session, start_date, days)
-    return _finalize(chat_id, session, answer)
-
-
-
-def _is_specific_date_slot_request(text: str) -> bool:
-    low = _low(text)
-    has_date = _parse_date(text) is not None
-    asks_time = any(x in low for x in [
-        "на какое время", "какое время", "во сколько", "в какое время",
-        "есть время", "свободное время", "свободные окна", "свободные окошки",
-        "могу записаться", "можно записаться", "хочу записаться",
-        "қай уақыт", "кандай уақыт", "сағат нешеде", "бос уақыт", "жазылуға бола"
-    ])
-    return has_date and asks_time
-
-
-def _is_next_week_request(text: str) -> bool:
-    low = _low(text)
-    return any(x in low for x in [
-        "следующую неделю", "на следующую неделю", "на следующей неделе",
-        "следующей неделе", "следующей недели", "след нед", "след. нед",
-        "на неделе", "через неделю",
-        "келесі апта", "келесі аптаға", "келесі аптада",
-        "келеси апта", "келеси аптага", "келеси аптада"
-    ])
-
-
-def _next_week_fallback_text(session: dict[str, Any]) -> str:
-    return _tr(
-        session,
-        "Поняла Вас 🌿 На следующую неделю сейчас не получается проверить свободные окна автоматически. Я передам администратору клиники, чтобы он подобрал удобное время на следующую неделю и связался с Вами.",
-        "Түсіндім 🌿 Келесі аптаға бос уақыттарды қазір автоматты түрде тексере алмадым. Клиника әкімшісіне жіберемін, ол келесі аптаға ыңғайлы уақытты таңдап, Сізбен байланысады.",
-    )
-
-
-def _is_short_no_answer(text: str) -> bool:
-    low = _low(text).strip(" .,!?:;")
-    return low in {"нет", "нету", "неа", "жоқ", "жок", "жоқпын", "жокпын"}
-
-
-def _is_short_ok_answer(text: str) -> bool:
-    low = _low(text).strip(" .,!?:;")
-    return low in {"ок", "okay", "ok", "хорошо", "ладно", "иә", "ия", "жақсы", "жаксы"}
-
 
 
 def _price_short_text(session: dict[str, Any]) -> str:
@@ -450,8 +299,38 @@ def _safe_log(chat_id: str, event: str, payload: dict[str, Any]) -> None:
         pass
 
 
+def _remove_name_addressing(answer: str, session: dict[str, Any]) -> str:
+    """Бот никогда не обращается к человеку по имени.
+
+    Имя можно собрать и передать в CRM для записи, но в исходящих сообщениях
+    не пишем: "Айжан, ...", "Кайрат, ...", "Иван, ...".
+    """
+    if not answer:
+        return answer
+
+    possible_names = [
+        session.get("patient_name"),
+        session.get("name"),
+        session.get("client_name"),
+        session.get("patientName"),
+    ]
+
+    cleaned = answer
+    for name in possible_names:
+        if not name:
+            continue
+        n = str(name).strip()
+        if not n:
+            continue
+        # Убираем только обращение в начале сообщения/строки: "Имя, ..."
+        cleaned = re.sub(rf"(?im)^\s*{re.escape(n)}\s*,\s*", "", cleaned)
+
+    return cleaned
+
+
 def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     answer = _clean(answer)
+    answer = _remove_name_addressing(answer, session)
     if not answer:
         if session.get("complaint") and not session.get("age"):
             answer = _ask_age(session)
@@ -547,9 +426,6 @@ def _parse_date(text: str) -> str | None:
     low = _low(text)
     today = (datetime.now(timezone.utc) + timedelta(hours=5)).date()
 
-    if _is_next_week_request(text):
-        return "__NEXT_WEEK__"
-
     if any(w in low for w in ["сегодня", "бүгін", "бугин"]):
         return today.isoformat()
     if any(w in low for w in ["завтра", "ертең", "ертен"]):
@@ -571,18 +447,14 @@ def _parse_date(text: str) -> str | None:
                 delta = 7
             return (today + timedelta(days=delta)).isoformat()
 
-    # Даты вида 17.06, 17/06/2026, 17-06-26, а также 17 06.
-    m = re.search(r"\b(\d{1,2})[.\-/\s]+(\d{1,2})(?:[.\-/\s]+(\d{2,4}))?\b", low)
+    m = re.search(r"\b(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?\b", low)
     if m:
         d, mo, y = m.groups()
         year = int(y) if y else today.year
         if year < 100:
             year += 2000
         try:
-            parsed = datetime(year, int(mo), int(d)).date()
-            if parsed < today:
-                return "__PAST_DATE__"
-            return parsed.isoformat()
+            return datetime(year, int(mo), int(d)).date().isoformat()
         except ValueError:
             return None
 
@@ -880,6 +752,8 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         session["booked"] = True
         session["appointment"] = booked
         session["step"] = "done"
+        session["status"] = "booked"
+        session["crm_status"] = "Записан"
 
         date = booked.get("date") or slot.get("date") or session.get("preferred_date") or ""
         time_start = booked.get("timeStart") or booked.get("time_start") or slot.get("time") or ""
@@ -1035,63 +909,19 @@ def _contra_is_clear_no(text: str) -> bool:
     return any(w == low or w in low for w in NO_CONTRA_WORDS)
 
 
-async def _handle_specific_date_slot_request(chat_id: str, session: dict[str, Any], text: str) -> str:
-    date_iso = _parse_date(text)
-    if date_iso:
-        session["preferred_date"] = date_iso
-
-    # Если нет жалобы — сначала собираем жалобу.
-    if not session.get("complaint"):
-        session["step"] = "complaint"
-        return _finalize(chat_id, session, _tr(
-            session,
-            "Да, можем подобрать время на указанную дату 🌿 Подскажите, пожалуйста, что именно Вас беспокоит?",
-            "Иә, көрсетілген күнге уақыт қарастыра аламыз 🌿 Нақты не мазалайды?",
-        ))
-
-    # Если нет возраста — спрашиваем возраст.
-    if not session.get("age"):
-        session["step"] = "age"
-        return _finalize(chat_id, session, _tr(
-            session,
-            "Поняла Вас 🌿 Перед подбором времени подскажите, пожалуйста, сколько Вам лет?",
-            "Түсіндім 🌿 Уақыт таңдамас бұрын жасыңызды айтыңызшы?",
-        ))
-
-    # Если возраст стоповый — мягко останавливаем/передаём админу.
-    try:
-        age_int = int(session.get("age") or 0)
-    except Exception:
-        age_int = 0
-    reason = _age_block_reason(age_int)
-    if reason:
-        session["step"] = "stopped"
-        session["contraindications_verdict"] = "stop"
-        return _finalize(chat_id, session, _stop_booking_text(session, reason))
-
-    # Если противопоказания ещё не подтверждены — спрашиваем строго по регламенту.
-    if session.get("contraindications_ok") is not True:
-        session["step"] = "contraindications"
-        return _finalize(chat_id, session, _ask_contra(session))
-
-    # Всё собрано — показываем слоты.
-    if date_iso:
-        answer = await _show_slots(chat_id, session, date_iso)
-        return _finalize(chat_id, session, answer)
-
-    session["step"] = "date"
-    return _finalize(chat_id, session, _ask_date(session))
-
-
-
 async def _continue_after_collected_age(chat_id: str, session: dict[str, Any], text: str, age: int) -> str:
     """Продолжение сценария, если возраст уже есть в этом же сообщении."""
     age_reason = _age_block_reason(age)
     if age_reason:
         session["contraindications_raw"] = text
         session["contraindications_ok"] = False
-        session["contraindications_verdict"] = "stop"
-        session["step"] = "stopped"
+        if age_reason == "over_75":
+            session["contraindications_verdict"] = "admin_contact"
+            session["step"] = "escalated"
+            session["escalated"] = True
+        else:
+            session["contraindications_verdict"] = "stop"
+            session["step"] = "stopped"
         return _prepend_price_if_needed(text, session, _stop_booking_text(session, age_reason))
 
     if _contra_has_hard_stop(text):
@@ -1156,16 +986,6 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         answer = _relative_dual_task_answer(session, text)
         return _finalize(chat_id, session, answer)
 
-    # Если клиент просит следующую неделю или ближайшие даты на месяц —
-    # после обязательных вопросов ищем слоты в диапазоне дат.
-    if _is_next_week_request(text) or _is_month_range_request(text):
-        return await _handle_range_slot_request(chat_id, session, text)
-
-    # Если клиент сразу спрашивает "на какое время можно записаться завтра",
-    # не передаём координатору, а ведём по обязательным шагам записи.
-    if _is_specific_date_slot_request(text):
-        return await _handle_specific_date_slot_request(chat_id, session, text)
-
     if not text:
         return _finalize(chat_id, session, _tr(session, "Напишите, пожалуйста, что Вас беспокоит 🌿", "Сізді не мазалайды? 🌿"))
 
@@ -1212,7 +1032,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # 3) Типовые вопросы.
     # Если в сообщении есть жалоба, жалоба важнее FAQ.
     # Например "Белім ауырады, похоже протрузия" нельзя ошибочно трактовать как вопрос про УЗИ.
-    info = None if _has_complaint(text) else _clinic_answer(text, session)
+    diagnostic_booking_request = _has_booking_intent(text) and _has_mri_question(text)
+    info = None if (_has_complaint(text) or diagnostic_booking_request) else _clinic_answer(text, session)
     if info and not session.get("complaint"):
         session["step"] = "complaint"
         return _finalize(chat_id, session, info)
@@ -1258,11 +1079,18 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
         if _has_booking_intent(text) or _is_greeting_only(text):
             session["step"] = "complaint"
-            answer = _tr(
-                session,
-                "Здравствуйте! Да, можно записаться на консультацию по акции 🌿\nПодскажите, пожалуйста, что Вас беспокоит?",
-                "Сәлеметсіз бе! Иә, акция бойынша консультацияға жазылуға болады 🌿\nСізді не мазалайды?",
-            )
+            if _has_mri_question(text):
+                answer = _tr(
+                    session,
+                    "Здравствуйте! Да, поможем с записью на первичную консультацию/диагностику 🌿\nПодскажите, пожалуйста, что именно Вас беспокоит?",
+                    "Сәлеметсіз бе! Иә, алғашқы консультацияға/диагностикаға жазылуға көмектесеміз 🌿\nСізді нақты не мазалайды?",
+                )
+            else:
+                answer = _tr(
+                    session,
+                    "Здравствуйте! Да, можно записаться на консультацию по акции 🌿\nПодскажите, пожалуйста, что Вас беспокоит?",
+                    "Сәлеметсіз бе! Иә, акция бойынша консультацияға жазылуға болады 🌿\nСізді не мазалайды?",
+                )
             return _finalize(chat_id, session, answer)
 
         session["step"] = "complaint"
@@ -1325,10 +1153,17 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
         session["age"] = age
         stop = _age_stop_text(age, session)
-        if age < 16 or age > 75:
+        if age < 16:
             session["contraindications_ok"] = False
             session["contraindications_verdict"] = "stop"
             session["step"] = "stopped"
+            return _finalize(chat_id, session, stop)
+
+        if age > 75:
+            session["contraindications_ok"] = False
+            session["contraindications_verdict"] = "admin_contact"
+            session["step"] = "escalated"
+            session["escalated"] = True
             return _finalize(chat_id, session, stop)
 
         # 16–18: не стоп, но только с родителем/законным представителем.
@@ -1343,25 +1178,6 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _finalize(chat_id, session, _ask_contra(session))
 
     # 7) Противопоказания — обязательный гейт перед датой.
-    if step == "contraindications" and _is_short_ok_answer(text):
-        session["step"] = "contraindications"
-        return _finalize(chat_id, session, _tr(
-            session,
-            "Спасибо 🌿 Подтвердите, пожалуйста, коротко: противопоказаний нет?",
-            "Рақмет 🌿 Қысқаша растап жазыңызшы: қарсы көрсетілімдер жоқ па?",
-        ))
-
-    if step == "contraindications" and _is_short_no_answer(text):
-        session["contraindications_ok"] = True
-        session["contraindications_verdict"] = "ok"
-        session["contraindications_raw"] = text
-        session["step"] = "date"
-        return _finalize(chat_id, session, _tr(
-            session,
-            "Отлично, противопоказаний нет. На какой день Вам удобно прийти?",
-            "Жақсы, қарсы көрсетілімдер жоқ. Қай күнге келу ыңғайлы?",
-        ))
-
     if step == "contraindications":
         session["contraindications_raw"] = text
 
@@ -1398,27 +1214,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     # 8) Дата.
     if step in ("date", "preferred_time"):
-        if _is_next_week_request(text) or _is_month_range_request(text):
-            return await _handle_range_slot_request(chat_id, session, text)
-
         date_iso = _parse_date(text)
-
-        if date_iso == "__NEXT_WEEK__":
-            return await _handle_range_slot_request(chat_id, session, text)
-
-        if date_iso == "__PAST_DATE__":
-            return _finalize(chat_id, session, _tr(
-                session,
-                "Эта дата уже прошла. Напишите, пожалуйста, будущую дату, например: 17.06 или завтра 🌿",
-                "Бұл күн өтіп кеткен. Болашақ күнді жазыңызшы, мысалы: 17.06 немесе ертең 🌿",
-            ))
-
         if not date_iso:
-            return _finalize(chat_id, session, _tr(
-                session,
-                "Напишите, пожалуйста, дату в формате день.месяц, например: 17.06 🌿",
-                "Күнді күн.ай форматында жазыңызшы, мысалы: 17.06 🌿",
-            ))
+            return _finalize(chat_id, session, _ask_date(session))
 
         answer = await _show_slots(chat_id, session, date_iso)
         return _finalize(chat_id, session, answer)
