@@ -111,6 +111,97 @@ MRI_WORDS = [
     "диагностика", "диагностик", "томография",
 ]
 
+
+# ============================================================
+# Profile classifier
+# Профиль клиники: спина, позвоночник, суставы, мышцы, неврология,
+# реабилитация после операции/травм, парезы, онемение, нарушение походки.
+# Не профиль: стоматология, ЛОР, глаза, кожа, живот/ЖКТ, сердце/скорая,
+# гинекология/урология, инфекция/температура, психиатрия, чистая косметология.
+# ============================================================
+
+PROFILE_COMPLAINT_WORDS = [
+    # позвоночник / спина
+    "спина", "спине", "спину", "поясниц", "крестец", "копчик",
+    "шея", "шей", "воротников", "лопат", "межлопат",
+    "позвоноч", "омыртқа", "омыртка", "арқа", "арка", "белім", "белим",
+
+    # диагнозы опорно-двигательного аппарата
+    "грыж", "грыжа", "протруз", "остеохонд", "сколиоз", "кифоз",
+    "лордоз", "радикул", "ишиас", "невралг", "защем", "защим",
+    "артроз", "артрит", "коксартроз", "гонартроз", "остеоартроз",
+    "плоскостоп", "пяточная шпора", "шпора", "плантар",
+
+    # суставы / мышцы / связки
+    "сустав", "колен", "плеч", "локт", "кисть", "запяст", "тазобед",
+    "бедро", "голен", "стоп", "стопа", "стопы", "табан",
+    "мышц", "мышца", "связк", "сухожил", "растяж", "вывих",
+
+    # неврология / симптомы
+    "онем", "немеет", "мурашк", "прострел", "стреляет", "отдает", "отдаёт",
+    "тянет", "ноет", "ломит", "хрустит", "судорог", "спазм",
+    "парез", "паралич", "слабость в ног", "слабость в рук",
+    "нарушение походки", "хром", "координац", "вестибул",
+
+    # реабилитация / после операций
+    "после операции", "послеоперац", "операции", "операция",
+    "прооперировали", "реабилитац", "реабилитация", "восстановлен",
+    "после травмы", "травм", "перелом", "ушиб",
+
+    # казахский
+    "ауырады", "ауыр", "ауырсын", "аяқ", "аяк", "қол", "кол",
+    "мойын", "буын", "тізе", "тизе", "иық", "иык",
+    "оң аяқ", "сол аяқ", "қысқа", "кыска", "оналту",
+]
+
+NON_PROFILE_COMPLAINT_WORDS = [
+    # зубы / стоматология
+    "зуб", "зубы", "десна", "кариес", "стоматолог", "тіс", "тис",
+
+    # ЛОР
+    "горло", "ангина", "насморк", "кашель", "ухо", "уши", "отит",
+    "гайморит", "нос", "лор", "құлақ", "кулак", "тамақ", "тамак",
+
+    # глаза
+    "глаз", "глаза", "зрение", "офтальм", "конъюнктив", "көз", "коз",
+
+    # кожа / косметология
+    "кожа", "сыпь", "прыщ", "акне", "дермат", "экзема", "псориаз",
+    "родинка", "бородав", "аллергия на коже", "бетім", "бет", "тері", "тери",
+
+    # ЖКТ / живот
+    "живот", "желуд", "кишеч", "понос", "диар", "рвота", "тошнит",
+    "печень", "желчный", "гастрит", "аппендиц", "іш", "асқазан", "асказан",
+
+    # сердце / сосуды / скорая
+    "сердце", "сердеч", "давление", "гипертони", "инфаркт", "стенокард",
+    "боль в груди", "грудь сжимает", "одышка", "тромб", "варикоз",
+    "жүрек", "журек", "қан қысым", "кан кысым",
+
+    # урология / гинекология / беременность
+    "почки", "моч", "цистит", "простата", "уролог", "гинеколог",
+    "месячные", "беремен", "беременность", "жүктілік", "жукцилик",
+
+    # инфекции / высокая температура
+    "температура", "лихорад", "грипп", "ковид", "covid", "инфекц",
+    "пневмони", "бронхит", "астма", "қызу", "кызу",
+
+    # психиатрия / зависимости
+    "депресс", "паничес", "тревога", "психиатр", "нарколог", "алкогол",
+
+    # эндокринология без невро/суставной жалобы
+    "щитовид", "сахарный диабет", "диабет", "эндокрин",
+
+    # экстренное
+    "инсульт", "потеря сознания", "обморок", "кровотеч", "судороги сейчас",
+    "не чувствую половину тела",
+]
+
+UNCLEAR_DISEASE_WORDS = [
+    "диагноз", "болезнь", "заболевание", "лечите", "емдей", "емдейсіздер",
+    "емдей аласыз", "емдей аласыздар", "можно лечить", "лечите ли",
+]
+
 CANCEL_WORDS = [
     "отмен", "не приду", "не смогу", "перенес", "перенести", "поменять время",
     "басқа уақыт", "ауыстыр", "келмеймін", "келе алмаймын",
@@ -313,20 +404,57 @@ def _safe_log(chat_id: str, event: str, payload: dict[str, Any]) -> None:
         pass
 
 
-def _has_medical_complaint_text(text: str) -> bool:
+
+def _profile_status(text: str) -> str:
+    """Возвращает: profile / non_profile / unclear / none.
+
+    profile — можно вести на первичную консультацию;
+    non_profile — не обещаем лечение, передаём администратору/рекомендуем профильного врача;
+    unclear — пациент спрашивает "лечите ли ...", но неясно, относится ли к профилю.
+    """
     low = _low(text)
     if not low:
-        return False
+        return "none"
 
-    complaint_patterns = [
-        "болит", "боль", "ауырады", "ауыр", "мазалайды",
-        "парез", "парез стопы", "стопы", "стопа",
-        "после операции", "послеоперац", "операции", "операция",
-        "реабилитац", "реабилитация",
-        "нога", "ноги", "аяқ", "аяк", "табан",
-        "спина", "поясница", "шея", "грыжа", "протруз",
-    ]
-    return any(p in low for p in complaint_patterns)
+    has_profile = any(w in low for w in PROFILE_COMPLAINT_WORDS)
+    has_non_profile = any(w in low for w in NON_PROFILE_COMPLAINT_WORDS)
+
+    # Если есть профильная жалоба + сопутствующий диагноз, ведём как профиль.
+    # Например: "диабет, но немеет нога" — профильная жалоба есть.
+    if has_profile:
+        return "profile"
+
+    if has_non_profile:
+        return "non_profile"
+
+    if any(w in low for w in UNCLEAR_DISEASE_WORDS):
+        return "unclear"
+
+    return "none"
+
+
+def _non_profile_answer(session: dict[str, Any], text: str) -> str:
+    return _tr(
+        session,
+        "Спасибо, что описали ситуацию 🌿 По этому вопросу не хочу вводить Вас в заблуждение: это может быть не профиль нашей клиники. Я передам обращение администратору клиники, он уточнит детали и подскажет, к какому специалисту лучше обратиться.",
+        "Жағдайды жазғаныңызға рақмет 🌿 Бұл сұрақ бойынша қате бағыт бергім келмейді: бұл біздің клиниканың негізгі бағытына жатпауы мүмкін. Өтінішті клиника әкімшісіне жіберемін, ол нақтылап, қай маманға жүгінген дұрыс екенін айтады.",
+    )
+
+
+def _unclear_profile_answer(session: dict[str, Any], text: str) -> str:
+    return _tr(
+        session,
+        "Подскажите, пожалуйста, что именно беспокоит: спина, шея, суставы, онемение, боль/прострел в руку или ногу, нарушение походки? Так я точнее пойму, относится ли вопрос к профилю нашей клиники 🌿",
+        "Нақты не мазалайды: арқа/бел, мойын, буындар, ұю, қолға немесе аяққа берілетін ауырсыну, жүрудің бұзылуы ма? Солай сұрағыңыз біздің клиника бағытына жата ма — дәлірек түсінемін 🌿",
+    )
+
+def _has_medical_complaint_text(text: str) -> bool:
+    # Медицинская жалоба есть, если классификатор понял профиль/не профиль/неясную болезнь.
+    # Отдельно оставляем старые базовые слова через COMPLAINT_WORDS.
+    status = _profile_status(text)
+    if status in ("profile", "non_profile", "unclear"):
+        return True
+    return _has_any(text, COMPLAINT_WORDS)
 
 
 def _is_thanks_or_ok(text: str) -> bool:
@@ -1087,6 +1215,22 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _finalize(chat_id, session, info)
 
     step = session.get("step") or "start"
+    # profile_classifier_guard:
+    # Сначала определяем, относится ли жалоба к профилю клиники.
+    # Если не профиль — не ведём в запись и не обещаем лечение.
+    profile_status = _profile_status(text)
+    if step in ("start", "complaint") and profile_status == "non_profile":
+        session["complaint"] = text
+        session["step"] = "escalated"
+        session["escalated"] = True
+        session["profile_status"] = "non_profile"
+        return _finalize(chat_id, session, _non_profile_answer(session, text))
+
+    if step in ("start", "complaint") and profile_status == "unclear":
+        session["step"] = "complaint"
+        session["profile_status"] = "unclear"
+        return _finalize(chat_id, session, _unclear_profile_answer(session, text))
+
     # handoff_already_done_thanks_guard:
     # После передачи координатору/администратору не запускаем сценарий заново
     # на короткие ответы "спасибо/ок/хорошо".
@@ -1107,10 +1251,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         )
 
     # complaint_already_given_guard:
-    # Если пациент сразу написал жалобу ("парез стопы", "после операции", "болит..."),
+    # Если пациент сразу написал профильную жалобу ("парез стопы", "после операции", "болит..."),
     # не спрашиваем "что беспокоит" повторно.
-    if step in ("start", "complaint") and _has_medical_complaint_text(text):
+    if step in ("start", "complaint") and _profile_status(text) == "profile":
         session["complaint"] = text
+        session["profile_status"] = "profile"
         session["step"] = "age"
         answer = _tr(
             session,
@@ -1145,7 +1290,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             )
             return _finalize(chat_id, session, answer)
 
-        if (_has_complaint(text) or _has_medical_complaint_text(text)):
+        if (_has_complaint(text) or _has_medical_complaint_text(text)) and _profile_status(text) != "non_profile":
             session["complaint"] = text
 
             # Если возраст уже есть в этом же сообщении — не спрашиваем его повторно.
@@ -1192,6 +1337,18 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session["escalated"] = True
             return _finalize(chat_id, session, _tr(session, "Поняла Вас 🌿 Передам администратору, чтобы он помог с записью и подсказал, какая консультация подойдёт.", "Түсіндім 🌿 Әкімшіге жіберемін, ол жазылуға көмектесіп, қандай консультация қолайлы екенін айтады."))
 
+        if _profile_status(text) == "non_profile":
+            session["complaint"] = text
+            session["step"] = "escalated"
+            session["escalated"] = True
+            session["profile_status"] = "non_profile"
+            return _finalize(chat_id, session, _non_profile_answer(session, text))
+
+        if _profile_status(text) == "unclear":
+            session["step"] = "complaint"
+            session["profile_status"] = "unclear"
+            return _finalize(chat_id, session, _unclear_profile_answer(session, text))
+
         if not (_has_complaint(text) or _has_medical_complaint_text(text)):
             if _has_booking_intent(text) or _is_greeting_only(text):
                 return _finalize(chat_id, session, _ask_complaint(session))
@@ -1210,7 +1367,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session["complaint"] = "Профилактическая консультация, без конкретной жалобы"
             session["step"] = "age"
             return _finalize(chat_id, session, _tr(session, "Хорошо 🌿 Подскажите, пожалуйста, сколько Вам лет?", "Жақсы 🌿 Жасыңыз нешеде?"))
-        if (_has_complaint(text) or _has_medical_complaint_text(text)):
+        if (_has_complaint(text) or _has_medical_complaint_text(text)) and _profile_status(text) != "non_profile":
             session["complaint"] = text
 
             # Если возраст уже есть в этом же сообщении — не спрашиваем его повторно.
