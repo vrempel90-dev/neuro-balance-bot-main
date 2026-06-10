@@ -642,37 +642,119 @@ def _avoid_repeating_same_question(answer: str, session: dict[str, Any]) -> str:
 
 
 def _remove_name_addressing(answer: str, session: dict[str, Any]) -> str:
-    """Бот никогда не обращается к человеку по имени.
+    """Жёсткая защита: бот никогда не обращается к пациенту по имени/нику.
 
-    Имя можно собрать и передать в CRM для записи, но в исходящих сообщениях
-    не пишем: "Айжан, ...", "Кайрат, ...", "Иван, ...".
+    Имя можно собрать и передать в CRM, но в исходящих сообщениях запрещено:
+    - "Здравствуйте, Айжан!"
+    - "Добрый день, Сергей!"
+    - "Уважаемый(-ая) Съемка!"
+    - "Спасибо, Арман!"
+    - "Арман, подскажите..."
     """
     if not answer:
         return answer
 
+    cleaned = str(answer)
+
+    # Убираем универсальные обращения по имени/нику в начале любой строки.
+    # Это ловит имена из Wazzup/CRM даже если они не сохранены в session.
+    patterns = [
+        r"(?im)^\s*Здравствуйте,\s*[^!\n]{2,80}!\s*",
+        r"(?im)^\s*Добрый день,\s*[^!\n]{2,80}!\s*",
+        r"(?im)^\s*Доброе утро,\s*[^!\n]{2,80}!\s*",
+        r"(?im)^\s*Добрый вечер,\s*[^!\n]{2,80}!\s*",
+        r"(?im)^\s*Уважаемый\(-ая\)\s*[^!\n]{1,80}!\s*",
+        r"(?im)^\s*Уважаемый\s*[^!\n]{1,80}!\s*",
+        r"(?im)^\s*Уважаемая\s*[^!\n]{1,80}!\s*",
+        r"(?im)^\s*Спасибо,\s*[^!\n.]{2,80}[.!]?\s*",
+    ]
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    # Если конкретное имя/ник лежит в session — убираем персональное обращение.
     possible_names = [
         session.get("patient_name"),
         session.get("name"),
         session.get("client_name"),
         session.get("patientName"),
+        session.get("contact_name"),
+        session.get("contactName"),
+        session.get("wazzup_name"),
+        session.get("wazzupName"),
     ]
 
-    cleaned = answer
     for name in possible_names:
         if not name:
             continue
         n = str(name).strip()
         if not n:
             continue
-        # Убираем только обращение в начале сообщения/строки: "Имя, ..."
         cleaned = re.sub(rf"(?im)^\s*{re.escape(n)}\s*,\s*", "", cleaned)
+        cleaned = re.sub(rf"(?im)^\s*Здравствуйте,\s*{re.escape(n)}!\s*", "Здравствуйте! ", cleaned)
+        cleaned = re.sub(rf"(?im)^\s*Добрый день,\s*{re.escape(n)}!\s*", "Добрый день! ", cleaned)
+        cleaned = re.sub(rf"(?im)^\s*Уважаемый\(-ая\)\s*{re.escape(n)}!\s*", "", cleaned)
 
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    if not cleaned:
+        cleaned = _tr(session, "Спасибо, принято 🌿", "Рақмет, қабылданды 🌿")
     return cleaned
 
+
+def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
+    """Страховка от лишней отсебятины.
+
+    Не трогаем обязательные длинные сообщения: чек-лист противопоказаний,
+    подтверждение записи, адрес/цены/МРТ и системные ответы об эскалации.
+    """
+    if not answer:
+        return answer
+
+    low = _low(answer)
+    allow_long_markers = [
+        "перед записью нужно подтвердить",
+        "жазылмас бұрын нақтылау",
+        "противопоказан",
+        "қарсы көрсетілім",
+        "ваш визит в neuro balance",
+        "neuro balance қабылдауы",
+        "запись подтверждена",
+        "жазба расталды",
+        "адрес:",
+        "мекенжай:",
+        "приём в нашей клинике",
+        "қабылдау",
+        "мрт",
+        "снимки",
+        "передам администратору",
+        "әкімшіге",
+    ]
+    if any(marker in low for marker in allow_long_markers):
+        return answer.strip()
+
+    banned_fragments = [
+        "мы команда профессионалов",
+        "гарантируем результат",
+        "обязательно вылечим",
+        "лучшие специалисты",
+        "не переживайте, мы вас вылечим",
+    ]
+    cleaned = answer
+    for fragment in banned_fragments:
+        cleaned = re.sub(re.escape(fragment), "", cleaned, flags=re.I)
+
+    # Обычные ответы держим короткими. Блоки через \n\n не режем агрессивно,
+    # чтобы не сломать уже готовые шаблоны.
+    if "\n" not in cleaned:
+        sentences = re.split(r"(?<=[.!?])\s+", cleaned.strip())
+        if len(sentences) > 2:
+            cleaned = " ".join(sentences[:2]).strip()
+
+    return cleaned.strip()
 
 def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     answer = _clean(answer)
     answer = _remove_name_addressing(answer, session)
+    answer = _strict_trim_extra(answer, session)
     if not answer:
         if session.get("complaint") and not session.get("age"):
             answer = _ask_age(session)
@@ -1010,8 +1092,8 @@ def _ask_date(session: dict[str, Any]) -> str:
 def _ask_name(session: dict[str, Any]) -> str:
     return _tr(
         session,
-        "Перед записью подскажите, пожалуйста, как к Вам обращаться? Напишите только имя.",
-        "Жазбас бұрын атыңызды жазыңызшы. Тек атыңызды жазыңыз.",
+        "Для оформления записи подскажите, пожалуйста, Ваше имя.",
+        "Жазбаны рәсімдеу үшін атыңызды жазыңызшы.",
     )
 
 
@@ -1074,7 +1156,7 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
 
     if not slot:
         session["step"] = "date"
-        return _prepend_price_if_needed(text, session, _ask_date(session))
+        return _ask_date(session)
 
     try:
         booked = await crm.book_appointment(
@@ -1101,11 +1183,28 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         time_start = booked.get("timeStart") or booked.get("time_start") or slot.get("time") or ""
         doctor = booked.get("doctorName") or slot.get("doctor_name") or ""
 
-        details = " ".join(x for x in [date, time_start, doctor] if x)
         return _tr(
             session,
-            f"Готово, записала Вас 🌿\n{details}\n\nБудем ждать Вас!",
-            f"Дайын, Сізді жаздым 🌿\n{details}\n\nКүтеміз!",
+            (
+                "Спасибо, запись подтверждена ✅\n\n"
+                "Ваш визит в Neuro Balance:\n"
+                f"📅 Дата: {date}\n"
+                f"⏰ Время: {time_start}\n"
+                "📍 Адрес: Кабанбай батыра 28, внутренний двор, подъезд 3.\n"
+                "👉 Местоположение: https://go.2gis.com/NcqGj\n\n"
+                "Просим взять с собой все имеющиеся снимки, заключения или анализы. "
+                "Если их нет — ничего страшного, врач при необходимости подскажет, что нужно."
+            ),
+            (
+                "Рақмет, жазба расталды ✅\n\n"
+                "Neuro Balance қабылдауы:\n"
+                f"📅 Күні: {date}\n"
+                f"⏰ Уақыты: {time_start}\n"
+                "📍 Мекенжай: Қабанбай батыр 28, ішкі аула, 3-подъезд.\n"
+                "👉 Орналасуы: https://go.2gis.com/NcqGj\n\n"
+                "Өзіңізде бар снимок, қорытынды немесе анализ болса, ала келіңіз. "
+                "Егер жоқ болса — ештеңе етпейді, дәрігер қажет болса өзі айтады."
+            ),
         )
     except Exception as exc:
         _safe_log(chat_id, "crm_book_error", {"error": str(exc)[:500]})
