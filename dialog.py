@@ -67,6 +67,20 @@ COMPLAINT_WORDS = [
     "belim", "белім", "белим", "бел", "арқа", "аркам", "арқам",
     "аяқ", "аяққа", "аяк", "аякка", "аяғым", "аягым",
     "мойын", "мойным", "буын", "тізе", "тизе", "иық", "иык", "қол", "кол",
+    "парез",
+    "парез стопы",
+    "стопа",
+    "стопы",
+    "после операции",
+    "операции",
+    "операция",
+    "прооперировали",
+    "шов",
+    "реабилитация",
+    "реабилитацию",
+    "оналту",
+    "табан",
+    "ота",
 ]
 
 NO_COMPLAINT_WORDS = [
@@ -297,6 +311,40 @@ def _safe_log(chat_id: str, event: str, payload: dict[str, Any]) -> None:
         state.log_event(chat_id, event, payload)
     except Exception:
         pass
+
+
+def _has_medical_complaint_text(text: str) -> bool:
+    low = _low(text)
+    if not low:
+        return False
+
+    complaint_patterns = [
+        "болит", "боль", "ауырады", "ауыр", "мазалайды",
+        "парез", "парез стопы", "стопы", "стопа",
+        "после операции", "послеоперац", "операции", "операция",
+        "реабилитац", "реабилитация",
+        "нога", "ноги", "аяқ", "аяк", "табан",
+        "спина", "поясница", "шея", "грыжа", "протруз",
+    ]
+    return any(p in low for p in complaint_patterns)
+
+
+def _is_thanks_or_ok(text: str) -> bool:
+    low = _low(text)
+    if not low:
+        return False
+
+    final_words = [
+        "спасибо", "спс", "благодарю", "хорошо", "ок", "окей", "понял", "поняла",
+        "рахмет", "жақсы", "жаксы", "түсіндім", "тусиндим",
+    ]
+    cleaned = re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", low)
+
+    for w in final_words:
+        if cleaned == re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", w):
+            return True
+
+    return len(low) <= 40 and any(w in low for w in final_words)
 
 
 def _remove_name_addressing(answer: str, session: dict[str, Any]) -> str:
@@ -1020,7 +1068,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     inline_age = _extract_age(text, step="age")
     if (
         inline_age
-        and _has_complaint(text)
+        and (_has_complaint(text) or _has_medical_complaint_text(text))
         and session.get("contraindications_ok") is not True
         and not session.get("contraindications_verdict")
     ):
@@ -1033,12 +1081,44 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # Если в сообщении есть жалоба, жалоба важнее FAQ.
     # Например "Белім ауырады, похоже протрузия" нельзя ошибочно трактовать как вопрос про УЗИ.
     diagnostic_booking_request = _has_booking_intent(text) and _has_mri_question(text)
-    info = None if (_has_complaint(text) or diagnostic_booking_request) else _clinic_answer(text, session)
+    info = None if ((_has_complaint(text) or _has_medical_complaint_text(text)) or diagnostic_booking_request) else _clinic_answer(text, session)
     if info and not session.get("complaint"):
         session["step"] = "complaint"
         return _finalize(chat_id, session, info)
 
     step = session.get("step") or "start"
+    # handoff_already_done_thanks_guard:
+    # После передачи координатору/администратору не запускаем сценарий заново
+    # на короткие ответы "спасибо/ок/хорошо".
+    if step in ("escalated", "done", "booked", "stopped") and _is_thanks_or_ok(text):
+        return _finalize(chat_id, session, _tr(session, "Спасибо 🌿", "Рақмет 🌿"))
+
+    # Если координатор уже закрепляет время вручную, новые уточнения по дню/времени
+    # не должны снова спрашивать дату и запускать повторную заявку.
+    if step == "escalated" and (_parse_date(text) or _has_time_hint(text) or _has_booking_intent(text)):
+        return _finalize(
+            chat_id,
+            session,
+            _tr(
+                session,
+                "Спасибо, зафиксировала пожелание по времени. Координатор клиники свяжется с Вами и закрепит удобное время вручную 🌿",
+                "Рақмет, уақыт бойынша қалауыңызды белгіледім. Клиника координаторы Сізбен байланысып, ыңғайлы уақытты қолмен бекітеді 🌿",
+            ),
+        )
+
+    # complaint_already_given_guard:
+    # Если пациент сразу написал жалобу ("парез стопы", "после операции", "болит..."),
+    # не спрашиваем "что беспокоит" повторно.
+    if step in ("start", "complaint") and _has_medical_complaint_text(text):
+        session["complaint"] = text
+        session["step"] = "age"
+        answer = _tr(
+            session,
+            "Понимаем Вас 🙏 Это относится к профилю нашей клиники. С такой жалобой можно прийти на первичную консультацию, врач осмотрит и подскажет дальнейший план.\n\nПодскажите, пожалуйста, возраст пациента?",
+            "Түсінеміз 🙏 Бұл біздің клиниканың бағытына жатады. Мұндай шағыммен алғашқы консультацияға келуге болады, дәрігер қарап, әрі қарайғы жоспарды түсіндіреді.\n\nПациенттің жасы нешеде?",
+        )
+        return _finalize(chat_id, session, answer)
+
 
     # 4) Если пациент прислал возраст внутри любого сообщения — сохраняем,
     # но НЕ перескакиваем противопоказания.
@@ -1065,7 +1145,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             )
             return _finalize(chat_id, session, answer)
 
-        if _has_complaint(text):
+        if (_has_complaint(text) or _has_medical_complaint_text(text)):
             session["complaint"] = text
 
             # Если возраст уже есть в этом же сообщении — не спрашиваем его повторно.
@@ -1112,7 +1192,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session["escalated"] = True
             return _finalize(chat_id, session, _tr(session, "Поняла Вас 🌿 Передам администратору, чтобы он помог с записью и подсказал, какая консультация подойдёт.", "Түсіндім 🌿 Әкімшіге жіберемін, ол жазылуға көмектесіп, қандай консультация қолайлы екенін айтады."))
 
-        if not _has_complaint(text):
+        if not (_has_complaint(text) or _has_medical_complaint_text(text)):
             if _has_booking_intent(text) or _is_greeting_only(text):
                 return _finalize(chat_id, session, _ask_complaint(session))
             return _finalize(chat_id, session, _ask_complaint(session))
@@ -1130,7 +1210,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session["complaint"] = "Профилактическая консультация, без конкретной жалобы"
             session["step"] = "age"
             return _finalize(chat_id, session, _tr(session, "Хорошо 🌿 Подскажите, пожалуйста, сколько Вам лет?", "Жақсы 🌿 Жасыңыз нешеде?"))
-        if _has_complaint(text):
+        if (_has_complaint(text) or _has_medical_complaint_text(text)):
             session["complaint"] = text
 
             # Если возраст уже есть в этом же сообщении — не спрашиваем его повторно.
@@ -1194,7 +1274,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return _finalize(chat_id, session, _stop_booking_text(session, "contra"))
 
         # Если пациент написал симптомы вместо ответа по противопоказаниям — не считаем это противопоказанием.
-        if _has_complaint(text):
+        if (_has_complaint(text) or _has_medical_complaint_text(text)):
             return _finalize(chat_id, session, _ask_contra(session))
 
         # Если пациент написал просто "есть/да/бар" без деталей — запись не продолжаем.
