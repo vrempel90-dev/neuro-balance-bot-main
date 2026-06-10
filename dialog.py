@@ -264,16 +264,31 @@ def _has_mri_question(text: str) -> bool:
 def _detect_lang(text: str, session: dict[str, Any]) -> str:
     current = session.get("language") or "ru"
     low = _low(text)
+    text_stripped = (text or "").strip()
 
-    # ЖЁСТКИЙ приоритет казахского:
-    # если пациент пишет с казахскими буквами/фразами, отвечаем на казахском,
-    # даже если раньше в этом чате была русская фраза типа "Здравствуйте".
-    strong_kz = (
-        bool(re.search(r"[әғқңөұүһіӘҒҚҢӨҰҮҺІ]", text or ""))
-        or any(w in low for w in KZ_MARKERS)
-        or bool(re.search(r"(емдей\s+аласыз|емдей\s+аласыздар|аласыздар\s+ма)", low))
+    # Короткие казахские ответы в русской беседе НЕ должны переключать язык:
+    # "69 жаста", "Жоқ", "жок", "ия" — это ответы на вопросы, а не смена языка.
+    short_kz_answer = bool(
+        re.fullmatch(
+            r"\s*(?:\d{1,3}\s*(?:жаста|жас)?|жоқ|жок|ия|иә|жақсы|жаксы|рахмет)\s*[.!?🙏🌿]*\s*",
+            low,
+        )
     )
-    if strong_kz:
+    if current == "ru" and short_kz_answer:
+        return "ru"
+
+    # Сильный казахский: казахские буквы/фразы + нет явной русской основы.
+    has_kz_letters = bool(re.search(r"[әғқңөұүһіӘҒҚҢӨҰҮҺІ]", text_stripped))
+    has_kz_words = any(w in low for w in KZ_MARKERS) or bool(
+        re.search(r"(емдей\s+аласыз|емдей\s+аласыздар|аласыздар\s+ма)", low)
+    )
+    has_ru = any(w in low for w in RU_MARKERS)
+
+    # Если в одном сообщении есть русские слова и пару казахских ответов — держим русский.
+    if has_ru and current == "ru":
+        return "ru"
+
+    if has_kz_letters or has_kz_words:
         return "kk"
 
     if detect_message_language:
@@ -284,7 +299,6 @@ def _detect_lang(text: str, session: dict[str, Any]) -> str:
         except Exception:
             pass
 
-    has_ru = any(w in low for w in RU_MARKERS)
     if has_ru:
         return "ru"
 
@@ -457,6 +471,33 @@ def _has_medical_complaint_text(text: str) -> bool:
     return _has_any(text, COMPLAINT_WORDS)
 
 
+def _is_no_contra_answer(text: str) -> bool:
+    low = _low(text)
+    if not low:
+        return False
+
+    # Explicit answers meaning "no contraindications".
+    explicit_no = [
+        "нет", "нету", "не имеется", "противопоказаний нет",
+        "нет противопоказаний", "ограничений нет", "не противопоказаний",
+        "жоқ", "жок", "қарсы көрсетілім жоқ", "карсы корсетилим жок",
+        "қарсы көрсетілімдер жоқ", "карсы корсетилимдер жок",
+        "жоқ!", "жок!",
+    ]
+
+    compact = re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", low)
+    for phrase in explicit_no:
+        if compact == re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", phrase):
+            return True
+
+    if "противопоказ" in low and any(x in low for x in ["нет", "нету", "жоқ", "жок"]):
+        return True
+    if ("қарсы" in low or "карсы" in low) and any(x in low for x in ["жоқ", "жок", "нет"]):
+        return True
+
+    return False
+
+
 def _is_thanks_or_ok(text: str) -> bool:
     low = _low(text)
     if not low:
@@ -473,6 +514,76 @@ def _is_thanks_or_ok(text: str) -> bool:
             return True
 
     return len(low) <= 40 and any(w in low for w in final_words)
+
+
+def _strip_quoted_bot_text(text: str) -> str:
+    """Убирает из входящего текста цитаты предыдущих сообщений бота.
+
+    В Wazzup пользователь может ответить реплаем. Иногда в payload попадает
+    процитированный текст бота + реальный ответ клиента. Нам нужен реальный ответ.
+    """
+    if not text:
+        return text
+
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    if not lines:
+        return text
+
+    bot_quote_patterns = [
+        "спасибо. на какой день вам удобно прийти",
+        "на какой день вам удобно прийти",
+        "подскажите, пожалуйста, что вас беспокоит",
+        "перед записью нужно подтвердить",
+        "қаи күн ыңғайлы",
+        "қай күн ыңғайлы",
+        "сізді не мазалайды",
+    ]
+
+    cleaned_lines: list[str] = []
+    for line in lines:
+        low = _low(line)
+        if any(p in low for p in bot_quote_patterns):
+            continue
+        if low in ("phone", "api", "admin", "api · admin", "api · null"):
+            continue
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip() or text
+
+
+def _is_unknown_date_answer(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    if not low:
+        return False
+
+    patterns = [
+        "пока не знаю", "не знаю", "позже", "потом", "напишу позже",
+        "когда дома буду", "когда буду дома", "с работы приду",
+        "после работы", "на работе", "я пока на работа", "я пока на работе",
+        "уточню", "надо подумать", "пока не могу сказать",
+        "кейін", "кейин", "білмеймін", "билмеймин", "үйге келгенде", "уйге келгенде",
+    ]
+    return any(p in low for p in patterns)
+
+
+def _is_tentative_date_answer(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    if not low:
+        return False
+    return any(p in low for p in [
+        "следующ", "недел", "вторник", "сред", "четверг", "пятниц", "понедельник",
+        "может вторник", "может среда", "на следующей неделе",
+        "келесі апта", "сейсенбі", "сәрсенбі", "бейсенбі", "жұма",
+    ])
+
+
+def _is_doctor_can_treat_question(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    return any(p in low for p in [
+        "сможет леч", "сможете леч", "лечите это", "можно лечить",
+        "этот сможет", "это сможет", "по фото", "по снимку", "по документу",
+        "осы емдей", "емдей аласыз",
+    ])
 
 
 def _remove_name_addressing(answer: str, session: dict[str, Any]) -> str:
@@ -1215,6 +1326,56 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _finalize(chat_id, session, info)
 
     step = session.get("step") or "start"
+
+    # doctor_can_treat_question_guard:
+    # Если пациент отправил фото/документ и спрашивает "это сможет лечить?",
+    # не обещаем лечение и не повторяем вопрос про дату.
+    if _is_doctor_can_treat_question(text):
+        session["step"] = "escalated"
+        session["escalated"] = True
+        session["handoff_reason"] = "doctor_can_treat_question"
+        return _finalize(
+            chat_id,
+            session,
+            _tr(
+                session,
+                "По фото/документу точно не буду обещать лечение, чтобы не ввести Вас в заблуждение. Передам вопрос координатору клиники, он уточнит у врача и свяжется с Вами 🌿",
+                "Фото/құжат бойынша емді нақты уәде ете алмаймын, қате бағыт бергім келмейді. Сұрағыңызды клиника координаторына жіберемін, ол дәрігерден нақтылап, Сізбен байланысады 🌿",
+            ),
+        )
+
+    # unknown_date_answer_guard:
+    # Если пациент пока не знает день/время, не повторяем один и тот же вопрос.
+    if step == "date" and _is_unknown_date_answer(text):
+        session["step"] = "date"
+        session["waiting_for_date"] = True
+        return _finalize(
+            chat_id,
+            session,
+            _tr(
+                session,
+                "Хорошо, ничего страшного 🌿 Когда определитесь с удобным днём и временем, просто напишите сюда — я помогу продолжить запись.",
+                "Жақсы, ештеңе етпейді 🌿 Қай күн мен уақыт ыңғайлы екенін анықтаған кезде осында жазыңыз — жазылуды жалғастыруға көмектесемін.",
+            ),
+        )
+
+    # tentative_date_answer_guard:
+    # Если пациент пишет неопределённо: "на следующей неделе, может вторник/среда",
+    # фиксируем пожелание и не спамим вопросом повторно.
+    if step == "date" and _is_tentative_date_answer(text) and not _parse_date(text):
+        session["step"] = "escalated"
+        session["escalated"] = True
+        session["handoff_reason"] = "tentative_date"
+        return _finalize(
+            chat_id,
+            session,
+            _tr(
+                session,
+                "Спасибо, зафиксировала пожелание по дню. Так как точное время пока не выбрано, передам заявку координатору клиники — он свяжется с Вами и закрепит удобное время вручную 🌿",
+                "Рақмет, күн бойынша қалауыңызды белгіледім. Нақты уақыт әлі таңдалмағандықтан, өтінімді клиника координаторына жіберемін — ол Сізбен байланысып, ыңғайлы уақытты қолмен бекітеді 🌿",
+            ),
+        )
+
     # profile_classifier_guard:
     # Сначала определяем, относится ли жалоба к профилю клиники.
     # Если не профиль — не ведём в запись и не обещаем лечение.
@@ -1230,6 +1391,22 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["step"] = "complaint"
         session["profile_status"] = "unclear"
         return _finalize(chat_id, session, _unclear_profile_answer(session, text))
+
+    # escalated_repeat_guard_v2:
+    # После передачи координатору не задаём повторно вопросы анкеты.
+    if step == "escalated":
+        if _is_thanks_or_ok(text):
+            return _finalize(chat_id, session, _tr(session, "Спасибо 🌿", "Рақмет 🌿"))
+        if _is_unknown_date_answer(text):
+            return _finalize(
+                chat_id,
+                session,
+                _tr(
+                    session,
+                    "Хорошо, когда определитесь — напишите сюда. Координатор клиники также сможет связаться с Вами и закрепить удобное время 🌿",
+                    "Жақсы, анықтаған кезде осында жазыңыз. Клиника координаторы да Сізбен байланысып, ыңғайлы уақытты бекіте алады 🌿",
+                ),
+            )
 
     # handoff_already_done_thanks_guard:
     # После передачи координатору/администратору не запускаем сценарий заново
@@ -1253,7 +1430,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # complaint_already_given_guard:
     # Если пациент сразу написал профильную жалобу ("парез стопы", "после операции", "болит..."),
     # не спрашиваем "что беспокоит" повторно.
-    if step in ("start", "complaint") and _profile_status(text) == "profile":
+    if step in ("start", "complaint") and not _is_no_contra_answer(text) and _profile_status(text) == "profile":
         session["complaint"] = text
         session["profile_status"] = "profile"
         session["step"] = "age"
@@ -1416,6 +1593,16 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     # 7) Противопоказания — обязательный гейт перед датой.
     if step == "contraindications":
+        # contra_no_answer_direct_date_guard:
+        # "Нет" / "Жоқ!" на вопрос о противопоказаниях = противопоказаний нет,
+        # дальше спрашиваем дату, а не возвращаемся к жалобе.
+        if _is_no_contra_answer(text):
+            session["contraindications_ok"] = True
+            session["contraindications_raw"] = "нет"
+            session["step"] = "date"
+            session["questionnaire_step"] = "date"
+            return _finalize(chat_id, session, _ask_date(session))
+
         session["contraindications_raw"] = text
 
         if _contra_is_clear_no(text):
