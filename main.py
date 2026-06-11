@@ -69,6 +69,13 @@ def _guard_answer(chat_id: str, answer: str) -> str:
     return enforce_prompt_only(answer or "", session)
 
 
+def _voice_fallback_answer() -> str:
+    return (
+        "Спасибо за Ваше обращение 🌿 "
+        "Передам информацию врачу — он свяжется с Вами в ближайшее время."
+    )
+
+
 
 def _deep_find_audio_items(obj: Any) -> list[dict[str, Any]]:
     """Ищет в payload Wazzup вложения/медиа, похожие на голосовое или аудио.
@@ -312,9 +319,13 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
         return ""
 
     if kind == "voice" or _message_has_voice_url(message):
-        transcript_text = await _transcribe_voice_message(message)
-        user_text = voice_text_for_bot(transcript_text)
-        state.log_event(chat_id, "voice_transcribed", {"text": transcript_text[:500]})
+        try:
+            transcript_text = await _transcribe_voice_message(message)
+            user_text = voice_text_for_bot(transcript_text)
+            state.log_event(chat_id, "voice_transcribed", {"text": transcript_text[:500]})
+        except Exception as exc:
+            state.log_event(chat_id, "voice_transcription_failed_fallback_doctor", {"error": str(exc)[:1000]})
+            return _guard_answer(chat_id, _voice_fallback_answer())
     else:
         user_text = str(message.get("text") or "")
 
@@ -395,10 +406,12 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
     except Exception as exc:
         state.log_event(chat_id, "background_processing_error", {"error": str(exc)[:1000]})
         try:
-            fallback = _guard_answer(
-                chat_id,
-                "Передам Ваш вопрос администратору, она ответит Вам в ближайшее время.",
-            )
+            if kind == "voice" or _message_has_voice_url(message):
+                fallback_text = _voice_fallback_answer()
+            else:
+                fallback_text = "Передам Ваш вопрос администратору, она ответит Вам в ближайшее время."
+
+            fallback = _guard_answer(chat_id, fallback_text)
             await send_text(
                 chat_id=chat_id,
                 chat_type=chat_type,
