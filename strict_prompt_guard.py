@@ -207,7 +207,7 @@ def enforce_prompt_only(answer: str, session: dict[str, Any] | None = None) -> s
         await wazzup.send_message(chat_id, answer)
     """
     if not answer:
-        return "Сізді не мазалайды? 🌿" if _lang(session) == "kk" else "Подскажите, пожалуйста, что Вас беспокоит? 🌿"
+        return ""
 
     cleaned = str(answer).strip()
     cleaned = _remove_name_addressing(cleaned, session)
