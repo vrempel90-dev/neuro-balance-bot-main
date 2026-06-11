@@ -1,419 +1,1996 @@
 from __future__ import annotations
 
-from functools import lru_cache
-from typing import Any
-import time
 import re
+from datetime import datetime, timedelta, timezone
+from typing import Any
 
-import httpx
+import crm
+import state
 
-from config import get_settings
+try:
+    from phone import sanitize_kz_phone
+except Exception:
+    def sanitize_kz_phone(phone: str) -> str:
+        digits = re.sub(r"\D+", "", phone or "")
+        if digits.startswith("8") and len(digits) == 11:
+            digits = "7" + digits[1:]
+        return digits
 
+try:
+    from language_guard import detect_language as detect_message_language
+except Exception:
+    detect_message_language = None
 
-class CRMError(Exception):
-    pass
-
-
-@lru_cache(maxsize=1)
-def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=3.0))
-
-
-def _headers() -> dict[str, str]:
-    settings = get_settings()
-    secret = (
-        getattr(settings, "crm_bot_secret", "")
-        or getattr(settings, "external_booking_api_secret", "")
-        or getattr(settings, "bot_api_secret", "")
-        or ""
-    )
-
-    # Railway/копирование с телефона иногда добавляет пробел или перевод строки.
-    # httpx тогда падает с LocalProtocolError: Illegal header value.
-    secret = str(secret or "").strip()
-
-    return {"x-bot-secret": secret}
-def _url(path: str) -> str:
-    settings = get_settings()
-    base = getattr(settings, "crm_base_url", "https://neuro-balance-crm.vercel.app")
-    return f"{str(base).rstrip('/')}{path}"
+try:
+    from config import get_settings
+except Exception:
+    get_settings = None
 
 
-def _raise_for_crm(response: httpx.Response, label: str) -> None:
-    if response.status_code == 401:
-        raise CRMError("CRM вернула 401: неверный CRM_BOT_SECRET / EXTERNAL_BOOKING_API_SECRET")
-    if response.status_code == 403:
-        raise CRMError(f"CRM {label} error 403: запись не принадлежит этому телефону")
-    if response.status_code == 404:
-        raise CRMError(f"CRM {label} error 404: endpoint/запись не найдены")
-    if response.status_code == 409:
-        raise CRMError(f"CRM {label} error 409: слот уже занят или вне расписания")
-    if response.status_code == 410:
-        raise CRMError(f"CRM {label} error 410: запись уже неактивна или отменена")
-    if response.status_code == 429:
-        try:
-            retry = response.json().get("retryAfterSec")
-        except Exception:
-            retry = None
-        raise CRMError(
-            f"CRM {label} error 429: превышен лимит"
-            + (f", повтор через {retry} сек" if retry else "")
+# ============================================================
+# Neuro Balance dialog.py
+# Safe controller:
+# complaint -> age -> contraindications -> date -> time -> name -> booking
+# ============================================================
+
+KZ_MARKERS = [
+    "сәлем", "салем", "қалай", "менің", "меним", "атым",
+    "белім", "белим", "ауырады", "ауыр", "аурат", "ертең", "ертен",
+    "бүгін", "бугин", "жоқ", "жок", "joq", "ия", "иә",
+    "қарсы", "карсы", "көрсетілім", "корсетилим",
+    "жазыл", "жазылғым", "келеді", "жас", "жастамын",
+    "аяқ", "аяг", "аяғым", "аягым", "аяғымнан", "аягымнан",
+    "қол", "кол", "омыртқа", "омыртка", "жарық", "жарык",
+    "оң", "он ая", "сол аяқ", "сол ая", "қысқа", "кыска",
+    "емдей", "емдей аласыз", "емдей аласыздар", "аласыздар ма",
+]
+
+RU_MARKERS = [
+    "здравствуйте", "привет", "добрый", "хочу", "записаться", "консультац",
+    "болит", "боль", "спина", "поясница", "шея", "грыжа", "протрузия",
+    "сколько", "стоит", "адрес", "завтра", "сегодня", "лет",
+]
+
+BOOKING_WORDS = [
+    "запис", "консультац", "прием", "приём", "акци", "50%",
+    "жазыл", "қабылдау", "кабылдау",
+]
+
+COMPLAINT_WORDS = [
+    "болит", "боль", "ноет", "тянет", "ломит", "хрустит", "онем",
+    "мурашк", "защем", "грыж", "грыжа", "протруз", "протрузия",
+    "отдает", "отдаёт", "стреляет", "прострел", "нога", "ногу", "ноге",
+    "рука", "руку", "руке", "бедро", "таз", "лопат", "ребр",
+    "спина", "спине", "спину", "поясниц", "шея", "шей", "сустав",
+    "колен", "плеч", "голова", "артроз", "артрит", "остеохонд", "травм",
+    "ауырады", "ауырып", "ауыр", "аурат", "қатты", "катты", "береді", "береди",
+    "belim", "белім", "белим", "бел", "арқа", "аркам", "арқам",
+    "аяқ", "аяққа", "аяк", "аякка", "аяғым", "аягым",
+    "мойын", "мойным", "буын", "тізе", "тизе", "иық", "иык", "қол", "кол",
+    "парез",
+    "парез стопы",
+    "стопа",
+    "стопы",
+    "после операции",
+    "операции",
+    "операция",
+    "прооперировали",
+    "шов",
+    "реабилитация",
+    "реабилитацию",
+    "оналту",
+    "табан",
+    "ота",
+]
+
+NO_COMPLAINT_WORDS = [
+    "ничего", "ничего не беспокоит", "не беспокоит", "ничего не болит",
+    "просто консультация", "просто осмотр", "профилактика",
+    "профилактический осмотр", "для профилактики", "не знаю",
+    "ештеңе", "ештене", "мазаламайды", "ауырмайды",
+    "білмеймін", "билмеймин", "жай консультация", "профилактика үшін",
+]
+
+PRICE_WORDS = [
+    "сколько стоит", "стоимость", "цена", "прайс", "қанша тұрады",
+    "канша турады", "бағасы", "багасы", "стоить",
+]
+
+ADDRESS_WORDS = [
+    "адрес", "где находитесь", "вы в астане", "2gis", "2 гис",
+    "мекенжай", "қайда", "кайда", "астанада",
+]
+
+SCHEDULE_WORDS = [
+    "график", "режим", "работаете", "расписание", "сенбі", "жексенбі",
+    "кесте", "жұмыс", "жумыс",
+]
+
+MRI_WORDS = [
+    "мрт", "кт", "рентген", "узи", "анализ", "снимок", "снимки",
+    "диагностика", "диагностик", "томография",
+]
+
+
+# ============================================================
+# Profile classifier
+# Профиль клиники: спина, позвоночник, суставы, мышцы, неврология,
+# реабилитация после операции/травм, парезы, онемение, нарушение походки.
+# Не профиль: стоматология, ЛОР, глаза, кожа, живот/ЖКТ, сердце/скорая,
+# гинекология/урология, инфекция/температура, психиатрия, чистая косметология.
+# ============================================================
+
+PROFILE_COMPLAINT_WORDS = [
+    # позвоночник / спина
+    "спина", "спине", "спину", "поясниц", "крестец", "копчик",
+    "шея", "шей", "воротников", "лопат", "межлопат",
+    "позвоноч", "омыртқа", "омыртка", "арқа", "арка", "белім", "белим",
+
+    # диагнозы опорно-двигательного аппарата
+    "грыж", "грыжа", "протруз", "остеохонд", "сколиоз", "кифоз",
+    "лордоз", "радикул", "ишиас", "невралг", "защем", "защим",
+    "артроз", "артрит", "коксартроз", "гонартроз", "остеоартроз",
+    "плоскостоп", "пяточная шпора", "шпора", "плантар",
+
+    # суставы / мышцы / связки
+    "сустав", "колен", "плеч", "локт", "кисть", "запяст", "тазобед",
+    "бедро", "голен", "стоп", "стопа", "стопы", "табан",
+    "мышц", "мышца", "связк", "сухожил", "растяж", "вывих",
+
+    # неврология / симптомы
+    "онем", "немеет", "мурашк", "прострел", "стреляет", "отдает", "отдаёт",
+    "тянет", "ноет", "ломит", "хрустит", "судорог", "спазм",
+    "парез", "паралич", "слабость в ног", "слабость в рук",
+    "нарушение походки", "хром", "координац", "вестибул",
+
+    # реабилитация / после операций
+    "после операции", "послеоперац", "операции", "операция",
+    "прооперировали", "реабилитац", "реабилитация", "восстановлен",
+    "после травмы", "травм", "перелом", "ушиб",
+
+    # казахский
+    "ауырады", "ауыр", "ауырсын", "аяқ", "аяк", "қол", "кол",
+    "мойын", "буын", "тізе", "тизе", "иық", "иык",
+    "оң аяқ", "сол аяқ", "қысқа", "кыска", "оналту",
+]
+
+NON_PROFILE_COMPLAINT_WORDS = [
+    # зубы / стоматология
+    "зуб", "зубы", "десна", "кариес", "стоматолог", "тіс", "тис",
+
+    # ЛОР
+    "горло", "ангина", "насморк", "кашель", "ухо", "уши", "отит",
+    "гайморит", "нос", "лор", "құлақ", "кулак", "тамақ", "тамак",
+
+    # глаза
+    "глаз", "глаза", "зрение", "офтальм", "конъюнктив", "көз", "коз",
+
+    # кожа / косметология
+    "кожа", "сыпь", "прыщ", "акне", "дермат", "экзема", "псориаз",
+    "родинка", "бородав", "аллергия на коже", "бетім", "бет", "тері", "тери",
+
+    # ЖКТ / живот
+    "живот", "желуд", "кишеч", "понос", "диар", "рвота", "тошнит",
+    "печень", "желчный", "гастрит", "аппендиц", "іш", "асқазан", "асказан",
+
+    # сердце / сосуды / скорая
+    "сердце", "сердеч", "давление", "гипертони", "инфаркт", "стенокард",
+    "боль в груди", "грудь сжимает", "одышка", "тромб", "варикоз",
+    "жүрек", "журек", "қан қысым", "кан кысым",
+
+    # урология / гинекология / беременность
+    "почки", "моч", "цистит", "простата", "уролог", "гинеколог",
+    "месячные", "беремен", "беременность", "жүктілік", "жукцилик",
+
+    # инфекции / высокая температура
+    "температура", "лихорад", "грипп", "ковид", "covid", "инфекц",
+    "пневмони", "бронхит", "астма", "қызу", "кызу",
+
+    # психиатрия / зависимости
+    "депресс", "паничес", "тревога", "психиатр", "нарколог", "алкогол",
+
+    # эндокринология без невро/суставной жалобы
+    "щитовид", "сахарный диабет", "диабет", "эндокрин",
+
+    # экстренное
+    "инсульт", "потеря сознания", "обморок", "кровотеч", "судороги сейчас",
+    "не чувствую половину тела",
+]
+
+UNCLEAR_DISEASE_WORDS = [
+    "диагноз", "болезнь", "заболевание", "лечите", "емдей", "емдейсіздер",
+    "емдей аласыз", "емдей аласыздар", "можно лечить", "лечите ли",
+]
+
+CANCEL_WORDS = [
+    "отмен", "не приду", "не смогу", "перенес", "перенести", "поменять время",
+    "басқа уақыт", "ауыстыр", "келмеймін", "келе алмаймын",
+]
+
+LOOKUP_WORDS = [
+    "я уже записан", "я уже записана", "уже записан", "уже записана",
+    "у меня запись", "моя запись", "мою запись", "когда я записан",
+    "когда у меня запись", "напомните", "на какое время", "во сколько",
+    "проверить запись", "посмотреть запись", "жазылдым", "жазбам", "қашан",
+]
+
+NO_CONTRA_WORDS = [
+    "нет", "нету", "не было", "противопоказаний нет", "нет противопоказаний",
+    "ничего нет", "все нет", "всё нет", "по всем нет",
+    "жоқ", "жок", "joq", "jok", "қарсы көрсетілім жоқ", "карсы корсетилим жок",
+]
+
+YES_WORDS = [
+    "да", "есть", "бар", "иә", "ия", "есть противопоказ", "имеется",
+]
+
+HARD_CONTRA_WORDS = [
+    "кардиостимулятор", "имплант", "металл", "метал", "металлоконструк",
+    "беремен", "беременность", "жүктілік", "жукцилик",
+    "онколог", "онкология", "рак", "эпилеп", "эпилепсия",
+    "коляск", "костыл", "костыли", "ограниченная подвижность", "ограниченной подвижностью",
+    "мүгедек арба", "арбамен", "таяқ", "балдақ",
+]
+
+NAME_BANNED_WORDS = set(
+    "да нет ок окей хорошо приду буду завтра сегодня ертең бугин бүгін жок жоқ хочу записаться консультация болит боль".split()
+)
+
+
+def _clean(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _low(text: str) -> str:
+    return _clean(text).lower().replace("ё", "е")
+
+
+def _has_any(text: str, words: list[str]) -> bool:
+    low = _low(text)
+    return any(w in low for w in words)
+
+
+def _has_mri_question(text: str) -> bool:
+    low = _low(text)
+    # ВАЖНО: "узи" проверяем только как отдельное слово.
+    # Иначе слово "протрузия" содержит "узи" внутри и ошибочно включает ответ про УЗИ/МРТ.
+    if re.search(r"\b(мрт|кт|рентген|снимок|снимки|томография|диагностика|диагностик)\b", low):
+        return True
+    if re.search(r"(?<![а-яa-z])узи(?![а-яa-z])", low):
+        return True
+    return False
+
+
+def _explicit_language_request(text: str) -> str | None:
+    low = _low(text)
+    if not low:
+        return None
+
+    # Клиент явно просит язык.
+    ru_patterns = [
+        "на русском", "по русски", "по-русски", "русский язык",
+        "пишите на русском", "говорите на русском", "можно на русском",
+    ]
+    kk_patterns = [
+        "қазақша", "казакша", "на казахском", "по казахски", "по-казахски",
+        "қазақ тілінде", "казахский язык", "пишите на казахском",
+    ]
+
+    if any(p in low for p in ru_patterns):
+        return "ru"
+    if any(p in low for p in kk_patterns):
+        return "kk"
+    return None
+
+
+def _detect_lang(text: str, session: dict[str, Any]) -> str:
+    current = session.get("language") or "ru"
+    low = _low(text)
+    text_stripped = (text or "").strip()
+
+    # Короткие казахские ответы в русской беседе НЕ должны переключать язык:
+    # "69 жаста", "Жоқ", "жок", "ия" — это ответы на вопросы, а не смена языка.
+    short_kz_answer = bool(
+        re.fullmatch(
+            r"\s*(?:\d{1,3}\s*(?:жаста|жас)?|жоқ|жок|ия|иә|жақсы|жаксы|рахмет)\s*[.!?🙏🌿]*\s*",
+            low,
         )
-    if response.status_code >= 400:
-        raise CRMError(f"CRM {label} error {response.status_code}: {response.text}")
-
-
-_SLOTS_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
-_SLOTS_CACHE_TTL = 25.0
-
-_DOCTORS_CACHE: tuple[float, dict[str, Any]] | None = None
-_SERVICES_CACHE: tuple[float, dict[str, Any]] | None = None
-_META_CACHE_TTL = 300.0
-
-
-def _normalize_phone(phone: str | None) -> str:
-    digits = re.sub(r"\D+", "", phone or "")
-    if digits.startswith("8") and len(digits) == 11:
-        digits = "7" + digits[1:]
-    return digits
-
-
-async def patient_lookup(phone: str) -> dict[str, Any]:
-    response = await _client().get(
-        _url("/api/bot/patient-lookup"),
-        params={"phone": _normalize_phone(phone)},
-        headers=_headers(),
     )
-    _raise_for_crm(response, "patient-lookup")
-    data = response.json()
+    if current == "ru" and short_kz_answer:
+        return "ru"
 
-    if data.get("lastAppointment") and not data.get("appointment"):
-        data["appointment"] = data.get("lastAppointment")
-
-    data.setdefault("hasActiveAppointment", bool(data.get("lastAppointment") or data.get("appointment")))
-    data.setdefault("ok", True)
-    return data
-
-
-async def get_doctors(force: bool = False) -> dict[str, Any]:
-    global _DOCTORS_CACHE
-
-    now = time.monotonic()
-    if not force and _DOCTORS_CACHE and now - _DOCTORS_CACHE[0] < _META_CACHE_TTL:
-        return _DOCTORS_CACHE[1]
-
-    response = await _client().get(
-        _url("/api/bot/doctors"),
-        headers=_headers(),
+    # Сильный казахский: казахские буквы/фразы + нет явной русской основы.
+    has_kz_letters = bool(re.search(r"[әғқңөұүһіӘҒҚҢӨҰҮҺІ]", text_stripped))
+    has_kz_words = any(w in low for w in KZ_MARKERS) or bool(
+        re.search(r"(емдей\s+аласыз|емдей\s+аласыздар|аласыздар\s+ма)", low)
     )
-    _raise_for_crm(response, "doctors")
+    has_ru = any(w in low for w in RU_MARKERS)
 
-    data = response.json()
-    data.setdefault("ok", True)
-    _DOCTORS_CACHE = (now, data)
-    return data
+    # Если в одном сообщении есть русские слова и пару казахских ответов — держим русский.
+    if has_ru and current == "ru":
+        return "ru"
+
+    if has_kz_letters or has_kz_words:
+        return "kk"
+
+    if detect_message_language:
+        try:
+            detected = detect_message_language(text, current)
+            if detected in ("ru", "kk"):
+                return detected
+        except Exception:
+            pass
+
+    if has_ru:
+        return "ru"
+
+    return current if current in ("ru", "kk") else "ru"
 
 
-async def get_services(force: bool = False) -> dict[str, Any]:
-    global _SERVICES_CACHE
+def _tr(session_or_lang: dict[str, Any] | str, ru: str, kk: str) -> str:
+    if isinstance(session_or_lang, dict):
+        lang = session_or_lang.get("language") or "ru"
+    else:
+        lang = session_or_lang or "ru"
+    return kk if lang == "kk" else ru
 
-    now = time.monotonic()
-    if not force and _SERVICES_CACHE and now - _SERVICES_CACHE[0] < _META_CACHE_TTL:
-        return _SERVICES_CACHE[1]
 
-    response = await _client().get(
-        _url("/api/bot/services"),
-        headers=_headers(),
+def _price_short_text(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Приём в нашей клинике — 5 000 тг 🌿",
+        "Біздің клиникада алғашқы қабылдау — 5 000 тг 🌿",
     )
-    _raise_for_crm(response, "services")
-
-    data = response.json()
-    data.setdefault("treatable", [])
-    data.setdefault("notTreatable", [])
-    data.setdefault("doctorCount", 0)
-    data.setdefault("ok", True)
-
-    _SERVICES_CACHE = (now, data)
-    return data
 
 
-async def check_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
-    if not date:
-        raise CRMError("CRM check-slots error: date is required")
+def _prepend_price_if_needed(text: str, session: dict[str, Any], answer: str) -> str:
+    if _has_any(text, PRICE_WORDS):
+        price = _price_short_text(session)
+        if price not in answer:
+            return price + "\n\n" + answer
+    return answer
 
-    params: dict[str, str] = {"date": date}
-    if doctor_login:
-        params["doctor"] = doctor_login
 
-    cache_key = (date, doctor_login or "")
-    cached = _SLOTS_CACHE.get(cache_key)
-    now = time.monotonic()
+def _is_relative_new_booking_request(text: str) -> bool:
+    low = _low(text)
 
-    if cached and now - cached[0] < _SLOTS_CACHE_TTL:
-        return cached[1]
+    relatives = [
+        "маму", "мама", "папу", "папа", "отца", "отец", "сына", "сын",
+        "дочь", "дочку", "дочери", "мужа", "жену", "брата", "сестру",
+        "анамды", "анама", "әкемді", "әкем", "баламды", "балам",
+        "ұлымды", "қызымды", "жолдасымды", "ағамды", "інімді", "әпкемді",
+    ]
 
-    response = await _client().get(
-        _url("/api/bot/check-slots"),
-        params=params,
-        headers=_headers(),
+    booking_words = [
+        "записать", "записаться", "запишите", "хочу записать", "хочу записаться",
+        "жазу", "жазғым", "жазыл", "жазып", "жазайын",
+    ]
+
+    existing_words = [
+        "уже записан", "уже записана", "я записан", "я записана", "был записан",
+        "была записана", "бұрын жазылған", "жазылған едім",
+        "отмените", "отменить", "перенести", "перенесите",
+        "басқа уақыт", "ауыстыру", "ауыстырыңыз",
+    ]
+
+    return (
+        any(w in low for w in relatives)
+        and any(w in low for w in booking_words)
+        and any(w in low for w in existing_words)
     )
-    _raise_for_crm(response, "check-slots")
 
-    data = response.json()
-    availability = data.get("availability") or []
-    slots: list[dict[str, Any]] = []
 
-    for item in availability:
-        if not isinstance(item, dict):
+def _relative_dual_task_answer(session: dict[str, Any], text: str) -> str:
+    low = _low(text)
+
+    details = []
+    age_match = _extract_age(text, step="age")
+    if age_match:
+        details.append(f"возраст: {age_match}")
+
+    if any(w in low for w in ["шея", "мойын"]):
+        details.append("жалоба: шея")
+    elif any(w in low for w in ["спина", "поясница", "бел"]):
+        details.append("жалоба: спина/поясница")
+    elif any(w in low for w in ["колено", "тізе"]):
+        details.append("жалоба: колено")
+    elif any(w in low for w in ["нога", "аяқ"]):
+        details.append("жалоба: нога")
+
+    if _contra_is_clear_no(text):
+        details.append("противопоказаний нет")
+    elif _contra_has_hard_stop(text):
+        details.append("есть важные ограничения — передать врачу")
+
+    if any(w in low for w in ["завтра", "ертең", "ертен"]):
+        details.append("желательная дата: завтра")
+
+    details_text_ru = ""
+    details_text_kk = ""
+    if details:
+        joined = "; ".join(details)
+        details_text_ru = f"\n\nПо новой записи передам данные: {joined}."
+        details_text_kk = f"\n\nЖаңа жазба бойынша мәліметтерді жіберемін: {joined}."
+
+    return _tr(
+        session,
+        "Поняла Вас. Передам администратору, чтобы он проверил Вашу запись и помог отменить или перенести её 🌿\n\nТакже администратор отдельно поможет записать родственника на консультацию.",
+        "Түсіндім. Әкімшіге жіберемін, ол Сіздің жазбаңызды тексеріп, тоқтатуға немесе ауыстыруға көмектеседі 🌿\n\nСонымен қатар әкімші туысыңызды консультацияға бөлек жазуға көмектеседі.",
+    ) + _tr(session, details_text_ru, details_text_kk)
+
+
+def _safe_save(chat_id: str, session: dict[str, Any]) -> None:
+    try:
+        state.save_session(chat_id, session)
+    except Exception:
+        pass
+
+
+def _safe_add_message(chat_id: str, role: str, text: str) -> None:
+    try:
+        state.add_message(chat_id, role, text)
+    except Exception:
+        pass
+
+
+def _safe_log(chat_id: str, event: str, payload: dict[str, Any]) -> None:
+    try:
+        state.log_event(chat_id, event, payload)
+    except Exception:
+        pass
+
+
+
+def _profile_status(text: str) -> str:
+    """Возвращает: profile / non_profile / unclear / none.
+
+    profile — можно вести на первичную консультацию;
+    non_profile — не обещаем лечение, передаём администратору/рекомендуем профильного врача;
+    unclear — пациент спрашивает "лечите ли ...", но неясно, относится ли к профилю.
+    """
+    low = _low(text)
+    if not low:
+        return "none"
+
+    has_profile = any(w in low for w in PROFILE_COMPLAINT_WORDS)
+    has_non_profile = any(w in low for w in NON_PROFILE_COMPLAINT_WORDS)
+
+    # Если есть профильная жалоба + сопутствующий диагноз, ведём как профиль.
+    # Например: "диабет, но немеет нога" — профильная жалоба есть.
+    if has_profile:
+        return "profile"
+
+    if has_non_profile:
+        return "non_profile"
+
+    if any(w in low for w in UNCLEAR_DISEASE_WORDS):
+        return "unclear"
+
+    return "none"
+
+
+def _non_profile_answer(session: dict[str, Any], text: str) -> str:
+    return _tr(
+        session,
+        "Спасибо, что описали ситуацию 🌿 По этому вопросу не хочу вводить Вас в заблуждение: это может быть не профиль нашей клиники. Я передам обращение администратору клиники, он уточнит детали и подскажет, к какому специалисту лучше обратиться.",
+        "Жағдайды жазғаныңызға рақмет 🌿 Бұл сұрақ бойынша қате бағыт бергім келмейді: бұл біздің клиниканың негізгі бағытына жатпауы мүмкін. Өтінішті клиника әкімшісіне жіберемін, ол нақтылап, қай маманға жүгінген дұрыс екенін айтады.",
+    )
+
+
+def _unclear_profile_answer(session: dict[str, Any], text: str) -> str:
+    return _tr(
+        session,
+        "Подскажите, пожалуйста, что именно беспокоит: спина, шея, суставы, онемение, боль/прострел в руку или ногу, нарушение походки? Так я точнее пойму, относится ли вопрос к профилю нашей клиники 🌿",
+        "Нақты не мазалайды: арқа/бел, мойын, буындар, ұю, қолға немесе аяққа берілетін ауырсыну, жүрудің бұзылуы ма? Солай сұрағыңыз біздің клиника бағытына жата ма — дәлірек түсінемін 🌿",
+    )
+
+def _has_medical_complaint_text(text: str) -> bool:
+    # Медицинская жалоба есть, если классификатор понял профиль/не профиль/неясную болезнь.
+    # Отдельно оставляем старые базовые слова через COMPLAINT_WORDS.
+    status = _profile_status(text)
+    if status in ("profile", "non_profile", "unclear"):
+        return True
+    return _has_any(text, COMPLAINT_WORDS)
+
+
+def _is_no_contra_answer(text: str) -> bool:
+    low = _low(text)
+    if not low:
+        return False
+
+    # Explicit answers meaning "no contraindications".
+    explicit_no = [
+        "нет", "нету", "не имеется", "противопоказаний нет",
+        "нет противопоказаний", "ограничений нет", "не противопоказаний",
+        "жоқ", "жок", "қарсы көрсетілім жоқ", "карсы корсетилим жок",
+        "қарсы көрсетілімдер жоқ", "карсы корсетилимдер жок",
+        "жоқ!", "жок!",
+    ]
+
+    compact = re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", low)
+    for phrase in explicit_no:
+        if compact == re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", phrase):
+            return True
+
+    if "противопоказ" in low and any(x in low for x in ["нет", "нету", "жоқ", "жок"]):
+        return True
+    if ("қарсы" in low or "карсы" in low) and any(x in low for x in ["жоқ", "жок", "нет"]):
+        return True
+
+    return False
+
+
+def _is_thanks_or_ok(text: str) -> bool:
+    low = _low(text)
+    if not low:
+        return False
+
+    final_words = [
+        "спасибо", "спс", "благодарю", "хорошо", "ок", "окей", "понял", "поняла",
+        "рахмет", "жақсы", "жаксы", "түсіндім", "тусиндим",
+    ]
+    cleaned = re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", low)
+
+    for w in final_words:
+        if cleaned == re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", w):
+            return True
+
+    return len(low) <= 40 and any(w in low for w in final_words)
+
+
+def _strip_quoted_bot_text(text: str) -> str:
+    """Убирает из входящего текста цитаты предыдущих сообщений бота.
+
+    В Wazzup пользователь может ответить реплаем. Иногда в payload попадает
+    процитированный текст бота + реальный ответ клиента. Нам нужен реальный ответ.
+    """
+    if not text:
+        return text
+
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    if not lines:
+        return text
+
+    bot_quote_patterns = [
+        "спасибо. на какой день вам удобно прийти",
+        "на какой день вам удобно прийти",
+        "подскажите, пожалуйста, что вас беспокоит",
+        "перед записью нужно подтвердить",
+        "қаи күн ыңғайлы",
+        "қай күн ыңғайлы",
+        "сізді не мазалайды",
+        "сейчас не получается проверить свободные окошки",
+    ]
+
+    cleaned_lines: list[str] = []
+    for line in lines:
+        low = _low(line)
+        if any(p in low for p in bot_quote_patterns):
             continue
-
-        doctor_login_item = item.get("doctorLogin") or item.get("doctor_login")
-        doctor_name = item.get("doctorName") or item.get("doctor_name") or "Врач клиники"
-        item_date = item.get("date") or date
-        available_slots = item.get("availableSlots") or item.get("slots") or []
-
-        if not isinstance(available_slots, list):
+        if low in ("phone", "api", "admin", "api · admin", "api · null"):
             continue
+        cleaned_lines.append(line)
 
-        for time_start in available_slots:
-            if isinstance(time_start, dict):
-                time_start = time_start.get("timeStart") or time_start.get("time")
-            if not time_start:
-                continue
+    return "\n".join(cleaned_lines).strip() or text
 
-            slots.append(
-                {
-                    "doctorLogin": doctor_login_item,
-                    "doctor_login": doctor_login_item,
-                    "doctorName": doctor_name,
-                    "doctor_name": doctor_name,
-                    "date": item_date,
-                    "timeStart": str(time_start),
-                    "time_start": str(time_start),
-                    "time": str(time_start),
-                }
+
+def _is_unknown_date_answer(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    if not low:
+        return False
+
+    patterns = [
+        "пока не знаю", "не знаю", "позже", "потом", "напишу позже",
+        "когда дома буду", "когда буду дома", "с работы приду",
+        "после работы", "на работе", "я пока на работа", "я пока на работе",
+        "уточню", "надо подумать", "пока не могу сказать",
+        "кейін", "кейин", "білмеймін", "билмеймин", "үйге келгенде", "уйге келгенде",
+    ]
+    return any(p in low for p in patterns)
+
+
+def _is_tentative_date_answer(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    if not low:
+        return False
+    return any(p in low for p in [
+        "следующ", "недел", "вторник", "сред", "четверг", "пятниц", "понедельник",
+        "может вторник", "может среда", "на следующей неделе",
+        "келесі апта", "сейсенбі", "сәрсенбі", "бейсенбі", "жұма",
+    ])
+
+
+def _is_doctor_can_treat_question(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    return any(p in low for p in [
+        "сможет леч", "сможете леч", "лечите это", "можно лечить",
+        "этот сможет", "это сможет", "по фото", "по снимку", "по документу",
+        "осы емдей", "емдей аласыз",
+    ])
+
+
+def _avoid_repeating_same_question(answer: str, session: dict[str, Any]) -> str:
+    """Не повторять один и тот же вопрос подряд, если пользователь уже дал ответ/отложил.
+
+    Это не заменяет антидубль webhook, но защищает диалог от зацикливания.
+    """
+    if not answer:
+        return answer
+
+    last = _clean(str(session.get("last_bot_answer") or ""))
+    current = _clean(answer)
+
+    if not last or last != current:
+        return answer
+
+    # Если ответ полностью совпал с прошлым, даём мягкую альтернативу.
+    if "на какой день" in _low(current) or "қай күн" in _low(current):
+        return _tr(
+            session,
+            "Когда определитесь с удобным днём и временем — напишите сюда, я продолжу запись 🌿",
+            "Қай күн мен уақыт ыңғайлы екенін анықтағанда осында жазыңыз, жазылуды жалғастырамын 🌿",
+        )
+
+    if "что вас беспокоит" in _low(current) or "сізді не мазалайды" in _low(current):
+        return _tr(
+            session,
+            "Опишите, пожалуйста, жалобу одним сообщением: что болит или что беспокоит 🌿",
+            "Шағымыңызды бір хабарламада жазыңызшы: қай жеріңіз ауырады немесе не мазалайды 🌿",
+        )
+
+    return answer
+
+
+def _remove_name_addressing(answer: str, session: dict[str, Any]) -> str:
+    """Жёсткая защита: бот никогда не обращается к пациенту по имени/нику.
+
+    Имя можно собрать и передать в CRM, но в исходящих сообщениях запрещено:
+    - "Здравствуйте, Айжан!"
+    - "Добрый день, Сергей!"
+    - "Уважаемый(-ая) Съемка!"
+    - "Спасибо, Арман!"
+    - "Арман, подскажите..."
+    """
+    if not answer:
+        return answer
+
+    cleaned = str(answer)
+
+    # Убираем универсальные обращения по имени/нику в начале любой строки.
+    # Это ловит имена из Wazzup/CRM даже если они не сохранены в session.
+    patterns = [
+        r"(?im)^\s*Здравствуйте,\s*[^!\n]{2,80}!\s*",
+        r"(?im)^\s*Добрый день,\s*[^!\n]{2,80}!\s*",
+        r"(?im)^\s*Доброе утро,\s*[^!\n]{2,80}!\s*",
+        r"(?im)^\s*Добрый вечер,\s*[^!\n]{2,80}!\s*",
+        r"(?im)^\s*Уважаемый\(-ая\)\s*[^!\n]{1,80}!\s*",
+        r"(?im)^\s*Уважаемый\s*[^!\n]{1,80}!\s*",
+        r"(?im)^\s*Уважаемая\s*[^!\n]{1,80}!\s*",
+        r"(?im)^\s*Спасибо,\s*[^!\n.]{2,80}[.!]?\s*",
+    ]
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    # Если конкретное имя/ник лежит в session — убираем персональное обращение.
+    possible_names = [
+        session.get("patient_name"),
+        session.get("name"),
+        session.get("client_name"),
+        session.get("patientName"),
+        session.get("contact_name"),
+        session.get("contactName"),
+        session.get("wazzup_name"),
+        session.get("wazzupName"),
+    ]
+
+    for name in possible_names:
+        if not name:
+            continue
+        n = str(name).strip()
+        if not n:
+            continue
+        cleaned = re.sub(rf"(?im)^\s*{re.escape(n)}\s*,\s*", "", cleaned)
+        cleaned = re.sub(rf"(?im)^\s*Здравствуйте,\s*{re.escape(n)}!\s*", "Здравствуйте! ", cleaned)
+        cleaned = re.sub(rf"(?im)^\s*Добрый день,\s*{re.escape(n)}!\s*", "Добрый день! ", cleaned)
+        cleaned = re.sub(rf"(?im)^\s*Уважаемый\(-ая\)\s*{re.escape(n)}!\s*", "", cleaned)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    if not cleaned:
+        cleaned = _tr(session, "Спасибо, принято 🌿", "Рақмет, қабылданды 🌿")
+    return cleaned
+
+
+def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
+    """Мягкая защита от лишней отсебятины.
+
+    Обязательные вопросы сценария не обрезаем.
+    """
+    if not answer:
+        return answer
+
+    low = _low(answer)
+
+    allow_long = any(x in low for x in [
+        "перед записью нужно подтвердить",
+        "перед записью мне нужно уточнить",
+        "противопоказан",
+        "ваш визит в neuro balance",
+        "запись подтверждена",
+        "кардиостимулятор",
+        "сколько вам лет",
+        "жасыңыз нешеде",
+        "жасыныз нешеде",
+        "на какой день вам удобно",
+        "қай күн ыңғайлы",
+        "кай кун ыңгайлы",
+        "какое вам удобно",
+        "қайсысы ыңғайлы",
+        "кайсысы ыңгайлы",
+        "для оформления записи",
+        "жазбаны рәсімдеу",
+    ])
+
+    if allow_long:
+        return answer.strip()
+
+    banned_fragments = [
+        "мы команда профессионалов",
+        "гарантируем результат",
+        "обязательно вылечим",
+        "лучшие специалисты",
+        "не переживайте, мы вас вылечим",
+    ]
+
+    cleaned = answer
+    for fragment in banned_fragments:
+        cleaned = re.sub(re.escape(fragment), "", cleaned, flags=re.I)
+
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned.strip())
+    if len(sentences) > 2:
+        cleaned = " ".join(sentences[:2]).strip()
+
+    return cleaned.strip()
+def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
+    answer = _clean(answer)
+    answer = _remove_name_addressing(answer, session)
+    answer = _strict_trim_extra(answer, session)
+    if not answer:
+        if session.get("complaint") and not session.get("age"):
+            answer = _ask_age(session)
+        else:
+            answer = _tr(
+                session,
+                "Подскажите, пожалуйста, что Вас беспокоит? 🌿",
+                "Сізді не мазалайды? 🌿",
             )
 
-    normalized = {
-        **data,
-        "availability": availability,
-        "slots": slots,
-        "ok": True,
+    # Никогда не возвращаем пустой ответ: если ответ совпал, мягко уточняем.
+    session["last_assistant_answer"] = answer
+    _safe_save(chat_id, session)
+    _safe_add_message(chat_id, "assistant", answer)
+    return answer
+
+
+def _extract_age(text: str, step: str = "") -> int | None:
+    low = _low(text)
+
+    # Не путать время с возрастом: "10:30" не возраст.
+    if re.search(r"\b\d{1,2}[:.]\d{2}\b", low):
+        return None
+
+    # Прямые формы возраста RU/KZ.
+    patterns = [
+        r"\bмне\s*(\d{1,2})\s*(?:лет|года|год)?\b",
+        r"\bмен\s*(\d{1,2})\s*(?:жастамын|жаста|жас)?\b",
+        r"\b(\d{1,2})\s*(?:лет|года|год|жас|жастамын|жаста)\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, low)
+        if m:
+            age = int(m.group(1))
+            if 1 <= age <= 99:
+                return age
+
+    # Не путать длительность боли с возрастом: "3 день болит" не возраст.
+    if re.search(r"\b\d{1,2}\s*(день|дня|дней|недел|неделя|месяц|месяцев|сутки)\b", low):
+        return None
+
+    # Если мы явно ждём возраст — можно принять просто число.
+    nums = re.findall(r"\b(\d{1,2})\b", low)
+    if nums and step == "age":
+        age = int(nums[0])
+        if 1 <= age <= 99:
+            return age
+
+    return None
+
+
+def _age_stop_text(age: int, session: dict[str, Any]) -> str:
+    if age < 16:
+        return _stop_booking_text(session, "under_16")
+    if 16 <= age < 18:
+        return _tr(
+            session,
+            "Так как Вам нет 18 лет, на консультацию нужно прийти с родителем или законным представителем 🌿",
+            "18 жасқа толмағандықтан, консультацияға ата-анаңызбен немесе заңды өкіліңізбен келу керек 🌿",
+        )
+    if age > 75:
+        return _stop_booking_text(session, "over_75")
+    return ""
+
+
+def _has_booking_intent(text: str) -> bool:
+    return _has_any(text, BOOKING_WORDS)
+
+
+def _has_complaint(text: str) -> bool:
+    return _has_any(text, COMPLAINT_WORDS)
+
+
+def _has_no_complaint(text: str) -> bool:
+    return _has_any(text, NO_COMPLAINT_WORDS)
+
+
+def _is_positive_confirm(text: str) -> bool:
+    low = _low(text)
+    return any(w in low for w in [
+        "да", "хочу", "запишите", "можно", "ок", "окей", "давайте",
+        "иә", "ия", "жаз", "жазылы", "болады", "келісемін", "келисемин",
+    ])
+
+
+def _is_greeting_only(text: str) -> bool:
+    low = _low(text)
+    words = re.sub(r"[^\wа-яА-ЯәіңғүұқөһӘІҢҒҮҰҚӨҺ]+", " ", low).split()
+    return bool(words) and len(words) <= 3 and any(w in words for w in ["здравствуйте", "привет", "салем", "сәлем"])
+
+
+def _parse_date(text: str) -> str | None:
+    low = _low(text)
+    today = (datetime.now(timezone.utc) + timedelta(hours=5)).date()
+
+    if any(w in low for w in ["сегодня", "бүгін", "бугин"]):
+        return today.isoformat()
+    if any(w in low for w in ["завтра", "ертең", "ертен"]):
+        return (today + timedelta(days=1)).isoformat()
+
+    weekdays = {
+        "понедельник": 0, "в понедельник": 0, "дүйсенбі": 0, "дуйсенби": 0,
+        "вторник": 1, "во вторник": 1, "сейсенбі": 1, "сейсенби": 1,
+        "среда": 2, "среду": 2, "в среду": 2, "сәрсенбі": 2, "сарсенби": 2,
+        "четверг": 3, "в четверг": 3, "бейсенбі": 3, "бейсенби": 3,
+        "пятница": 4, "пятницу": 4, "в пятницу": 4, "жұма": 4, "жума": 4,
+        "суббота": 5, "субботу": 5, "в субботу": 5, "сенбі": 5, "сенби": 5,
+        "воскресенье": 6, "воскресенье": 6, "жексенбі": 6, "жексенби": 6,
     }
+    for name, wd in weekdays.items():
+        if name in low:
+            delta = (wd - today.weekday()) % 7
+            if delta == 0:
+                delta = 7
+            return (today + timedelta(days=delta)).isoformat()
 
-    _SLOTS_CACHE[cache_key] = (now, normalized)
-    return normalized
+    m = re.search(r"\b(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?\b", low)
+    if m:
+        d, mo, y = m.groups()
+        year = int(y) if y else today.year
+        if year < 100:
+            year += 2000
+        try:
+            return datetime(year, int(mo), int(d)).date().isoformat()
+        except ValueError:
+            return None
+
+    return None
 
 
-async def book_appointment(
-    *,
-    patient_name: str,
-    phone: str,
-    doctor_login: str,
-    date: str,
-    time_start: str,
-    doctor_name: str | None = None,
-    notes: str | None = None,
-    conversation_id: str | int | None = None,
-    lead_id: str | int | None = None,
-) -> dict[str, Any]:
-    if not patient_name:
-        patient_name = "Пациент"
-    if not phone:
-        raise CRMError("CRM book error: phone is required")
-    if not doctor_login:
-        raise CRMError("CRM book error: doctorLogin is required")
-    if not date:
-        raise CRMError("CRM book error: date is required")
-    if not time_start:
-        raise CRMError("CRM book error: timeStart is required")
+def _time_from_text(text: str) -> str | None:
+    m = re.search(r"\b([01]?\d|2[0-3])[:.\- ]([0-5]\d)\b", text or "")
+    if m:
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
 
-    payload: dict[str, Any] = {
-        "patientName": patient_name,
-        "phone": _normalize_phone(phone),
-        "doctorLogin": doctor_login,
-        "date": date,
-        "timeStart": time_start,
-    }
+    m = re.search(r"\b([8-9]|1\d|20)\s*(?:час|ч|:00)?\b", _low(text))
+    if m:
+        return f"{int(m.group(1)):02d}:00"
 
-    if doctor_name:
-        payload["doctorName"] = doctor_name
-    if notes:
-        payload["notes"] = notes
-    if conversation_id:
-        payload["conversationId"] = conversation_id
-    if lead_id:
-        payload["leadId"] = lead_id
+    return None
 
-    response = await _client().post(
-        _url("/api/bot/book"),
-        json=payload,
-        headers={**_headers(), "Content-Type": "application/json"},
+
+def _format_slots(slots_data: dict[str, Any], max_count: int = 5) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+
+    # CRM format: {"availability":[{"doctorLogin": "...", "doctorName": "...", "date": "...", "availableSlots":["09:00"]}]}
+    for item in slots_data.get("availability", []) or []:
+        doctor_login = item.get("doctorLogin") or item.get("doctor_login") or ""
+        doctor_name = item.get("doctorName") or item.get("doctor_name") or "Врач клиники"
+        date = item.get("date") or ""
+        for time_start in item.get("availableSlots", []) or item.get("slots", []) or []:
+            if isinstance(time_start, dict):
+                time_start = time_start.get("timeStart") or time_start.get("time") or ""
+            if not time_start:
+                continue
+            result.append({
+                "doctor_login": str(doctor_login),
+                "doctor_name": str(doctor_name),
+                "date": str(date),
+                "time": str(time_start),
+            })
+            if len(result) >= max_count:
+                return result
+
+    # Fallback format: {"slots":[...]}
+    for item in slots_data.get("slots", []) or []:
+        if isinstance(item, str):
+            result.append({"doctor_login": "", "doctor_name": "Врач клиники", "date": "", "time": item})
+        elif isinstance(item, dict):
+            result.append({
+                "doctor_login": str(item.get("doctorLogin") or item.get("doctor_login") or ""),
+                "doctor_name": str(item.get("doctorName") or item.get("doctor_name") or "Врач клиники"),
+                "date": str(item.get("date") or ""),
+                "time": str(item.get("timeStart") or item.get("time") or ""),
+            })
+        if len(result) >= max_count:
+            return result
+
+    return result
+
+
+def _slots_text(slots: list[dict[str, str]], lang: str) -> str:
+    lines = []
+    for i, slot in enumerate(slots, 1):
+        date = slot.get("date") or ""
+        time = slot.get("time") or ""
+        doctor = slot.get("doctor_name") or "Врач клиники"
+        if lang == "kk":
+            lines.append(f"{i}) {date} {time} — {doctor}")
+        else:
+            lines.append(f"{i}) {date} в {time} — {doctor}")
+    return "\n".join(lines)
+
+
+def _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | None:
+    low = _low(text)
+
+    m = re.search(r"\b([1-9])\b", low)
+    if m:
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < len(slots):
+            return slots[idx]
+
+    t = _time_from_text(text)
+    if t:
+        for slot in slots:
+            if slot.get("time") == t:
+                return slot
+
+    return None
+
+
+def _looks_like_name(text: str) -> bool:
+    clean = _clean(text)
+    low = _low(clean)
+    if not clean or len(clean) > 60:
+        return False
+    if any(ch.isdigit() for ch in clean):
+        return False
+    if low in NAME_BANNED_WORDS:
+        return False
+    if _has_any(low, BOOKING_WORDS + COMPLAINT_WORDS + PRICE_WORDS + ADDRESS_WORDS):
+        return False
+    return bool(re.match(r"^[A-Za-zА-Яа-яӘәҒғҚқҢңӨөҰұҮүҺһІі\-\s]{2,}$", clean))
+
+
+def _extract_name(text: str) -> str:
+    clean = _clean(text)
+
+    patterns = [
+        r"\bменя\s+зовут\s+([A-Za-zА-Яа-яӘәҒғҚқҢңӨөҰұҮүҺһІі\-\s]{2,50})",
+        r"\bзовут\s+([A-Za-zА-Яа-яӘәҒғҚқҢңӨөҰұҮүҺһІі\-\s]{2,50})",
+        r"\bмо[её]\s+имя\s+([A-Za-zА-Яа-яӘәҒғҚқҢңӨөҰұҮүҺһІі\-\s]{2,50})",
+        r"\bатым\s+([A-Za-zА-Яа-яӘәҒғҚқҢңӨөҰұҮүҺһІі\-\s]{2,50})",
+        r"\bменің\s+атым\s+([A-Za-zА-Яа-яӘәҒғҚқҢңӨөҰұҮүҺһІі\-\s]{2,50})",
+    ]
+    low = clean.lower()
+    for p in patterns:
+        m = re.search(p, low, flags=re.I)
+        if m:
+            name = _clean(m.group(1)).strip(" .,!?:;")
+            return name.title() if _looks_like_name(name) else ""
+
+    return clean.title() if _looks_like_name(clean) else ""
+
+
+def _clinic_answer(text: str, session: dict[str, Any]) -> str | None:
+    lang = session.get("language") or "ru"
+
+    if _has_any(text, PRICE_WORDS):
+        return _tr(
+            lang,
+            "Приём в нашей клинике — 5 000 тг 🌿\nВ стоимость входит осмотр врача, подробная консультация, индивидуальные назначения и составление плана лечения.\n\nПодскажите, пожалуйста, что Вас беспокоит?",
+            "Біздің клиникада алғашқы қабылдау — 5 000 тг 🌿\nҚабылдауға дәрігердің қарауы, толық консультация, жеке ұсыныстар және емдеу жоспарын құру кіреді.\n\nСізді не мазалайды?",
+        )
+
+    if _has_any(text, ADDRESS_WORDS):
+        return _tr(
+            lang,
+            "Мы находимся в Астане 🌿\nАдрес: Кабанбай батыра 28, ішкі двор, подъезд 3. Вход со стороны Кунаева, после шлагбаума направо.\n\nПодскажите, пожалуйста, что Вас беспокоит?",
+            "Біз Астанадамыз 🌿\nМекенжай: Қабанбай батыр 28, ішкі аула, 3-подъезд. Қонаев жағынан кіріп, шлагбаумнан кейін оңға бұрыласыз.\n\nСізді не мазалайды?",
+        )
+
+    if _has_any(text, SCHEDULE_WORDS):
+        return _tr(
+            lang,
+            "Работаем по предварительной записи 🌿 Напишите, пожалуйста, какой день Вам удобен — проверю свободное время.",
+            "Алдын ала жазылу бойынша жұмыс істейміз 🌿 Қай күн ыңғайлы екенін жазыңыз — бос уақытты тексеремін.",
+        )
+
+    if _has_mri_question(text):
+        return _tr(
+            lang,
+            "Снимки и МРТ у нас не делают. Но заранее делать обследование не обязательно 🌿 Врач на консультации осмотрит Вас и подскажет, нужно ли МРТ/КТ или другое обследование.\n\nПодскажите, пожалуйста, что Вас беспокоит?",
+            "Бізде МРТ/снимок жасалмайды. Бірақ алдын ала тексеруден өту міндетті емес 🌿 Дәрігер консультацияда қарап, МРТ/КТ немесе басқа тексеріс керек пе — соны айтады.\n\nСізді не мазалайды?",
+        )
+
+    return None
+
+
+def _ask_complaint(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Подскажите, пожалуйста, что Вас беспокоит? 🌿",
+        "Сізді не мазалайды? 🌿",
     )
-    _raise_for_crm(response, "book")
-
-    for key in list(_SLOTS_CACHE.keys()):
-        if key[0] == date:
-            _SLOTS_CACHE.pop(key, None)
-
-    data = response.json()
-    data.setdefault("ok", True)
-    data.setdefault("status", "Записан")
-    data.setdefault("date", date)
-    data.setdefault("timeStart", time_start)
-    if doctor_name:
-        data.setdefault("doctorName", doctor_name)
-
-    return data
 
 
-async def cancel_appointment(
-    *,
-    phone: str,
-    appointment_id: int | str | None = None,
-    reason: str = "",
-) -> dict[str, Any]:
-    if not phone:
-        raise CRMError("CRM appointment/cancel error: phone is required")
-
-    payload: dict[str, Any] = {
-        "phone": _normalize_phone(phone),
-        "reason": reason or "отмена через бота",
-    }
-
-    if appointment_id:
-        payload["appointmentId"] = appointment_id
-
-    response = await _client().post(
-        _url("/api/bot/appointment/cancel"),
-        json=payload,
-        headers={**_headers(), "Content-Type": "application/json"},
+def _ask_age(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Подскажите, пожалуйста, сколько Вам лет?",
+        "Жасыңыз нешеде?",
     )
-    _raise_for_crm(response, "appointment/cancel")
+def _ask_age_contextual(session: dict[str, Any], text: str) -> str:
+    parts_ru: list[str] = []
+    parts_kk: list[str] = []
 
-    data = response.json()
-    data.setdefault("ok", bool(data.get("success", True)))
-    data.setdefault("cancelled", bool(data.get("success") or data.get("alreadyCancelled")))
-    return data
+    if _has_any(text, PRICE_WORDS):
+        parts_ru.append("Приём в нашей клинике — 5 000 тг 🌿")
+        parts_kk.append("Біздің клиникада алғашқы қабылдау — 5 000 тг 🌿")
+
+    if _has_mri_question(text):
+        parts_ru.append("МРТ заранее делать не обязательно. Врач на консультации подскажет, нужно ли обследование.")
+        parts_kk.append("МРТ-ны алдын ала жасау міндетті емес. Дәрігер консультацияда қажет пе — соны айтады.")
+
+    parts_ru.append("Подскажите, пожалуйста, сколько Вам лет?")
+    parts_kk.append("Жасыңыз нешеде?")
+
+    return _tr(session, "\n\n".join(parts_ru), "\n\n".join(parts_kk))
+def _senior_contra_intro(session: dict[str, Any]) -> str:
+    return _stop_booking_text(session, "over_75")
 
 
-async def reschedule_appointment(
-    *,
-    phone: str,
-    new_date: str,
-    new_time_start: str,
-    appointment_id: int | str | None = None,
-    reason: str = "",
-) -> dict[str, Any]:
-    if not phone:
-        raise CRMError("CRM appointment/reschedule error: phone is required")
-    if not new_date:
-        raise CRMError("CRM appointment/reschedule error: newDate is required")
-    if not new_time_start:
-        raise CRMError("CRM appointment/reschedule error: newTimeStart is required")
-
-    payload: dict[str, Any] = {
-        "phone": _normalize_phone(phone),
-        "newDate": new_date,
-        "newTimeStart": new_time_start,
-        "reason": reason or "перенос через бота",
-    }
-
-    if appointment_id:
-        payload["appointmentId"] = appointment_id
-
-    response = await _client().post(
-        _url("/api/bot/appointment/reschedule"),
-        json=payload,
-        headers={**_headers(), "Content-Type": "application/json"},
+def _ask_contra(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Перед записью нужно подтвердить: нет ли у Вас противопоказаний — кардиостимулятор, беременность, онкология, металл в зоне лечения, эпилепсия, возраст до 16 или более 75 лет?\n\nТакже обращаем Ваше внимание: для обеспечения безопасности и эффективности лечения приём не проводится пациентам с ограниченной подвижностью — коляски, костыли.\n\nЛицам от 16 до 18 лет — только в сопровождении родителей или законного представителя.\n\nПодтвердите, пожалуйста: противопоказаний нет?",
+        "Жазылмас бұрын нақтылау қажет: Сізде қарсы көрсетілімдер жоқ па — кардиостимулятор, жүктілік, онкология, емдеу аймағындағы металл, эпилепсия, 16 жасқа дейін немесе 75 жастан жоғары жас?\n\nҚауіпсіздік пен емнің тиімділігі үшін қозғалысы шектеулі пациенттерге — арба, балдақ/костыль — қабылдау жүргізілмейді.\n\n16–18 жас аралығындағы пациенттер тек ата-анасымен немесе заңды өкілімен келе алады.\n\nРастап жазыңызшы: қарсы көрсетілімдер жоқ па?",
     )
-    _raise_for_crm(response, "appointment/reschedule")
-
-    data = response.json()
-    data.setdefault("ok", True)
-    data.setdefault("rescheduled", True)
-
-    for key in list(_SLOTS_CACHE.keys()):
-        if key[0] == new_date:
-            _SLOTS_CACHE.pop(key, None)
-
-    return data
 
 
-async def escalate_to_operator(
-    *,
-    phone: str | None = None,
-    conversation_id: int | str | None = None,
-    reason: str = "",
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "reason": reason or "нужен живой оператор",
-    }
-
-    if phone:
-        payload["phone"] = _normalize_phone(phone)
-    if conversation_id:
-        payload["conversationId"] = conversation_id
-
-    if not payload.get("phone") and not payload.get("conversationId"):
-        raise CRMError("CRM escalate error: phone or conversationId is required")
-
-    response = await _client().post(
-        _url("/api/bot/escalate"),
-        json=payload,
-        headers={**_headers(), "Content-Type": "application/json"},
+def _ask_date(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Спасибо. На какой день Вам удобно прийти?",
+        "Рақмет. Қай күн ыңғайлы?",
     )
-    _raise_for_crm(response, "escalate")
-
-    data = response.json()
-    data.setdefault("ok", True)
-    return data
 
 
-async def log_outcome(
-    *,
-    outcome: str,
-    phone: str | None = None,
-    conversation_id: int | str | None = None,
-    appointment_id: int | str | None = None,
-    note: str = "",
-) -> dict[str, Any]:
-    allowed = {
-        "booked",
-        "rejected",
-        "escalated",
-        "abandoned",
-        "no_show",
-        "attended",
-        "out_of_scope",
-        "contraindicated",
-    }
-
-    if outcome not in allowed:
-        raise CRMError(f"CRM outcome error: invalid outcome {outcome!r}")
-
-    payload: dict[str, Any] = {
-        "outcome": outcome,
-        "note": note,
-    }
-
-    if appointment_id:
-        payload["appointmentId"] = appointment_id
-    if phone:
-        payload["phone"] = _normalize_phone(phone)
-    if conversation_id:
-        payload["conversationId"] = conversation_id
-
-    if not payload.get("phone") and not payload.get("conversationId"):
-        raise CRMError("CRM outcome error: phone or conversationId is required")
-
-    response = await _client().post(
-        _url("/api/bot/outcome"),
-        json=payload,
-        headers={**_headers(), "Content-Type": "application/json"},
+def _ask_name(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Для оформления записи подскажите, пожалуйста, Ваше имя.",
+        "Жазбаны рәсімдеу үшін атыңызды жазыңызшы.",
     )
-    _raise_for_crm(response, "outcome")
 
-    data = response.json()
-    data.setdefault("ok", True)
-    return data
+
+def _no_slots_text(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "На эту дату свободных окошек не нашла. Напишите, пожалуйста, другую дату — проверю расписание.",
+        "Бұл күнге бос уақыт табылмады. Басқа күнді жазыңызшы — кестені тексеремін.",
+    )
+
+
+async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> str:
+    session["preferred_date"] = date_iso
+    lang = session.get("language") or "ru"
+
+    try:
+        max_slots = 5
+        if get_settings:
+            try:
+                max_slots = int(getattr(get_settings(), "max_slots_to_show", 5) or 5)
+            except Exception:
+                pass
+
+        data = await crm.check_slots(date_iso)
+        slots = _format_slots(data, max_count=max_slots)
+    except Exception as exc:
+        _safe_log(chat_id, "crm_check_slots_error", {"error": str(exc)[:500]})
+        session["step"] = "escalated"
+        session["escalated"] = True
+        return _tr(
+            session,
+            "Сейчас не получается проверить свободные окошки автоматически. Я оформлю заявку на консультацию, координатор закрепит удобное время вручную 🌿",
+            "Қазір бос уақыттарды автоматты түрде тексере алмадым. Консультацияға өтінім қалдырамын, координатор ыңғайлы уақытты қолмен бекітеді 🌿",
+        )
+
+    if not slots:
+        session["step"] = "date"
+        return _no_slots_text(session)
+
+    session["last_slots"] = slots
+    session["step"] = "time"
+    return _tr(
+        session,
+        "Есть такие свободные окошки:\n" + _slots_text(slots, lang) + "\n\nКакое Вам удобно? Можно ответить номером варианта.",
+        "Мынадай бос уақыттар бар:\n" + _slots_text(slots, lang) + "\n\nҚайсысы ыңғайлы? Нұсқа нөмірімен жауап беруге болады.",
+    )
+
+
+async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
+    normalized_phone = sanitize_kz_phone(phone or session.get("phone") or "")
+    slot = session.get("selected_slot") or {}
+
+    if not normalized_phone:
+        session["step"] = "phone"
+        return _tr(
+            session,
+            "Не вижу номер телефона. Напишите, пожалуйста, Ваш номер в формате 77001234567.",
+            "Телефон нөмірі көрінбей тұр. Нөміріңізді 77001234567 форматында жазыңызшы.",
+        )
+
+    if not slot:
+        session["step"] = "date"
+        return _ask_date(session)
+
+    try:
+        booked = await crm.book_appointment(
+            patient_name=session.get("patient_name") or "Пациент",
+            phone=normalized_phone,
+            doctor_login=slot.get("doctor_login") or slot.get("doctorLogin") or "",
+            doctor_name=slot.get("doctor_name") or slot.get("doctorName") or None,
+            date=slot.get("date") or session.get("preferred_date"),
+            time_start=slot.get("time") or slot.get("timeStart"),
+            notes=(
+                f"Жалоба: {session.get('complaint') or ''}; "
+                f"возраст: {session.get('age') or ''}; "
+                f"противопоказания/ограничения: {session.get('contraindications_raw') or ''}; "
+                f"важно для врача: {'да' if session.get('doctor_note_required') else 'нет'}"
+            ),
+        )
+        session["booked"] = True
+        session["appointment"] = booked
+        session["step"] = "done"
+        session["status"] = "booked"
+        session["crm_status"] = "Записан"
+
+        date = booked.get("date") or slot.get("date") or session.get("preferred_date") or ""
+        time_start = booked.get("timeStart") or booked.get("time_start") or slot.get("time") or ""
+        doctor = booked.get("doctorName") or slot.get("doctor_name") or ""
+
+        return _tr(
+            session,
+            (
+                "Спасибо, запись подтверждена ✅\n\n"
+                "Ваш визит в Neuro Balance:\n"
+                f"📅 Дата: {date}\n"
+                f"⏰ Время: {time_start}\n"
+                "📍 Адрес: Кабанбай батыра 28, внутренний двор, подъезд 3.\n"
+                "👉 Местоположение: https://go.2gis.com/NcqGj\n\n"
+                "Просим взять с собой все имеющиеся снимки, заключения или анализы. "
+                "Если их нет — ничего страшного, врач при необходимости подскажет, что нужно."
+            ),
+            (
+                "Рақмет, жазба расталды ✅\n\n"
+                "Neuro Balance қабылдауы:\n"
+                f"📅 Күні: {date}\n"
+                f"⏰ Уақыты: {time_start}\n"
+                "📍 Мекенжай: Қабанбай батыр 28, ішкі аула, 3-подъезд.\n"
+                "👉 Орналасуы: https://go.2gis.com/NcqGj\n\n"
+                "Өзіңізде бар снимок, қорытынды немесе анализ болса, ала келіңіз. "
+                "Егер жоқ болса — ештеңе етпейді, дәрігер қажет болса өзі айтады."
+            ),
+        )
+    except Exception as exc:
+        _safe_log(chat_id, "crm_book_error", {"error": str(exc)[:500]})
+        session["step"] = "escalated"
+        session["escalated"] = True
+        return _tr(
+            session,
+            "Не получилось автоматически создать запись в CRM. Я оформлю заявку, чтобы координатор закрепил удобное время вручную 🌿",
+            "CRM-де жазбаны автоматты түрде жасай алмадым. Өтінім қалдырамын, координатор ыңғайлы уақытты қолмен бекітеді 🌿",
+        )
+
+
+async def _handle_existing_lookup(chat_id: str, phone: str, session: dict[str, Any], text: str = "") -> str:
+    normalized = sanitize_kz_phone(phone or session.get("phone") or "") or phone
+    try:
+        lookup = await crm.patient_lookup(normalized)
+        session["patient_lookup"] = lookup
+        session["patient_lookup_done"] = True
+
+        appt = None
+        if isinstance(lookup, dict) and lookup.get("hasActiveAppointment"):
+            raw = lookup.get("lastAppointment") or lookup.get("appointment") or {}
+            if isinstance(raw, dict) and raw:
+                appt = raw
+
+        if appt:
+            date = appt.get("date") or appt.get("appointmentDate") or ""
+            time = appt.get("timeStart") or appt.get("time_start") or appt.get("time") or ""
+            doctor = appt.get("doctorName") or appt.get("doctor_name") or ""
+            details = ", ".join(str(x) for x in [date, time, doctor] if x) or "активная запись"
+            session["step"] = "done"
+            return _tr(session, f"Вы уже записаны: {details} 🌿", f"Сіз жазылғансыз: {details} 🌿")
+    except Exception as exc:
+        _safe_log(chat_id, "patient_lookup_error", {"error": str(exc)[:500]})
+
+    low = _low(text)
+    wants_move = _is_cancel(text) or any(w in low for w in [
+        "перенести", "перенес", "поменять время", "на завтра", "завтра",
+        "ауыстыр", "басқа уақыт", "ертең", "ертен"
+    ])
+    has_contra_note = _contra_has_hard_stop(text) or any(w in low for w in ["кардиостимулятор", "кардиостимулятор бар"])
+
+    session["step"] = "escalated"
+    session["escalated"] = True
+
+    if wants_move:
+        answer = _tr(
+            session,
+            "Поняла Вас. Передам администратору, чтобы он проверил Вашу запись, напомнил дату и время и помог перенести на удобное время 🌿",
+            "Түсіндім. Әкімшіге жіберемін, ол жазбаңызды тексеріп, күні мен уақытын еске салып, ыңғайлы уақытқа ауыстыруға көмектеседі 🌿",
+        )
+    else:
+        answer = _tr(
+            session,
+            "Поняла Вас. Я передам администратору, чтобы он проверил Вашу запись и напомнил дату и время 🌿",
+            "Түсіндім. Жазбаңызды тексеріп, күні мен уақытын еске салу үшін әкімшіге жіберемін 🌿",
+        )
+
+    if has_contra_note:
+        answer += "\n\n" + _tr(
+            session,
+            "Информацию про кардиостимулятор обязательно передадим врачу.",
+            "Кардиостимулятор туралы ақпаратты дәрігерге міндетті түрде жеткіземіз.",
+        )
+
+    return answer
+
+def _wants_existing_lookup(text: str) -> bool:
+    low = _low(text)
+    if any(w in low for w in LOOKUP_WORDS):
+        return True
+    has_existing = any(w in low for w in ["уже", "моя", "мою", "у меня", "менің", "меним"])
+    has_record = any(w in low for w in ["запис", "запись", "жазыл", "жазба"])
+    has_time = any(w in low for w in ["когда", "время", "дат", "во сколько", "напом", "қашан", "уақыт"])
+    return has_existing and has_record and has_time
+
+
+def _is_cancel(text: str) -> bool:
+    return _has_any(text, CANCEL_WORDS)
+
+
+def _is_reschedule_request(text: str) -> bool:
+    low = _low(text)
+    return any(w in low for w in [
+        "перенес", "перенести", "перенесите", "поменять время", "изменить время",
+        "на другое время", "на другую дату", "басқа уақыт", "баска уакыт",
+        "ауыстыр", "ауыстыру", "ауыстырыңыз",
+    ])
+
+
+def _is_cancel_direct_request(text: str) -> bool:
+    low = _low(text)
+    return any(w in low for w in [
+        "отмен", "уберите запись", "снимите запись", "я не приду",
+        "не приду", "не смогу прийти", "не смогу приехать",
+        "келмеймін", "келе алмаймын", "тоқтат", "токтат",
+    ])
+
+
+async def _handle_cancel_appointment(chat_id: str, phone: str, session: dict[str, Any], text: str) -> str:
+    """Автоматически отменяет активную запись через CRM.
+
+    CRM умеет отменять последнюю активную запись по телефону даже без appointmentId.
+    Если lookup не сработал — всё равно пробуем cancel по телефону.
+    """
+    normalized = sanitize_kz_phone(phone or session.get("phone") or "") or (phone or session.get("phone") or "")
+    normalized = _clean(str(normalized))
+
+    if not normalized:
+        session["step"] = "phone"
+        return _tr(
+            session,
+            "Для отмены записи напишите, пожалуйста, номер телефона, на который оформляли запись.",
+            "Жазбаны тоқтату үшін жазба рәсімделген телефон нөмірін жазыңызшы.",
+        )
+
+    appointment_id = None
+
+    # Сначала пробуем найти активную запись, чтобы отменить точнее.
+    try:
+        lookup = await crm.patient_lookup(normalized)
+        session["patient_lookup"] = lookup
+
+        if isinstance(lookup, dict):
+            appt = lookup.get("lastAppointment") or lookup.get("appointment") or None
+            if isinstance(appt, dict):
+                appointment_id = appt.get("id") or appt.get("appointmentId")
+
+            # Если lookup точно ответил, что активной записи нет — не вызываем cancel вслепую.
+            if lookup.get("hasActiveAppointment") is False:
+                session["step"] = "escalated"
+                session["escalated"] = True
+                return _tr(
+                    session,
+                    "Сейчас не нашла активную запись автоматически. Передам администратору, чтобы он проверил и отменил вручную 🌿",
+                    "Қазір белсенді жазбаны автоматты түрде таба алмадым. Әкімшіге жіберемін, ол тексеріп, қолмен тоқтатады 🌿",
+                )
+    except Exception as exc:
+        # Lookup может быть недоступен/залимичен — всё равно пробуем cancel по телефону.
+        _safe_log(chat_id, "patient_lookup_before_cancel_error", {"error": str(exc)[:500]})
+
+    try:
+        result = await crm.cancel_appointment(
+            phone=normalized,
+            appointment_id=appointment_id,
+            reason=f"отмена через бота: {text[:200]}",
+        )
+        session["cancel_result"] = result
+        session["step"] = "done"
+        session["status"] = "cancelled"
+        session["cancelled"] = True
+        session["escalated"] = False
+
+        if isinstance(result, dict) and result.get("alreadyCancelled"):
+            return _tr(
+                session,
+                "Эта запись уже была отменена. Будем рады Вам в другой раз🌿",
+                "Бұл жазба бұрын тоқтатылған. Сізді басқа уақытта күтеміз🌿",
+            )
+
+        return _tr(
+            session,
+            "Запись отменили. Хорошо, будем рады Вам в другой раз🌿",
+            "Жазба тоқтатылды. Жақсы, Сізді басқа уақытта күтеміз🌿",
+        )
+    except Exception as exc:
+        _safe_log(chat_id, "crm_cancel_error", {"error": str(exc)[:500]})
+        session["step"] = "escalated"
+        session["escalated"] = True
+        return _tr(
+            session,
+            "Сейчас не получилось отменить запись автоматически. Передам администратору, чтобы запись отменили вручную 🌿",
+            "Қазір жазбаны автоматты түрде тоқтата алмадым. Әкімшіге жіберемін, ол жазбаны қолмен тоқтатады 🌿",
+        )
+
+
+def _contra_has_hard_stop(text: str) -> bool:
+    low = _low(text)
+
+    # Отрицания считаем только если "нет/жоқ" стоит рядом с конкретным словом.
+    direct_neg_patterns = [
+        r"(?:нет|нету|жоқ|жок)\s+(?:у\s+меня\s+)?{word}",
+        r"{word}\s+(?:у\s+меня\s+)?(?:нет|нету|жоқ|жок)",
+        r"{word}\s+жоқ",
+        r"{word}\s+жок",
+    ]
+
+    for word in HARD_CONTRA_WORDS:
+        w = re.escape(word)
+        if not re.search(w, low):
+            continue
+
+        negated = False
+        for pat in direct_neg_patterns:
+            if re.search(pat.format(word=w), low):
+                negated = True
+                break
+        if negated:
+            continue
+
+        return True
+
+    return False
+
+
+def _age_block_reason(age: int | None) -> str | None:
+    if age is None:
+        return None
+    if age < 16:
+        return "under_16"
+    if age > 75:
+        return "over_75"
+    return None
+
+
+def _stop_booking_text(session: dict[str, Any], reason: str = "contra") -> str:
+    if reason == "under_16":
+        return _tr(
+            session,
+            "К сожалению, по правилам клиники приём не проводится пациентам младше 16 лет. Запись оформить не смогу.",
+            "Өкінішке қарай, клиника ережесі бойынша 16 жасқа дейінгі пациенттерге қабылдау жүргізілмейді. Жазба рәсімдей алмаймын.",
+        )
+    if reason == "over_75":
+        return _tr(
+            session,
+            "Спасибо, что уточнили 🌿 По правилам клиники пациентам старше 75 лет запись автоматически не оформляется. Я передам Ваши данные администратору клиники, он свяжется с Вами и подскажет, как лучше поступить.",
+            "Нақтылағаныңызға рақмет 🌿 Клиника ережесі бойынша 75 жастан асқан пациенттерге жазба автоматты түрде рәсімделмейді. Деректеріңізді клиника әкімшісіне жіберемін, ол Сізбен байланысып, қалай дұрыс жасау керегін түсіндіреді.",
+        )
+
+    return _tr(
+        session,
+        "Спасибо, что уточнили. По правилам клиники при наличии таких противопоказаний запись на приём не оформляется: кардиостимулятор, беременность, онкология, металл в зоне лечения, эпилепсия, возраст до 16 или более 75 лет, а также ограниченная подвижность. Для безопасности приём проводить нельзя.",
+        "Нақтылағаныңызға рақмет. Клиника ережесі бойынша мұндай қарсы көрсетілімдер болса, қабылдауға жазу рәсімделмейді: кардиостимулятор, жүктілік, онкология, емдеу аймағындағы металл, эпилепсия, 16 жасқа дейін немесе 75 жастан жоғары жас, сондай-ақ қозғалыстың шектелуі. Қауіпсіздік үшін қабылдау жүргізілмейді.",
+    )
+
+def _contra_is_clear_no(text: str) -> bool:
+    low = _low(text)
+    return any(w == low or w in low for w in NO_CONTRA_WORDS)
+
+
+async def _continue_after_collected_age(chat_id: str, session: dict[str, Any], text: str, age: int) -> str:
+    """Продолжение сценария, если возраст уже есть в этом же сообщении."""
+    age_reason = _age_block_reason(age)
+    if age_reason:
+        session["contraindications_raw"] = text
+        session["contraindications_ok"] = False
+        if age_reason == "over_75":
+            session["contraindications_verdict"] = "admin_contact"
+            session["step"] = "escalated"
+            session["escalated"] = True
+        else:
+            session["contraindications_verdict"] = "stop"
+            session["step"] = "stopped"
+        return _prepend_price_if_needed(text, session, _stop_booking_text(session, age_reason))
+
+    if _contra_has_hard_stop(text):
+        session["contraindications_raw"] = text
+        session["contraindications_ok"] = False
+        session["contraindications_verdict"] = "stop"
+        session["step"] = "stopped"
+        return _prepend_price_if_needed(text, session, _stop_booking_text(session, "contra"))
+
+    # Если пациент сразу написал, что противопоказаний нет — не спрашиваем это повторно.
+    if _contra_is_clear_no(text):
+        session["contraindications_raw"] = text
+        session["contraindications_ok"] = True
+        session["contraindications_verdict"] = "proceed"
+
+        date_iso = _parse_date(text)
+        if date_iso:
+            slots_answer = await _show_slots(chat_id, session, date_iso)
+            return _prepend_price_if_needed(text, session, slots_answer)
+
+        session["step"] = "date"
+        return _ask_date(session)
+
+    # Если противопоказания ещё не ясны — задаём обязательный вопрос.
+    session["step"] = "contraindications"
+    session["questionnaire_step"] = "contra"
+
+    if age > 74:
+        session["senior_patient"] = True
+        return _senior_contra_intro(session)
+
+    stop = _age_stop_text(age, session)
+    if age < 18:
+        session["minor_parent_required"] = True
+        return stop + "\n\n" + _ask_contra(session)
+
+    return _ask_contra(session)
+
+
+async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
+    """Главная функция, которую вызывает main.py.
+
+    main.py ожидает именно такую сигнатуру:
+    await handle_message(chat_id=chat_id, phone=phone, user_text=text)
+    """
+    text = _clean(user_text)
+    text = _strip_quoted_bot_text(text)
+    text = _clean(text)
+    _safe_add_message(chat_id, "user", text)
+
+    session = state.get_session(chat_id)
+    if not isinstance(session, dict):
+        session = {}
+
+    session["phone"] = phone or session.get("phone") or ""
+    session["language"] = _detect_lang(text, session)
+
+    # explicit_language_switch_guard:
+    # Если клиент просит отвечать на другом языке — переключаем язык и подтверждаем.
+    lang_request = _explicit_language_request(text)
+    if lang_request:
+        session["language"] = lang_request
+        return _finalize(
+            chat_id,
+            session,
+            _tr(session, "Хорошо, буду отвечать на русском 🌿", "Жақсы, қазақша жауап беремін 🌿"),
+        )
+
+    # 0.5) Две задачи в одном сообщении:
+    # "я уже записан/отмените/перенести" + "маму/папу/сына хочу записать".
+    # Не запускаем обычную анкету, чтобы не перепутать пациентов.
+    if _is_relative_new_booking_request(text):
+        session["step"] = "escalated"
+        session["escalated"] = True
+        answer = _relative_dual_task_answer(session, text)
+        return _finalize(chat_id, session, answer)
+
+    if not text:
+        return _finalize(chat_id, session, _tr(session, "Напишите, пожалуйста, что Вас беспокоит 🌿", "Сізді не мазалайды? 🌿"))
+
+    # 1) Уже записан / напомнить запись — не запускаем новую запись.
+    if _wants_existing_lookup(text):
+        answer = await _handle_existing_lookup(chat_id, phone, session, text)
+        return _finalize(chat_id, session, answer)
+
+    # 2) Отмена/перенос — не запускаем новую запись.
+    if _is_cancel(text):
+        # Если пациент просит именно перенос, не отменяем запись автоматически.
+        # Перенос требует выбора новой даты/времени, поэтому безопаснее передать админу.
+        if _is_reschedule_request(text) and not _is_cancel_direct_request(text):
+            session["step"] = "escalated"
+            session["escalated"] = True
+            answer = _tr(
+                session,
+                "Поняла Вас 🌿 Передам администратору, чтобы он проверил Вашу запись и помог перенести её на удобное время.",
+                "Түсіндім 🌿 Әкімшіге жіберемін, ол жазбаңызды тексеріп, ыңғайлы уақытқа ауыстыруға көмектеседі.",
+            )
+            return _finalize(chat_id, session, answer)
+
+        answer = await _handle_cancel_appointment(chat_id, phone, session, text)
+        return _finalize(chat_id, session, answer)
+
+    # 2.5) Суперсложный сценарий: жалоба + возраст + противопоказания/дата в одном сообщении.
+    # Важно: этот блок стоит ДО FAQ и ДО обычной анкеты.
+    # Примеры:
+    # "Мне 78 лет, болит спина, противопоказаний нет"
+    # "Мне 45, грыжа поясницы, но есть кардиостимулятор"
+    # "Мен 62 жастамын, белім ауырады, ертең келуге бола ма?"
+    inline_age = _extract_age(text, step="age")
+    if (
+        inline_age
+        and (_has_complaint(text) or _has_medical_complaint_text(text))
+        and session.get("contraindications_ok") is not True
+        and not session.get("contraindications_verdict")
+    ):
+        session["complaint"] = session.get("complaint") or text
+        session["age"] = inline_age
+        answer = await _continue_after_collected_age(chat_id, session, text, inline_age)
+        return _finalize(chat_id, session, answer)
+
+    # 3) Типовые вопросы.
+    # Если в сообщении есть жалоба, жалоба важнее FAQ.
+    # Например "Белім ауырады, похоже протрузия" нельзя ошибочно трактовать как вопрос про УЗИ.
+    diagnostic_booking_request = _has_booking_intent(text) and _has_mri_question(text)
+    info = None if ((_has_complaint(text) or _has_medical_complaint_text(text)) or diagnostic_booking_request) else _clinic_answer(text, session)
+    if info and not session.get("complaint"):
+        session["step"] = "complaint"
+        return _finalize(chat_id, session, info)
+
+    step = session.get("step") or "start"
+
+    # contra_no_answer_final_guard:
+    # "Нет/Жоқ" на этапе противопоказаний = противопоказаний нет.
+    if step == "contraindications" and _is_no_contra_answer(text):
+        session["contraindications_ok"] = True
+        session["contraindications_raw"] = "нет"
+        session["step"] = "date"
+        session["questionnaire_step"] = "date"
+        return _finalize(chat_id, session, _ask_date(session))
+
+    # doctor_can_treat_question_guard:
+    # Если пациент отправил фото/документ и спрашивает "это сможет лечить?",
+    # не обещаем лечение и не повторяем вопрос про дату.
+    if _is_doctor_can_treat_question(text):
+        session["step"] = "escalated"
+        session["escalated"] = True
+        session["handoff_reason"] = "doctor_can_treat_question"
+        return _finalize(
+            chat_id,
+            session,
+            _tr(
+                session,
+                "По фото/документу точно не буду обещать лечение, чтобы не ввести Вас в заблуждение. Передам вопрос координатору клиники, он уточнит у врача и свяжется с Вами 🌿",
+                "Фото/құжат бойынша емді нақты уәде ете алмаймын, қате бағыт бергім келмейді. Сұрағыңызды клиника координаторына жіберемін, ол дәрігерден нақтылап, Сізбен байланысады 🌿",
+            ),
+        )
+
+    # unknown_date_answer_guard:
+    # Если пациент пока не знает день/время, не повторяем один и тот же вопрос.
+    if step == "date" and _is_unknown_date_answer(text):
+        session["step"] = "date"
+        session["waiting_for_date"] = True
+        return _finalize(
+            chat_id,
+            session,
+            _tr(
+                session,
+                "Хорошо, ничего страшного 🌿 Когда определитесь с удобным днём и временем, просто напишите сюда — я помогу продолжить запись.",
+                "Жақсы, ештеңе етпейді 🌿 Қай күн мен уақыт ыңғайлы екенін анықтаған кезде осында жазыңыз — жазылуды жалғастыруға көмектесемін.",
+            ),
+        )
+
+    # tentative_date_answer_guard:
+    # Если пациент пишет неопределённо: "на следующей неделе, может вторник/среда",
+    # фиксируем пожелание и не спамим вопросом повторно.
+    if step == "date" and _is_tentative_date_answer(text) and not _parse_date(text):
+        session["step"] = "escalated"
+        session["escalated"] = True
+        session["handoff_reason"] = "tentative_date"
+        return _finalize(
+            chat_id,
+            session,
+            _tr(
+                session,
+                "Спасибо, зафиксировала пожелание по дню. Так как точное время пока не выбрано, передам заявку координатору клиники — он свяжется с Вами и закрепит удобное время вручную 🌿",
+                "Рақмет, күн бойынша қалауыңызды белгіледім. Нақты уақыт әлі таңдалмағандықтан, өтінімді клиника координаторына жіберемін — ол Сізбен байланысып, ыңғайлы уақытты қолмен бекітеді 🌿",
+            ),
+        )
+
+    # post_done_new_booking_guard_final:
+    # После завершения/передачи не начинаем новый сценарий от коротких сообщений,
+    # но если человек явно снова просит записаться с новой жалобой — начинаем аккуратно.
+    if step in ("done", "booked", "stopped", "escalated") and _has_booking_intent(text) and _profile_status(text) == "profile":
+        session.clear()
+        session["phone"] = phone or ""
+        session["language"] = _detect_lang(text, session)
+        session["complaint"] = text
+        session["profile_status"] = "profile"
+        session["step"] = "age"
+        return _finalize(
+            chat_id,
+            session,
+            _ask_age(session),
+        )
+
+    # profile_classifier_guard:
+    # Сначала определяем, относится ли жалоба к профилю клиники.
+    # Если не профиль — не ведём в запись и не обещаем лечение.
+    profile_status = _profile_status(text)
+    if step in ("start", "complaint") and profile_status == "non_profile":
+        session["complaint"] = text
+        session["step"] = "escalated"
+        session["escalated"] = True
+        session["profile_status"] = "non_profile"
+        return _finalize(chat_id, session, _non_profile_answer(session, text))
+
+    if step in ("start", "complaint") and profile_status == "unclear":
+        session["step"] = "complaint"
+        session["profile_status"] = "unclear"
+        return _finalize(chat_id, session, _unclear_profile_answer(session, text))
+
+    # escalated_repeat_guard_v2:
+    # После передачи координатору не задаём повторно вопросы анкеты.
+    if step == "escalated":
+        if _is_thanks_or_ok(text):
+            return _finalize(chat_id, session, _tr(session, "Спасибо 🌿", "Рақмет 🌿"))
+        if _is_unknown_date_answer(text):
+            return _finalize(
+                chat_id,
+                session,
+                _tr(
+                    session,
+                    "Хорошо, когда определитесь — напишите сюда. Координатор клиники также сможет связаться с Вами и закрепить удобное время 🌿",
+                    "Жақсы, анықтаған кезде осында жазыңыз. Клиника координаторы да Сізбен байланысып, ыңғайлы уақытты бекіте алады 🌿",
+                ),
+            )
+
+    # handoff_already_done_thanks_guard:
+    # После передачи координатору/администратору не запускаем сценарий заново
+    # на короткие ответы "спасибо/ок/хорошо".
+    if step in ("escalated", "done", "booked", "stopped") and _is_thanks_or_ok(text):
+        return _finalize(chat_id, session, _tr(session, "Спасибо 🌿", "Рақмет 🌿"))
+
+    # Если координатор уже закрепляет время вручную, новые уточнения по дню/времени
+    # не должны снова спрашивать дату и запускать повторную заявку.
+    if step == "escalated" and (_parse_date(text) or _has_time_hint(text) or _has_booking_intent(text)):
+        return _finalize(
+            chat_id,
+            session,
+            _tr(
+                session,
+                "Спасибо, зафиксировала пожелание по времени. Координатор клиники свяжется с Вами и закрепит удобное время вручную 🌿",
+                "Рақмет, уақыт бойынша қалауыңызды белгіледім. Клиника координаторы Сізбен байланысып, ыңғайлы уақытты қолмен бекітеді 🌿",
+            ),
+        )
+
+    # complaint_already_given_guard:
+    # Если пациент сразу написал профильную жалобу ("парез стопы", "после операции", "болит..."),
+    # не спрашиваем "что беспокоит" повторно.
+    if step in ("start", "complaint") and not _is_no_contra_answer(text) and _profile_status(text) == "profile":
+        session["complaint"] = text
+        session["profile_status"] = "profile"
+        session["step"] = "age"
+        answer = _ask_age_contextual(session, text)
+        return _finalize(chat_id, session, answer)
+
+
+    # 4) Если пациент прислал возраст внутри любого сообщения — сохраняем,
+    # но НЕ перескакиваем противопоказания.
+    age = _extract_age(text, step="age" if step == "age" else "")
+    if age and not session.get("age"):
+        session["age"] = age
+
+    # ЖЁСТКИЙ ГЕЙТ: если жалоба уже есть и пациент прислал возраст,
+    # нельзя перейти к дате, пока не закрыты противопоказания.
+    if age and session.get("complaint") and session.get("contraindications_ok") is not True and not session.get("contraindications_verdict"):
+        answer = await _continue_after_collected_age(chat_id, session, text, age)
+        return _finalize(chat_id, session, answer)
+
+    # 5) Старт / выясняем жалобу.
+    if step in ("start", "", None):
+        if _has_no_complaint(text):
+            count = int(session.get("no_complaint_count") or 0) + 1
+            session["no_complaint_count"] = count
+            session["step"] = "complaint_no_confirm"
+            answer = _tr(
+                session,
+                "Поняла 🌿 Если конкретной жалобы нет, можно прийти на первичную консультацию для профилактического осмотра. Хотите записаться на консультацию?",
+                "Түсіндім 🌿 Егер нақты шағым болмаса, профилактикалық қаралу үшін алғашқы консультацияға келуге болады. Консультацияға жазылайын ба?",
+            )
+            return _finalize(chat_id, session, answer)
+
+        if (_has_complaint(text) or _has_medical_complaint_text(text)) and _profile_status(text) != "non_profile":
+            session["complaint"] = text
+
+            # Если возраст уже есть в этом же сообщении — не спрашиваем его повторно.
+            # Сразу проверяем противопоказания/дату.
+            if session.get("age"):
+                answer = await _continue_after_collected_age(chat_id, session, text, int(session["age"]))
+                return _finalize(chat_id, session, answer)
+
+            session["step"] = "age"
+            return _finalize(chat_id, session, _ask_age_contextual(session, text))
+
+        if _has_booking_intent(text) or _is_greeting_only(text):
+            session["step"] = "complaint"
+            if _has_mri_question(text):
+                answer = _tr(
+                    session,
+                    "Здравствуйте! Да, поможем с записью на первичную консультацию/диагностику 🌿\nПодскажите, пожалуйста, что именно Вас беспокоит?",
+                    "Сәлеметсіз бе! Иә, алғашқы консультацияға/диагностикаға жазылуға көмектесеміз 🌿\nСізді нақты не мазалайды?",
+                )
+            else:
+                answer = _tr(
+                    session,
+                    "Здравствуйте! Да, можно записаться на консультацию по акции 🌿\nПодскажите, пожалуйста, что Вас беспокоит?",
+                    "Сәлеметсіз бе! Иә, акция бойынша консультацияға жазылуға болады 🌿\nСізді не мазалайды?",
+                )
+            return _finalize(chat_id, session, answer)
+
+        session["step"] = "complaint"
+        return _finalize(chat_id, session, _ask_complaint(session))
+
+    if step == "complaint":
+        if _has_no_complaint(text):
+            count = int(session.get("no_complaint_count") or 0) + 1
+            session["no_complaint_count"] = count
+            if count == 1:
+                session["step"] = "complaint_no_confirm"
+                answer = _tr(
+                    session,
+                    "Поняла 🌿 Если конкретной жалобы нет, можно прийти на первичную консультацию для профилактического осмотра. Хотите записаться на консультацию?",
+                    "Түсіндім 🌿 Егер нақты шағым болмаса, профилактикалық қаралу үшін алғашқы консультацияға келуге болады. Консультацияға жазылайын ба?",
+                )
+                return _finalize(chat_id, session, answer)
+            session["step"] = "escalated"
+            session["escalated"] = True
+            return _finalize(chat_id, session, _tr(session, "Поняла Вас 🌿 Передам администратору, чтобы он помог с записью и подсказал, какая консультация подойдёт.", "Түсіндім 🌿 Әкімшіге жіберемін, ол жазылуға көмектесіп, қандай консультация қолайлы екенін айтады."))
+
+        if _profile_status(text) == "non_profile":
+            session["complaint"] = text
+            session["step"] = "escalated"
+            session["escalated"] = True
+            session["profile_status"] = "non_profile"
+            return _finalize(chat_id, session, _non_profile_answer(session, text))
+
+        if _profile_status(text) == "unclear":
+            session["step"] = "complaint"
+            session["profile_status"] = "unclear"
+            return _finalize(chat_id, session, _unclear_profile_answer(session, text))
+
+        if not (_has_complaint(text) or _has_medical_complaint_text(text)):
+            if _has_booking_intent(text) or _is_greeting_only(text):
+                return _finalize(chat_id, session, _ask_complaint(session))
+            return _finalize(chat_id, session, _ask_complaint(session))
+
+        session["complaint"] = text
+        session["step"] = "age"
+        return _finalize(chat_id, session, _ask_age_contextual(session, text))
+
+    if step == "complaint_no_confirm":
+        if _has_no_complaint(text):
+            session["step"] = "escalated"
+            session["escalated"] = True
+            return _finalize(chat_id, session, _tr(session, "Поняла Вас 🌿 Передам администратору, чтобы он помог с записью и подсказал, какая консультация подойдёт.", "Түсіндім 🌿 Әкімшіге жіберемін, ол жазылуға көмектесіп, қандай консультация қолайлы екенін айтады."))
+        if _is_positive_confirm(text) or _has_booking_intent(text):
+            session["complaint"] = "Профилактическая консультация, без конкретной жалобы"
+            session["step"] = "age"
+            return _finalize(chat_id, session, _tr(session, "Хорошо 🌿 Подскажите, пожалуйста, сколько Вам лет?", "Жақсы 🌿 Жасыңыз нешеде?"))
+        if (_has_complaint(text) or _has_medical_complaint_text(text)) and _profile_status(text) != "non_profile":
+            session["complaint"] = text
+
+            # Если возраст уже есть в этом же сообщении — не спрашиваем его повторно.
+            # Сразу проверяем противопоказания/дату.
+            if session.get("age"):
+                answer = await _continue_after_collected_age(chat_id, session, text, int(session["age"]))
+                return _finalize(chat_id, session, answer)
+
+            session["step"] = "age"
+            return _finalize(chat_id, session, _ask_age_contextual(session, text))
+        session["step"] = "escalated"
+        session["escalated"] = True
+        return _finalize(chat_id, session, _tr(session, "Поняла Вас 🌿 Передам администратору, чтобы он помог сориентироваться.", "Түсіндім 🌿 Әкімшіге жіберемін, ол нақтылап көмектеседі."))
+
+    # 6) Возраст: после возраста ВСЕГДА спрашиваем противопоказания.
+    if step == "age":
+        # age_unknown_answer_guard:
+        # Если пациент не готов назвать возраст, не перескакиваем и не путаемся.
+        if any(p in _low(text) for p in ["не знаю", "позже", "потом", "уточню", "білмеймін", "билмеймин"]):
+            return _finalize(
+                chat_id,
+                session,
+                _tr(
+                    session,
+                    "Хорошо 🌿 Для записи возраст всё равно понадобится. Когда сможете — напишите, пожалуйста, возраст пациента.",
+                    "Жақсы 🌿 Жазылу үшін жас бәрібір қажет болады. Мүмкін болғанда пациенттің жасын жазыңызшы.",
+                ),
+            )
+
+        age = _extract_age(text, step="age")
+        if not age:
+            return _finalize(chat_id, session, _tr(session, "Подскажите, пожалуйста, сколько Вам лет?", "Жасыңыз нешеде?"))
+
+        session["age"] = age
+        stop = _age_stop_text(age, session)
+        if age < 16:
+            session["contraindications_ok"] = False
+            session["contraindications_verdict"] = "stop"
+            session["step"] = "stopped"
+            return _finalize(chat_id, session, stop)
+
+        if age > 75:
+            session["contraindications_ok"] = False
+            session["contraindications_verdict"] = "admin_contact"
+            session["step"] = "escalated"
+            session["escalated"] = True
+            return _finalize(chat_id, session, stop)
+
+        # 16–18: не стоп, но только с родителем/законным представителем.
+        if age < 18:
+            session["minor_parent_required"] = True
+            session["step"] = "contraindications"
+            answer = stop + "\n\n" + _ask_contra(session)
+            return _finalize(chat_id, session, answer)
+
+        session["step"] = "contraindications"
+        session["questionnaire_step"] = "contra"
+        return _finalize(chat_id, session, _ask_contra(session))
+
+    # 7) Противопоказания — обязательный гейт перед датой.
+    if step == "contraindications":
+        # contra_no_answer_direct_date_guard:
+        # "Нет" / "Жоқ!" на вопрос о противопоказаниях = противопоказаний нет,
+        # дальше спрашиваем дату, а не возвращаемся к жалобе.
+        if _is_no_contra_answer(text):
+            session["contraindications_ok"] = True
+            session["contraindications_raw"] = "нет"
+            session["step"] = "date"
+            session["questionnaire_step"] = "date"
+            return _finalize(chat_id, session, _ask_date(session))
+
+        session["contraindications_raw"] = text
+
+        if _contra_is_clear_no(text):
+            session["contraindications_ok"] = True
+            session["contraindications_verdict"] = "proceed"
+            session["step"] = "date"
+            return _finalize(chat_id, session, _ask_date(session))
+
+        if _contra_has_hard_stop(text):
+            session["contraindications_ok"] = False
+            session["contraindications_verdict"] = "stop"
+            session["step"] = "stopped"
+            return _finalize(chat_id, session, _stop_booking_text(session, "contra"))
+
+        # Если пациент написал симптомы вместо ответа по противопоказаниям — не считаем это противопоказанием.
+        if (_has_complaint(text) or _has_medical_complaint_text(text)):
+            return _finalize(chat_id, session, _ask_contra(session))
+
+        # Если пациент написал просто "есть/да/бар" без деталей — запись не продолжаем.
+        # Просим уточнить, какое именно противопоказание, потому что при наличии противопоказаний приём не проводится.
+        if any(w in _low(text) for w in YES_WORDS):
+            session["contraindications_ok"] = False
+            session["contraindications_verdict"] = "need_details"
+            session["step"] = "contraindications"
+            answer = _tr(
+                session,
+                "Поняла Вас. Уточните, пожалуйста, какое именно противопоказание есть: кардиостимулятор, беременность, онкология, металл в зоне лечения, эпилепсия, возраст до 16 или более 75 лет, ограниченная подвижность? Если что-то из этого есть — запись оформить нельзя.",
+                "Түсіндім. Қай қарсы көрсетілім бар екенін нақтылап жазыңызшы: кардиостимулятор, жүктілік, онкология, емдеу аймағындағы металл, эпилепсия, 16 жасқа дейін немесе 75 жастан жоғары жас, қозғалыстың шектелуі? Егер осының бірі болса — жазба рәсімделмейді.",
+            )
+            return _finalize(chat_id, session, answer)
+
+        return _finalize(chat_id, session, _ask_contra(session))
+
+    # 8) Дата.
+    if step in ("date", "preferred_time"):
+        date_iso = _parse_date(text)
+        if not date_iso:
+            return _finalize(chat_id, session, _ask_date(session))
+
+        answer = await _show_slots(chat_id, session, date_iso)
+        return _finalize(chat_id, session, answer)
+
+    # 9) Выбор времени.
+    if step in ("time", "select_slot"):
+        slots = session.get("last_slots") or []
+        slot = _select_slot(text, slots)
+        if not slot:
+            return _finalize(
+                chat_id,
+                session,
+                _tr(session, "Какое время из вариантов выше Вам удобно?", "Жоғарыдағы уақыттардың қайсысы ыңғайлы?"),
+            )
+
+        session["selected_slot"] = slot
+        session["selected_date"] = slot.get("date") or session.get("preferred_date")
+        session["selected_time"] = slot.get("time")
+        session["step"] = "name"
+        return _finalize(chat_id, session, _ask_name(session))
+
+    # 10) Имя.
+    if step == "name":
+        name = _extract_name(text)
+        if not name:
+            return _finalize(chat_id, session, _ask_name(session))
+
+        session["patient_name"] = name
+        answer = await _book(chat_id, session, phone)
+        return _finalize(chat_id, session, answer)
+
+    # 11) После записи короткие сообщения не запускают новую анкету.
+    if step == "done" or session.get("booked"):
+        if _is_cancel(text):
+            session["step"] = "escalated"
+            answer = _tr(
+                session,
+                "Поняла Вас 🌿 Передам администратору, он поможет отменить или перенести запись.",
+                "Түсіндім 🌿 Әкімшіге жіберемін, ол жазбаны тоқтатуға немесе ауыстыруға көмектеседі.",
+            )
+            return _finalize(chat_id, session, answer)
+        return _finalize(chat_id, session, _tr(session, "Хорошо, приняли 🌿 Будем ждать Вас!", "Жақсы, қабылдадық 🌿 Күтеміз!"))
+
+    # 11.5) Запись остановлена из-за противопоказаний/возраста.
+    if step == "stopped":
+        return _finalize(chat_id, session, _stop_booking_text(session, "contra"))
+
+    # 12) Если состояние непонятное — безопасно продолжаем с ближайшего обязательного шага.
+    if not session.get("complaint"):
+        session["step"] = "complaint"
+        return _finalize(chat_id, session, _ask_complaint(session))
+
+    if not session.get("age"):
+        session["step"] = "age"
+        return _finalize(chat_id, session, _tr(session, "Подскажите, пожалуйста, сколько Вам лет?", "Жасыңыз нешеде?"))
+
+    if session.get("contraindications_ok") is not True:
+        session["step"] = "contraindications"
+        return _finalize(chat_id, session, _ask_contra(session))
+
+    session["step"] = "date"
+    return _finalize(chat_id, session, _ask_date(session))
