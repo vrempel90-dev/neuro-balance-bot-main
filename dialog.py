@@ -931,6 +931,37 @@ def _strip_quoted_bot_text(text: str) -> str:
     return "\n".join(cleaned_lines).strip() or text
 
 
+def _is_visit_confirmation_reply(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    if not low:
+        return False
+
+    confirm_words = [
+        "буду", "приду", "подойду", "приеду", "буду завтра", "подойду завтра",
+        "да буду", "хорошо буду", "ок буду", "буду в", "подойду в", "приду в",
+        "келемін", "келемин", "барамын", "барам", "барамын ертең", "ертең барамын",
+        "иә барамын", "ия барамын", "жақсы барамын", "жаксы барамын",
+    ]
+
+    # Подтверждение часто содержит время: "буду в 18.00", "буду 18:00".
+    has_time = bool(re.search(r"\b([01]?\d|2[0-3])[:.]\d{2}\b|\b([01]?\d|2[0-3])\s*(?:час|ч|:00)?\b", low))
+    has_confirm = any(w in low for w in confirm_words)
+
+    # Не считаем жалобы подтверждением.
+    if _has_complaint(low) or _has_medical_complaint_text(low):
+        return False
+
+    return has_confirm or (has_time and any(w in low for w in ["буд", "прид", "подойд", "кел", "бар"]))
+
+
+def _visit_confirmation_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Хорошо, спасибо, будем ждать Вас 🌿",
+        "Жақсы, рақмет, Сізді күтеміз 🌿",
+    )
+
+
 def _is_time_question_without_date(text: str) -> bool:
     low = _low(_strip_quoted_bot_text(text))
     if not low:
@@ -2049,6 +2080,15 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             _tr(session, "Хорошо, буду отвечать на русском 🌿", "Жақсы, қазақша жауап беремін 🌿"),
         )
 
+    # visit_confirmation_guard:
+    # Если пациент отвечает на напоминание о существующей записи
+    # ("буду", "подойду", "буду в 18:00"), не начинаем новую анкету.
+    if _is_visit_confirmation_reply(text):
+        session["step"] = "done"
+        session["status"] = "visit_confirmed"
+        session["visit_confirmed"] = True
+        return _finalize(chat_id, session, _visit_confirmation_answer(session))
+
     # 0.5) Две задачи в одном сообщении:
     # "я уже записан/отмените/перенести" + "маму/папу/сына хочу записать".
     # Не запускаем обычную анкету, чтобы не перепутать пациентов.
@@ -2273,6 +2313,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
                 "Рақмет, күн бойынша қалауыңызды белгіледім. Нақты уақыт әлі таңдалмағандықтан, өтінімді клиника координаторына жіберемін — ол Сізбен байланысып, ыңғайлы уақытты қолмен бекітеді 🌿",
             ),
         )
+
+    # visit_confirmed_thanks_guard:
+    if session.get("visit_confirmed") and _is_thanks_or_ok(text):
+        return _no_reply(chat_id, session)
 
     # post_done_new_booking_guard_final:
     # После завершения/передачи не начинаем новый сценарий от коротких сообщений,
