@@ -269,3 +269,35 @@ async def debug_voice_file(
         "transcript": transcript.text,
         "answer": answer,
     }
+
+
+@app.get("/debug/crm-check")
+async def debug_crm_check(date: str = "2026-06-12"):
+    """Direct CRM connectivity check from Railway.
+
+    This endpoint does NOT send anything to WhatsApp.
+    It only calls crm.check_slots(date) and returns the raw result or error.
+    """
+    try:
+        import crm
+        from config import get_settings
+
+        settings = get_settings()
+        data = await crm.check_slots(date)
+
+        return {
+            "ok": True,
+            "date": date,
+            "crm_base_url": getattr(settings, "crm_base_url", ""),
+            "slots_count": len(data.get("slots", []) or []),
+            "availability_count": len(data.get("availability", []) or []),
+            "data": data,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "date": date,
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+        }
+
