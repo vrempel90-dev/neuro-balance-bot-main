@@ -1004,13 +1004,25 @@ def _parse_date(text: str) -> str | None:
         "четверг": 3, "в четверг": 3, "бейсенбі": 3, "бейсенби": 3,
         "пятница": 4, "пятницу": 4, "в пятницу": 4, "жұма": 4, "жума": 4,
         "суббота": 5, "субботу": 5, "в субботу": 5, "сенбі": 5, "сенби": 5,
-        "воскресенье": 6, "воскресенье": 6, "жексенбі": 6, "жексенби": 6,
+        "воскресенье": 6, "в воскресенье": 6, "жексенбі": 6, "жексенби": 6,
     }
+
+    has_next_week = any(p in low for p in [
+        "следующ", "на следующей неделе", "келесі апта", "келеси апта",
+    ])
+
     for name, wd in weekdays.items():
         if name in low:
             delta = (wd - today.weekday()) % 7
             if delta == 0:
                 delta = 7
+
+            # Если человек явно пишет "на следующей неделе в понедельник",
+            # не передаём координатору, а считаем дату и показываем слоты.
+            # Если ближайший такой день ещё на этой неделе, переносим на неделю вперёд.
+            if has_next_week and delta < 7:
+                delta += 7
+
             return (today + timedelta(days=delta)).isoformat()
 
     m = re.search(r"\b(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?\b", low)
@@ -1025,7 +1037,6 @@ def _parse_date(text: str) -> str | None:
             return None
 
     return None
-
 
 def _time_from_text(text: str) -> str | None:
     m = re.search(r"\b([01]?\d|2[0-3])[:.\- ]([0-5]\d)\b", text or "")
@@ -1884,8 +1895,19 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if step in ("escalated", "stopped") and _is_thanks_or_ok(text):
         return _finalize(chat_id, session, _tr(session, "Спасибо 🌿", "Рақмет 🌿"))
 
-    # Если координатор уже закрепляет время вручную, новые уточнения по дню/времени
-    # не должны снова спрашивать дату и запускать повторную заявку.
+    # Если ранее пациент написал неопределённо ("на следующей неделе"),
+    # а потом уточнил конкретный день ("в понедельник") — продолжаем запись
+    # и показываем реальные слоты CRM, а не передаём координатору.
+    if step == "escalated" and session.get("handoff_reason") == "tentative_date":
+        date_iso = _parse_date(text)
+        if date_iso:
+            session["step"] = "time"
+            session["escalated"] = False
+            session["handoff_reason"] = ""
+            return _finalize(chat_id, session, await _show_slots(chat_id, session, date_iso))
+
+    # Если координатор уже закрепляет время вручную по другой причине,
+    # новые уточнения по дню/времени не должны запускать повторную заявку.
     if step == "escalated" and (_parse_date(text) or _has_time_hint(text) or _has_booking_intent(text)):
         return _finalize(
             chat_id,
