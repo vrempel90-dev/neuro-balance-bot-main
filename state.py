@@ -89,6 +89,20 @@ def log_event(chat_id: str, event_type: str, payload: dict[str, Any]) -> None:
         )
 
 
+def log_bot_action(
+    chat_id: str,
+    action: str,
+    note: str = "",
+    payload: dict[str, Any] | None = None,
+    **extra: Any,
+) -> None:
+    data = dict(payload or {})
+    data.update(extra)
+    if note:
+        data["note"] = note
+    log_event(chat_id, f"bot_action:{action}", data)
+
+
 def get_session(chat_id: str) -> dict[str, Any]:
     with _connect() as conn:
         row = conn.execute("SELECT data_json FROM sessions WHERE chat_id=?", (chat_id,)).fetchone()
