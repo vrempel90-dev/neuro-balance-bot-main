@@ -914,6 +914,21 @@ def _no_reply(chat_id: str, session: dict[str, Any]) -> str:
     return ""
 
 
+def _last_answer_was_info(session: dict[str, Any]) -> bool:
+    last = _low(str(session.get("last_assistant_answer") or session.get("last_bot_answer") or ""))
+    if not last:
+        return False
+
+    info_markers = [
+        "адрес", "2гис", "2gis", "кабанбай", "кунаева", "қабанбай", "мекенжай",
+        "стоимость", "цена", "приём", "прием", "5000", "5 000", "бағасы", "багасы",
+        "график", "режим", "работаем", "выходной", "дүйсенбі", "понедельник",
+        "instagram", "tiktok", "тик ток", "инстаграм",
+        "находимся", "мы находимся", "орналасқан",
+    ]
+    return any(marker in last for marker in info_markers)
+
+
 def _extract_age(text: str, step: str = "") -> int | None:
     low = _low(text)
 
@@ -1668,6 +1683,12 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     session["phone"] = phone or session.get("phone") or ""
     session["language"] = _detect_lang(text, session)
+
+    # thanks_after_info_guard:
+    # Если пациент поблагодарил после адреса/цены/графика, не начинаем анкету заново.
+    # В WhatsApp это должно выглядеть как молчание живого админа, а не как новый сценарий.
+    if _is_thanks_or_ok(text) and _last_answer_was_info(session):
+        return _no_reply(chat_id, session)
 
     # no_duplicate_after_booking_guard:
     # После успешной записи короткие ответы "хорошо/спасибо/ок" не требуют ответа.
