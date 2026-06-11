@@ -151,45 +151,47 @@ def _allow_long_answer(answer: str) -> bool:
 
 
 def _limit_length(answer: str) -> str:
-    """Обычные ответы режем до 1-2 предложений или максимум 3 блоков."""
     if not answer:
         return answer
 
-    if _allow_long_answer(answer):
+    low = _low(answer)
+
+    allow_long = any(x in low for x in [
+        "перед записью мне нужно уточнить",
+        "перед записью нужно подтвердить",
+        "кардиостимулятор",
+        "противопоказан",
+        "ваш визит в neuro balance",
+        "запись подтверждена",
+        "мекенжай",
+        "қабылдауы",
+        "сколько вам лет",
+        "жасыңыз нешеде",
+        "жасыныз нешеде",
+        "на какой день вам удобно",
+        "қай күн ыңғайлы",
+        "кай кун ыңгайлы",
+        "какое вам удобно",
+        "қайсысы ыңғайлы",
+        "кайсысы ыңгайлы",
+        "для оформления записи",
+        "жазбаны рәсімдеу",
+    ])
+
+    if allow_long:
         return answer.strip()
 
     blocks = [b.strip() for b in answer.split("---") if b.strip()]
     if len(blocks) > 3:
         blocks = blocks[:3]
-    if blocks:
-        answer = "\n---\n".join(blocks)
 
-    # Если нет дробления на блоки и текст длинный — оставляем коротко,
-    # но НЕ выкидываем обязательный следующий вопрос сценария.
-    if "---" not in answer:
-        sentences = re.split(r"(?<=[.!?])\s+", answer.strip())
-        if len(sentences) > 2:
-            last = sentences[-1].strip()
-            last_low = _low(last)
-            must_keep_last = any(x in last_low for x in [
-                "сколько вам лет",
-                "жасыңыз нешеде",
-                "жасыныз нешеде",
-                "на какой день вам удобно",
-                "қай күн ыңғайлы",
-                "кай кун ыңгайлы",
-                "какое вам удобно",
-                "қайсысы ыңғайлы",
-                "кайсысы ыңгайлы",
-                "для оформления записи",
-            ])
-            if must_keep_last:
-                answer = " ".join([sentences[0].strip(), last]).strip()
-            else:
-                answer = " ".join(sentences[:2]).strip()
+    answer = "\n---\n".join(blocks) if blocks else answer
+
+    sentences = re.split(r"(?<=[.!?])\s+", answer.strip())
+    if len(sentences) > 2 and "---" not in answer:
+        answer = " ".join(sentences[:2]).strip()
 
     return answer.strip()
-
 
 def _normalize_empty_lines(answer: str) -> str:
     answer = re.sub(r"[ \t]+\n", "\n", answer or "")
