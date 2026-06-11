@@ -1721,10 +1721,19 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _finalize(chat_id, session, _tr(session, "Напишите, пожалуйста, что Вас беспокоит 🌿", "Сізді не мазалайды? 🌿"))
 
     # standalone_thanks_guard:
-    # Если человек просто написал "спасибо/рахмет/ок" без активного сценария,
+    # Если человек просто написал "спасибо/рахмет/ок" без активной записи/жалобы,
     # не начинаем анкету заново. В WhatsApp это должно выглядеть как молчание.
     current_step_for_thanks = session.get("step") or "start"
-    if _is_thanks_or_ok(text) and current_step_for_thanks in ("start", "", None):
+    has_active_booking_context = bool(
+        session.get("complaint")
+        or session.get("age")
+        or session.get("preferred_date")
+        or session.get("selected_time")
+        or session.get("booked")
+        or session.get("patient_name")
+    )
+    if _is_thanks_or_ok(text) and not has_active_booking_context and current_step_for_thanks in ("start", "complaint", "", None):
+        session["step"] = "start"
         return _no_reply(chat_id, session)
 
     # refusal_guard:
@@ -1969,6 +1978,13 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if age and session.get("complaint") and session.get("contraindications_ok") is not True and not session.get("contraindications_verdict"):
         answer = await _continue_after_collected_age(chat_id, session, text, age)
         return _finalize(chat_id, session, answer)
+
+    # complaint_thanks_guard:
+    # Если бот уже спросил "что беспокоит?", а клиент ответил только "спасибо/рахмет",
+    # не повторяем вопрос и не пушим анкету.
+    if (session.get("step") or "start") == "complaint" and _is_thanks_or_ok(text) and not session.get("complaint"):
+        session["step"] = "start"
+        return _no_reply(chat_id, session)
 
     # 5) Старт / выясняем жалобу.
     if step in ("start", "", None):
