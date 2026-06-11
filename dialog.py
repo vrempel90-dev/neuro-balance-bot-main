@@ -1720,6 +1720,13 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if not text:
         return _finalize(chat_id, session, _tr(session, "Напишите, пожалуйста, что Вас беспокоит 🌿", "Сізді не мазалайды? 🌿"))
 
+    # standalone_thanks_guard:
+    # Если человек просто написал "спасибо/рахмет/ок" без активного сценария,
+    # не начинаем анкету заново. В WhatsApp это должно выглядеть как молчание.
+    current_step_for_thanks = session.get("step") or "start"
+    if _is_thanks_or_ok(text) and current_step_for_thanks in ("start", "", None):
+        return _no_reply(chat_id, session)
+
     # refusal_guard:
     # Если пациент во время диалога отказался от записи ("не надо", "не хочу", "потом"),
     # останавливаем сценарий и не задаём дальше вопросы анкеты.
