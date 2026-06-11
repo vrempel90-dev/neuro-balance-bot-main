@@ -376,7 +376,7 @@ def _detect_lang(text: str, session: dict[str, Any]) -> str:
     """Определяет язык без скачков туда-сюда.
 
     Правило:
-    - первый осмысленный язык диалога фиксируем;
+    - первый осмысленный язык диалога фиксируется;
     - короткие ответы типа "жоқ/рахмет/37 жаста" не переключают язык;
     - смешанные сообщения не переключают язык;
     - смена языка только если клиент явно попросил: "пишите на казахском/русском".
@@ -385,18 +385,15 @@ def _detect_lang(text: str, session: dict[str, Any]) -> str:
     low = _low(text)
     text_stripped = (text or "").strip()
 
-    # Если язык уже зафиксирован в активном диалоге — держим его.
-    # Явная просьба сменить язык обрабатывается ниже в handle_message через _explicit_language_request.
+    # Если язык уже зафиксирован — держим его.
+    # Явная просьба сменить язык обрабатывается в handle_message через _explicit_language_request.
     if session.get("language_locked") and current in ("ru", "kk"):
         return current
 
-    # Если диалог уже идёт, не переключаем язык от одного казахского/русского слова.
     step_now = session.get("step") or "start"
     if session.get("language") in ("ru", "kk") and step_now not in ("start", "", None):
         return current
 
-    # Короткие ответы не должны переключать язык:
-    # "69 жаста", "Жоқ", "жок", "ия", "рахмет", "ок", "спасибо".
     short_answer = bool(
         re.fullmatch(
             r"\s*(?:\d{1,3}\s*(?:жаста|жас|лет|года|год)?|жоқ|жок|ия|иә|жақсы|жаксы|рахмет|спасибо|ок|окей|нет|да)\s*[.!?🙏🌿]*\s*",
@@ -412,7 +409,7 @@ def _detect_lang(text: str, session: dict[str, Any]) -> str:
     )
     has_ru = any(w in low for w in RU_MARKERS)
 
-    # Смешанный текст: не скачем, держим текущий язык.
+    # Смешанный текст: держим текущий язык.
     if has_ru and (has_kz_letters or has_kz_words) and current in ("ru", "kk"):
         return current
 
@@ -719,6 +716,33 @@ def _strip_quoted_bot_text(text: str) -> str:
         cleaned_lines.append(line)
 
     return "\n".join(cleaned_lines).strip() or text
+
+
+def _is_vacation_later_visit(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    if not low:
+        return False
+
+    vacation_words = [
+        "отпуск", "отпускға", "отпускка", "отпуска",
+        "демалыс", "демалысқа", "демалыска",
+        "демалысқа шық", "демалыска шык", "шығамын", "шыгамын",
+    ]
+    visit_later_words = [
+        "сонда", "баруға", "баруга", "барып", "көрінуге", "коринуге",
+        "болама", "бола ма", "келейін", "келейин", "приду", "приеду",
+        "когда смогу", "как смогу", "потом прийти", "позже прийти",
+    ]
+
+    return any(w in low for w in vacation_words) and any(w in low for w in visit_later_words)
+
+
+def _vacation_later_visit_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Хорошо, будем ждать Вас в любое удобное время 🌿 Спасибо за обращение, всего доброго!",
+        "Жақсы, Сізді өзіңізге ыңғайлы уақытта күтеміз 🌿 Хабарласқаныңызға рақмет, сау болыңыз!",
+    )
 
 
 def _is_unknown_date_answer(text: str) -> bool:
@@ -1902,6 +1926,15 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if step == "date" and _has_mri_question(text):
         session["waiting_for_date"] = True
         return _finalize(chat_id, session, _mri_answer_in_flow(session))
+
+    # vacation_later_visit_guard:
+    # Если пациент пишет, что позже/в отпуске сам придёт на консультацию,
+    # не повторяем вопрос про дату, а мягко завершаем диалог.
+    if step == "date" and _is_vacation_later_visit(text):
+        session["step"] = "stopped"
+        session["status"] = "waiting_patient_later"
+        session["waiting_for_date"] = True
+        return _finalize(chat_id, session, _vacation_later_visit_answer(session))
 
     # unknown_date_answer_guard:
     # Если пациент пока не знает день/время, не повторяем один и тот же вопрос.
