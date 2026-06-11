@@ -778,12 +778,31 @@ def _extract_age(text: str, step: str = "") -> int | None:
     if re.search(r"\b\d{1,2}[:.]\d{2}\b", low):
         return None
 
-    # Прямые формы возраста RU/KZ.
+    # КРИТИЧНО: не путать длительность болезни/жалобы с возрастом.
+    duration_patterns = [
+        r"\b\d{1,2}\s*(?:жыл|жылдан|жылдай)\s*(?:болды|бері|бери|мазалайды|ауырады|ауырып|бар|жүр|жур)\b",
+        r"\b\d{1,2}\s*(?:лет|года|год)\s*(?:болит|беспокоит|мучаюсь|мучает|назад|уже|как|после|есть|бар)\b",
+        r"\b(?:уже|как|шамамен|примерно|около)\s*\d{1,2}\s*(?:лет|года|год|жыл|жылдан|жылдай)\b",
+        r"\b\d{1,2}\s*(?:день|дня|дней|недел|неделя|недель|месяц|месяцев|сутки|күн|апта|ай)\b",
+    ]
+    for pat in duration_patterns:
+        if re.search(pat, low):
+            return None
+
     patterns = [
         r"\bмне\s*(\d{1,2})\s*(?:лет|года|год)?\b",
+        r"\bмой\s+возраст\s*(\d{1,2})\b",
+        r"\bвозраст\s*(\d{1,2})\b",
+        r"\bя\s*(\d{1,2})\s*(?:лет|года|год)\b",
         r"\bмен\s*(\d{1,2})\s*(?:жастамын|жаста|жас)?\b",
-        r"\b(\d{1,2})\s*(?:лет|года|год|жас|жастамын|жаста)\b",
+        r"\bмаған\s*(\d{1,2})\s*(?:жас|жаста)?\b",
+        r"\bжасым\s*(\d{1,2})\b",
+        r"\bменің\s+жасым\s*(\d{1,2})\b",
+        r"\bменим\s+жасым\s*(\d{1,2})\b",
+        r"\b(\d{1,2})\s*(?:жастамын|жаста)\b",
+        r"\b(\d{1,2})\s*(?:лет|года|год)\b",
     ]
+
     for pat in patterns:
         m = re.search(pat, low)
         if m:
@@ -791,20 +810,15 @@ def _extract_age(text: str, step: str = "") -> int | None:
             if 1 <= age <= 99:
                 return age
 
-    # Не путать длительность боли с возрастом: "3 день болит" не возраст.
-    if re.search(r"\b\d{1,2}\s*(день|дня|дней|недел|неделя|месяц|месяцев|сутки)\b", low):
-        return None
-
-    # Если мы явно ждём возраст — можно принять просто число.
-    nums = re.findall(r"\b(\d{1,2})\b", low)
-    if nums and step == "age":
-        age = int(nums[0])
-        if 1 <= age <= 99:
-            return age
+    if step == "age":
+        stripped = re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", low)
+        m = re.fullmatch(r"(\d{1,2})(?:жас|лет|год|года)?", stripped)
+        if m:
+            age = int(m.group(1))
+            if 1 <= age <= 99:
+                return age
 
     return None
-
-
 def _age_stop_text(age: int, session: dict[str, Any]) -> str:
     if age < 16:
         return _stop_booking_text(session, "under_16")
@@ -1560,11 +1574,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _finalize(
             chat_id,
             session,
-            _tr(
-                session,
-                "Понимаем Вас 🙏 Это относится к профилю нашей клиники. Подскажите, пожалуйста, возраст пациента?",
-                "Түсінеміз 🙏 Бұл біздің клиниканың бағытына жатады. Пациенттің жасы нешеде?",
-            ),
+            _ask_age(session),
         )
 
     # profile_classifier_guard:
@@ -1625,11 +1635,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["complaint"] = text
         session["profile_status"] = "profile"
         session["step"] = "age"
-        answer = _tr(
-            session,
-            "Понимаем Вас 🙏 Это относится к профилю нашей клиники. С такой жалобой можно прийти на первичную консультацию, врач осмотрит и подскажет дальнейший план.\n\nПодскажите, пожалуйста, возраст пациента?",
-            "Түсінеміз 🙏 Бұл біздің клиниканың бағытына жатады. Мұндай шағыммен алғашқы консультацияға келуге болады, дәрігер қарап, әрі қарайғы жоспарды түсіндіреді.\n\nПациенттің жасы нешеде?",
-        )
+        answer = _ask_age_contextual(session, text)
         return _finalize(chat_id, session, answer)
 
 
