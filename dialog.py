@@ -2031,6 +2031,157 @@ async def _continue_after_collected_age(chat_id: str, session: dict[str, Any], t
     return _ask_contra(session)
 
 
+def _has_active_context(session: dict[str, Any]) -> bool:
+    return bool(
+        session.get("complaint")
+        or session.get("age")
+        or session.get("contraindications_ok")
+        or session.get("preferred_date")
+        or session.get("selected_time")
+        or session.get("selected_slot")
+        or session.get("booked")
+        or session.get("patient_name")
+        or session.get("appointment")
+    )
+
+
+def _is_question_mark_only(text: str) -> bool:
+    return _low(text).strip() in ("?", "??", "???", "？")
+
+
+def _is_too_vague_to_start(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    if not low:
+        return False
+
+    # Эти фразы сами по себе не являются заявкой и не должны запускать анкету.
+    vague = [
+        "добрый вечер", "добрый день", "здравствуйте", "привет",
+        "салем", "сәлем", "ассалаумағалейкум", "ассалаумагалейкум",
+        "можно вопрос", "вопрос", "уточнить", "хотел спросить", "хотела спросить",
+        "а можно", "подскажите", "скажите пожалуйста",
+    ]
+
+    if low in vague:
+        return True
+
+    tokens = re.findall(r"[a-zа-яәғқңөұүһі0-9]+", low)
+    if len(tokens) <= 2 and not (
+        _has_complaint(low)
+        or _has_medical_complaint_text(low)
+        or _has_booking_intent(low)
+        or _is_visit_confirmation_reply(low)
+        or _wants_existing_lookup(low)
+        or _is_cancel(low)
+        or _has_mri_question(low)
+        or _has_any(low, PRICE_WORDS)
+        or _has_any(low, ADDRESS_WORDS)
+        or _has_any(low, SCHEDULE_WORDS)
+        or _is_thanks_or_ok(low)
+    ):
+        return True
+
+    return False
+
+
+def _clarify_intent_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Подскажите, пожалуйста, Вы хотите записаться на консультацию или уточняете по уже имеющейся записи? 🌿",
+        "Нақтылап жіберіңізші, консультацияға жазылғыңыз келе ме, әлде бұрынғы жазбаңыз бойынша сұрап тұрсыз ба? 🌿",
+    )
+
+
+async def _safe_intent_router(chat_id: str, phone: str, session: dict[str, Any], text: str) -> str | None:
+    """Главный роутер намерений живого администратора.
+
+    Смысл: прежде чем запускать сценарий записи, определяем, что человек реально хочет.
+    Если не уверены — уточняем намерение, а не начинаем анкету заново.
+    """
+    step = session.get("step") or "start"
+
+    if not text:
+        return _tr(session, "Напишите, пожалуйста, чем можем помочь 🌿", "Қалай көмектесе аламыз? 🌿")
+
+    # 1. Простые завершающие сообщения не запускают сценарий.
+    if _is_thanks_or_ok(text):
+        if step in ("start", "complaint", "date", "done", "booked", "stopped", "escalated") or not _has_active_context(session):
+            return _no_reply(chat_id, session)
+
+    # 2. Подтверждение уже назначенного визита.
+    if _is_visit_confirmation_reply(text):
+        session["step"] = "done"
+        session["status"] = "visit_confirmed"
+        session["visit_confirmed"] = True
+        return _visit_confirmation_answer(session)
+
+    # 3. Отмена / перенос / уже записан — это не новая анкета.
+    if _wants_existing_lookup(text):
+        return await _handle_existing_lookup(chat_id, phone, session, text)
+
+    if _is_cancel(text):
+        if _is_reschedule_request(text) and not _is_cancel_direct_request(text):
+            session["step"] = "escalated"
+            session["escalated"] = True
+            return _tr(
+                session,
+                "Поняла Вас 🌿 Передам администратору, чтобы он проверил Вашу запись и помог перенести её на удобное время.",
+                "Түсіндім 🌿 Әкімшіге жіберемін, ол жазбаңызды тексеріп, ыңғайлы уақытқа ауыстыруға көмектеседі.",
+            )
+        return await _handle_cancel_appointment(chat_id, phone, session, text)
+
+    # 4. Отказ, позже, отпуск, сентябрь, сам выберу.
+    if _is_refuse_booking(text) and not _is_cancel_direct_request(text):
+        session["step"] = "stopped"
+        session["status"] = "refused"
+        session["refused_booking"] = True
+        return _refuse_booking_answer(session)
+
+    if _is_vacation_later_visit(text) or _is_later_month_or_self_schedule(text):
+        session["step"] = "stopped"
+        session["status"] = "waiting_patient_later"
+        session["waiting_for_date"] = True
+        return _vacation_later_visit_answer(session)
+
+    # 5. Вопросы, которые админ должен обработать без запуска анкеты.
+    # Вопрос про время без выбранной даты.
+    if _is_time_question_without_date(text) and not _parse_date(text):
+        session["step"] = "date"
+        session["waiting_for_date"] = True
+        return _time_question_without_date_answer(session)
+
+    # Просто "?" — не повторяем тот же вопрос.
+    if _is_question_mark_only(text):
+        if step == "date":
+            return _tr(
+                session,
+                "Чтобы проверить свободное время, напишите, пожалуйста, удобный день — например: завтра, в понедельник или 23 июня 🌿",
+                "Бос уақытты тексеру үшін ыңғайлы күнді жазыңызшы — мысалы: ертең, дүйсенбі немесе 23 маусым 🌿",
+            )
+        if step == "contraindications":
+            return _ask_contra(session)
+        return _clarify_intent_answer(session)
+
+    # МРТ/снимки/КТ — отдельный вопрос, не старт новой анкеты.
+    if _has_mri_question(text) and not (_has_complaint(text) or _has_medical_complaint_text(text)):
+        return _mri_answer_in_flow(session)
+
+    info = _clinic_answer(text, session)
+    if info and not (_has_complaint(text) or _has_medical_complaint_text(text)):
+        # После инфо-вопросов не ставим жёстко "complaint", чтобы "спасибо" не запустило анкету.
+        session["last_info_answer"] = True
+        if step in ("start", "", None):
+            session["step"] = "start"
+        return info
+
+    # 6. Если сообщение слишком vague, не начинаем анкету вслепую.
+    if step in ("start", "", None) and _is_too_vague_to_start(text):
+        session["step"] = "start"
+        return _clarify_intent_answer(session)
+
+    return None
+
+
 async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     """Главная функция, которую вызывает main.py.
 
@@ -2079,6 +2230,14 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session,
             _tr(session, "Хорошо, буду отвечать на русском 🌿", "Жақсы, қазақша жауап беремін 🌿"),
         )
+
+    # universal_intent_router:
+    # Сначала понимаем намерение клиента, потом запускаем сценарий записи.
+    routed_answer = await _safe_intent_router(chat_id, phone, session, text)
+    if routed_answer is not None:
+        if routed_answer == "":
+            return routed_answer
+        return _finalize(chat_id, session, routed_answer)
 
     # visit_confirmation_guard:
     # Если пациент отвечает на напоминание о существующей записи
