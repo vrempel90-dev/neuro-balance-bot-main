@@ -718,6 +718,31 @@ def _strip_quoted_bot_text(text: str) -> str:
     return "\n".join(cleaned_lines).strip() or text
 
 
+def _is_time_question_without_date(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    if not low:
+        return False
+
+    patterns = [
+        "за какое время", "на какое время", "какое время", "какие времена",
+        "во сколько", "когда можно", "в какое время", "какое окно", "какие окна",
+        "подсказать чтобы записаться", "подскажите время", "есть время",
+        "какое свободное время", "свободное время",
+        "қай уақыт", "кай уакыт", "сағат нешеде", "сагат нешеде",
+        "бос уақыт", "бос уакыт", "қай уақытта", "кай уакытта",
+    ]
+
+    return any(p in low for p in patterns) and not _parse_date(text)
+
+
+def _time_question_without_date_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Могу подсказать свободное время 🌿 Напишите, пожалуйста, на какой день Вам удобно прийти — я сразу проверю окошки в расписании.",
+        "Бос уақыттарды қарап бере аламын 🌿 Қай күні келгеніңіз ыңғайлы екенін жазыңызшы — кестеден бос уақыттарды бірден тексеремін.",
+    )
+
+
 def _is_later_month_or_self_schedule(text: str) -> bool:
     low = _low(_strip_quoted_bot_text(text))
     if not low:
@@ -1966,6 +1991,27 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if step == "date" and _is_thanks_or_ok(text):
         session["waiting_for_date"] = True
         return _no_reply(chat_id, session)
+
+    # date_question_mark_guard:
+    # Если пациент ответил только "?", не повторяем тот же вопрос дословно.
+    if step == "date" and _low(text).strip() in ("?", "??", "???"):
+        session["waiting_for_date"] = True
+        return _finalize(
+            chat_id,
+            session,
+            _tr(
+                session,
+                "Чтобы проверить свободное время, напишите, пожалуйста, удобный день — например: завтра, в понедельник или 23 июня 🌿",
+                "Бос уақытты тексеру үшін ыңғайлы күнді жазыңызшы — мысалы: ертең, дүйсенбі немесе 23 маусым 🌿",
+            ),
+        )
+
+    # time_without_date_guard:
+    # Если пациент спрашивает "на какое время можно?", но день ещё не выбран,
+    # не повторяем одну и ту же фразу, а объясняем, что сначала нужен день.
+    if step == "date" and _is_time_question_without_date(text):
+        session["waiting_for_date"] = True
+        return _finalize(chat_id, session, _time_question_without_date_answer(session))
 
     # mri_question_during_date_guard:
     # Если пациент на этапе выбора даты спрашивает про МРТ/снимок,
