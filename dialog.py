@@ -364,34 +364,54 @@ def _explicit_language_request(text: str) -> str | None:
 
 
 def _detect_lang(text: str, session: dict[str, Any]) -> str:
+    """Определяет язык без скачков туда-сюда.
+
+    Правило:
+    - первый осмысленный язык диалога фиксируем;
+    - короткие ответы типа "жоқ/рахмет/37 жаста" не переключают язык;
+    - смешанные сообщения не переключают язык;
+    - смена языка только если клиент явно попросил: "пишите на казахском/русском".
+    """
     current = session.get("language") or "ru"
     low = _low(text)
     text_stripped = (text or "").strip()
 
-    # Короткие казахские ответы в русской беседе НЕ должны переключать язык:
-    # "69 жаста", "Жоқ", "жок", "ия" — это ответы на вопросы, а не смена языка.
-    short_kz_answer = bool(
+    # Если язык уже зафиксирован в активном диалоге — держим его.
+    # Явная просьба сменить язык обрабатывается ниже в handle_message через _explicit_language_request.
+    if session.get("language_locked") and current in ("ru", "kk"):
+        return current
+
+    # Если диалог уже идёт, не переключаем язык от одного казахского/русского слова.
+    step_now = session.get("step") or "start"
+    if session.get("language") in ("ru", "kk") and step_now not in ("start", "", None):
+        return current
+
+    # Короткие ответы не должны переключать язык:
+    # "69 жаста", "Жоқ", "жок", "ия", "рахмет", "ок", "спасибо".
+    short_answer = bool(
         re.fullmatch(
-            r"\s*(?:\d{1,3}\s*(?:жаста|жас)?|жоқ|жок|ия|иә|жақсы|жаксы|рахмет)\s*[.!?🙏🌿]*\s*",
+            r"\s*(?:\d{1,3}\s*(?:жаста|жас|лет|года|год)?|жоқ|жок|ия|иә|жақсы|жаксы|рахмет|спасибо|ок|окей|нет|да)\s*[.!?🙏🌿]*\s*",
             low,
         )
     )
-    if current == "ru" and short_kz_answer:
-        return "ru"
+    if short_answer and current in ("ru", "kk"):
+        return current
 
-    # Сильный казахский: казахские буквы/фразы + нет явной русской основы.
     has_kz_letters = bool(re.search(r"[әғқңөұүһіӘҒҚҢӨҰҮҺІ]", text_stripped))
     has_kz_words = any(w in low for w in KZ_MARKERS) or bool(
         re.search(r"(емдей\s+аласыз|емдей\s+аласыздар|аласыздар\s+ма)", low)
     )
     has_ru = any(w in low for w in RU_MARKERS)
 
-    # Если в одном сообщении есть русские слова и пару казахских ответов — держим русский.
-    if has_ru and current == "ru":
-        return "ru"
+    # Смешанный текст: не скачем, держим текущий язык.
+    if has_ru and (has_kz_letters or has_kz_words) and current in ("ru", "kk"):
+        return current
 
     if has_kz_letters or has_kz_words:
         return "kk"
+
+    if has_ru:
+        return "ru"
 
     if detect_message_language:
         try:
@@ -401,12 +421,7 @@ def _detect_lang(text: str, session: dict[str, Any]) -> str:
         except Exception:
             pass
 
-    if has_ru:
-        return "ru"
-
     return current if current in ("ru", "kk") else "ru"
-
-
 def _tr(session_or_lang: dict[str, Any] | str, ru: str, kk: str) -> str:
     if isinstance(session_or_lang, dict):
         lang = session_or_lang.get("language") or "ru"
@@ -707,7 +722,11 @@ def _is_unknown_date_answer(text: str) -> bool:
         "когда дома буду", "когда буду дома", "с работы приду",
         "после работы", "на работе", "я пока на работа", "я пока на работе",
         "уточню", "надо подумать", "пока не могу сказать",
+        "в отпуск", "отпуск", "когда выйду в отпуск", "после отпуска",
+        "как освобожусь", "когда освобожусь",
         "кейін", "кейин", "білмеймін", "билмеймин", "үйге келгенде", "уйге келгенде",
+        "демалыс", "отпуска", "отпускға", "отпускка", "демалысқа", "демалыска",
+        "демалысқа шыққанда", "демалыска шыкканда", "қашан босаймын", "кашан босаймын",
     ]
     return any(p in low for p in patterns)
 
@@ -1223,6 +1242,19 @@ def _profile_confirm_and_ask_age(session: dict[str, Any]) -> str:
         "Здравствуйте! Да, это наша специализация 🌿 С такими жалобами к нам обращаются. Подскажите, пожалуйста, сколько Вам лет?",
         "Сәлеметсіз бе! Иә, бұл біздің клиниканың бағытына жатады 🌿 Мұндай шағымдармен бізге жиі келеді. Жасыңыз нешеде?",
     )
+def _profile_confirm_next_step(session: dict[str, Any]) -> str:
+    # Если возраст уже был написан раньше, не спрашиваем его повторно.
+    if session.get("age"):
+        return _tr(
+            session,
+            "Здравствуйте! Да, это наша специализация 🌿 С такими жалобами к нам обращаются.",
+            "Сәлеметсіз бе! Иә, бұл біздің клиниканың бағытына жатады 🌿 Мұндай шағымдармен бізге жиі келеді.",
+        ) + "\n\n" + _ask_contra(session)
+
+    return _profile_confirm_and_ask_age(session)
+
+
+
 def _ask_age_contextual(session: dict[str, Any], text: str) -> str:
     parts_ru: list[str] = []
     parts_kk: list[str] = []
@@ -1684,6 +1716,12 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session["phone"] = phone or session.get("phone") or ""
     session["language"] = _detect_lang(text, session)
 
+    # language_lock_guard:
+    # Фиксируем язык диалога, чтобы бот не прыгал RU/KZ от коротких ответов.
+    # Сменить язык можно только явной просьбой клиента.
+    if not session.get("language_locked") and text and not _is_thanks_or_ok(text):
+        session["language_locked"] = True
+
     # thanks_after_info_guard:
     # Если пациент поблагодарил после адреса/цены/графика, не начинаем анкету заново.
     # В WhatsApp это должно выглядеть как молчание живого админа, а не как новый сценарий.
@@ -1702,6 +1740,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     lang_request = _explicit_language_request(text)
     if lang_request:
         session["language"] = lang_request
+        session["language_locked"] = True
         return _finalize(
             chat_id,
             session,
@@ -1834,6 +1873,12 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             ),
         )
 
+    # waiting_date_thanks_guard:
+    # Если пациент уже сказал, что напишет дату позже, на "спасибо/рахмет/ок"
+    # не повторяем вопрос и не запускаем сценарий заново.
+    if step == "date" and session.get("waiting_for_date") and _is_thanks_or_ok(text):
+        return _no_reply(chat_id, session)
+
     # unknown_date_answer_guard:
     # Если пациент пока не знает день/время, не повторяем один и тот же вопрос.
     if step == "date" and _is_unknown_date_answer(text):
@@ -1844,8 +1889,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session,
             _tr(
                 session,
-                "Хорошо, ничего страшного 🌿 Когда определитесь с удобным днём и временем, просто напишите сюда — я помогу продолжить запись.",
-                "Жақсы, ештеңе етпейді 🌿 Қай күн мен уақыт ыңғайлы екенін анықтаған кезде осында жазыңыз — жазылуды жалғастыруға көмектесемін.",
+                "Да, конечно, можно 🌿 Когда будете знать удобный день и время — напишите сюда, я проверю свободные окошки и помогу с записью.",
+                "Иә, әрине болады 🌿 Сізге ыңғайлы күн мен уақыт белгілі болғанда осында жазыңыз — бос уақыттарды қарап, жазылуға көмектесемін.",
             ),
         )
 
@@ -1873,13 +1918,14 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session.clear()
         session["phone"] = phone or ""
         session["language"] = _detect_lang(text, session)
+        session["language_locked"] = True
         session["complaint"] = text
         session["profile_status"] = "profile"
         session["step"] = "age"
         return _finalize(
             chat_id,
             session,
-            _profile_confirm_and_ask_age(session),
+            _profile_confirm_next_step(session),
         )
 
     # profile_classifier_guard:
@@ -1962,8 +2008,12 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if step in ("start", "complaint") and not _is_no_contra_answer(text) and _profile_status(text) == "profile":
         session["complaint"] = text
         session["profile_status"] = "profile"
-        session["step"] = "age"
-        answer = _ask_age_contextual(session, text)
+        if session.get("age"):
+            session["step"] = "contra"
+            answer = _profile_confirm_next_step(session)
+        else:
+            session["step"] = "age"
+            answer = _ask_age_contextual(session, text)
         return _finalize(chat_id, session, answer)
 
 
@@ -2064,6 +2114,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return _finalize(chat_id, session, _ask_complaint(session))
 
         session["complaint"] = text
+        if session.get("age"):
+            session["step"] = "contra"
+            return _finalize(chat_id, session, _profile_confirm_next_step(session))
         session["step"] = "age"
         return _finalize(chat_id, session, _ask_age_contextual(session, text))
 
