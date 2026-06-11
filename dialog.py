@@ -701,34 +701,36 @@ def _remove_name_addressing(answer: str, session: dict[str, Any]) -> str:
 
 
 def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
-    """Страховка от лишней отсебятины.
+    """Мягкая защита от лишней отсебятины.
 
-    Не трогаем обязательные длинные сообщения: чек-лист противопоказаний,
-    подтверждение записи, адрес/цены/МРТ и системные ответы об эскалации.
+    Обязательные вопросы сценария не обрезаем.
     """
     if not answer:
         return answer
 
     low = _low(answer)
-    allow_long_markers = [
+
+    allow_long = any(x in low for x in [
         "перед записью нужно подтвердить",
-        "жазылмас бұрын нақтылау",
+        "перед записью мне нужно уточнить",
         "противопоказан",
-        "қарсы көрсетілім",
         "ваш визит в neuro balance",
-        "neuro balance қабылдауы",
         "запись подтверждена",
-        "жазба расталды",
-        "адрес:",
-        "мекенжай:",
-        "приём в нашей клинике",
-        "қабылдау",
-        "мрт",
-        "снимки",
-        "передам администратору",
-        "әкімшіге",
-    ]
-    if any(marker in low for marker in allow_long_markers):
+        "кардиостимулятор",
+        "сколько вам лет",
+        "жасыңыз нешеде",
+        "жасыныз нешеде",
+        "на какой день вам удобно",
+        "қай күн ыңғайлы",
+        "кай кун ыңгайлы",
+        "какое вам удобно",
+        "қайсысы ыңғайлы",
+        "кайсысы ыңгайлы",
+        "для оформления записи",
+        "жазбаны рәсімдеу",
+    ])
+
+    if allow_long:
         return answer.strip()
 
     banned_fragments = [
@@ -738,19 +740,16 @@ def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
         "лучшие специалисты",
         "не переживайте, мы вас вылечим",
     ]
+
     cleaned = answer
     for fragment in banned_fragments:
         cleaned = re.sub(re.escape(fragment), "", cleaned, flags=re.I)
 
-    # Обычные ответы держим короткими. Блоки через \n\n не режем агрессивно,
-    # чтобы не сломать уже готовые шаблоны.
-    if "\n" not in cleaned:
-        sentences = re.split(r"(?<=[.!?])\s+", cleaned.strip())
-        if len(sentences) > 2:
-            cleaned = " ".join(sentences[:2]).strip()
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned.strip())
+    if len(sentences) > 2:
+        cleaned = " ".join(sentences[:2]).strip()
 
     return cleaned.strip()
-
 def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     answer = _clean(answer)
     answer = _remove_name_addressing(answer, session)
@@ -1046,29 +1045,25 @@ def _ask_complaint(session: dict[str, Any]) -> str:
 def _ask_age(session: dict[str, Any]) -> str:
     return _tr(
         session,
-        "Понимаю Вас 🙏 С такой жалобой можно прийти на первичную консультацию. Подскажите, пожалуйста, сколько Вам лет?",
-        "Түсіндім 🙏 Мұндай шағыммен алғашқы консультацияға келуге болады. Жасыңыз нешеде?",
+        "Подскажите, пожалуйста, сколько Вам лет?",
+        "Жасыңыз нешеде?",
     )
-
-
 def _ask_age_contextual(session: dict[str, Any], text: str) -> str:
     parts_ru: list[str] = []
     parts_kk: list[str] = []
 
     if _has_any(text, PRICE_WORDS):
-        parts_ru.append("Приём в нашей клинике — 5 000 тг 🌿 В стоимость входит осмотр врача и консультация.")
-        parts_kk.append("Біздің клиникада алғашқы қабылдау — 5 000 тг 🌿 Құнына дәрігердің қарауы және консультация кіреді.")
+        parts_ru.append("Приём в нашей клинике — 5 000 тг 🌿")
+        parts_kk.append("Біздің клиникада алғашқы қабылдау — 5 000 тг 🌿")
 
     if _has_mri_question(text):
-        parts_ru.append("МРТ заранее делать не обязательно. Врач на консультации осмотрит Вас и подскажет, нужно ли МРТ/КТ или другое обследование.")
-        parts_kk.append("МРТ-ны алдын ала жасау міндетті емес. Дәрігер консультацияда қарап, МРТ/КТ немесе басқа тексеріс керек пе — соны айтады.")
+        parts_ru.append("МРТ заранее делать не обязательно. Врач на консультации подскажет, нужно ли обследование.")
+        parts_kk.append("МРТ-ны алдын ала жасау міндетті емес. Дәрігер консультацияда қажет пе — соны айтады.")
 
-    parts_ru.append("Понимаю Вас 🙏 С такой жалобой можно прийти на первичную консультацию. Подскажите, пожалуйста, сколько Вам лет?")
-    parts_kk.append("Түсіндім 🙏 Мұндай шағыммен алғашқы консультацияға келуге болады. Жасыңыз нешеде?")
+    parts_ru.append("Подскажите, пожалуйста, сколько Вам лет?")
+    parts_kk.append("Жасыңыз нешеде?")
 
     return _tr(session, "\n\n".join(parts_ru), "\n\n".join(parts_kk))
-
-
 def _senior_contra_intro(session: dict[str, Any]) -> str:
     return _stop_booking_text(session, "over_75")
 
