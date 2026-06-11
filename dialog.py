@@ -493,6 +493,34 @@ def _normalize_typos(text: str) -> str:
     for wrong, right in replacements.items():
         s = s.replace(wrong, right)
 
+    live_typos = {
+        "хачу": "хочу",
+        "хочу записатся": "хочу записаться",
+        "хочу записатса": "хочу записаться",
+        "хочу записаца": "хочу записаться",
+        "записатся": "записаться",
+        "записатса": "записаться",
+        "записаца": "записаться",
+        "кансультация": "консультация",
+        "консультацы": "консультация",
+        "спосибо": "спасибо",
+        "спасиба": "спасибо",
+        "рахмед": "рахмет",
+        "ракмет": "рахмет",
+        "отмините": "отмените",
+        "атмените": "отмените",
+        "отменити": "отмените",
+        "атмена": "отмена",
+        "ни приду": "не приду",
+        "не прийду": "не приду",
+        "не смогу придти": "не смогу прийти",
+        "напомнити": "напомните",
+        "напамните": "напомните",
+        "времья": "время",
+    }
+    for wrong, right in live_typos.items():
+        s = s.replace(wrong, right)
+
     # Нормализуем пробелы.
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -500,6 +528,21 @@ def _normalize_typos(text: str) -> str:
 
 def _low(text: str) -> str:
     return _normalize_typos(text)
+
+
+def _has_negative_visit_intent(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    if not low:
+        return False
+
+    negative_phrases = [
+        "не приду", "не прийду", "не буду", "не смогу прийти", "не смогу приехать",
+        "не получится прийти", "не получается прийти", "я не приду", "я не буду",
+        "келмеймін", "келе алмаймын", "бармаймын",
+    ]
+    return any(p in low for p in negative_phrases)
+
+
 def _word_distance_one(a: str, b: str) -> bool:
     """Очень лёгкая проверка опечатки в 1 символ для слов длиной от 5.
 
@@ -945,6 +988,9 @@ def _strip_quoted_bot_text(text: str) -> str:
 def _is_visit_confirmation_reply(text: str) -> bool:
     low = _low(_strip_quoted_bot_text(text))
     if not low:
+        return False
+
+    if _has_negative_visit_intent(low):
         return False
 
     confirm_words = [
