@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+import mimetypes
 from typing import Any
+
+import httpx
 
 from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File
 
@@ -66,6 +69,238 @@ def _guard_answer(chat_id: str, answer: str) -> str:
     return enforce_prompt_only(answer or "", session)
 
 
+
+def _deep_find_audio_items(obj: Any) -> list[dict[str, Any]]:
+    """Ищет в payload Wazzup вложения/медиа, похожие на голосовое или аудио.
+
+    Сделано максимально безопасно: если Wazzup пришлёт обычный текст,
+    функция ничего не добавит и старый путь не изменится.
+    """
+    found: list[dict[str, Any]] = []
+
+    audio_keys = {
+        "audio", "voice", "ptt", "media", "attachment", "attachments",
+        "file", "files", "document", "content", "message",
+    }
+
+    def walk(x: Any, parents: list[dict[str, Any]]) -> None:
+        if isinstance(x, dict):
+            low_keys = {str(k).lower() for k in x.keys()}
+            type_text = " ".join(str(x.get(k, "")) for k in [
+                "type", "messageType", "contentType", "mimeType", "mime", "mediaType",
+            ]).lower()
+
+            url_text = " ".join(str(x.get(k, "")) for k in [
+                "url", "fileUrl", "mediaUrl", "downloadUrl", "contentUri",
+                "contentUrl", "link", "href",
+            ]).lower()
+
+            filename_text = " ".join(str(x.get(k, "")) for k in [
+                "filename", "fileName", "name",
+            ]).lower()
+
+            looks_audio = (
+                "audio" in type_text
+                or "voice" in type_text
+                or "ptt" in type_text
+                or "ogg" in filename_text
+                or "oga" in filename_text
+                or "opus" in filename_text
+                or "mp3" in filename_text
+                or "m4a" in filename_text
+                or "wav" in filename_text
+                or ".ogg" in url_text
+                or ".oga" in url_text
+                or ".mp3" in url_text
+                or ".m4a" in url_text
+                or ".wav" in url_text
+            )
+
+            if looks_audio and (low_keys & audio_keys or url_text):
+                item = dict(x)
+                for parent in reversed(parents):
+                    for k in [
+                        "chatId", "chat_id", "chat_id_external", "phone", "from", "sender",
+                        "chatType", "chat_type", "channelId", "channel_id", "messageId",
+                        "id", "messageKey", "message_key",
+                    ]:
+                        if k not in item and k in parent:
+                            item[k] = parent[k]
+                found.append(item)
+
+            walk_parents = parents + [x]
+            for v in x.values():
+                walk(v, walk_parents)
+
+        elif isinstance(x, list):
+            for v in x:
+                walk(v, parents)
+
+    walk(obj, [])
+    return found
+
+
+def _first_value(d: dict[str, Any], keys: list[str]) -> Any:
+    for key in keys:
+        if key in d and d.get(key) not in (None, ""):
+            return d.get(key)
+    return None
+
+
+def _message_from_audio_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Превращает найденное audio/media-вложение в формат сообщения для обработчика."""
+    url = _first_value(item, [
+        "url", "fileUrl", "mediaUrl", "downloadUrl", "contentUri",
+        "contentUrl", "link", "href",
+    ])
+
+    # Иногда URL лежит глубже: file.url / media.url / audio.url
+    if not url:
+        for nested_key in ["file", "media", "audio", "voice", "attachment", "content"]:
+            nested = item.get(nested_key)
+            if isinstance(nested, dict):
+                url = _first_value(nested, [
+                    "url", "fileUrl", "mediaUrl", "downloadUrl", "contentUri",
+                    "contentUrl", "link", "href",
+                ])
+                if url:
+                    break
+
+    if not url:
+        return None
+
+    chat_id = _first_value(item, [
+        "chat_id", "chatId", "chat_id_external", "phone", "from", "sender", "contactPhone",
+    ])
+    if isinstance(chat_id, dict):
+        chat_id = _first_value(chat_id, ["phone", "id", "chatId", "chat_id"])
+
+    phone = _first_value(item, ["phone", "from", "sender", "contactPhone"]) or chat_id
+    if isinstance(phone, dict):
+        phone = _first_value(phone, ["phone", "id", "chatId", "chat_id"]) or chat_id
+
+    if not chat_id:
+        return None
+
+    message_key = _first_value(item, ["message_key", "messageKey", "messageId", "id"])
+    filename = _first_value(item, ["filename", "fileName", "name"]) or "voice.ogg"
+    content_type = _first_value(item, ["contentType", "mimeType", "mime"]) or ""
+
+    return {
+        "chat_id": str(chat_id),
+        "phone": str(phone or chat_id),
+        "chat_type": str(_first_value(item, ["chat_type", "chatType"]) or "whatsapp"),
+        "channel_id": _first_value(item, ["channel_id", "channelId"]),
+        "message_key": str(message_key or f"voice:{chat_id}:{url}"),
+        "kind": "voice",
+        "media_url": str(url),
+        "file_url": str(url),
+        "filename": str(filename),
+        "content_type": str(content_type),
+        "raw_audio_item": item,
+    }
+
+
+def _extract_voice_messages_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for item in _deep_find_audio_items(payload):
+        msg = _message_from_audio_item(item)
+        if not msg:
+            continue
+        key = str(msg.get("message_key") or msg.get("media_url") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        messages.append(msg)
+
+    return messages
+
+
+def _message_has_voice_url(message: dict[str, Any]) -> bool:
+    if str(message.get("kind") or "").lower() == "voice":
+        return True
+
+    maybe = " ".join(str(message.get(k, "")) for k in [
+        "media_url", "file_url", "url", "fileUrl", "mediaUrl", "downloadUrl",
+        "content_type", "mimeType", "type",
+    ]).lower()
+
+    return any(x in maybe for x in ["audio", "voice", "ogg", "oga", "opus", "mp3", "m4a", "wav"])
+
+
+def _voice_url_from_message(message: dict[str, Any]) -> str | None:
+    for key in ["media_url", "file_url", "url", "fileUrl", "mediaUrl", "downloadUrl", "contentUri", "contentUrl"]:
+        value = message.get(key)
+        if value:
+            return str(value)
+
+    raw = message.get("raw_audio_item")
+    if isinstance(raw, dict):
+        nested_msg = _message_from_audio_item(raw)
+        if nested_msg:
+            return str(nested_msg.get("media_url") or "")
+
+    return None
+
+
+async def _download_voice_bytes(message: dict[str, Any]) -> tuple[bytes, str, str]:
+    """Скачивает голосовое по URL из Wazzup.
+
+    Если URL подписанный — хватит обычного GET.
+    Если Wazzup требует авторизацию — добавляем Bearer/API headers, но только если ключ есть.
+    """
+    url = _voice_url_from_message(message)
+    if not url:
+        raise ValueError("voice media url not found")
+
+    settings = get_settings()
+    api_key = (
+        getattr(settings, "wazzup_api_key", "")
+        or getattr(settings, "wazzup_token", "")
+        or getattr(settings, "wazzup_access_token", "")
+        or ""
+    )
+
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+        headers["X-API-KEY"] = str(api_key)
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
+        response = await client.get(url, headers=headers, follow_redirects=True)
+        response.raise_for_status()
+
+    content_type = response.headers.get("content-type") or str(message.get("content_type") or "")
+    filename = str(message.get("filename") or "")
+
+    if not filename or "." not in filename:
+        ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ".ogg"
+        filename = f"voice{ext}"
+
+    return response.content, filename, content_type
+
+
+async def _transcribe_voice_message(message: dict[str, Any]) -> str:
+    """Распознаёт голосовое максимально совместимо со старым кодом.
+
+    Сначала пробуем существующую функцию transcribe_wazzup_voice(message).
+    Если она не подходит под формат Wazzup — скачиваем файл и отправляем bytes в Whisper/OpenAI.
+    """
+    try:
+        transcript = await transcribe_wazzup_voice(message, language="ru")
+        text = str(getattr(transcript, "text", "") or "")
+        if text.strip():
+            return text.strip()
+    except Exception as exc:
+        state.log_event(str(message.get("chat_id") or "voice"), "voice_transcribe_wazzup_error", {"error": str(exc)[:1000]})
+
+    data, filename, _content_type = await _download_voice_bytes(message)
+    transcript = await transcribe_bytes(data, filename=filename, language="ru")
+    return str(getattr(transcript, "text", "") or "").strip()
+
+
 async def _build_answer_for_message(message: dict[str, Any]) -> str:
     chat_id = str(message["chat_id"])
     phone = str(message.get("phone") or chat_id)
@@ -76,9 +311,10 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
         state.log_event(chat_id, "silent_outside_work_time", {"kind": kind})
         return ""
 
-    if kind == "voice":
-        transcript = await transcribe_wazzup_voice(message, language="ru")
-        user_text = voice_text_for_bot(transcript.text)
+    if kind == "voice" or _message_has_voice_url(message):
+        transcript_text = await _transcribe_voice_message(message)
+        user_text = voice_text_for_bot(transcript_text)
+        state.log_event(chat_id, "voice_transcribed", {"text": transcript_text[:500]})
     else:
         user_text = str(message.get("text") or "")
 
@@ -183,6 +419,25 @@ async def wazzup_webhook(request: Request, authorization: str | None = Header(de
 
     payload = await request.json()
     messages = extract_incoming_messages(payload)
+
+    # voice_fallback_extractor:
+    # Если текущий wazzup.extract_incoming_messages не распознал голосовое,
+    # аккуратно достаём audio/media из raw payload. Для обычного текста ничего не меняется.
+    try:
+        extra_voice_messages = _extract_voice_messages_from_payload(payload)
+        existing_keys = {str(m.get("message_key") or "") for m in messages}
+        existing_voice_urls = {
+            str(m.get("media_url") or m.get("file_url") or m.get("url") or "")
+            for m in messages
+        }
+        for vm in extra_voice_messages:
+            vm_key = str(vm.get("message_key") or "")
+            vm_url = str(vm.get("media_url") or "")
+            if (vm_key and vm_key in existing_keys) or (vm_url and vm_url in existing_voice_urls):
+                continue
+            messages.append(vm)
+    except Exception as exc:
+        state.log_event("system", "voice_payload_extract_error", {"error": str(exc)[:1000]})
 
     accepted = 0
     skipped = 0
