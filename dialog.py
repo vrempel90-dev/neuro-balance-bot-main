@@ -718,6 +718,29 @@ def _strip_quoted_bot_text(text: str) -> str:
     return "\n".join(cleaned_lines).strip() or text
 
 
+def _is_later_month_or_self_schedule(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    if not low:
+        return False
+
+    later_words = [
+        "потом", "позже", "позже сам", "позже сама", "сам выберу", "сама выберу",
+        "сам напишу", "сама напишу", "когда смогу", "как смогу",
+        "только в сентябре", "в сентябре", "сентябрь", "сентябре",
+        "в августе", "август", "в июле", "июль", "через месяц", "через пару месяцев",
+        "после каникул", "каникулы", "сейчас сижу с внуками",
+        "кейін", "кейин", "өзім жазамын", "озим жазамын", "өзім таңдаймын", "озим тандаймын",
+        "қыркүйек", "кыркүйек", "қыркүйекте", "кыркуйекте",
+        "тамыз", "шілде", "шилде", "бір айдан кейін", "бир айдан кейин",
+    ]
+
+    # Если пациент всё-таки назвал конкретную дату/день недели — не закрываем, пусть CRM покажет слоты.
+    if _parse_date(text):
+        return False
+
+    return any(w in low for w in later_words)
+
+
 def _is_vacation_later_visit(text: str) -> bool:
     low = _low(_strip_quoted_bot_text(text))
     if not low:
@@ -1888,11 +1911,28 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["profile_status"] = "non_profile"
         return _finalize(chat_id, session, _non_profile_answer(session, text))
 
+    # later_during_contra_guard:
+    # Если пациент ещё на этапе противопоказаний пишет, что сможет только позже
+    # ("только в сентябре", "сам выберу время", "потом приеду"),
+    # мягко завершаем диалог и НЕ спрашиваем потом дату после "нет/спасибо".
+    if step == "contraindications" and _is_later_month_or_self_schedule(text):
+        session["step"] = "stopped"
+        session["status"] = "waiting_patient_later"
+        session["waiting_for_date"] = True
+        session["contraindications_pending"] = True
+        return _finalize(chat_id, session, _vacation_later_visit_answer(session))
+
     # contra_no_answer_final_guard:
     # "Нет/Жоқ" на этапе противопоказаний = противопоказаний нет.
     if step == "contraindications" and _is_no_contra_answer(text):
         session["contraindications_ok"] = True
         session["contraindications_raw"] = "нет"
+
+        if session.get("waiting_for_date") or session.get("status") == "waiting_patient_later":
+            session["step"] = "stopped"
+            session["status"] = "waiting_patient_later"
+            return _no_reply(chat_id, session)
+
         session["step"] = "date"
         session["questionnaire_step"] = "date"
         return _finalize(chat_id, session, _ask_date(session))
@@ -1920,6 +1960,13 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if step == "date" and session.get("waiting_for_date") and _is_thanks_or_ok(text):
         return _no_reply(chat_id, session)
 
+    # date_plain_thanks_guard:
+    # Если бот спросил дату, а пациент ответил только "спасибо/рахмет/ок",
+    # не повторяем вопрос "На какой день удобно?".
+    if step == "date" and _is_thanks_or_ok(text):
+        session["waiting_for_date"] = True
+        return _no_reply(chat_id, session)
+
     # mri_question_during_date_guard:
     # Если пациент на этапе выбора даты спрашивает про МРТ/снимок,
     # отвечаем на вопрос и не повторяем "қай күн ыңғайлы?".
@@ -1928,9 +1975,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _finalize(chat_id, session, _mri_answer_in_flow(session))
 
     # vacation_later_visit_guard:
-    # Если пациент пишет, что позже/в отпуске сам придёт на консультацию,
+    # Если пациент пишет, что позже/в отпуске/в другом месяце сам придёт на консультацию,
     # не повторяем вопрос про дату, а мягко завершаем диалог.
-    if step == "date" and _is_vacation_later_visit(text):
+    if step == "date" and (_is_vacation_later_visit(text) or _is_later_month_or_self_schedule(text)):
         session["step"] = "stopped"
         session["status"] = "waiting_patient_later"
         session["waiting_for_date"] = True
