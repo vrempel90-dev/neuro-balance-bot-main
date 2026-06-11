@@ -27,9 +27,12 @@ def _headers() -> dict[str, str]:
         or getattr(settings, "bot_api_secret", "")
         or ""
     )
+
+    # Railway/копирование с телефона иногда добавляет пробел или перевод строки.
+    # httpx тогда падает с LocalProtocolError: Illegal header value.
+    secret = str(secret or "").strip()
+
     return {"x-bot-secret": secret}
-
-
 def _url(path: str) -> str:
     settings = get_settings()
     base = getattr(settings, "crm_base_url", "https://neuro-balance-crm.vercel.app")
