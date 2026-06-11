@@ -15,6 +15,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import crm
+import main
 import state
 from dialog import handle_message
 
@@ -104,6 +105,7 @@ def test_standalone_thanks_ok_do_not_start_questionnaire(monkeypatch: Any) -> No
         result = answer(chat_id, text)
         session = state.get_session(chat_id)
         assert result == ""
+        assert main._guard_answer(chat_id, result) == ""
         assert session["step"] == "start"
 
     assert calls["lookup"] == []
