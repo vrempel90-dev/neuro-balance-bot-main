@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 import sys
@@ -17,6 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import crm
 import main
 import state
+import dialog
 from dialog import handle_message
 
 
@@ -550,3 +552,26 @@ def test_old_bot_tool_gates_and_operator_templates(monkeypatch: Any) -> None:
     assert result
     assert session["status"] == "booked"
     assert len(calls["book"]) == 1
+
+
+def test_static_dialog_template_wiring_and_tr_arity() -> None:
+    source = (PROJECT_ROOT / "dialog.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    tr_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_tr"]
+    assert tr_calls
+    assert all(len(node.args) == 3 for node in tr_calls)
+
+    session: dict[str, Any] = {"language": "ru"}
+    address = dialog._address_answer(session)
+    schedule = dialog._schedule_answer(session)
+    mri = dialog._mri_answer_in_flow(session)
+
+    assert "2gis.kz" in address
+    assert "График приёма" in schedule
+    assert "Снимок заранее делать не обязательно" in mri
+
+    escalated_session: dict[str, Any] = {"language": "ru"}
+    returning = dialog._clinic_answer("Я уже была у вас раньше", escalated_session)
+    assert returning and "когда Вы у нас были" in returning
+    assert escalated_session["step"] == "escalated"
