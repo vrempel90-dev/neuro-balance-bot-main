@@ -422,6 +422,75 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
             pass
 
 
+def _dig_any(obj: Any, path: str) -> Any:
+    cur = obj
+    for key in path.split("."):
+        if isinstance(cur, dict) and key in cur:
+            cur = cur[key]
+        else:
+            return None
+    return cur
+
+
+def _raw_wazzup_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = payload.get("messages") or payload.get("message") or []
+    if isinstance(raw, dict):
+        raw = [raw]
+    return [m for m in raw if isinstance(m, dict)]
+
+
+def _looks_like_outgoing_message(msg: dict[str, Any]) -> bool:
+    return bool(
+        msg.get("isEcho") is True
+        or msg.get("fromMe") is True
+        or str(msg.get("direction") or msg.get("status") or "").lower() in {"out", "outgoing", "sent"}
+        or str(_dig_any(msg, "message.direction") or "").lower() in {"out", "outgoing", "sent"}
+    )
+
+
+def _looks_like_api_bot_message(msg: dict[str, Any], session: dict[str, Any]) -> bool:
+    source_text = " ".join(
+        str(x or "")
+        for x in [
+            msg.get("source"), msg.get("sender"), msg.get("author"), msg.get("createdBy"),
+            msg.get("from"), msg.get("type"), _dig_any(msg, "message.source"),
+            _dig_any(msg, "message.sender"), _dig_any(msg, "message.author"),
+        ]
+    ).lower()
+    if any(marker in source_text for marker in ["api", "bot", "integration", "webhook"]):
+        return True
+    if msg.get("fromApi") is True or msg.get("isApi") is True or _dig_any(msg, "message.fromApi") is True:
+        return True
+
+    text = str(
+        msg.get("text")
+        or msg.get("body")
+        or msg.get("content")
+        or _dig_any(msg, "message.text")
+        or _dig_any(msg, "message.body")
+        or ""
+    ).strip()
+    last_bot = str(session.get("last_assistant_answer") or session.get("last_bot_answer") or "").strip()
+    return bool(text and last_bot and text == last_bot)
+
+
+def _mark_manual_admin_interventions(payload: dict[str, Any]) -> None:
+    for msg in _raw_wazzup_messages(payload):
+        if not _looks_like_outgoing_message(msg):
+            continue
+        chat_id = str(msg.get("chatId") or msg.get("chat_id") or msg.get("from") or "").strip()
+        if not chat_id:
+            continue
+        session = _get_session_safe(chat_id)
+        if _looks_like_api_bot_message(msg, session):
+            continue
+        session["manual_admin_intervention"] = True
+        session["manual_takeover"] = True
+        session["ai_muted"] = True
+        state.save_session(chat_id, session)
+        state.log_event(chat_id, "manual_admin_intervention_detected", {"source": "wazzup_outgoing"})
+
+
 @app.post("/webhook/wazzup")
 async def wazzup_webhook(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     settings = get_settings()
@@ -431,6 +500,7 @@ async def wazzup_webhook(request: Request, authorization: str | None = Header(de
             raise HTTPException(status_code=401, detail="Bad webhook secret")
 
     payload = await request.json()
+    _mark_manual_admin_interventions(payload)
     messages = extract_incoming_messages(payload)
 
     # voice_fallback_extractor:

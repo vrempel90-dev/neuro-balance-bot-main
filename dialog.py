@@ -121,6 +121,22 @@ MRI_WORDS = [
 ]
 
 
+METHOD_WORDS = [
+    "что за методика", "какая методика", "методика", "методы лечения", "как лечите",
+    "чем лечите", "какое лечение", "что делаете", "безоперацион", "без операции",
+]
+
+DOCTOR_WORDS = [
+    "у вас врачи", "врачи или как", "врач или как", "консультацию проводит врач",
+    "кто консультирует", "кто смотрит", "врач смотрит", "доктор", "доктора",
+]
+
+COURSE_DURATION_WORDS = [
+    "сколько дней будет всего", "сколько дней", "сколько процедур", "сколько длится курс",
+    "длительность курса", "курс сколько", "сколько сеансов", "сколько лечение длится",
+]
+
+
 # ============================================================
 # Profile classifier
 # Профиль клиники: спина, позвоночник, суставы, мышцы, неврология,
@@ -305,7 +321,7 @@ LOOKUP_WORDS = [
 
 NO_CONTRA_WORDS = [
     "нет", "нету", "не было", "противопоказаний нет", "нет противопоказаний",
-    "ничего нет", "все нет", "всё нет", "по всем нет",
+    "ничего нет", "нет такого ничего", "нет такого", "все нет", "всё нет", "по всем нет",
     "жоқ", "жок", "joq", "jok", "қарсы көрсетілім жоқ", "карсы корсетилим жок",
 ]
 
@@ -903,7 +919,7 @@ def _is_no_contra_answer(text: str) -> bool:
 
     # Explicit answers meaning "no contraindications".
     explicit_no = [
-        "нет", "нету", "не имеется", "нет ничего", "ничего нет", "противопоказаний нет", "противопаказаний нет", "противопокозаний нет",
+        "нет", "нету", "не имеется", "нет ничего", "ничего нет", "нет такого ничего", "нет такого", "противопоказаний нет", "противопаказаний нет", "противопокозаний нет",
         "нет противопоказаний", "ограничений нет", "не противопоказаний",
         "жоқ", "жок", "қарсы көрсетілім жоқ", "карсы корсетилим жок",
         "қарсы көрсетілімдер жоқ", "карсы корсетилимдер жок",
@@ -1288,6 +1304,11 @@ def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
         "жасыңыз нешеде",
         "жасыныз нешеде",
         "на какой день вам удобно",
+        "безоперационные методы лечения",
+        "магнитотерапия",
+        "консультацию проводит врач",
+        "количество дней и процедур",
+        "процедурные дни",
         "қай күн ыңғайлы",
         "кай кун ыңгайлы",
         "какое вам удобно",
@@ -1333,7 +1354,14 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
                 "Сізді не мазалайды? 🌿",
             )
 
-    # Никогда не возвращаем пустой ответ: если ответ совпал, мягко уточняем.
+    # duplicate_answer_guard: на одно входящее сообщение — один ответ.
+    # Если новый текст полностью совпадает с последним ответом бота, молчим,
+    # чтобы Wazzup не получал одинаковые сообщения подряд.
+    last_answer = _clean(str(session.get("last_assistant_answer") or session.get("last_bot_answer") or ""))
+    if last_answer and _low(last_answer) == _low(answer):
+        _safe_save(chat_id, session)
+        return ""
+
     session["last_assistant_answer"] = answer
     _safe_save(chat_id, session)
     _safe_add_message(chat_id, "assistant", answer)
@@ -1606,8 +1634,41 @@ def _extract_name(text: str) -> str:
     return clean.title() if _looks_like_name(clean) else ""
 
 
+def _method_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "В клинике применяются безоперационные методы лечения боли в спине, шее, грыж, протрузий и суставов: магнитотерапия, лазерная терапия, ударно-волновая терапия, PRP, иглотерапия и ЛФК 🌿",
+        "Клиникада арқа, мойын, грыжа, протрузия және буын ауруларын емдеудің операциясыз әдістері қолданылады: магнитотерапия, лазерлік терапия, соққы-толқынды терапия, PRP, инетерапия және ЕДШ 🌿",
+    )
+
+
+def _doctor_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Да, консультацию проводит врач 🌿 Он осматривает, оценивает состояние и подбирает индивидуальный план лечения.",
+        "Иә, консультацияны дәрігер жүргізеді 🌿 Ол қарап, жағдайды бағалап, жеке ем жоспарын таңдайды.",
+    )
+
+
+def _course_duration_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Количество дней и процедур врач сможет определить только после первичного осмотра 🌿 Всё зависит от диагноза, состояния и индивидуального плана лечения.",
+        "Күндер мен процедуралар санын дәрігер алғашқы қараудан кейін ғана анықтай алады 🌿 Бәрі диагнозға, жағдайға және жеке ем жоспарына байланысты.",
+    )
+
+
 def _clinic_answer(text: str, session: dict[str, Any]) -> str | None:
     lang = session.get("language") or "ru"
+
+    if _has_any(text, METHOD_WORDS):
+        return _method_answer(session)
+
+    if _has_any(text, DOCTOR_WORDS):
+        return _doctor_answer(session)
+
+    if _has_any(text, COURSE_DURATION_WORDS):
+        return _course_duration_answer(session)
 
     if _has_any(text, PRICE_WORDS):
         return _price_answer(text, session)
@@ -1669,6 +1730,15 @@ def _profile_confirm_next_step(session: dict[str, Any]) -> str:
 
 
 
+def _has_leg_radiation_profile(text: str) -> bool:
+    low = _low(text)
+    patterns = [
+        "отдаёт в ногу", "отдает в ногу", "боль отдаёт в ногу", "боль отдает в ногу",
+        "тянет ногу", "немеет нога", "в ногу стреляет", "стреляет в ногу",
+        "отдаёт на ногу", "отдает на ногу",
+    ]
+    return any(p in low for p in patterns)
+
 def _ask_age_contextual(session: dict[str, Any], text: str) -> str:
     parts_ru: list[str] = []
     parts_kk: list[str] = []
@@ -1681,8 +1751,12 @@ def _ask_age_contextual(session: dict[str, Any], text: str) -> str:
         parts_ru.append("Снимки и МРТ заранее делать не обязательно 🌿 На первичном осмотре врач сам посмотрит Ваше состояние и, если потребуется, назначит обследование.")
         parts_kk.append("Снимок немесе МРТ-ны алдын ала жасау міндетті емес 🌿 Алғашқы қаралу кезінде дәрігер қажет болса тексеріс тағайындайды.")
 
-    parts_ru.append("Здравствуйте! Да, это наша специализация 🌿 С такими жалобами к нам обращаются. Подскажите, пожалуйста, сколько Вам лет?")
-    parts_kk.append("Сәлеметсіз бе! Иә, бұл біздің клиниканың бағытына жатады 🌿 Мұндай шағымдармен бізге жиі келеді. Жасыңыз нешеде?")
+    if _has_leg_radiation_profile(text):
+        parts_ru.append("Да, с такими жалобами к нам обращаются 🌿 Боль в пояснице, которая отдаёт в ногу, относится к нашему профилю. Подскажите, пожалуйста, сколько Вам лет?")
+        parts_kk.append("Иә, мұндай шағымдармен бізге жүгінеді 🌿 Белден аяққа берілетін ауырсыну біздің профильге жатады. Жасыңыз нешеде?")
+    else:
+        parts_ru.append("Здравствуйте! Да, это наша специализация 🌿 С такими жалобами к нам обращаются. Подскажите, пожалуйста, сколько Вам лет?")
+        parts_kk.append("Сәлеметсіз бе! Иә, бұл біздің клиниканың бағытына жатады 🌿 Мұндай шағымдармен бізге жиі келеді. Жасыңыз нешеде?")
 
     return _tr(session, "\n\n".join(parts_ru), "\n\n".join(parts_kk))
 def _senior_contra_intro(session: dict[str, Any]) -> str:
@@ -2074,6 +2148,12 @@ def _mandatory_step_prompt(session: dict[str, Any], step: str) -> str:
 
 
 def _faq_answer(text: str, session: dict[str, Any]) -> str | None:
+    if _has_any(text, METHOD_WORDS):
+        return _method_answer(session)
+    if _has_any(text, DOCTOR_WORDS):
+        return _doctor_answer(session)
+    if _has_any(text, COURSE_DURATION_WORDS):
+        return _course_duration_answer(session)
     if _has_any(text, PRICE_WORDS):
         return _price_answer(text, session)
     if _has_mri_question(text):
@@ -2309,8 +2389,11 @@ async def _safe_intent_router(chat_id: str, phone: str, session: dict[str, Any],
 
     info = _clinic_answer(text, session)
     if info and not (_has_complaint(text) or _has_medical_complaint_text(text)):
-        # После инфо-вопросов не ставим жёстко "complaint", чтобы "спасибо" не запустило анкету.
         session["last_info_answer"] = True
+        if _has_any(text, METHOD_WORDS) and step in ("start", "", None):
+            session["step"] = "complaint"
+            return info + "\n\n" + _tr(session, "Чтобы подсказать точнее, напишите, пожалуйста, что Вас беспокоит?", "Дәлірек бағыттау үшін не мазалайтынын жазыңызшы?")
+        # После остальных инфо-вопросов не ставим жёстко "complaint", чтобы "спасибо" не запустило анкету.
         if step in ("start", "", None):
             session["step"] = "start"
         return info
@@ -2321,6 +2404,43 @@ async def _safe_intent_router(chat_id: str, phone: str, session: dict[str, Any],
         return _clarify_intent_answer(session)
 
     return None
+
+
+def _is_ai_muted(session: dict[str, Any]) -> bool:
+    return bool(
+        session.get("manual_admin_intervention")
+        or session.get("manual_takeover")
+        or session.get("ai_muted")
+    )
+
+
+def _is_new_patient_consultation(session: dict[str, Any]) -> bool:
+    if session.get("existing_patient") or session.get("is_existing_patient") or session.get("procedure_patient"):
+        return False
+    visit_type = _low(str(session.get("visit_type") or session.get("appointment_type") or ""))
+    if any(w in visit_type for w in ["процед", "повтор", "existing", "procedure"]):
+        return False
+    return True
+
+
+def _mentions_weekend_day(text: str) -> bool:
+    low = _low(text)
+    return any(w in low for w in ["суббот", "воскрес", "сенбі", "сенби", "жексенбі", "жексенби"])
+
+
+def _is_weekend_date(date_iso: str) -> bool:
+    try:
+        return datetime.fromisoformat(date_iso).date().weekday() >= 5
+    except Exception:
+        return False
+
+
+def _weekend_primary_block_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "В субботу и воскресенье у нас процедурные дни 🌿 Первичных пациентов на консультацию записываем в будние дни. Давайте подберём ближайший удобный день на неделе?",
+        "Сенбі және жексенбі бізде процедуралық күндер 🌿 Алғашқы консультацияға жаңа пациенттерді жұмыс күндері жазамыз. Апта ішінен ыңғайлы күн таңдайық?",
+    )
 
 
 async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
@@ -2340,6 +2460,12 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     session["phone"] = phone or session.get("phone") or ""
     session["language"] = _detect_lang(text, session)
+
+    # human_takeover_guard: если живой админ уже вмешался, AI молчит и не продолжает старый сценарий.
+    if _is_ai_muted(session):
+        session["ai_muted"] = True
+        session["manual_takeover"] = True
+        return _no_reply(chat_id, session)
 
     # language_lock_guard:
     # Фиксируем язык диалога, чтобы бот не прыгал RU/KZ от коротких ответов.
@@ -2404,9 +2530,18 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if step in ("age", "contraindications", "date", "preferred_time", "time", "select_slot", "name"):
         if _is_thanks_or_ok(text) and step in ("date", "preferred_time", "time", "select_slot"):
             return _no_reply(chat_id, session)
-        faq_resume = _faq_answer_then_resume(text, session, step)
-        if faq_resume:
-            return _finalize(chat_id, session, faq_resume)
+        faq_info = _faq_answer(text, session)
+
+        if step == "age" and faq_info:
+            inline_age = _extract_age(text, step="age")
+            if inline_age:
+                session["age"] = inline_age
+                after_age = await _continue_after_collected_age(chat_id, session, text, inline_age)
+                return _finalize(chat_id, session, faq_info + "\n\n" + after_age)
+            return _finalize(chat_id, session, faq_info + "\n\n" + _mandatory_step_prompt(session, step))
+
+        if faq_info:
+            return _finalize(chat_id, session, faq_info + "\n\n" + _mandatory_step_prompt(session, step))
 
         if step == "age":
             if any(p in _low(text) for p in ["не знаю", "позже", "потом", "уточню", "білмеймін", "билмеймин"]):
@@ -2473,6 +2608,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             date_iso = _parse_date(text)
             if not date_iso:
                 return _finalize(chat_id, session, _ask_date(session))
+            if _is_new_patient_consultation(session) and _mentions_weekend_day(text) and _is_weekend_date(date_iso):
+                session["step"] = "date"
+                return _finalize(chat_id, session, _weekend_primary_block_answer(session))
             return _finalize(chat_id, session, await _show_slots(chat_id, session, date_iso))
 
         if step in ("time", "select_slot"):
@@ -2596,6 +2734,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     info = None if ((_has_complaint(text) or _has_medical_complaint_text(text)) or diagnostic_booking_request) else _clinic_answer(text, session)
     if info and not session.get("complaint"):
         session["step"] = "complaint"
+        if _has_any(text, METHOD_WORDS):
+            info = info + "\n\n" + _tr(session, "Чтобы подсказать точнее, напишите, пожалуйста, что Вас беспокоит?", "Дәлірек бағыттау үшін не мазалайтынын жазыңызшы?")
         return _finalize(chat_id, session, info)
 
     step = session.get("step") or "start"
@@ -3067,6 +3207,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         date_iso = _parse_date(text)
         if not date_iso:
             return _finalize(chat_id, session, _ask_date(session))
+
+        if _is_new_patient_consultation(session) and _mentions_weekend_day(text) and _is_weekend_date(date_iso):
+            session["step"] = "date"
+            return _finalize(chat_id, session, _weekend_primary_block_answer(session))
 
         answer = await _show_slots(chat_id, session, date_iso)
         return _finalize(chat_id, session, answer)
