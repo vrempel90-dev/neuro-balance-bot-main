@@ -493,3 +493,60 @@ def test_production_fix_live_admin_regressions(monkeypatch: Any) -> None:
     ]:
         reset(chat_id, {**preset, "language": "ru", "language_locked": True})
         assert answer(chat_id, text) == ""
+
+
+def test_old_bot_tool_gates_and_operator_templates(monkeypatch: Any) -> None:
+    calls = setup_crm(monkeypatch)
+
+    reset("oldtpl_address")
+    result = answer("oldtpl_address", "Как доехать, адрес и 2GIS?")
+    session = state.get_session("oldtpl_address")
+    assert "Кабанбай батыра 28" in result
+    assert "2gis.kz" in result
+    assert session["last_clinic_info_topic"] == "address"
+    assert any(item.get("name") == "get_clinic_info" and item.get("topic") == "address" for item in session["tool_history"])
+
+    reset("oldtpl_returning")
+    result = answer("oldtpl_returning", "Я уже была у вас раньше")
+    session = state.get_session("oldtpl_returning")
+    assert "когда Вы у нас были" in result
+    assert session["step"] == "escalated"
+    assert any(item.get("name") == "escalate_to_human" for item in session["tool_history"])
+
+    reset(
+        "gate_no_complaint",
+        {
+            "step": "name",
+            "language": "ru",
+            "language_locked": True,
+            "age": 36,
+            "contraindications_ok": True,
+            "contraindications_verdict": "proceed",
+            "selected_slot": {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "18:00"},
+        },
+    )
+    result = answer("gate_no_complaint", "Виктор")
+    session = state.get_session("gate_no_complaint")
+    assert "что именно Вас беспокоит" in result
+    assert session["step"] == "complaint"
+    assert calls["book"] == []
+
+    reset(
+        "gate_passed",
+        {
+            "step": "name",
+            "language": "ru",
+            "language_locked": True,
+            "complaint": "болит спина",
+            "complaint_gate": "COMPLAINT_OK",
+            "age": 36,
+            "contraindications_ok": True,
+            "contraindications_verdict": "proceed",
+            "selected_slot": {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "18:00"},
+        },
+    )
+    result = answer("gate_passed", "Виктор")
+    session = state.get_session("gate_passed")
+    assert result
+    assert session["status"] == "booked"
+    assert len(calls["book"]) == 1

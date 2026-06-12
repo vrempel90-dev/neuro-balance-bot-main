@@ -12,6 +12,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import bot_tools
 import crm
 import state
 
@@ -135,6 +136,17 @@ COURSE_DURATION_WORDS = [
     "сколько дней будет всего", "сколько дней", "сколько процедур", "сколько длится курс",
     "длительность курса", "курс сколько", "сколько сеансов", "сколько лечение длится",
 ]
+
+INSTALLMENT_WORDS = ["рассрочка", "каспи ред", "kaspi red", "kaspi", "кредит"]
+REFUND_WORDS = ["возврат", "предоплат", "претенз", "жалоба", "отдел забот", "асем"]
+PHONE_CALL_WORDS = ["позвоните", "перезвоните", "можете позвонить", "звонок", "позвонить мне"]
+RETURNING_PATIENT_WORDS = ["был у вас", "была у вас", "были у вас", "лечился у вас", "лечилась у вас", "приходил", "приходила раньше", "повторно"]
+OTHER_CITY_WORDS = ["я из ", "не из астаны", "костанай", "караганда", "кокшетау", "алматы", "павлодар", "семей", "усть-каменогорск", "шымкент"]
+TOO_EXPENSIVE_WORDS = ["дорого", "нет денег", "не по карману", "дороговато"]
+WILL_THINK_WORDS = ["подумаю", "посоветуюсь", "изучу", "если что напишу"]
+HELPS_WORDS = ["поможет", "помогает", "гарантия", "правда лечит", "эффективно"]
+IMMOBILITY_WORDS = ["коляска", "костыли", "лежит", "не ходит", "тяжело ходить", "ходунки"]
+
 
 
 # ============================================================
@@ -720,6 +732,11 @@ def _tr(session_or_lang: dict[str, Any] | str, ru: str, kk: str) -> str:
     return kk if lang == "kk" else ru
 
 
+def _clinic_info_template(session: dict[str, Any], topic: str) -> str | None:
+    """Return old-bot operator template through the Python get_clinic_info tool."""
+    return bot_tools.get_clinic_info(session, topic)
+
+
 def _price_short_text(session: dict[str, Any]) -> str:
     return _tr(
         session,
@@ -730,6 +747,11 @@ def _price_short_text(session: dict[str, Any]) -> str:
 
 def _price_answer(text: str, session: dict[str, Any]) -> str:
     course = any(w in _low(text) for w in ["курс", "лечение", "лечения", "емдеу", "ем"])
+    template = _clinic_info_template(session, "price_course" if course else "price_first_visit")
+    if template:
+        if course and "5 000" not in template:
+            return _price_short_text(session) + "\n\nСтоимость курса подбирается индивидуально. " + template
+        return template
     base = _price_short_text(session)
     if not course:
         return base
@@ -741,7 +763,7 @@ def _price_answer(text: str, session: dict[str, Any]) -> str:
 
 
 def _address_answer(session: dict[str, Any]) -> str:
-    return _tr(
+    return _clinic_info_template(session, "address") or _tr(
         session,
         "Астана, Кабанбай батыра 28, внутренний двор, подъезд 3. Вход со стороны Кунаева, после шлагбаума направо.",
         "Астана, Қабанбай батыр 28, ішкі аула, 3-подъезд. Қонаев жағынан кіріп, шлагбаумнан кейін оңға бұрыласыз.",
@@ -749,7 +771,7 @@ def _address_answer(session: dict[str, Any]) -> str:
 
 
 def _schedule_answer(session: dict[str, Any]) -> str:
-    return _tr(
+    return _clinic_info_template(session, "schedule") or _tr(
         session,
         "Работаем по предварительной записи 🌿 Напишите удобный день — я проверю свободное время.",
         "Алдын ала жазылу бойынша жұмыс істейміз 🌿 Ыңғайлы күнді жазыңыз — бос уақытты тексеремін.",
@@ -891,6 +913,15 @@ def _profile_status(text: str) -> str:
         return "unclear"
 
     return "none"
+def _record_complaint_tool(session: dict[str, Any], complaint: str, *, is_in_profile: bool) -> None:
+    bot_tools.record_chief_complaint(session, complaint, is_in_profile=is_in_profile)
+
+
+def _mark_irrelevant_tool(session: dict[str, Any], reason: str = "non_profile") -> None:
+    bot_tools.mark_irrelevant(session, reason)
+    bot_tools.escalate_to_human(session, reason)
+
+
 def _non_profile_answer(session: dict[str, Any], text: str) -> str:
     return _tr(
         session,
@@ -1235,7 +1266,6 @@ def _remove_name_addressing(answer: str, session: dict[str, Any]) -> str:
         r"(?im)^\s*Уважаемый\(-ая\)\s*[^!\n]{1,80}!\s*",
         r"(?im)^\s*Уважаемый\s*[^!\n]{1,80}!\s*",
         r"(?im)^\s*Уважаемая\s*[^!\n]{1,80}!\s*",
-        r"(?im)^\s*Спасибо,\s*[^!\n.]{2,80}[.!]?\s*",
     ]
     for pattern in patterns:
         cleaned = re.sub(pattern, "", cleaned)
@@ -1318,6 +1348,16 @@ def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
         "противопоказаний нет",
         "қарсы көрсетілімдер жоқ",
         "жазбаны рәсімдеу",
+        "в стоимость уже входит",
+        "местоположение в 2gis",
+        "каспи red",
+        "отдел забот",
+        "у нас нет филиалов",
+        "современные методы",
+        "европейском аппарате",
+        "подбирается индивидуально",
+        "снимок заранее делать не обязательно",
+        "график приёма",
     ])
 
     if allow_long:
@@ -1635,6 +1675,9 @@ def _extract_name(text: str) -> str:
 
 
 def _method_answer(session: dict[str, Any]) -> str:
+    template = _clinic_info_template(session, "methods")
+    if template:
+        return "В клинике применяются безоперационные методы лечения: магнитотерапия, лазерная терапия, УВТ, PRP, иглотерапия и ЛФК 🌿\n\n" + template
     return _tr(
         session,
         "В клинике применяются безоперационные методы лечения боли в спине, шее, грыж, протрузий и суставов: магнитотерапия, лазерная терапия, ударно-волновая терапия, PRP, иглотерапия и ЛФК 🌿",
@@ -1659,38 +1702,53 @@ def _course_duration_answer(session: dict[str, Any]) -> str:
 
 
 def _clinic_answer(text: str, session: dict[str, Any]) -> str | None:
-    lang = session.get("language") or "ru"
-
+    if _has_any(text, RETURNING_PATIENT_WORDS):
+        bot_tools.escalate_to_human(session, "returning_patient")
+        return _clinic_info_template(session, "returning_patient")
+    if _has_any(text, REFUND_WORDS):
+        bot_tools.escalate_to_human(session, "refund_or_complaint")
+        return _clinic_info_template(session, "refund_complaint")
+    if _has_any(text, PHONE_CALL_WORDS):
+        session["phone_call_requested"] = True
+        return _clinic_info_template(session, "phone_call_request")
+    if _has_any(text, OTHER_CITY_WORDS):
+        return _clinic_info_template(session, "other_city")
+    if _has_any(text, IMMOBILITY_WORDS):
+        bot_tools.escalate_to_human(session, "immobility")
+        return _clinic_info_template(session, "immobility_refuse")
+    if _has_any(text, TOO_EXPENSIVE_WORDS):
+        session["objection_handled"] = True
+        return _clinic_info_template(session, "objection_too_expensive")
+    if _has_any(text, WILL_THINK_WORDS):
+        session["objection_handled"] = True
+        return _clinic_info_template(session, "objection_will_think")
+    if _has_any(text, HELPS_WORDS):
+        return _clinic_info_template(session, "helps_question")
+    if _has_any(text, INSTALLMENT_WORDS):
+        return _clinic_info_template(session, "installment")
     if _has_any(text, METHOD_WORDS):
         return _method_answer(session)
-
     if _has_any(text, DOCTOR_WORDS):
         return _doctor_answer(session)
-
     if _has_any(text, COURSE_DURATION_WORDS):
         return _course_duration_answer(session)
-
     if _has_any(text, PRICE_WORDS):
         return _price_answer(text, session)
-
     if _has_any(text, ADDRESS_WORDS):
         return _address_answer(session)
-
     if _has_any(text, SCHEDULE_WORDS):
         return _schedule_answer(session)
-
     if _has_mri_question(text):
-        return _tr(
-            lang,
+        return _clinic_info_template(session, "mri_needed") or _tr(
+            session,
             "Снимки и МРТ заранее делать не обязательно 🌿 На первичном осмотре врач сам посмотрит Ваше состояние и, если потребуется, назначит МРТ/КТ или другое обследование.",
             "Снимок немесе МРТ-ны алдын ала жасау міндетті емес 🌿 Алғашқы қаралу кезінде дәрігер жағдайыңызды өзі қарап, қажет болса МРТ/КТ немесе басқа тексеріс тағайындайды.",
         )
-
     return None
 
 
 def _mri_answer_in_flow(session: dict[str, Any]) -> str:
-    return _tr(
+    return _clinic_info_template(session, "mri_needed") or _tr(
         session,
         "Снимки и МРТ заранее делать не обязательно 🌿 На первичном осмотре врач сам посмотрит Ваше состояние и, если потребуется, назначит МРТ/КТ или другое обследование.",
         "Снимок немесе МРТ-ны алдын ала жасау міндетті емес 🌿 Алғашқы қаралу кезінде дәрігер жағдайыңызды өзі қарап, қажет болса МРТ/КТ немесе басқа тексеріс тағайындайды.",
@@ -1766,9 +1824,11 @@ def _senior_contra_intro(session: dict[str, Any]) -> str:
 def _ask_contra(session: dict[str, Any]) -> str:
     return _tr(
         session,
-        "Спасибо 🌿 Перед записью уточню противопоказания для безопасности. Подскажите, пожалуйста, нет ли у Вас кардиостимулятора, беременности, онкологии, металла в зоне лечения, эпилепсии? Также приём не проводится пациентам младше 16 или старше 75 лет, а также при ограниченной подвижности — коляски, костыли. Противопоказаний нет?",
-        "Жақсы 🌿 Жазылу алдында қауіпсіздік үшін қарсы көрсетілімдерді нақтылаймын. Сізде кардиостимулятор, жүктілік, онкология, емдеу аймағында металл, эпилепсия бар ма? Сондай-ақ қабылдау 16 жасқа дейінгі немесе 75 жастан асқан пациенттерге, әрі қозғалысы шектеулі адамдарға жүргізілмейді. Қарсы көрсетілімдер жоқ па?",
+        'Перед записью мне нужно уточнить несколько важных моментов — у нашего метода есть противопоказания.\n\nСкажите, есть ли у Вас сейчас или в анамнезе:\n— кардиостимулятор, дефибриллятор, инсулиновая помпа или кохлеарный имплант?\n— тромбофлебит, тромбозы или серьёзные нарушения свёртываемости крови?\n— активное онкологическое заболевание или подозрение, ещё не исключённое?\n— эпилепсия или судороги?\n— декомпенсированный сахарный диабет или тиреотоксикоз?\n— беременность?\n— сейчас высокая температура, ОРВИ, грипп или другая острая инфекция?\n— тяжёлые проблемы с сердцем, дыханием или психическим состоянием?\n\nПротивопоказаний нет?',
+        'Жазылу алдында қауіпсіздік үшін бірнеше маңызды қарсы көрсетілімді нақтылаймын. Сізде кардиостимулятор, жүктілік, онкология, эпилепсия, тромбоз/қан ұю бұзылысы, декомпенсацияланған диабет/тиреотоксикоз, қызу/жедел инфекция немесе жүрек, тыныс алу, психикалық жағдай бойынша ауыр мәселе бар ма? Қарсы көрсетілімдер жоқ па?',
     )
+
+
 def _ask_date(session: dict[str, Any]) -> str:
     return _tr(
         session,
@@ -1841,6 +1901,30 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
     if not slot:
         session["step"] = "date"
         return _ask_date(session)
+
+    if session.get("contraindications_ok") is True and not session.get("contraindications_verdict"):
+        # Backward-compatible migration for existing sessions created before tool gates.
+        bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, str(session.get("contraindications_raw") or "нет"))
+    if session.get("complaint") and not session.get("complaint_gate"):
+        # Existing in-flight Python sessions had complaint text but no old-bot marker yet.
+        _record_complaint_tool(session, str(session.get("complaint") or ""), is_in_profile=True)
+
+    gate_ok, gate_reason = bot_tools.booking_gate_status(session)
+    if not gate_ok:
+        if gate_reason == "complaint":
+            session["step"] = "complaint"
+            return _tr(
+                session,
+                "Перед записью уточню, что именно Вас беспокоит — так врач сможет корректно подготовиться 🌿",
+                "Жазбас бұрын нақты не мазалайтынын анықтайын — дәрігер дұрыс дайындала алады 🌿",
+            )
+        if gate_reason == "contra_refuse":
+            session["step"] = "stopped"
+            return _stop_booking_text(session, "contra")
+        session["step"] = "contraindications"
+        return _ask_contra(session)
+
+    bot_tools.mark_tool(session, "book_appointment", gate="passed")
 
     try:
         booked = await crm.book_appointment(
@@ -2207,18 +2291,14 @@ async def _continue_after_collected_age(chat_id: str, session: dict[str, Any], t
         return _prepend_price_if_needed(text, session, _stop_booking_text(session, age_reason))
 
     if _contra_has_hard_stop(text):
-        session["contraindications_raw"] = text
-        session["contraindications_ok"] = False
-        session["contraindications_verdict"] = "stop"
+        bot_tools.verify_contraindications(session, bot_tools.CONTRA_REFUSE, text)
         session["step"] = "stopped"
         session["escalated"] = True
         return _prepend_price_if_needed(text, session, _stop_booking_text(session, "contra"))
 
     # Если пациент сразу написал, что противопоказаний нет — не спрашиваем это повторно.
     if _contra_is_clear_no(text):
-        session["contraindications_raw"] = text
-        session["contraindications_ok"] = True
-        session["contraindications_verdict"] = "proceed"
+        bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, text)
 
         date_iso = _parse_date(text)
         if date_iso:
@@ -2394,7 +2474,7 @@ async def _safe_intent_router(chat_id: str, phone: str, session: dict[str, Any],
             session["step"] = "complaint"
             return info + "\n\n" + _tr(session, "Чтобы подсказать точнее, напишите, пожалуйста, что Вас беспокоит?", "Дәлірек бағыттау үшін не мазалайтынын жазыңызшы?")
         # После остальных инфо-вопросов не ставим жёстко "complaint", чтобы "спасибо" не запустило анкету.
-        if step in ("start", "", None):
+        if step in ("start", "", None) and not session.get("escalated"):
             session["step"] = "start"
         return info
 
@@ -2505,9 +2585,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     step = session.get("step") or "start"
 
     if _contra_has_hard_stop(text) and step not in ("done", "booked", "stopped"):
-        session["contraindications_raw"] = text
-        session["contraindications_ok"] = False
-        session["contraindications_verdict"] = "stop"
+        bot_tools.verify_contraindications(session, bot_tools.CONTRA_REFUSE, text)
         session["step"] = "stopped"
         session["escalated"] = True
         return _finalize(chat_id, session, _stop_booking_text(session, "contra"))
@@ -2579,16 +2657,12 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
         if step == "contraindications":
             if _is_no_contra_answer(text) or _contra_is_clear_no(text):
-                session["contraindications_ok"] = True
-                session["contraindications_raw"] = text or "нет"
-                session["contraindications_verdict"] = "proceed"
+                bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, text or "нет")
                 session["step"] = "date"
                 session["questionnaire_step"] = "date"
                 return _finalize(chat_id, session, _ask_date(session))
             if _contra_has_hard_stop(text):
-                session["contraindications_raw"] = text
-                session["contraindications_ok"] = False
-                session["contraindications_verdict"] = "stop"
+                bot_tools.verify_contraindications(session, bot_tools.CONTRA_REFUSE, text)
                 session["step"] = "stopped"
                 return _finalize(chat_id, session, _stop_booking_text(session, "contra"))
             if (_has_complaint(text) or _has_medical_complaint_text(text)):
@@ -2744,10 +2818,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # прекращаем автоматическую запись и передаём администратору.
     current_profile_status = _profile_status(text)
     if step not in ("done", "escalated", "stopped") and current_profile_status == "non_profile":
-        session["complaint"] = text
-        session["step"] = "escalated"
-        session["escalated"] = True
-        session["profile_status"] = "non_profile"
+        _record_complaint_tool(session, text, is_in_profile=False)
+        _mark_irrelevant_tool(session, "non_profile")
         return _finalize(chat_id, session, _non_profile_answer(session, text))
 
     # later_during_contra_guard:
@@ -2887,8 +2959,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["phone"] = phone or ""
         session["language"] = _detect_lang(text, session)
         session["language_locked"] = True
-        session["complaint"] = text
-        session["profile_status"] = "profile"
+        _record_complaint_tool(session, text, is_in_profile=True)
         session["step"] = "age"
         return _finalize(
             chat_id,
@@ -2901,10 +2972,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # Если не профиль — не ведём в запись и не обещаем лечение.
     profile_status = _profile_status(text)
     if step in ("start", "complaint") and profile_status == "non_profile":
-        session["complaint"] = text
-        session["step"] = "escalated"
-        session["escalated"] = True
-        session["profile_status"] = "non_profile"
+        _record_complaint_tool(session, text, is_in_profile=False)
+        _mark_irrelevant_tool(session, "non_profile")
         return _finalize(chat_id, session, _non_profile_answer(session, text))
 
     if step in ("start", "complaint") and profile_status == "unclear":
@@ -2916,8 +2985,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # Если ранее запрос был не профильный, но пациент уточнил профильную жалобу
     # по спине/шее/суставам — продолжаем обычную запись.
     if step == "escalated" and session.get("profile_status") == "non_profile" and _profile_status(text) == "profile":
-        session["complaint"] = text
-        session["profile_status"] = "profile"
+        _record_complaint_tool(session, text, is_in_profile=True)
         session["escalated"] = False
         session["step"] = "age"
         return _finalize(chat_id, session, _profile_confirm_and_ask_age(session))
@@ -2974,8 +3042,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # Если пациент сразу написал профильную жалобу ("парез стопы", "после операции", "болит..."),
     # не спрашиваем "что беспокоит" повторно.
     if step in ("start", "complaint") and not _is_no_contra_answer(text) and _profile_status(text) == "profile":
-        session["complaint"] = text
-        session["profile_status"] = "profile"
+        _record_complaint_tool(session, text, is_in_profile=True)
         if session.get("age"):
             session["step"] = "contra"
             answer = _profile_confirm_next_step(session)
@@ -3018,7 +3085,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return _finalize(chat_id, session, answer)
 
         if (_has_complaint(text) or _has_medical_complaint_text(text)) and _profile_status(text) != "non_profile":
-            session["complaint"] = text
+            _record_complaint_tool(session, text, is_in_profile=True)
 
             # Если возраст уже есть в этом же сообщении — не спрашиваем его повторно.
             # Сразу проверяем противопоказания/дату.
@@ -3065,10 +3132,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return _finalize(chat_id, session, _tr(session, "Поняла Вас 🌿 Передам администратору, чтобы он помог с записью и подсказал, какая консультация подойдёт.", "Түсіндім 🌿 Әкімшіге жіберемін, ол жазылуға көмектесіп, қандай консультация қолайлы екенін айтады."))
 
         if _profile_status(text) == "non_profile":
-            session["complaint"] = text
-            session["step"] = "escalated"
-            session["escalated"] = True
-            session["profile_status"] = "non_profile"
+            _record_complaint_tool(session, text, is_in_profile=False)
+            _mark_irrelevant_tool(session, "non_profile")
             return _finalize(chat_id, session, _non_profile_answer(session, text))
 
         if _profile_status(text) == "unclear":
@@ -3081,7 +3146,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
                 return _finalize(chat_id, session, _ask_complaint(session))
             return _finalize(chat_id, session, _ask_complaint(session))
 
-        session["complaint"] = text
+        _record_complaint_tool(session, text, is_in_profile=True)
         if session.get("age"):
             session["step"] = "contra"
             return _finalize(chat_id, session, _profile_confirm_next_step(session))
@@ -3094,11 +3159,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session["escalated"] = True
             return _finalize(chat_id, session, _tr(session, "Поняла Вас 🌿 Передам администратору, чтобы он помог с записью и подсказал, какая консультация подойдёт.", "Түсіндім 🌿 Әкімшіге жіберемін, ол жазылуға көмектесіп, қандай консультация қолайлы екенін айтады."))
         if _is_positive_confirm(text) or _has_booking_intent(text):
-            session["complaint"] = "Профилактическая консультация, без конкретной жалобы"
+            _record_complaint_tool(session, "Профилактическая консультация, без конкретной жалобы", is_in_profile=True)
             session["step"] = "age"
             return _finalize(chat_id, session, _tr(session, "Хорошо 🌿 Подскажите, пожалуйста, сколько Вам лет?", "Жақсы 🌿 Жасыңыз нешеде?"))
         if (_has_complaint(text) or _has_medical_complaint_text(text)) and _profile_status(text) != "non_profile":
-            session["complaint"] = text
+            _record_complaint_tool(session, text, is_in_profile=True)
 
             # Если возраст уже есть в этом же сообщении — не спрашиваем его повторно.
             # Сразу проверяем противопоказания/дату.
@@ -3163,8 +3228,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         # "Нет" / "Жоқ!" на вопрос о противопоказаниях = противопоказаний нет,
         # дальше спрашиваем дату, а не возвращаемся к жалобе.
         if _is_no_contra_answer(text):
-            session["contraindications_ok"] = True
-            session["contraindications_raw"] = "нет"
+            bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, "нет")
             session["step"] = "date"
             session["questionnaire_step"] = "date"
             return _finalize(chat_id, session, _ask_date(session))
@@ -3172,8 +3236,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["contraindications_raw"] = text
 
         if _contra_is_clear_no(text):
-            session["contraindications_ok"] = True
-            session["contraindications_verdict"] = "proceed"
+            bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, text)
             session["step"] = "date"
             return _finalize(chat_id, session, _ask_date(session))
 
