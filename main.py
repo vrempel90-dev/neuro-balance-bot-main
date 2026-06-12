@@ -329,6 +329,14 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
     else:
         user_text = str(message.get("text") or "")
 
+    try:
+        session = state.get_session(chat_id)
+        session["source"] = "wazzup"
+        session["phone"] = phone or session.get("phone") or ""
+        state.save_session(chat_id, session)
+    except Exception:
+        pass
+
     answer = await handle_message(chat_id=chat_id, phone=phone, user_text=user_text)
     return _guard_answer(chat_id, answer)
 

@@ -116,6 +116,36 @@ def get_session(chat_id: str) -> dict[str, Any]:
     return data
 
 
+
+
+def _phone_digits(value: str) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if digits.startswith("8") and len(digits) == 11:
+        digits = "7" + digits[1:]
+    return digits
+
+
+def find_session_by_phone(phone: str) -> dict[str, Any] | None:
+    """Find an existing session by stable phone when Wazzup chat_id changes."""
+    target = _phone_digits(phone)
+    if not target:
+        return None
+
+    with _connect() as conn:
+        rows = conn.execute("SELECT data_json FROM sessions ORDER BY updated_at DESC").fetchall()
+
+    for row in rows:
+        try:
+            data = json.loads(row["data_json"])
+        except Exception:
+            continue
+        if _phone_digits(str(data.get("phone") or "")) == target:
+            merged = dict(DEFAULT_SESSION)
+            merged.update(data)
+            return merged
+    return None
+
+
 def save_session(chat_id: str, data: dict[str, Any]) -> None:
     cleaned = dict(DEFAULT_SESSION)
     cleaned.update(data)

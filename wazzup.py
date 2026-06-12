@@ -98,18 +98,56 @@ def _message_ts(msg: dict[str, Any]) -> int:
     return 0
 
 
+GENERIC_LEAD_TEXT_MARKERS = [
+    "вы оставляли у нас заявку",
+    "скажите, что вас беспокоит",
+    "скажите, что Вас беспокоит",
+]
+
+MEDICAL_TEXT_MARKERS = [
+    "спина", "поясниц", "протруз", "грыж", "шея", "немеет", "онем",
+    "сустав", "колен", "плеч", "отдаёт", "отдает", "нога", "рука",
+]
+
+
 def _message_text(msg: dict[str, Any]) -> str:
-    text = (
-        _dig(msg, "text")
-        or _dig(msg, "body")
-        or _dig(msg, "content")
-        or _dig(msg, "message.text")
-        or _dig(msg, "message.body")
-        or ""
-    )
-    if isinstance(text, dict):
-        text = text.get("text") or text.get("body") or ""
-    return str(text).strip()
+    candidates: list[str] = []
+    for value in [
+        _dig(msg, "message.text"),
+        _dig(msg, "message.body"),
+        _dig(msg, "text"),
+        _dig(msg, "body"),
+        _dig(msg, "content"),
+    ]:
+        if isinstance(value, dict):
+            value = value.get("text") or value.get("body") or ""
+        value = str(value or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    if not candidates:
+        return ""
+
+    def has_medical_marker(value: str) -> bool:
+        low = value.lower()
+        return any(marker.lower() in low for marker in MEDICAL_TEXT_MARKERS)
+
+    def is_generic_lead(value: str) -> bool:
+        low = value.lower()
+        return any(marker.lower() in low for marker in GENERIC_LEAD_TEXT_MARKERS)
+
+    # Wazzup payloads may include the lead template at top level and the real
+    # incoming text deeper in message.*.  If any candidate has a medical
+    # complaint, never replace it with the generic lead template.
+    for candidate in candidates:
+        if has_medical_marker(candidate) and not is_generic_lead(candidate):
+            return candidate
+
+    for candidate in candidates:
+        if not is_generic_lead(candidate):
+            return candidate
+
+    return candidates[0]
 
 
 def _message_media(msg: dict[str, Any]) -> dict[str, str]:

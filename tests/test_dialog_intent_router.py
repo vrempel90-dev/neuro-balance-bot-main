@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 import sys
@@ -17,6 +18,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import crm
 import main
 import state
+import dialog
+import wazzup
 from dialog import handle_message
 
 
@@ -493,3 +496,199 @@ def test_production_fix_live_admin_regressions(monkeypatch: Any) -> None:
     ]:
         reset(chat_id, {**preset, "language": "ru", "language_locked": True})
         assert answer(chat_id, text) == ""
+
+
+def test_old_bot_tool_gates_and_operator_templates(monkeypatch: Any) -> None:
+    calls = setup_crm(monkeypatch)
+
+    reset("oldtpl_address")
+    result = answer("oldtpl_address", "Как доехать, адрес и 2GIS?")
+    session = state.get_session("oldtpl_address")
+    assert "Кабанбай батыра 28" in result
+    assert "2gis.kz" in result
+    assert session["last_clinic_info_topic"] == "address"
+    assert any(item.get("name") == "get_clinic_info" and item.get("topic") == "address" for item in session["tool_history"])
+
+    reset("oldtpl_returning")
+    result = answer("oldtpl_returning", "Я уже была у вас раньше")
+    session = state.get_session("oldtpl_returning")
+    assert "когда Вы у нас были" in result
+    assert session["step"] == "escalated"
+    assert any(item.get("name") == "escalate_to_human" for item in session["tool_history"])
+
+    reset(
+        "gate_no_complaint",
+        {
+            "step": "name",
+            "language": "ru",
+            "language_locked": True,
+            "age": 36,
+            "contraindications_ok": True,
+            "contraindications_verdict": "proceed",
+            "selected_slot": {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "18:00"},
+        },
+    )
+    result = answer("gate_no_complaint", "Виктор")
+    session = state.get_session("gate_no_complaint")
+    assert "что именно Вас беспокоит" in result
+    assert session["step"] == "complaint"
+    assert calls["book"] == []
+
+    reset(
+        "gate_passed",
+        {
+            "step": "name",
+            "language": "ru",
+            "language_locked": True,
+            "complaint": "болит спина",
+            "complaint_gate": "COMPLAINT_OK",
+            "age": 36,
+            "contraindications_ok": True,
+            "contraindications_verdict": "proceed",
+            "selected_slot": {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "18:00"},
+        },
+    )
+    result = answer("gate_passed", "Виктор")
+    session = state.get_session("gate_passed")
+    assert result
+    assert session["status"] == "booked"
+    assert len(calls["book"]) == 1
+
+
+def test_static_dialog_template_wiring_and_tr_arity() -> None:
+    source = (PROJECT_ROOT / "dialog.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    tr_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_tr"]
+    assert tr_calls
+    assert all(len(node.args) == 3 for node in tr_calls)
+    assert "return _tr(\n    return _clinic_info_template" not in source
+    assert "return _tr(lang" not in source
+    assert "Вы оставляли у нас заявку. Скажите, что вас беспокоит?" not in source
+    assert (
+        'if step in ("start", "", None):\n        if step in ("start", "", None) and not session.get("escalated")'
+        not in source
+    )
+
+    session: dict[str, Any] = {"language": "ru"}
+    address = dialog._address_answer(session)
+    schedule = dialog._schedule_answer(session)
+    mri = dialog._mri_answer_in_flow(session)
+
+    assert "2gis.kz" in address
+    assert "График приёма" in schedule
+    assert "Снимок заранее делать не обязательно" in mri
+
+    escalated_session: dict[str, Any] = {"language": "ru"}
+    returning = dialog._clinic_answer("Я уже была у вас раньше", escalated_session)
+    assert returning and "когда Вы у нас были" in returning
+    assert escalated_session["step"] == "escalated"
+
+
+
+def test_wazzup_profile_complaint_from_empty_session_sets_gate(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    chat_id = "wazzup_profile_empty"
+    reset(chat_id)
+
+    result = answer(chat_id, "Спина болит, делала давно рентген была протрузия")
+    session = state.get_session(chat_id)
+
+    assert "с такими жалобами к нам обращаются" in result.lower() or "это наша специализация" in result.lower()
+    assert "сколько Вам лет" in result
+    assert session["complaint"] == "Спина болит, делала давно рентген была протрузия"
+    assert session["profile_status"] == "profile"
+    assert session["complaint_gate"] == "COMPLAINT_OK"
+    assert session["step"] == "age"
+    assert any(item.get("name") == "record_chief_complaint" for item in session["tool_history"])
+    assert "Скажите, что вас беспокоит" not in result
+    assert "Вы оставляли у нас заявку" not in result
+
+
+def test_wazzup_profile_complaint_after_generic_lead_session(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    chat_id = "wazzup_profile_lead"
+    reset(chat_id, {"source": "wazzup", "lead": True, "step": "start"})
+
+    result = answer(chat_id, "Спина болит, делала давно рентген была протрузия")
+    session = state.get_session(chat_id)
+
+    assert "сколько Вам лет" in result
+    assert session["complaint"]
+    assert session["profile_status"] == "profile"
+    assert session["step"] == "age"
+    assert "Скажите, что вас беспокоит" not in result
+    assert "Вы оставляли у нас заявку" not in result
+
+
+def test_wazzup_manual_admin_context_with_profile_complaint(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+
+    reset("manual_seen_not_muted", {"last_admin_message": "Здравствуйте, что беспокоит?", "manual_admin_seen": True, "step": "start"})
+    result = answer("manual_seen_not_muted", "Спина болит, делала давно рентген была протрузия")
+    session = state.get_session("manual_seen_not_muted")
+    assert "сколько Вам лет" in result
+    assert session["profile_status"] == "profile"
+    assert session["step"] == "age"
+    assert "Скажите, что вас беспокоит" not in result
+    assert "Вы оставляли у нас заявку" not in result
+
+    reset("manual_muted", {"manual_admin_intervention": True, "ai_muted": True, "step": "start"})
+    result = answer("manual_muted", "Спина болит, делала давно рентген была протрузия")
+    assert result == ""
+
+
+def test_wazzup_non_profile_and_debug_profile_controls(monkeypatch: Any) -> None:
+    calls = setup_crm(monkeypatch)
+
+    reset("non_profile_stomach")
+    result = answer("non_profile_stomach", "Болит живот")
+    session = state.get_session("non_profile_stomach")
+    assert session["step"] == "escalated"
+    assert session["profile_status"] == "non_profile"
+    assert "сколько Вам лет" not in result
+    assert calls["slots"] == []
+    assert calls["book"] == []
+
+    reset("debug_leg_radiation")
+    result = answer("debug_leg_radiation", "У меня боль в пояснице и отдаёт в ногу")
+    session = state.get_session("debug_leg_radiation")
+    assert session["profile_status"] == "profile"
+    assert session["step"] == "age"
+    assert "сколько Вам лет" in result
+    assert "противопоказание для записи" not in result
+
+
+def test_wazzup_text_extractor_prefers_real_medical_text_over_lead_template() -> None:
+    payload = {
+        "messages": [
+            {
+                "id": "m1",
+                "chatId": "77011234567",
+                "chatType": "whatsapp",
+                "text": "Здравствуйте! Это клиника Neuro Balance - лечение спины и суставов. Вы оставляли у нас заявку. Скажите, что вас беспокоит?",
+                "message": {"text": "Спина болит, делала давно рентген была протрузия"},
+                "contact": {"phone": "77011234567"},
+            }
+        ]
+    }
+
+    messages = wazzup.extract_incoming_messages(payload)
+    assert messages[0]["text"] == "Спина болит, делала давно рентген была протрузия"
+
+
+def test_session_recovers_by_phone_when_wazzup_chat_id_changes(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    old_chat = "old_wazzup_chat_id"
+    new_chat = "new_wazzup_chat_id"
+    phone = "77011234567"
+    reset(old_chat, {"source": "wazzup", "phone": phone, "step": "age", "complaint": "болит спина", "profile_status": "profile", "complaint_gate": "COMPLAINT_OK"})
+
+    result = run(handle_message(new_chat, phone, "42"))
+    session = state.get_session(new_chat)
+
+    assert session["session_recovered_by_phone"] is True
+    assert session["complaint"] == "болит спина"
+    assert session["age"] == 42
+    assert session["step"] == "contraindications"
+    assert "противопоказ" in result.lower()
