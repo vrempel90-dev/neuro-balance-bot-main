@@ -51,7 +51,8 @@ CLINIC_INFO_TEMPLATES: dict[str, str] = {
 }
 
 
-def get_clinic_info(topic: str) -> str | None:
+def get_clinic_info(topic: str, lang: str | None = None) -> str | None:
+    # lang is accepted for compatibility with the older questionnaire engine.
     return CLINIC_INFO_TEMPLATES.get(topic)
 
 
