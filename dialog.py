@@ -106,6 +106,7 @@ PRICE_WORDS = [
 
 ADDRESS_WORDS = [
     "адрес", "где находитесь", "вы в астане", "2gis", "2 гис",
+    "куда обращаться", "куда прийти", "как пройти", "куда ехать",
     "мекенжай", "қайда", "кайда", "астанада",
 ]
 
@@ -706,14 +707,42 @@ def _tr(session_or_lang: dict[str, Any] | str, ru: str, kk: str) -> str:
 def _price_short_text(session: dict[str, Any]) -> str:
     return _tr(
         session,
-        "Приём в нашей клинике — 5 000 тг 🌿",
+        "Первичный приём в нашей клинике — 5 000 тг 🌿",
         "Біздің клиникада алғашқы қабылдау — 5 000 тг 🌿",
+    )
+
+
+def _price_answer(text: str, session: dict[str, Any]) -> str:
+    course = any(w in _low(text) for w in ["курс", "лечение", "лечения", "емдеу", "ем"])
+    base = _price_short_text(session)
+    if not course:
+        return base
+    return _tr(
+        session,
+        base + " Стоимость курса врач сможет рассчитать после осмотра, потому что всё зависит от диагноза, состояния и количества процедур.",
+        base + " Емдеу курсының құнын дәрігер алғашқы қараудан кейін ғана есептей алады, себебі бәрі диагнозға, жағдайға және процедура санына байланысты.",
+    )
+
+
+def _address_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Астана, Кабанбай батыра 28, внутренний двор, подъезд 3. Вход со стороны Кунаева, после шлагбаума направо.",
+        "Астана, Қабанбай батыр 28, ішкі аула, 3-подъезд. Қонаев жағынан кіріп, шлагбаумнан кейін оңға бұрыласыз.",
+    )
+
+
+def _schedule_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Работаем по предварительной записи 🌿 Напишите удобный день — я проверю свободное время.",
+        "Алдын ала жазылу бойынша жұмыс істейміз 🌿 Ыңғайлы күнді жазыңыз — бос уақытты тексеремін.",
     )
 
 
 def _prepend_price_if_needed(text: str, session: dict[str, Any], answer: str) -> str:
     if _has_any(text, PRICE_WORDS):
-        price = _price_short_text(session)
+        price = _price_answer(text, session)
         if price not in answer:
             return price + "\n\n" + answer
     return answer
@@ -1241,7 +1270,12 @@ def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
         "ваш визит в neuro balance",
         "запись подтверждена",
         "кардиостимулятор",
+        "процесс записи останавливаю",
+        "этим направлением",
         "сколько вам лет",
+        "стоимость курса",
+        "первичный приём",
+        "первичный прием",
         "это наша специализация",
         "мұндай шағымдармен бізге жиі келеді",
         "я сориентирую",
@@ -1260,6 +1294,8 @@ def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
         "қайсысы ыңғайлы",
         "кайсысы ыңгайлы",
         "для оформления записи",
+        "противопоказаний нет",
+        "қарсы көрсетілімдер жоқ",
         "жазбаны рәсімдеу",
     ])
 
@@ -1574,31 +1610,19 @@ def _clinic_answer(text: str, session: dict[str, Any]) -> str | None:
     lang = session.get("language") or "ru"
 
     if _has_any(text, PRICE_WORDS):
-        return _tr(
-            lang,
-            "Приём в нашей клинике — 5 000 тг 🌿\nВ стоимость входит осмотр врача, подробная консультация, индивидуальные назначения и составление плана лечения.\n\nБонус: первая лечебная процедура бесплатно на европейском аппарате.\n\nПодскажите, пожалуйста, что Вас беспокоит?",
-            "Біздің клиникада алғашқы қабылдау — 5 000 тг 🌿\nҚабылдауға дәрігердің қарауы, толық консультация, жеке ұсыныстар және емдеу жоспарын құру кіреді.\n\nБонус: алғашқы емдік процедура тегін.\n\nСізді не мазалайды?",
-        )
+        return _price_answer(text, session)
 
     if _has_any(text, ADDRESS_WORDS):
-        return _tr(
-            lang,
-            "Мы находимся в Астане 🌿\nАдрес: Кабанбай батыра 28, ішкі двор, подъезд 3. Вход со стороны Кунаева, после шлагбаума направо.\n\nПодскажите, пожалуйста, что Вас беспокоит?",
-            "Біз Астанадамыз 🌿\nМекенжай: Қабанбай батыр 28, ішкі аула, 3-подъезд. Қонаев жағынан кіріп, шлагбаумнан кейін оңға бұрыласыз.\n\nСізді не мазалайды?",
-        )
+        return _address_answer(session)
 
     if _has_any(text, SCHEDULE_WORDS):
-        return _tr(
-            lang,
-            "Работаем по предварительной записи 🌿 Напишите, пожалуйста, какой день Вам удобен — проверю свободное время.",
-            "Алдын ала жазылу бойынша жұмыс істейміз 🌿 Қай күн ыңғайлы екенін жазыңыз — бос уақытты тексеремін.",
-        )
+        return _schedule_answer(session)
 
     if _has_mri_question(text):
         return _tr(
             lang,
-            "Снимки и МРТ заранее делать не обязательно 🌿 На первичном осмотре врач сам посмотрит Ваше состояние и, если потребуется, назначит МРТ/КТ или другое обследование.\n\nПодскажите, пожалуйста, что Вас беспокоит?",
-            "Снимок немесе МРТ-ны алдын ала жасау міндетті емес 🌿 Алғашқы қаралу кезінде дәрігер жағдайыңызды өзі қарап, қажет болса МРТ/КТ немесе басқа тексеріс тағайындайды.\n\nСізді не мазалайды?",
+            "Снимки и МРТ заранее делать не обязательно 🌿 На первичном осмотре врач сам посмотрит Ваше состояние и, если потребуется, назначит МРТ/КТ или другое обследование.",
+            "Снимок немесе МРТ-ны алдын ала жасау міндетті емес 🌿 Алғашқы қаралу кезінде дәрігер жағдайыңызды өзі қарап, қажет болса МРТ/КТ немесе басқа тексеріс тағайындайды.",
         )
 
     return None
@@ -1630,7 +1654,7 @@ def _profile_confirm_and_ask_age(session: dict[str, Any]) -> str:
     return _tr(
         session,
         "Здравствуйте! Да, это наша специализация 🌿 С такими жалобами к нам обращаются. Подскажите, пожалуйста, сколько Вам лет?",
-        "Сәлеметсіз бе! Иә, бұл біздің клиниканың бағытына жатады 🌿 Мұндай шағымдармен бізге жиі келеді. Жасыңыз нешеде?",
+        "Иә, бұл біздің клиниканың бағыты 🌿 Мұндай шағымдармен бізге жиі келеді. Жасыңыз нешеде?",
     )
 def _profile_confirm_next_step(session: dict[str, Any]) -> str:
     # Если возраст уже был написан раньше, не спрашиваем его повторно.
@@ -1668,8 +1692,8 @@ def _senior_contra_intro(session: dict[str, Any]) -> str:
 def _ask_contra(session: dict[str, Any]) -> str:
     return _tr(
         session,
-        "Хорошо, спасибо. Перед записью обязательно уточню противопоказания для безопасности 🌿\n\nПодскажите, пожалуйста, нет ли у Вас: кардиостимулятора, беременности, онкологии, металла в зоне лечения, эпилепсии? Также приём не проводится пациентам младше 16 или старше 75 лет, а также при ограниченной подвижности — коляски, костыли.\n\nПротивопоказаний нет?",
-        "Жақсы, рақмет. Жазбас бұрын қауіпсіздік үшін қарсы көрсетілімдерді нақтылап алайын 🌿\n\nСізде кардиостимулятор, жүктілік, онкология, емдеу аймағында металл, эпилепсия жоқ па? Сондай-ақ 16 жасқа дейін, 75 жастан жоғары және қозғалысы шектеулі пациенттерге — арба, балдақ/костыль — қабылдау жүргізілмейді.\n\nҚарсы көрсетілімдер жоқ па?",
+        "Спасибо 🌿 Перед записью уточню противопоказания для безопасности. Подскажите, пожалуйста, нет ли у Вас кардиостимулятора, беременности, онкологии, металла в зоне лечения, эпилепсии? Также приём не проводится пациентам младше 16 или старше 75 лет, а также при ограниченной подвижности — коляски, костыли. Противопоказаний нет?",
+        "Жақсы 🌿 Жазылу алдында қауіпсіздік үшін қарсы көрсетілімдерді нақтылаймын. Сізде кардиостимулятор, жүктілік, онкология, емдеу аймағында металл, эпилепсия бар ма? Сондай-ақ қабылдау 16 жасқа дейінгі немесе 75 жастан асқан пациенттерге, әрі қозғалысы шектеулі адамдарға жүргізілмейді. Қарсы көрсетілімдер жоқ па?",
     )
 def _ask_date(session: dict[str, Any]) -> str:
     return _tr(
@@ -1713,11 +1737,7 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
         _safe_log(chat_id, "crm_check_slots_error", {"error": str(exc)[:500]})
         session["step"] = "escalated"
         session["escalated"] = True
-        return _tr(
-            session,
-            "Сейчас не получается проверить свободные окошки автоматически. Я оформлю заявку на консультацию, координатор закрепит удобное время вручную 🌿",
-            "Қазір бос уақыттарды автоматты түрде тексере алмадым. Консультацияға өтінім қалдырамын, координатор ыңғайлы уақытты қолмен бекітеді 🌿",
-        )
+        return _crm_fallback_answer(session)
 
     if not slots:
         session["step"] = "date"
@@ -1800,11 +1820,7 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         _safe_log(chat_id, "crm_book_error", {"error": str(exc)[:500]})
         session["step"] = "escalated"
         session["escalated"] = True
-        return _tr(
-            session,
-            "Не получилось автоматически создать запись в CRM. Я оформлю заявку, чтобы координатор закрепил удобное время вручную 🌿",
-            "CRM-де жазбаны автоматты түрде жасай алмадым. Өтінім қалдырамын, координатор ыңғайлы уақытты қолмен бекітеді 🌿",
-        )
+        return _crm_fallback_answer(session)
 
 
 async def _handle_existing_lookup(chat_id: str, phone: str, session: dict[str, Any], text: str = "") -> str:
@@ -1824,9 +1840,11 @@ async def _handle_existing_lookup(chat_id: str, phone: str, session: dict[str, A
             date = appt.get("date") or appt.get("appointmentDate") or ""
             time = appt.get("timeStart") or appt.get("time_start") or appt.get("time") or ""
             doctor = appt.get("doctorName") or appt.get("doctor_name") or ""
-            details = ", ".join(str(x) for x in [date, time, doctor] if x) or "активная запись"
             session["step"] = "done"
-            return _tr(session, f"Вы уже записаны: {details} 🌿", f"Сіз жазылғансыз: {details} 🌿")
+            if date and time:
+                return _tr(session, f"Вы уже записаны на {date} в {time} к {doctor or 'врачу клиники'} 🌿", f"Сіз {date} күні {time} уақытқа {doctor or 'клиника дәрігеріне'} жазылғансыз 🌿")
+            details = ", ".join(str(x) for x in [date, time, doctor] if x) or "активная запись"
+            return _tr(session, f"Вы записаны: {details} 🌿", f"Сіз жазылғансыз: {details} 🌿")
     except Exception as exc:
         _safe_log(chat_id, "patient_lookup_error", {"error": str(exc)[:500]})
 
@@ -1865,6 +1883,8 @@ async def _handle_existing_lookup(chat_id: str, phone: str, session: dict[str, A
 def _wants_existing_lookup(text: str) -> bool:
     low = _low(text)
     if any(w in low for w in LOOKUP_WORDS):
+        return True
+    if any(w in low for w in ["на какое число", "на какую дату", "какое число записали", "какую дату записали", "на какое время", "когда запись"]):
         return True
     has_existing = any(w in low for w in ["уже", "моя", "мою", "у меня", "менің", "меним"])
     has_record = any(w in low for w in ["запис", "запись", "жазыл", "жазба"])
@@ -1966,8 +1986,8 @@ async def _handle_cancel_appointment(chat_id: str, phone: str, session: dict[str
         session["escalated"] = True
         return _tr(
             session,
-            "Сейчас не получилось отменить запись автоматически. Передам администратору, чтобы запись отменили вручную 🌿",
-            "Қазір жазбаны автоматты түрде тоқтата алмадым. Әкімшіге жіберемін, ол жазбаны қолмен тоқтатады 🌿",
+            "Передам администратору, чтобы он проверил запись и помог с отменой 🌿",
+            "Әкімшіге жіберемін, ол жазбаны тексеріп, тоқтатуға көмектеседі 🌿",
         )
 
 
@@ -2033,6 +2053,62 @@ def _contra_is_clear_no(text: str) -> bool:
     low = _low(text)
     return any(w == low or w in low for w in NO_CONTRA_WORDS)
 
+
+
+def _mandatory_step_prompt(session: dict[str, Any], step: str) -> str:
+    if step == "age":
+        return _ask_age(session)
+    if step == "contraindications":
+        return _tr(
+            session,
+            "Перед записью уточню противопоказания для безопасности. Подскажите, пожалуйста, противопоказаний нет?",
+            "Жазылу алдында қауіпсіздік үшін қарсы көрсетілімдерді нақтылаймын. Қарсы көрсетілімдер жоқ па?",
+        )
+    if step in ("date", "preferred_time"):
+        return _ask_date(session)
+    if step in ("time", "select_slot"):
+        return _tr(session, "Какое время из вариантов выше Вам удобно?", "Жоғарыдағы уақыттардың қайсысы ыңғайлы?")
+    if step == "name":
+        return _ask_name(session)
+    return _clarify_intent_answer(session)
+
+
+def _faq_answer(text: str, session: dict[str, Any]) -> str | None:
+    if _has_any(text, PRICE_WORDS):
+        return _price_answer(text, session)
+    if _has_mri_question(text):
+        return _mri_answer_in_flow(session)
+    if _has_any(text, ADDRESS_WORDS):
+        return _address_answer(session)
+    if _has_any(text, SCHEDULE_WORDS):
+        return _schedule_answer(session)
+    return None
+
+
+def _faq_answer_then_resume(text: str, session: dict[str, Any], step: str) -> str | None:
+    info = _faq_answer(text, session)
+    if not info:
+        return None
+    return info + "\n\n" + _mandatory_step_prompt(session, step)
+
+
+def _after_booking_admin_answer(text: str, session: dict[str, Any]) -> str:
+    info = _faq_answer(text, session)
+    if info:
+        return info
+    return _tr(
+        session,
+        "Чтобы не подсказать неверно, передам Ваш вопрос администратору/врачу — с Вами свяжутся 🌿",
+        "Қате ақпарат бермеу үшін сұрағыңызды әкімшіге/дәрігерге жіберемін — Сізбен байланысады 🌿",
+    )
+
+
+def _crm_fallback_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Вижу Ваш запрос 🌿 Сейчас передам администратору, чтобы он проверил данные и связался с Вами.",
+        "Сұрағыңызды көріп тұрмын 🌿 Қазір әкімшіге жіберемін, ол деректерді тексеріп, Сізбен байланысады.",
+    )
 
 async def _continue_after_collected_age(chat_id: str, session: dict[str, Any], text: str, age: int) -> str:
     """Продолжение сценария, если возраст уже есть в этом же сообщении."""
@@ -2295,6 +2371,127 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session,
             _tr(session, "Хорошо, буду отвечать на русском 🌿", "Жақсы, қазақша жауап беремін 🌿"),
         )
+
+    # state_machine_first_guard:
+    # После языкового режима сначала уважаем текущее состояние диалога.
+    # Intent-router запускается только после обязательных шагов, чтобы не перехватывать
+    # возраст/противопоказания/дату/время/имя и не начинать анкету заново.
+    step = session.get("step") or "start"
+
+    if _contra_has_hard_stop(text) and step not in ("done", "booked", "stopped"):
+        session["contraindications_raw"] = text
+        session["contraindications_ok"] = False
+        session["contraindications_verdict"] = "stop"
+        session["step"] = "stopped"
+        session["escalated"] = True
+        return _finalize(chat_id, session, _stop_booking_text(session, "contra"))
+
+    if step in ("done", "booked") or session.get("booked"):
+        if _is_cancel(text):
+            answer = await _handle_cancel_appointment(chat_id, phone, session, text)
+            return _finalize(chat_id, session, answer)
+        if _wants_existing_lookup(text):
+            answer = await _handle_existing_lookup(chat_id, phone, session, text)
+            return _finalize(chat_id, session, answer)
+        if _is_visit_confirmation_reply(text):
+            session["status"] = "visit_confirmed"
+            session["visit_confirmed"] = True
+            return _finalize(chat_id, session, _visit_confirmation_answer(session))
+        if _is_thanks_or_ok(text):
+            return _no_reply(chat_id, session)
+        return _finalize(chat_id, session, _after_booking_admin_answer(text, session))
+
+    if step in ("age", "contraindications", "date", "preferred_time", "time", "select_slot", "name"):
+        if _is_thanks_or_ok(text) and step in ("date", "preferred_time", "time", "select_slot"):
+            return _no_reply(chat_id, session)
+        faq_resume = _faq_answer_then_resume(text, session, step)
+        if faq_resume:
+            return _finalize(chat_id, session, faq_resume)
+
+        if step == "age":
+            if any(p in _low(text) for p in ["не знаю", "позже", "потом", "уточню", "білмеймін", "билмеймин"]):
+                return _finalize(
+                    chat_id,
+                    session,
+                    _tr(
+                        session,
+                        "Хорошо 🌿 Для записи возраст всё равно понадобится. Когда сможете — напишите, пожалуйста, возраст пациента.",
+                        "Жақсы 🌿 Жазылу үшін жас бәрібір қажет болады. Мүмкін болғанда пациенттің жасын жазыңызшы.",
+                    ),
+                )
+            age = _extract_age(text, step="age")
+            if not age:
+                return _finalize(chat_id, session, _ask_age(session))
+            session["age"] = age
+            stop = _age_stop_text(age, session)
+            if age < 16:
+                session["contraindications_ok"] = False
+                session["contraindications_verdict"] = "stop"
+                session["step"] = "stopped"
+                return _finalize(chat_id, session, stop)
+            if age > 75:
+                session["contraindications_ok"] = False
+                session["contraindications_verdict"] = "admin_contact"
+                session["step"] = "escalated"
+                session["escalated"] = True
+                return _finalize(chat_id, session, stop)
+            if age < 18:
+                session["minor_parent_required"] = True
+            session["step"] = "contraindications"
+            session["questionnaire_step"] = "contra"
+            answer = (stop + "\n\n" if age < 18 else "") + _ask_contra(session)
+            return _finalize(chat_id, session, answer)
+
+        if step == "contraindications":
+            if _is_no_contra_answer(text) or _contra_is_clear_no(text):
+                session["contraindications_ok"] = True
+                session["contraindications_raw"] = text or "нет"
+                session["contraindications_verdict"] = "proceed"
+                session["step"] = "date"
+                session["questionnaire_step"] = "date"
+                return _finalize(chat_id, session, _ask_date(session))
+            if _contra_has_hard_stop(text):
+                session["contraindications_raw"] = text
+                session["contraindications_ok"] = False
+                session["contraindications_verdict"] = "stop"
+                session["step"] = "stopped"
+                return _finalize(chat_id, session, _stop_booking_text(session, "contra"))
+            if (_has_complaint(text) or _has_medical_complaint_text(text)):
+                return _finalize(chat_id, session, _ask_contra(session))
+            if any(w in _low(text) for w in YES_WORDS):
+                session["contraindications_ok"] = False
+                session["contraindications_verdict"] = "need_details"
+                answer = _tr(
+                    session,
+                    "Поняла Вас. Уточните, пожалуйста, какое именно противопоказание есть: кардиостимулятор, беременность, онкология, металл в зоне лечения, эпилепсия, возраст до 16 или более 75 лет, ограниченная подвижность? Если что-то из этого есть — запись оформить нельзя.",
+                    "Түсіндім. Қай қарсы көрсетілім бар екенін нақтылап жазыңызшы: кардиостимулятор, жүктілік, онкология, емдеу аймағындағы металл, эпилепсия, 16 жасқа дейін немесе 75 жастан жоғары жас, қозғалыстың шектелуі? Егер осының бірі болса — жазба рәсімделмейді.",
+                )
+                return _finalize(chat_id, session, answer)
+            return _finalize(chat_id, session, _ask_contra(session))
+
+        if step in ("date", "preferred_time"):
+            date_iso = _parse_date(text)
+            if not date_iso:
+                return _finalize(chat_id, session, _ask_date(session))
+            return _finalize(chat_id, session, await _show_slots(chat_id, session, date_iso))
+
+        if step in ("time", "select_slot"):
+            slots = session.get("last_slots") or []
+            slot = _select_slot(text, slots)
+            if not slot:
+                return _finalize(chat_id, session, _mandatory_step_prompt(session, "time"))
+            session["selected_slot"] = slot
+            session["selected_date"] = slot.get("date") or session.get("preferred_date")
+            session["selected_time"] = slot.get("time")
+            session["step"] = "name"
+            return _finalize(chat_id, session, _ask_name(session))
+
+        if step == "name":
+            name = _extract_name(text)
+            if not name:
+                return _finalize(chat_id, session, _ask_name(session))
+            session["patient_name"] = name
+            return _finalize(chat_id, session, await _book(chat_id, session, phone))
 
     # universal_intent_router:
     # Сначала понимаем намерение клиента, потом запускаем сценарий записи.
