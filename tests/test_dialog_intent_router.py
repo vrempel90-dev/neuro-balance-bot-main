@@ -27,7 +27,7 @@ def run(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
-def setup_crm(monkeypatch: Any, *, lookup_error: bool = False, cancel_error: bool = False) -> dict[str, list[Any]]:
+def setup_crm(monkeypatch: Any, *, lookup_error: bool = False, cancel_error: bool = False, slots_error: bool = False, book_error: bool = False) -> dict[str, list[Any]]:
     calls: dict[str, list[Any]] = {
         "lookup": [],
         "cancel": [],
@@ -57,6 +57,8 @@ def setup_crm(monkeypatch: Any, *, lookup_error: bool = False, cancel_error: boo
 
     async def fake_check_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
         calls["slots"].append({"date": date, "doctor_login": doctor_login})
+        if slots_error:
+            raise crm.CRMError("CRM unavailable")
         return {
             "availability": [
                 {
@@ -69,6 +71,8 @@ def setup_crm(monkeypatch: Any, *, lookup_error: bool = False, cancel_error: boo
 
     async def fake_book_appointment(**kwargs: Any) -> dict[str, Any]:
         calls["book"].append(kwargs)
+        if book_error:
+            raise crm.CRMError("CRM unavailable")
         return {
             "ok": True,
             "appointmentId": 999,
@@ -253,3 +257,152 @@ def test_language_lock_keeps_ru_and_kk(monkeypatch: Any) -> None:
     reset("lang_kk", {"language": "kk", "language_locked": True, "step": "date"})
     assert answer("lang_kk", "ок") == ""
     assert state.get_session("lang_kk")["language"] == "kk"
+
+
+def test_release_candidate_state_machine_and_faq_regressions(monkeypatch: Any) -> None:
+    calls = setup_crm(monkeypatch)
+
+    reset("rc_age", {"step": "age", "complaint": "болит спина", "language": "ru", "language_locked": True})
+    result = answer("rc_age", "36 лет")
+    session = state.get_session("rc_age")
+    assert session["age"] == 36
+    assert session["step"] == "contraindications"
+    assert "противопоказ" in result.lower()
+
+    reset("rc_age_price", {"step": "age", "complaint": "болит спина", "language": "ru", "language_locked": True})
+    result = answer("rc_age_price", "Сколько стоит?")
+    session = state.get_session("rc_age_price")
+    assert "5 000" in result
+    assert "сколько Вам лет" in result
+    assert session["step"] == "age"
+
+    reset("rc_contra_price", {"step": "contraindications", "complaint": "болит спина", "age": 36, "language": "ru", "language_locked": True})
+    result = answer("rc_contra_price", "Сколько стоит курс лечения")
+    session = state.get_session("rc_contra_price")
+    assert "5 000" in result
+    assert "Стоимость курса" in result
+    assert "противопоказ" in result.lower()
+    assert "сколько Вам лет" not in result
+    assert session["step"] == "contraindications"
+
+    reset("rc_date_price", {"step": "date", "complaint": "болит спина", "age": 36, "contraindications_ok": True, "language": "ru", "language_locked": True})
+    result = answer("rc_date_price", "Сколько стоит приём?")
+    session = state.get_session("rc_date_price")
+    assert "5 000" in result
+    assert "На какой день" in result
+    assert session["step"] == "date"
+
+    reset("rc_contra_no", {"step": "contraindications", "complaint": "болит спина", "age": 36, "language": "ru", "language_locked": True})
+    result = answer("rc_contra_no", "Противопаказаний нет")
+    session = state.get_session("rc_contra_no")
+    assert session["contraindications_ok"] is True
+    assert session["step"] == "date"
+    assert "На какой день" in result
+
+    assert calls["book"] == []
+
+
+def test_release_candidate_done_mode_and_language_regressions(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+
+    reset("rc_done_lookup", {"step": "done", "booked": True, "language": "ru", "language_locked": True})
+    result = answer("rc_done_lookup", "На какое число записали")
+    assert "2099-01-01" in result and "18:00" in result
+
+    reset("rc_done_address", {"step": "done", "booked": True, "language": "ru", "language_locked": True})
+    result = answer("rc_done_address", "Куда обращаться?")
+    assert "Кабанбай батыра 28" in result
+    assert "Ваша запись уже оформлена" not in result
+
+    reset("rc_done_advice", {"step": "done", "booked": True, "language": "ru", "language_locked": True})
+    result = answer("rc_done_advice", "Посоветуйте")
+    assert "Ваша запись уже оформлена" not in result
+    assert "передам" in result.lower() or "уточ" in result.lower()
+
+    reset("rc_kk_switch")
+    result = answer("rc_kk_switch", "Қазақша жоқпа")
+    assert "қазақша" in result.lower()
+    result = answer("rc_kk_switch", "Ооо")
+    assert state.get_session("rc_kk_switch")["language"] == "kk"
+    assert "қазақша" not in result.lower()
+    result = answer("rc_kk_switch", "Бел жағын қарайсыздарма")
+    session = state.get_session("rc_kk_switch")
+    assert session["step"] == "age"
+    assert "Жасыңыз нешеде" in result
+    result = answer("rc_kk_switch", "36")
+    session = state.get_session("rc_kk_switch")
+    assert session["age"] == 36
+    assert session["step"] == "contraindications"
+    assert "Қарсы көрсетілім" in result
+
+
+def test_release_candidate_profile_nonprofile_and_safety_regressions(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+
+    reset("rc_mri")
+    result = answer("rc_mri", "МРТ заранее нужно делать?")
+    assert "заранее делать не обязательно" in result
+    assert state.get_session("rc_mri")["step"] == "start"
+
+    reset("rc_typo_complaint")
+    result = answer("rc_typo_complaint", "Здравствуйте у меня грижа и балит поесница")
+    session = state.get_session("rc_typo_complaint")
+    assert session["step"] == "age"
+    assert "сколько Вам лет" in result
+    assert "имя" not in result.lower()
+
+    reset("rc_hard_contra")
+    result = answer("rc_hard_contra", "кардиостемулятор")
+    session = state.get_session("rc_hard_contra")
+    assert session["step"] == "stopped"
+    assert "останавливаю" in result
+
+    reset("rc_nonprofile")
+    result = answer("rc_nonprofile", "зуб болит")
+    session = state.get_session("rc_nonprofile")
+    assert session["step"] == "escalated"
+    assert "этим направлением" in result
+    assert "сколько Вам лет" not in result
+
+    reset("rc_viktor")
+    result = answer("rc_viktor", "Виктор")
+    assert "МРТ" not in result and "КТ" not in result
+    assert "чем можем помочь" in result
+
+    from strict_prompt_guard import enforce_prompt_only
+    assert enforce_prompt_only("") == ""
+    unsafe = "Мы гарантируем результат и обязательно вылечим."
+    guarded = enforce_prompt_only(unsafe)
+    assert "гарантируем результат" not in guarded.lower()
+    assert "обязательно вылечим" not in guarded.lower()
+
+
+def test_release_candidate_crm_slots_and_book_fallbacks(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch, slots_error=True)
+    reset("rc_slots_error", {"step": "date", "complaint": "болит спина", "age": 36, "contraindications_ok": True, "language": "ru", "language_locked": True})
+    result = answer("rc_slots_error", "завтра")
+    session = state.get_session("rc_slots_error")
+    assert result
+    assert "администратор" in result
+    assert "CRM" not in result
+    assert session["step"] == "escalated"
+
+    setup_crm(monkeypatch, book_error=True)
+    reset(
+        "rc_book_error",
+        {
+            "step": "name",
+            "language": "ru",
+            "language_locked": True,
+            "complaint": "болит спина",
+            "age": 36,
+            "contraindications_ok": True,
+            "selected_slot": {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "18:00"},
+        },
+    )
+    result = answer("rc_book_error", "Виктор")
+    session = state.get_session("rc_book_error")
+    assert result
+    assert "администратор" in result
+    assert "CRM" not in result
+    assert session["step"] == "escalated"
