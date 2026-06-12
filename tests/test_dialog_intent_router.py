@@ -561,6 +561,12 @@ def test_static_dialog_template_wiring_and_tr_arity() -> None:
     tr_calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_tr"]
     assert tr_calls
     assert all(len(node.args) == 3 for node in tr_calls)
+    assert "return _tr(\n    return _clinic_info_template" not in source
+    assert "return _tr(lang" not in source
+    assert (
+        'if step in ("start", "", None):\n        if step in ("start", "", None) and not session.get("escalated")'
+        not in source
+    )
 
     session: dict[str, Any] = {"language": "ru"}
     address = dialog._address_answer(session)
