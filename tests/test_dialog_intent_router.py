@@ -406,3 +406,90 @@ def test_release_candidate_crm_slots_and_book_fallbacks(monkeypatch: Any) -> Non
     assert "администратор" in result
     assert "CRM" not in result
     assert session["step"] == "escalated"
+
+
+def test_production_fix_live_admin_regressions(monkeypatch: Any) -> None:
+    calls = setup_crm(monkeypatch)
+
+    reset("pf_method")
+    result = answer("pf_method", "Что за методика")
+    session = state.get_session("pf_method")
+    assert "безоперационные методы лечения" in result
+    assert "магнитотерапия" in result
+    assert "что Вас беспокоит" in result
+    assert session["step"] == "complaint"
+
+    reset("pf_doctors_age", {"step": "age", "complaint": "болит спина", "language": "ru", "language_locked": True})
+    result = answer("pf_doctors_age", "У вас врачи или как")
+    session = state.get_session("pf_doctors_age")
+    assert "консультацию проводит врач" in result
+    assert "сколько Вам лет" in result
+    assert session["step"] == "age"
+
+    reset("pf_doctors_age_inline", {"step": "age", "complaint": "болит спина", "language": "ru", "language_locked": True})
+    result = answer("pf_doctors_age_inline", "У вас врачи или как 46")
+    session = state.get_session("pf_doctors_age_inline")
+    assert "консультацию проводит врач" in result
+    assert session["age"] == 46
+    assert session["step"] == "contraindications"
+    assert "противопоказ" in result.lower()
+
+    reset("pf_leg_radiation")
+    result = answer("pf_leg_radiation", "У меня боль в пояснице и отдаёт на ногу")
+    session = state.get_session("pf_leg_radiation")
+    assert "с такими жалобами к нам обращаются" in result.lower()
+    assert "сколько Вам лет" in result
+    assert "противопоказание для записи" not in result
+    assert session["step"] == "age"
+
+    reset("pf_leg_pull")
+    result = answer("pf_leg_pull", "тянет ногу и болит поясница")
+    session = state.get_session("pf_leg_pull")
+    assert "с такими жалобами к нам обращаются" in result.lower()
+    assert "противопоказание для записи" not in result
+    assert session["step"] == "age"
+
+    reset("pf_duplicate", {"step": "date", "complaint": "болит спина", "age": 36, "contraindications_ok": True, "language": "ru", "language_locked": True})
+    first = answer("pf_duplicate", "в субботу")
+    second = answer("pf_duplicate", "в субботу")
+    assert "процедурные дни" in first
+    assert second == ""
+
+    reset("pf_course_days", {"step": "date", "complaint": "болит спина", "age": 36, "contraindications_ok": True, "language": "ru", "language_locked": True})
+    result = answer("pf_course_days", "Сколько дней будет всего")
+    session = state.get_session("pf_course_days")
+    assert "Количество дней и процедур врач сможет определить" in result
+    assert "На какой день Вам удобно прийти" in result
+    assert session["step"] == "date"
+
+    reset("pf_no_contra", {"step": "contraindications", "complaint": "болит спина", "age": 36, "language": "ru", "language_locked": True})
+    result = answer("pf_no_contra", "Противопоказаний нет!")
+    session = state.get_session("pf_no_contra")
+    assert session["contraindications_ok"] is True
+    assert session["step"] == "date"
+    assert "На какой день Вам удобно прийти" in result
+
+    reset("pf_tomorrow_after_no_contra", {"step": "date", "complaint": "болит спина", "age": 36, "contraindications_ok": True, "language": "ru", "language_locked": True})
+    result = answer("pf_tomorrow_after_no_contra", "Завтра")
+    assert "противопоказ" not in result.lower()
+    assert calls["slots"]
+
+    reset("pf_saturday", {"step": "date", "complaint": "болит спина", "age": 36, "contraindications_ok": True, "language": "ru", "language_locked": True})
+    result = answer("pf_saturday", "в субботу")
+    session = state.get_session("pf_saturday")
+    assert "процедурные дни" in result
+    assert session["step"] == "date"
+
+    reset("pf_sunday", {"step": "date", "complaint": "болит спина", "age": 36, "contraindications_ok": True, "language": "ru", "language_locked": True})
+    result = answer("pf_sunday", "в воскресенье")
+    session = state.get_session("pf_sunday")
+    assert "процедурные дни" in result
+    assert session["step"] == "date"
+
+    for chat_id, preset, text in [
+        ("pf_manual_like", {"manual_admin_intervention": True}, "👍"),
+        ("pf_manual_good", {"manual_admin_intervention": True, "step": "date"}, "хорошо"),
+        ("pf_manual_no_contra", {"manual_admin_intervention": True, "step": "contraindications"}, "ничего нет"),
+    ]:
+        reset(chat_id, {**preset, "language": "ru", "language_locked": True})
+        assert answer(chat_id, text) == ""
