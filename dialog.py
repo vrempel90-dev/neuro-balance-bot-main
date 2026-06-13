@@ -1686,6 +1686,22 @@ def _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | Non
     return None
 
 
+def _remember_selected_slot(session: dict[str, Any], slot: dict[str, Any]) -> None:
+    """Persist the exact CRM slot payload and denormalized booking fields."""
+    if session.get("contraindications_ok") is True and not session.get("contraindications_verdict"):
+        # Keep in-flight sessions created before the tool-gate markers bookable
+        # as soon as the patient chooses a concrete slot.
+        bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, str(session.get("contraindications_raw") or "нет"))
+    if session.get("complaint") and not session.get("complaint_gate"):
+        _record_complaint_tool(session, str(session.get("complaint") or ""), is_in_profile=True)
+
+    session["selected_slot"] = slot
+    session["selected_doctor_login"] = _slot_doctor_login(slot)
+    session["selected_doctor_name"] = _slot_doctor_name(slot)
+    session["selected_date"] = _slot_date(slot) or session.get("preferred_date")
+    session["selected_time"] = _slot_time(slot)
+
+
 def _looks_like_name(text: str) -> bool:
     clean = _clean(text)
     low = _low(clean)
@@ -2699,9 +2715,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             slots = session.get("last_slots") or []
             slot = _select_slot(text, slots)
             if slot:
-                session["selected_slot"] = slot
-                session["selected_date"] = _slot_date(slot) or session.get("preferred_date")
-                session["selected_time"] = _slot_time(slot)
+                _remember_selected_slot(session, slot)
                 session["step"] = "name"
                 return _finalize(chat_id, session, faq_info + "\n\n" + _ask_name(session))
 
@@ -3393,9 +3407,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
                 _tr(session, "Какое время из вариантов выше Вам удобно?", "Жоғарыдағы уақыттардың қайсысы ыңғайлы?"),
             )
 
-        session["selected_slot"] = slot
-        session["selected_date"] = _slot_date(slot) or session.get("preferred_date")
-        session["selected_time"] = _slot_time(slot)
+        _remember_selected_slot(session, slot)
         session["step"] = "name"
         return _finalize(chat_id, session, _ask_name(session))
 

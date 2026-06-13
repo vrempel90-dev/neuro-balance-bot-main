@@ -19,6 +19,7 @@ import crm
 import main
 import state
 import dialog
+import bot_tools
 from dialog import handle_message
 
 
@@ -693,6 +694,10 @@ def test_combined_faq_slot_selection_then_name_books_crm(monkeypatch: Any) -> No
     assert "Кабанбай" in first_result or "адрес" in first_result.lower()
     assert session["step"] == "name"
     assert session["selected_slot"] == slots[1]
+    assert session["selected_doctor_login"] == "doctor2"
+    assert session["selected_date"] == "2099-01-01"
+    assert session["selected_time"] == "10:00"
+    assert bot_tools.booking_gate_status(session) == (True, "ok")
 
     second_result = answer("combined_address_slot_then_book", "Алия")
     session = state.get_session("combined_address_slot_then_book")
