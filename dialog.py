@@ -1973,6 +1973,33 @@ def _no_slots_text(session: dict[str, Any]) -> str:
     )
 
 
+def _has_video_procedure_question(text: str) -> bool:
+    low = _low(text).replace("ё", "е")
+    compact = re.sub(r"[^\w\s]", " ", low)
+    compact = re.sub(r"\s+", " ", compact).strip()
+    patterns = [
+        "так же будет",
+        "как на видео",
+        "как в видео",
+        "точно так делают",
+        "это будут делать",
+        "все как на видео",
+        "процедура такая же",
+        "осылай болады ма",
+        "видеодагыдай болады ма",
+        "видеодағыдай болады ма",
+    ]
+    return any(pattern in compact for pattern in patterns)
+
+
+def _video_procedure_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Да, процедуры проходят по методике клиники, примерно как показано в видео 🌿 Но точный план врач подбирает после осмотра, потому что всё зависит от Вашего состояния.",
+        "Иә, процедуралар клиника әдістемесі бойынша, видеода көрсетілгендей форматта өтуі мүмкін 🌿 Бірақ нақты ем жоспарын дәрігер алғашқы қараудан кейін жағдайыңызға қарай таңдайды.",
+    )
+
+
 async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> str:
     session["preferred_date"] = date_iso
     lang = session.get("language") or "ru"
@@ -2841,16 +2868,29 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         if step in ("date", "preferred_time"):
             date_iso = _parse_date(text)
             if not date_iso:
+                if _has_video_procedure_question(text):
+                    return _finalize(chat_id, session, _video_procedure_answer(session) + "\n\n" + _ask_date(session))
                 return _finalize(chat_id, session, _ask_date(session))
             if _is_new_patient_consultation(session) and _mentions_weekend_day(text) and _is_weekend_date(date_iso):
                 session["step"] = "date"
                 return _finalize(chat_id, session, _weekend_primary_block_answer(session))
-            return _finalize(chat_id, session, await _show_slots(chat_id, session, date_iso))
+            answer = await _show_slots(chat_id, session, date_iso)
+            if _has_video_procedure_question(text):
+                answer = _video_procedure_answer(session) + "\n\n" + answer
+            return _finalize(chat_id, session, answer)
 
         if step in ("time", "select_slot"):
             slots = session.get("last_slots") or []
             slot = _select_slot(text, slots)
             if not slot:
+                if _has_video_procedure_question(text):
+                    return _finalize(
+                        chat_id,
+                        session,
+                        _video_procedure_answer(session)
+                        + "\n\n"
+                        + _tr(session, "Какое время из вариантов выше Вам удобно?", "Жоғарыдағы уақыттардың қайсысы ыңғайлы?"),
+                    )
                 return _finalize(chat_id, session, _mandatory_step_prompt(session, "time"))
             session["selected_slot"] = slot
             session["selected_date"] = _slot_date(slot) or session.get("preferred_date")
@@ -3437,6 +3477,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if step in ("date", "preferred_time"):
         date_iso = _parse_date(text)
         if not date_iso:
+            if _has_video_procedure_question(text):
+                return _finalize(chat_id, session, _video_procedure_answer(session) + "\n\n" + _ask_date(session))
             return _finalize(chat_id, session, _ask_date(session))
 
         if _is_new_patient_consultation(session) and _mentions_weekend_day(text) and _is_weekend_date(date_iso):
@@ -3444,6 +3486,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return _finalize(chat_id, session, _weekend_primary_block_answer(session))
 
         answer = await _show_slots(chat_id, session, date_iso)
+        if _has_video_procedure_question(text):
+            answer = _video_procedure_answer(session) + "\n\n" + answer
         return _finalize(chat_id, session, answer)
 
     # 9) Выбор времени.
@@ -3451,6 +3495,14 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         slots = session.get("last_slots") or []
         slot = _select_slot(text, slots)
         if not slot:
+            if _has_video_procedure_question(text):
+                return _finalize(
+                    chat_id,
+                    session,
+                    _video_procedure_answer(session)
+                    + "\n\n"
+                    + _tr(session, "Какое время из вариантов выше Вам удобно?", "Жоғарыдағы уақыттардың қайсысы ыңғайлы?"),
+                )
             return _finalize(
                 chat_id,
                 session,
