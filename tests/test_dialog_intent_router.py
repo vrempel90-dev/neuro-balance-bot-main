@@ -102,6 +102,13 @@ def answer(chat_id: str, text: str) -> str:
     return run(handle_message(chat_id, "77011234567", text))
 
 
+def test_thanks_ok_guard_does_not_match_substrings() -> None:
+    assert dialog._is_thanks_or_ok("ок") is True
+    assert dialog._is_thanks_or_ok("спасибо") is True
+    assert dialog._is_thanks_or_ok("Поясничная область начала беспокоить") is False
+    assert dialog._is_thanks_or_ok("спина беспокоит") is False
+
+
 def test_standalone_thanks_ok_do_not_start_questionnaire(monkeypatch: Any) -> None:
     calls = setup_crm(monkeypatch)
 
@@ -353,6 +360,14 @@ def test_release_candidate_profile_nonprofile_and_safety_regressions(monkeypatch
     assert "сколько Вам лет" in result
     assert "имя" not in result.lower()
 
+    reset("rc_back_area_bothers")
+    result = answer("rc_back_area_bothers", "Поясничная область начала беспокоить")
+    session = state.get_session("rc_back_area_bothers")
+    assert result != ""
+    assert session["profile_status"] == "profile"
+    assert session["step"] == "age"
+    assert "сколько Вам лет" in result
+
     reset("rc_hard_contra")
     result = answer("rc_hard_contra", "кардиостемулятор")
     session = state.get_session("rc_hard_contra")
@@ -439,7 +454,10 @@ def test_production_fix_live_admin_regressions(monkeypatch: Any) -> None:
     reset("pf_leg_radiation")
     result = answer("pf_leg_radiation", "У меня боль в пояснице и отдаёт на ногу")
     session = state.get_session("pf_leg_radiation")
-    assert "с такими жалобами к нам обращаются" in result.lower()
+    assert "относится к нашему профилю" in result.lower()
+    old_phrase = "С такими жалобами к нам " + "обращаются"
+    assert old_phrase not in result
+    assert old_phrase.lower() not in result
     assert "сколько Вам лет" in result
     assert "противопоказание для записи" not in result
     assert session["step"] == "age"
@@ -447,7 +465,10 @@ def test_production_fix_live_admin_regressions(monkeypatch: Any) -> None:
     reset("pf_leg_pull")
     result = answer("pf_leg_pull", "тянет ногу и болит поясница")
     session = state.get_session("pf_leg_pull")
-    assert "с такими жалобами к нам обращаются" in result.lower()
+    assert "относится к нашему профилю" in result.lower()
+    old_phrase = "С такими жалобами к нам " + "обращаются"
+    assert old_phrase not in result
+    assert old_phrase.lower() not in result
     assert "противопоказание для записи" not in result
     assert session["step"] == "age"
 
