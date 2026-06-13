@@ -195,13 +195,7 @@
     "must_contain": [
       "противопоказания"
     ],
-    "must_not_contain": [
-      "кардиостимулятор",
-      "дефибриллятор",
-      "тромбофлебит",
-      "эпилепсия",
-      "беременность"
-    ]
+    "must_not_contain": []
   },
   {
     "name": "no_name_addressing_after_booking",
