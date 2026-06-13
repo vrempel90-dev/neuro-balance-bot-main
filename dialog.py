@@ -159,7 +159,7 @@ IMMOBILITY_WORDS = ["коляска", "костыли", "лежит", "не хо
 
 PROFILE_COMPLAINT_WORDS = [
     # позвоночник / спина
-    "спина", "спине", "спину", "поясниц", "крестец", "копчик",
+    "спина", "спине", "спину", "поясниц", "пояснич", "крестец", "копчик",
     "шея", "шей", "воротников", "лопат", "межлопат",
     "позвоноч", "омыртқа", "омыртка", "арқа", "арка", "белім", "белим",
 
@@ -979,13 +979,24 @@ def _is_thanks_or_ok(text: str) -> bool:
         "спасибо", "спс", "благодарю", "хорошо", "ок", "окей", "понял", "поняла",
         "рахмет", "жақсы", "жаксы", "түсіндім", "тусиндим",
     ]
+
     cleaned = re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", low)
 
     for w in final_words:
-        if cleaned == re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", w):
+        normalized = re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", w)
+        if cleaned == normalized:
             return True
 
-    return len(low) <= 40 and any(w in low for w in final_words)
+    # ВАЖНО:
+    # Нельзя делать `"ок" in low`, потому что слово "беспокоить" содержит "ок".
+    # Для коротких фраз разрешаем только отдельные слова.
+    if len(low) <= 40:
+        for w in final_words:
+            pattern = rf"(?<![a-zа-яәғқңөұүһі]){re.escape(w)}(?![a-zа-яәғқңөұүһі])"
+            if re.search(pattern, low):
+                return True
+
+    return False
 
 
 def _is_refuse_booking(text: str) -> bool:
