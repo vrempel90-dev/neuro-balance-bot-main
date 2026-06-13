@@ -454,7 +454,10 @@ def test_production_fix_live_admin_regressions(monkeypatch: Any) -> None:
     reset("pf_leg_radiation")
     result = answer("pf_leg_radiation", "У меня боль в пояснице и отдаёт на ногу")
     session = state.get_session("pf_leg_radiation")
-    assert "с такими жалобами к нам обращаются" in result.lower()
+    assert "относится к нашему профилю" in result.lower()
+    old_phrase = "С такими жалобами к нам " + "обращаются"
+    assert old_phrase not in result
+    assert old_phrase.lower() not in result
     assert "сколько Вам лет" in result
     assert "противопоказание для записи" not in result
     assert session["step"] == "age"
@@ -462,7 +465,10 @@ def test_production_fix_live_admin_regressions(monkeypatch: Any) -> None:
     reset("pf_leg_pull")
     result = answer("pf_leg_pull", "тянет ногу и болит поясница")
     session = state.get_session("pf_leg_pull")
-    assert "с такими жалобами к нам обращаются" in result.lower()
+    assert "относится к нашему профилю" in result.lower()
+    old_phrase = "С такими жалобами к нам " + "обращаются"
+    assert old_phrase not in result
+    assert old_phrase.lower() not in result
     assert "противопоказание для записи" not in result
     assert session["step"] == "age"
 
