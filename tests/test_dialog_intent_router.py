@@ -636,7 +636,9 @@ def test_wazzup_manual_admin_context_with_profile_complaint(monkeypatch: Any) ->
 
     reset("manual_muted", {"manual_admin_intervention": True, "ai_muted": True, "step": "start"})
     result = answer("manual_muted", "Спина болит, делала давно рентген была протрузия")
-    assert result == ""
+    session = state.get_session("manual_muted")
+    assert "сколько Вам лет" in result
+    assert session["muted_reason"] == "bypassed_by_profile_complaint"
 
 
 def test_wazzup_non_profile_and_debug_profile_controls(monkeypatch: Any) -> None:
@@ -693,3 +695,86 @@ def test_session_recovers_by_phone_when_wazzup_chat_id_changes(monkeypatch: Any)
     assert session["age"] == 42
     assert session["step"] == "contraindications"
     assert "противопоказ" in result.lower()
+
+
+
+def test_debug_force_lumbar_typo_profile_empty_session(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    reset("debug_lumbar_typo")
+
+    result = run(main.debug_chat({"chat_id": "debug_lumbar_typo", "phone": "7700000992", "text": "Поясничная область начал бкспокоит", "force": True}))
+    session = result["session"]
+
+    assert result["answer"]
+    assert "с такими жалобами" in result["answer"].lower()
+    assert "сколько Вам лет" in result["answer"]
+    assert session["step"] == "age"
+    assert session["profile_status"] == "profile"
+    assert not result["debug"].get("no_reply_reason")
+
+
+def test_debug_force_bypasses_old_manual_mute_for_profile(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    reset("debug_force_muted", {"manual_takeover": True, "ai_muted": True, "step": "start"})
+
+    result = run(main.debug_chat({"chat_id": "debug_force_muted", "phone": "7700000993", "text": "Поясничная область начала беспокоить", "force": True}))
+
+    assert result["answer"]
+    assert "сколько Вам лет" in result["answer"]
+    assert result["debug"].get("muted_reason") == "bypassed_by_force"
+    assert not result["debug"].get("no_reply_reason")
+
+
+def test_wazzup_old_generic_lead_then_lumbar_typo_profile(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    reset(
+        "wazzup_old_lead_lumbar",
+        {
+            "source": "wazzup",
+            "step": "start",
+            "last_assistant_answer": "Здравствуйте! Это клиника Neuro Balance - лечение спины и суставов. Вы оставляли у нас заявку. Скажите, что вас беспокоит?",
+        },
+    )
+
+    result = answer("wazzup_old_lead_lumbar", "Поясничная область начал бкспокоит")
+    session = state.get_session("wazzup_old_lead_lumbar")
+
+    assert result
+    assert "сколько Вам лет" in result
+    assert session["profile_status"] == "profile"
+    assert session["step"] == "age"
+    assert session.get("no_reply_reason") not in ("manual_takeover", "business_hours_silence")
+
+
+def test_manual_takeover_thanks_stays_silent_with_reason(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    reset("manual_takeover_thanks", {"manual_takeover": True, "ai_muted": True, "step": "start"})
+
+    result = answer("manual_takeover_thanks", "спасибо")
+    session = state.get_session("manual_takeover_thanks")
+
+    assert result == ""
+    assert session["no_reply_reason"] == "thanks/manual_takeover"
+
+
+def test_debug_force_bypasses_business_hours_silence(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: False)
+    reset("debug_force_hours")
+
+    result = run(main.debug_chat({"chat_id": "debug_force_hours", "phone": "7700000994", "text": "Спина болит", "force": True}))
+
+    assert result["answer"]
+    assert "сколько Вам лет" in result["answer"]
+    assert not result["debug"].get("no_reply_reason")
+
+
+def test_debug_without_force_reports_business_hours_silence(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: False)
+    reset("debug_no_force_hours")
+
+    result = run(main.debug_chat({"chat_id": "debug_no_force_hours", "phone": "7700000995", "text": "Спина болит", "force": False}))
+
+    assert result["answer"] == ""
+    assert result["debug"]["no_reply_reason"] == "business_hours_silence"

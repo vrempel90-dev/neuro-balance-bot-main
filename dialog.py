@@ -164,7 +164,7 @@ GENERIC_LEAD_PROMPT_MARKERS = [
 
 PROFILE_COMPLAINT_WORDS = [
     # позвоночник / спина
-    "спина", "спине", "спину", "поясниц", "крестец", "копчик",
+    "спина", "спине", "спину", "спена", "поясниц", "пояснич", "крестец", "копчик",
     "шея", "шей", "воротников", "лопат", "межлопат",
     "позвоноч", "омыртқа", "омыртка", "арқа", "арка", "белім", "белим",
 
@@ -893,6 +893,9 @@ def _session_has_dialog_context(session: dict[str, Any]) -> bool:
         or session.get("manual_admin_intervention")
         or session.get("manual_takeover")
         or session.get("ai_muted")
+        or session.get("source")
+        or session.get("lead")
+        or session.get("last_assistant_answer")
     )
 
 
@@ -1032,10 +1035,13 @@ def _is_thanks_or_ok(text: str) -> bool:
     cleaned = re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", low)
 
     for w in final_words:
-        if cleaned == re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", w):
+        normalized = re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", w)
+        if cleaned == normalized:
+            return True
+        if len(low) <= 40 and re.search(rf"(?<![a-zа-яәғқңөұүһі]){re.escape(w)}(?![a-zа-яәғқңөұүһі])", low):
             return True
 
-    return len(low) <= 40 and any(w in low for w in final_words)
+    return False
 
 
 def _is_refuse_booking(text: str) -> bool:
@@ -1449,22 +1455,28 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     # чтобы Wazzup не получал одинаковые сообщения подряд.
     last_answer = _clean(str(session.get("last_assistant_answer") or session.get("last_bot_answer") or ""))
     if last_answer and _low(last_answer) == _low(answer):
+        session["no_reply_reason"] = "duplicate_answer"
+        session["guard_name"] = "duplicate_answer"
         _safe_save(chat_id, session)
         return ""
 
+    session.pop("no_reply_reason", None)
+    session.pop("guard_name", None)
     session["last_assistant_answer"] = answer
     _safe_save(chat_id, session)
     _safe_add_message(chat_id, "assistant", answer)
     return answer
 
 
-def _no_reply(chat_id: str, session: dict[str, Any]) -> str:
+def _no_reply(chat_id: str, session: dict[str, Any], reason: str = "no_reply") -> str:
     """Сохраняет состояние, но ничего не отправляет пациенту.
 
     Нужно после завершения записи: если пациент пишет "хорошо/спасибо/ок",
     бот не должен дублировать подтверждение и не должен запускать анкету заново.
     """
     session["last_assistant_answer"] = session.get("last_assistant_answer", "")
+    session["no_reply_reason"] = reason
+    session["guard_name"] = reason
     _safe_save(chat_id, session)
     return ""
 
@@ -1850,7 +1862,7 @@ def _has_leg_radiation_profile(text: str) -> bool:
 
 def _has_back_protrusion_profile(text: str) -> bool:
     low = _low(text)
-    return any(p in low for p in ["спина", "спине", "спину", "поясниц", "протруз", "грыж"])
+    return any(p in low for p in ["спина", "спине", "спину", "спена", "поясниц", "пояснич", "протруз", "грыж"])
 
 
 def _has_generic_lead_prompt(text: str) -> bool:
@@ -2587,7 +2599,7 @@ def _weekend_primary_block_answer(session: dict[str, Any]) -> str:
     )
 
 
-async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
+async def handle_message(chat_id: str, phone: str, user_text: str, force: bool = False) -> str:
     """Главная функция, которую вызывает main.py.
 
     main.py ожидает именно такую сигнатуру:
@@ -2602,12 +2614,25 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     session["phone"] = phone or session.get("phone") or ""
     session["language"] = _detect_lang(text, session)
+    session["force"] = bool(force)
+    session["step"] = session.get("step") or "start"
+
+    incoming_profile_status = _profile_status(text)
 
     # human_takeover_guard: если живой админ уже вмешался, AI молчит и не продолжает старый сценарий.
     if _is_ai_muted(session):
         session["ai_muted"] = True
         session["manual_takeover"] = True
-        return _no_reply(chat_id, session)
+        if _is_thanks_or_ok(text):
+            session["muted_reason"] = "manual_takeover"
+            return _no_reply(chat_id, session, "thanks/manual_takeover")
+        if (force or not session.get("manual_takeover_permanent")) and incoming_profile_status == "profile" and not _contra_has_hard_stop(text):
+            session["muted_reason"] = "bypassed_by_force" if force else "bypassed_by_profile_complaint"
+            session.pop("no_reply_reason", None)
+            session.pop("guard_name", None)
+        else:
+            session["muted_reason"] = "manual_takeover"
+            return _no_reply(chat_id, session, "manual_takeover")
 
     # language_lock_guard:
     # Фиксируем язык диалога, чтобы бот не прыгал RU/KZ от коротких ответов.
@@ -2646,7 +2671,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # возраст/противопоказания/дату/время/имя и не начинать анкету заново.
     step = session.get("step") or "start"
 
-    current_profile_status = _profile_status(text)
+    current_profile_status = incoming_profile_status
     if current_profile_status == "profile" and not _contra_has_hard_stop(text) and (
         step in ("start", "complaint", "")
         or not session.get("complaint")

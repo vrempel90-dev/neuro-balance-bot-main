@@ -316,6 +316,15 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
     # Вне рабочего времени бот полностью молчит.
     if not is_bot_work_time():
         state.log_event(chat_id, "silent_outside_work_time", {"kind": kind})
+        try:
+            session = state.get_session(chat_id)
+            session["no_reply_reason"] = "business_hours_silence"
+            session["guard_name"] = "business_hours_silence"
+            session["source"] = "wazzup"
+            session["phone"] = phone or session.get("phone") or ""
+            state.save_session(chat_id, session)
+        except Exception:
+            pass
         return ""
 
     if kind == "voice" or _message_has_voice_url(message):
@@ -380,6 +389,13 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
     try:
         if not is_bot_work_time():
             state.log_event(chat_id, "silent_outside_work_time", {"kind": kind})
+            try:
+                session = state.get_session(chat_id)
+                session["no_reply_reason"] = "business_hours_silence"
+                session["guard_name"] = "business_hours_silence"
+                state.save_session(chat_id, session)
+            except Exception:
+                pass
             return
 
         settings = get_settings()
@@ -558,14 +574,32 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
     force = bool(data.get("force") or False)
 
     if not force and not is_bot_work_time():
+        session = state.get_session(chat_id)
+        session["no_reply_reason"] = "business_hours_silence"
+        session["guard_name"] = "business_hours_silence"
+        session["force"] = False
+        state.save_session(chat_id, session)
         answer = ""
     else:
-        raw_answer = await handle_message(chat_id=chat_id, phone=phone, user_text=text)
+        raw_answer = await handle_message(chat_id=chat_id, phone=phone, user_text=text, force=force)
         answer = _guard_answer(chat_id, raw_answer)
+
+    session = state.get_session(chat_id)
+    debug = {
+        "no_reply_reason": session.get("no_reply_reason"),
+        "muted_reason": session.get("muted_reason"),
+        "guard_name": session.get("guard_name"),
+        "source": session.get("source"),
+        "force": force,
+        "step": session.get("step"),
+        "manual_takeover": session.get("manual_takeover"),
+        "ai_muted": session.get("ai_muted"),
+    }
 
     return {
         "answer": answer,
-        "session": state.get_session(chat_id),
+        "session": session,
+        "debug": debug,
         "bot_work_time_now": is_bot_work_time(),
     }
 
