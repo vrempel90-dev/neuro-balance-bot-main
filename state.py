@@ -125,8 +125,41 @@ def _phone_digits(value: str) -> str:
     return digits
 
 
+def _has_meaningful_context(session: dict[str, Any]) -> bool:
+    """Return True when a session has useful dialog state, not just identity metadata."""
+    step = str(session.get("step") or "start")
+    questionnaire_step = str(session.get("questionnaire_step") or "")
+    return bool(
+        session.get("complaint")
+        or step not in ("start", "", "None")
+        or questionnaire_step not in ("", "start", "None")
+        or session.get("last_slots")
+        or session.get("booked")
+        or session.get("appointment")
+        or session.get("status")
+        or session.get("patient_name")
+        or session.get("age")
+        or session.get("contraindications_ok") is not None
+        or session.get("contraindications_verdict")
+        or session.get("selected_slot")
+        or session.get("selected_date")
+        or session.get("selected_time")
+        or session.get("preferred_date")
+        or session.get("escalated")
+        or session.get("manual_takeover")
+        or session.get("ai_muted")
+        or session.get("manual_admin_intervention")
+    )
+
+
 def find_session_by_phone(phone: str) -> dict[str, Any] | None:
-    """Find an existing session by stable phone when Wazzup chat_id changes."""
+    """Find an existing session by stable phone when Wazzup chat_id changes.
+
+    Prefer the newest session with meaningful dialog context.  A fresh Wazzup
+    session for a new chat_id may already contain only phone/source metadata;
+    keep scanning older rows so that such blanks do not hide the real history.
+    If every matching session is blank, return the newest blank as a fallback.
+    """
     target = _phone_digits(phone)
     if not target:
         return None
@@ -134,16 +167,23 @@ def find_session_by_phone(phone: str) -> dict[str, Any] | None:
     with _connect() as conn:
         rows = conn.execute("SELECT data_json FROM sessions ORDER BY updated_at DESC").fetchall()
 
+    newest_blank: dict[str, Any] | None = None
     for row in rows:
         try:
             data = json.loads(row["data_json"])
         except Exception:
             continue
-        if _phone_digits(str(data.get("phone") or "")) == target:
-            merged = dict(DEFAULT_SESSION)
-            merged.update(data)
+        if _phone_digits(str(data.get("phone") or "")) != target:
+            continue
+
+        merged = dict(DEFAULT_SESSION)
+        merged.update(data)
+        if _has_meaningful_context(merged):
             return merged
-    return None
+        if newest_blank is None:
+            newest_blank = merged
+
+    return newest_blank
 
 
 def save_session(chat_id: str, data: dict[str, Any]) -> None:

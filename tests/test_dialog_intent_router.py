@@ -778,3 +778,41 @@ def test_debug_without_force_reports_business_hours_silence(monkeypatch: Any) ->
 
     assert result["answer"] == ""
     assert result["debug"]["no_reply_reason"] == "business_hours_silence"
+
+
+def test_find_session_by_phone_prefers_context_over_new_blank_wazzup_session() -> None:
+    phone = "77000001234"
+    older_chat = "phone_context_old_wazzup"
+    newer_chat = "phone_context_new_blank_wazzup"
+
+    reset(
+        older_chat,
+        {
+            "source": "wazzup",
+            "phone": phone,
+            "step": "age",
+            "complaint": "болит спина",
+            "profile_status": "profile",
+            "complaint_gate": "COMPLAINT_OK",
+        },
+    )
+    reset(newer_chat, {"source": "wazzup", "phone": phone, "step": "start"})
+
+    found = state.find_session_by_phone(phone)
+
+    assert found is not None
+    assert found["complaint"] == "болит спина"
+    assert found["step"] == "age"
+    assert found["profile_status"] == "profile"
+
+
+def test_find_session_by_phone_returns_newest_blank_when_no_context_exists() -> None:
+    phone = "77000005678"
+    reset("phone_blank_old", {"source": "wazzup", "phone": phone, "step": "start", "blank_marker": "old"})
+    reset("phone_blank_new", {"source": "wazzup", "phone": phone, "step": "start", "blank_marker": "new"})
+
+    found = state.find_session_by_phone(phone)
+
+    assert found is not None
+    assert found["blank_marker"] == "new"
+    assert found["step"] == "start"
