@@ -370,6 +370,47 @@ def test_release_candidate_done_mode_and_language_regressions(monkeypatch: Any) 
     assert "Қарсы көрсетілім" in result
 
 
+
+def test_booking_request_without_complaint_asks_for_complaint(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+
+    reset("appt_diagnostics")
+    result = answer("appt_diagnostics", "Здравствуйте хочу записаться на диагностику")
+    session = state.get_session("appt_diagnostics")
+    assert "можно записаться на диагностику" in result
+    assert "что Вас беспокоит" in result
+    assert session["step"] == "complaint"
+    assert "этим направлением" not in result
+    assert not session.get("escalated")
+
+    reset("appt_consultation")
+    result = answer("appt_consultation", "Здравствуйте хочу записаться на консультацию")
+    session = state.get_session("appt_consultation")
+    assert "можно записаться на консультацию" in result
+    assert "что Вас беспокоит" in result
+    assert session["step"] == "complaint"
+
+    reset("appt_reception")
+    result = answer("appt_reception", "Хочу записаться на приём")
+    session = state.get_session("appt_reception")
+    assert ("можно записаться на приём" in result) or ("можно записаться на прием" in result)
+    assert "что Вас беспокоит" in result
+    assert session["step"] == "complaint"
+
+    reset("appt_diagnostics_with_profile")
+    result = answer("appt_diagnostics_with_profile", "Хочу записаться на диагностику, спина болит")
+    session = state.get_session("appt_diagnostics_with_profile")
+    assert session["step"] == "age"
+    assert "спина" in result.lower()
+    assert "сколько Вам лет" in result
+
+    reset("appt_diagnostics_nonprofile")
+    result = answer("appt_diagnostics_nonprofile", "Хочу диагностику сердца")
+    session = state.get_session("appt_diagnostics_nonprofile")
+    assert session["step"] == "escalated"
+    assert session.get("escalated") is True
+    assert "этим направлением" in result
+
 def test_release_candidate_profile_nonprofile_and_safety_regressions(monkeypatch: Any) -> None:
     setup_crm(monkeypatch)
 
