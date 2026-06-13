@@ -131,7 +131,22 @@ def test_contra_question_stays_short_after_age(monkeypatch: Any) -> None:
     reset("contra_short", {"step": "age", "complaint": "болит спина", "language": "ru", "language_locked": True})
     result = answer("contra_short", "35")
     assert "противопоказ" in result.lower()
+    for item in ["дефибриллятора", "инсулиновой помпы", "кохлеарного импланта", "декомпенсированного диабета", "тиреотоксикоза"]:
+        assert item in result.lower()
     assert len(result) <= 700
+
+
+def test_contra_hard_stop_catches_full_checklist_items() -> None:
+    for text in [
+        "У меня дефибриллятор",
+        "Есть инсулиновая помпа",
+        "кохлеарный имплант установлен",
+        "декомпенсированный диабет",
+        "тиреотоксикоз",
+    ]:
+        assert dialog._contra_has_hard_stop(text) is True
+
+    assert dialog._contra_has_hard_stop("инсулиновой помпы нет") is False
 
 
 def test_standalone_thanks_ok_do_not_start_questionnaire(monkeypatch: Any) -> None:
