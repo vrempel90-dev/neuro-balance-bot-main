@@ -1621,14 +1621,30 @@ def _format_slots(slots_data: dict[str, Any], max_count: int = 5) -> list[dict[s
 def _slots_text(slots: list[dict[str, str]], lang: str) -> str:
     lines = []
     for i, slot in enumerate(slots, 1):
-        date = slot.get("date") or ""
-        time = slot.get("time") or ""
-        doctor = slot.get("doctor_name") or "Врач клиники"
+        date = _slot_date(slot)
+        time = _slot_time(slot)
+        doctor = _slot_doctor_name(slot) or "Врач клиники"
         if lang == "kk":
             lines.append(f"{i}) {date} {time} — {doctor}")
         else:
             lines.append(f"{i}) {date} в {time} — {doctor}")
     return "\n".join(lines)
+
+
+def _slot_doctor_login(slot: dict[str, Any]) -> str:
+    return str(slot.get("doctor_login") or slot.get("doctorLogin") or "")
+
+
+def _slot_doctor_name(slot: dict[str, Any]) -> str:
+    return str(slot.get("doctor_name") or slot.get("doctorName") or "")
+
+
+def _slot_date(slot: dict[str, Any]) -> str:
+    return str(slot.get("date") or slot.get("preferred_date") or "")
+
+
+def _slot_time(slot: dict[str, Any]) -> str:
+    return str(slot.get("time") or slot.get("timeStart") or slot.get("time_start") or "")
 
 
 def _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | None:
@@ -1664,7 +1680,7 @@ def _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | Non
     t = _time_from_text(text)
     if t:
         for slot in slots:
-            if slot.get("time") == t:
+            if _slot_time(slot) == t:
                 return slot
 
     return None
@@ -1981,10 +1997,10 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         booked = await crm.book_appointment(
             patient_name=session.get("patient_name") or "Пациент",
             phone=normalized_phone,
-            doctor_login=slot.get("doctor_login") or slot.get("doctorLogin") or "",
-            doctor_name=slot.get("doctor_name") or slot.get("doctorName") or None,
-            date=slot.get("date") or session.get("preferred_date"),
-            time_start=slot.get("time") or slot.get("timeStart"),
+            doctor_login=_slot_doctor_login(slot),
+            doctor_name=_slot_doctor_name(slot) or None,
+            date=_slot_date(slot) or session.get("preferred_date"),
+            time_start=_slot_time(slot),
             notes=(
                 f"Жалоба: {session.get('complaint') or ''}; "
                 f"возраст: {session.get('age') or ''}; "
@@ -1998,9 +2014,9 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         session["status"] = "booked"
         session["crm_status"] = "Записан"
 
-        date = booked.get("date") or slot.get("date") or session.get("preferred_date") or ""
-        time_start = booked.get("timeStart") or booked.get("time_start") or slot.get("time") or ""
-        doctor = booked.get("doctorName") or slot.get("doctor_name") or ""
+        date = booked.get("date") or _slot_date(slot) or session.get("preferred_date") or ""
+        time_start = booked.get("timeStart") or booked.get("time_start") or _slot_time(slot)
+        doctor = booked.get("doctorName") or _slot_doctor_name(slot) or ""
 
         return _tr(
             session,
@@ -2026,7 +2042,18 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
             ),
         )
     except Exception as exc:
-        _safe_log(chat_id, "crm_book_error", {"error": str(exc)[:500]})
+        _safe_log(
+            chat_id,
+            "crm_book_error",
+            {
+                "error": str(exc)[:500],
+                "gate": bot_tools.booking_gate_status(session),
+                "doctor_login": _slot_doctor_login(slot),
+                "date": _slot_date(slot) or session.get("preferred_date"),
+                "time_start": _slot_time(slot),
+                "selected_slot": slot,
+            },
+        )
         session["step"] = "escalated"
         session["escalated"] = True
         return _crm_fallback_answer(session)
@@ -2673,8 +2700,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             slot = _select_slot(text, slots)
             if slot:
                 session["selected_slot"] = slot
-                session["selected_date"] = slot.get("date") or session.get("preferred_date")
-                session["selected_time"] = slot.get("time")
+                session["selected_date"] = _slot_date(slot) or session.get("preferred_date")
+                session["selected_time"] = _slot_time(slot)
                 session["step"] = "name"
                 return _finalize(chat_id, session, faq_info + "\n\n" + _ask_name(session))
 
@@ -2767,8 +2794,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             if not slot:
                 return _finalize(chat_id, session, _mandatory_step_prompt(session, "time"))
             session["selected_slot"] = slot
-            session["selected_date"] = slot.get("date") or session.get("preferred_date")
-            session["selected_time"] = slot.get("time")
+            session["selected_date"] = _slot_date(slot) or session.get("preferred_date")
+            session["selected_time"] = _slot_time(slot)
             session["step"] = "name"
             return _finalize(chat_id, session, _ask_name(session))
 
@@ -3367,8 +3394,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             )
 
         session["selected_slot"] = slot
-        session["selected_date"] = slot.get("date") or session.get("preferred_date")
-        session["selected_time"] = slot.get("time")
+        session["selected_date"] = _slot_date(slot) or session.get("preferred_date")
+        session["selected_time"] = _slot_time(slot)
         session["step"] = "name"
         return _finalize(chat_id, session, _ask_name(session))
 
