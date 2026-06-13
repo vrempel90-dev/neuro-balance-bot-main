@@ -211,7 +211,7 @@ NON_PROFILE_COMPLAINT_WORDS = [
     "печень", "желчный", "гастрит", "аппендиц", "іш", "асқазан", "асказан",
 
     # сердце / сосуды / скорая
-    "сердце", "сердеч", "давление", "гипертони", "инфаркт", "стенокард",
+    "сердце", "сердц", "сердеч", "давление", "гипертони", "инфаркт", "стенокард",
     "боль в груди", "грудь сжимает", "одышка", "тромб", "варикоз",
     "жүрек", "журек", "қан қысым", "кан кысым",
 
@@ -889,7 +889,13 @@ def _profile_status(text: str) -> str:
         return "none"
 
     has_profile = any(w in low for w in PROFILE_COMPLAINT_WORDS) or any(w in low for w in PROFILE_DISEASE_WORDS)
-    has_non_profile = any(w in low for w in NON_PROFILE_COMPLAINT_WORDS) or any(w in low for w in NON_PROFILE_DISEASE_WORDS)
+
+    def has_non_profile_word(word: str) -> bool:
+        if word == "нос":
+            return re.search(r"(?<![а-яa-z])нос(?![а-яa-z])", low) is not None
+        return word in low
+
+    has_non_profile = any(has_non_profile_word(w) for w in NON_PROFILE_COMPLAINT_WORDS) or any(w in low for w in NON_PROFILE_DISEASE_WORDS)
 
     # Экстренные/явно чужие направления не ведём в запись, даже если есть слово "боль".
     emergency_or_foreign = [
@@ -913,6 +919,37 @@ def _profile_status(text: str) -> str:
         return "unclear"
 
     return "none"
+
+def _appointment_request_answer(session: dict[str, Any], text: str) -> str | None:
+    low = _low(text)
+    if not low:
+        return None
+
+    has_intent = _has_booking_intent(text) or "хочу" in low
+    if not has_intent:
+        return None
+
+    if "консультац" in low:
+        return _tr(
+            session,
+            "Да, можно записаться на консультацию 🌿 Подскажите, пожалуйста, что Вас беспокоит?",
+            "Иә, консультацияға жазылуға болады 🌿 Айтыңызшы, Сізді не мазалайды?",
+        )
+    if "диагностик" in low:
+        return _tr(
+            session,
+            "Да, можно записаться на диагностику 🌿 Подскажите, пожалуйста, что Вас беспокоит?",
+            "Иә, диагностикаға жазылуға болады 🌿 Айтыңызшы, Сізді не мазалайды?",
+        )
+    if any(w in low for w in ("приём", "прием", "осмотр")):
+        return _tr(
+            session,
+            "Да, можно записаться на приём 🌿 Подскажите, пожалуйста, что Вас беспокоит?",
+            "Иә, қабылдауға жазылуға болады 🌿 Айтыңызшы, Сізді не мазалайды?",
+        )
+
+    return None
+
 def _record_complaint_tool(session: dict[str, Any], complaint: str, *, is_in_profile: bool) -> None:
     bot_tools.record_chief_complaint(session, complaint, is_in_profile=is_in_profile)
 
@@ -2564,8 +2601,16 @@ async def _safe_intent_router(chat_id: str, phone: str, session: dict[str, Any],
             return _ask_contra(session)
         return _clarify_intent_answer(session)
 
+    if step in ("start", "complaint", "", None) and _appointment_request_answer(session, text):
+        return None
+
     # МРТ/снимки/КТ — отдельный вопрос, не старт новой анкеты.
-    if _has_mri_question(text) and not (_has_complaint(text) or _has_medical_complaint_text(text)):
+    # Но явную просьбу записаться на диагностику/консультацию/приём обрабатывает основной сценарий.
+    if (
+        _has_mri_question(text)
+        and not (_has_complaint(text) or _has_medical_complaint_text(text))
+        and not _appointment_request_answer(session, text)
+    ):
         return _mri_answer_in_flow(session)
 
     info = _clinic_answer(text, session)
@@ -3096,6 +3141,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["step"] = "complaint"
         session["profile_status"] = "unclear"
         return _finalize(chat_id, session, _unclear_profile_answer(session, text))
+
+    appointment_answer = _appointment_request_answer(session, text)
+    if step in ("start", "complaint") and appointment_answer and not (_has_complaint(text) or _has_medical_complaint_text(text)):
+        session["step"] = "complaint"
+        return _finalize(chat_id, session, appointment_answer)
 
     # escalated_repeat_guard_v2:
     # Если ранее запрос был не профильный, но пациент уточнил профильную жалобу
