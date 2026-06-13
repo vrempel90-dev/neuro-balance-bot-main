@@ -610,6 +610,51 @@ def test_old_bot_tool_gates_and_operator_templates(monkeypatch: Any) -> None:
     assert len(calls["book"]) == 1
 
 
+def test_combined_faq_and_slot_selection_asks_name() -> None:
+    slots = [
+        {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "09:20"},
+        {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "10:00"},
+    ]
+
+    reset(
+        "combined_address_slot",
+        {
+            "step": "time",
+            "language": "ru",
+            "language_locked": True,
+            "complaint": "болит спина",
+            "age": 36,
+            "contraindications_ok": True,
+            "last_slots": slots,
+        },
+    )
+    result = answer("combined_address_slot", "А адрес какой? И давайте 2 вариант")
+    session = state.get_session("combined_address_slot")
+    assert "Кабанбай" in result or "адрес" in result.lower()
+    assert "имя" in result.lower()
+    assert session["step"] == "name"
+    assert session["selected_slot"] == slots[1]
+
+    reset(
+        "combined_price_slot",
+        {
+            "step": "time",
+            "language": "ru",
+            "language_locked": True,
+            "complaint": "болит спина",
+            "age": 36,
+            "contraindications_ok": True,
+            "last_slots": slots,
+        },
+    )
+    result = answer("combined_price_slot", "А сколько стоит? Давайте первый")
+    session = state.get_session("combined_price_slot")
+    assert "5 000" in result or "стоим" in result.lower()
+    assert "имя" in result.lower()
+    assert session["step"] == "name"
+    assert session["selected_slot"] == slots[0]
+
+
 def test_static_dialog_template_wiring_and_tr_arity() -> None:
     source = (PROJECT_ROOT / "dialog.py").read_text(encoding="utf-8")
     tree = ast.parse(source)

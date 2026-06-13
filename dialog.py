@@ -1640,6 +1640,27 @@ def _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | Non
         if 0 <= idx < len(slots):
             return slots[idx]
 
+    ordinal_indexes = {
+        "первый": 0,
+        "первая": 0,
+        "первое": 0,
+        "первую": 0,
+        "первого": 0,
+        "второй": 1,
+        "вторая": 1,
+        "второе": 1,
+        "вторую": 1,
+        "второго": 1,
+        "третий": 2,
+        "третья": 2,
+        "третье": 2,
+        "третью": 2,
+        "третьего": 2,
+    }
+    for word, idx in ordinal_indexes.items():
+        if re.search(rf"\b{re.escape(word)}\b", low) and idx < len(slots):
+            return slots[idx]
+
     t = _time_from_text(text)
     if t:
         for slot in slots:
@@ -2646,6 +2667,16 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         if _is_thanks_or_ok(text) and step in ("date", "preferred_time", "time", "select_slot"):
             return _no_reply(chat_id, session)
         faq_info = _faq_answer(text, session)
+
+        if step in ("time", "select_slot") and faq_info:
+            slots = session.get("last_slots") or []
+            slot = _select_slot(text, slots)
+            if slot:
+                session["selected_slot"] = slot
+                session["selected_date"] = slot.get("date") or session.get("preferred_date")
+                session["selected_time"] = slot.get("time")
+                session["step"] = "name"
+                return _finalize(chat_id, session, faq_info + "\n\n" + _ask_name(session))
 
         if step == "age" and faq_info:
             inline_age = _extract_age(text, step="age")
