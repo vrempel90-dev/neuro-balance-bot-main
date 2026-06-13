@@ -753,6 +753,82 @@ def test_combined_faq_slot_selection_then_name_books_crm(monkeypatch: Any) -> No
     assert session["status"] == "booked"
 
 
+def test_video_question_with_date_answers_then_shows_slots(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    reset(
+        "video_question_date",
+        {
+            "step": "date",
+            "language": "ru",
+            "language_locked": True,
+            "complaint": "болит спина",
+            "age": 36,
+            "contraindications_ok": True,
+            "contraindications_verdict": "proceed",
+        },
+    )
+
+    result = answer("video_question_date", "Завтра. Так же будет как на видео?")
+    session = state.get_session("video_question_date")
+
+    assert "как показано в видео" in result
+    assert "свободные окошки" in result
+    assert session["step"] == "time"
+
+
+def test_video_question_after_slots_returns_to_time_choice() -> None:
+    slots = [
+        {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "09:20"},
+        {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "10:00"},
+    ]
+    selected_slot = {"doctor_login": "doctor0", "doctor_name": "Другой врач", "date": "2099-01-02", "time": "11:00"}
+    reset(
+        "video_question_time",
+        {
+            "step": "time",
+            "language": "ru",
+            "language_locked": True,
+            "complaint": "болит спина",
+            "age": 36,
+            "contraindications_ok": True,
+            "contraindications_verdict": "proceed",
+            "last_slots": slots,
+            "selected_slot": selected_slot.copy(),
+        },
+    )
+
+    result = answer("video_question_time", "Так же будет да?")
+    session = state.get_session("video_question_time")
+
+    assert "точный план врач подбирает после осмотра" in result
+    assert "Какое время" in result or "вариант" in result
+    assert session["step"] == "time"
+    assert session["selected_slot"] == selected_slot
+
+
+def test_video_question_does_not_guarantee_exact_match() -> None:
+    reset(
+        "video_question_no_guarantee",
+        {
+            "step": "time",
+            "language": "ru",
+            "language_locked": True,
+            "complaint": "болит спина",
+            "age": 36,
+            "contraindications_ok": True,
+            "contraindications_verdict": "proceed",
+            "last_slots": [
+                {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "09:20"},
+            ],
+        },
+    )
+
+    result = answer("video_question_no_guarantee", "это точно как на видео будет?")
+
+    assert "гарантируем" not in result.lower()
+    assert "примерно" in result or "точный план" in result
+
+
 def test_static_dialog_template_wiring_and_tr_arity() -> None:
     source = (PROJECT_ROOT / "dialog.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
