@@ -516,6 +516,17 @@ def test_production_fix_live_admin_regressions(monkeypatch: Any) -> None:
     assert session["step"] == "date"
     assert "На какой день Вам удобно прийти" in result
 
+    reset("pf_no_contra_with_course_days", {"step": "contraindications", "complaint": "болит спина", "age": 36, "language": "ru", "language_locked": True})
+    result = answer("pf_no_contra_with_course_days", "Противопоказаний нет, но сколько дней лечение обычно длится?")
+    session = state.get_session("pf_no_contra_with_course_days")
+    assert "Количество дней и процедур врач сможет определить" in result
+    assert "На какой день Вам удобно прийти" in result
+    assert "Противопоказаний нет?" not in result
+    assert session["contraindications_ok"] is True
+    assert session["contraindications_raw"] == "Противопоказаний нет, но сколько дней лечение обычно длится?"
+    assert session["contraindications_verdict"] == "proceed"
+    assert session["step"] == "date"
+
     reset("pf_tomorrow_after_no_contra", {"step": "date", "complaint": "болит спина", "age": 36, "contraindications_ok": True, "language": "ru", "language_locked": True})
     result = answer("pf_tomorrow_after_no_contra", "Завтра")
     assert "противопоказ" not in result.lower()

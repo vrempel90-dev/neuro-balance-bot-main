@@ -2286,6 +2286,13 @@ def _faq_answer_then_resume(text: str, session: dict[str, Any], step: str) -> st
     return info + "\n\n" + _mandatory_step_prompt(session, step)
 
 
+def _accept_no_contraindications(session: dict[str, Any], text: str) -> None:
+    session["contraindications_ok"] = True
+    session["contraindications_raw"] = text
+    session["contraindications_verdict"] = "proceed"
+    bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, text)
+
+
 def _after_booking_admin_answer(text: str, session: dict[str, Any]) -> str:
     info = _faq_answer(text, session)
     if info:
@@ -2648,6 +2655,12 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
                 return _finalize(chat_id, session, faq_info + "\n\n" + after_age)
             return _finalize(chat_id, session, faq_info + "\n\n" + _mandatory_step_prompt(session, step))
 
+        if step == "contraindications" and faq_info and (_is_no_contra_answer(text) or _contra_is_clear_no(text)):
+            _accept_no_contraindications(session, text)
+            session["step"] = "date"
+            session["questionnaire_step"] = "date"
+            return _finalize(chat_id, session, faq_info + "\n\n" + _ask_date(session))
+
         if faq_info:
             return _finalize(chat_id, session, faq_info + "\n\n" + _mandatory_step_prompt(session, step))
 
@@ -2687,7 +2700,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
         if step == "contraindications":
             if _is_no_contra_answer(text) or _contra_is_clear_no(text):
-                bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, text or "нет")
+                _accept_no_contraindications(session, text or "нет")
                 session["step"] = "date"
                 session["questionnaire_step"] = "date"
                 return _finalize(chat_id, session, _ask_date(session))
@@ -2866,8 +2879,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # contra_no_answer_final_guard:
     # "Нет/Жоқ" на этапе противопоказаний = противопоказаний нет.
     if step == "contraindications" and _is_no_contra_answer(text):
-        session["contraindications_ok"] = True
-        session["contraindications_raw"] = "нет"
+        _accept_no_contraindications(session, text)
 
         if session.get("waiting_for_date") or session.get("status") == "waiting_patient_later":
             session["step"] = "stopped"
@@ -2876,7 +2888,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
         session["step"] = "date"
         session["questionnaire_step"] = "date"
-        return _finalize(chat_id, session, _ask_date(session))
+        faq_info = _faq_answer(text, session)
+        answer = faq_info + "\n\n" + _ask_date(session) if faq_info else _ask_date(session)
+        return _finalize(chat_id, session, answer)
 
     # doctor_can_treat_question_guard:
     # Если пациент отправил фото/документ и спрашивает "это сможет лечить?",
@@ -3258,15 +3272,17 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         # "Нет" / "Жоқ!" на вопрос о противопоказаниях = противопоказаний нет,
         # дальше спрашиваем дату, а не возвращаемся к жалобе.
         if _is_no_contra_answer(text):
-            bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, "нет")
+            _accept_no_contraindications(session, text or "нет")
             session["step"] = "date"
             session["questionnaire_step"] = "date"
-            return _finalize(chat_id, session, _ask_date(session))
+            faq_info = _faq_answer(text, session)
+            answer = faq_info + "\n\n" + _ask_date(session) if faq_info else _ask_date(session)
+            return _finalize(chat_id, session, answer)
 
         session["contraindications_raw"] = text
 
         if _contra_is_clear_no(text):
-            bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, text)
+            _accept_no_contraindications(session, text)
             session["step"] = "date"
             return _finalize(chat_id, session, _ask_date(session))
 
