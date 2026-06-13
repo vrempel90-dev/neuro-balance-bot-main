@@ -1778,12 +1778,36 @@ def _ask_age(session: dict[str, Any]) -> str:
         "Подскажите, пожалуйста, сколько Вам лет?",
         "Жасыңыз нешеде?",
     )
-def _profile_confirm_and_ask_age(session: dict[str, Any]) -> str:
-    return _tr(
-        session,
-        "Да, это относится к нашему профилю 🌿 Подскажите, пожалуйста, сколько Вам лет?",
-        "Иә, бұл біздің клиниканың бағытына жатады 🌿 Жасыңыз нешеде?",
-    )
+def _human_profile_age_answer(session: dict[str, Any], text: str) -> str:
+    low = _low(text)
+
+    if any(w in low for w in ["поясниц", "пояснич", "бел"]):
+        ru = "Поняла Вас. Поясничная боль — по нашему направлению 🌿\nПодскажите, пожалуйста, сколько Вам лет?"
+        kk = "Түсіндім. Бел ауыруы біздің бағытқа жатады 🌿\nЖасыңыз нешеде?"
+    elif any(w in low for w in ["спина", "спине", "спину", "арқа", "арка"]):
+        ru = "Поняла, спина беспокоит. Это наш профиль 🌿\nПодскажите, пожалуйста, сколько Вам лет?"
+        kk = "Түсіндім, арқаңыз мазалап тұр екен. Бұл біздің бағыт 🌿\nЖасыңыз нешеде?"
+    elif any(w in low for w in ["протруз", "грыж", "грыжа"]):
+        ru = "Поняла. Протрузии и грыжи относятся к нашему профилю 🌿\nПодскажите, пожалуйста, сколько Вам лет?"
+        kk = "Түсіндім. Протрузия мен грыжа біздің бағытқа жатады 🌿\nЖасыңыз нешеде?"
+    elif any(w in low for w in ["шея", "шей", "мойын"]):
+        ru = "Поняла, шея беспокоит. Это по нашему направлению 🌿\nПодскажите, пожалуйста, сколько Вам лет?"
+        kk = "Түсіндім, мойын мазалап тұр екен. Бұл біздің бағыт 🌿\nЖасыңыз нешеде?"
+    elif any(w in low for w in ["онем", "немеет", "рук", "нога", "ногу", "аяқ", "аяк"]):
+        ru = "Поняла Вас. Онемение или боль, которая отдаёт в руку/ногу, относится к нашему профилю 🌿\nПодскажите, пожалуйста, сколько Вам лет?"
+        kk = "Түсіндім. Қолға/аяққа берілетін ауырсыну немесе ұю біздің бағытқа жатады 🌿\nЖасыңыз нешеде?"
+    elif any(w in low for w in ["сустав", "колен", "плеч", "локт", "тазобед", "буын", "тізе", "тизе"]):
+        ru = "Поняла Вас. По суставам тоже принимаем 🌿\nПодскажите, пожалуйста, сколько Вам лет?"
+        kk = "Түсіндім. Буын бойынша да қабылдаймыз 🌿\nЖасыңыз нешеде?"
+    else:
+        ru = "Поняла Вас. Это относится к нашему профилю 🌿\nПодскажите, пожалуйста, сколько Вам лет?"
+        kk = "Түсіндім. Бұл біздің клиниканың бағытына жатады 🌿\nЖасыңыз нешеде?"
+
+    return _tr(session, ru, kk)
+
+
+def _profile_confirm_and_ask_age(session: dict[str, Any], text: str = "") -> str:
+    return _human_profile_age_answer(session, text or str(session.get("complaint") or ""))
 def _profile_confirm_next_step(session: dict[str, Any]) -> str:
     # Если возраст уже был написан раньше, не спрашиваем его повторно.
     if session.get("age"):
@@ -1793,7 +1817,7 @@ def _profile_confirm_next_step(session: dict[str, Any]) -> str:
             "Иә, бұл біздің клиниканың бағытына жатады 🌿",
         ) + "\n\n" + _ask_contra(session)
 
-    return _profile_confirm_and_ask_age(session)
+    return _profile_confirm_and_ask_age(session, str(session.get("complaint") or ""))
 
 
 
@@ -1818,12 +1842,9 @@ def _ask_age_contextual(session: dict[str, Any], text: str) -> str:
         parts_ru.append("Снимки и МРТ заранее делать не обязательно 🌿 На первичном осмотре врач сам посмотрит Ваше состояние и, если потребуется, назначит обследование.")
         parts_kk.append("Снимок немесе МРТ-ны алдын ала жасау міндетті емес 🌿 Алғашқы қаралу кезінде дәрігер қажет болса тексеріс тағайындайды.")
 
-    if _has_leg_radiation_profile(text):
-        parts_ru.append("Да, боль в пояснице, которая отдаёт в ногу, относится к нашему профилю 🌿 Подскажите, пожалуйста, сколько Вам лет?")
-        parts_kk.append("Иә, бұл біздің клиниканың бағытына жатады 🌿 Жасыңыз нешеде?")
-    else:
-        parts_ru.append("Да, это относится к нашему профилю 🌿 Подскажите, пожалуйста, сколько Вам лет?")
-        parts_kk.append("Иә, бұл біздің клиниканың бағытына жатады 🌿 Жасыңыз нешеде?")
+    profile_answer = _human_profile_age_answer(session, text)
+    parts_ru.append(profile_answer)
+    parts_kk.append(profile_answer)
 
     return _tr(session, "\n\n".join(parts_ru), "\n\n".join(parts_kk))
 def _senior_contra_intro(session: dict[str, Any]) -> str:
@@ -2997,7 +3018,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         _record_complaint_tool(session, text, is_in_profile=True)
         session["escalated"] = False
         session["step"] = "age"
-        return _finalize(chat_id, session, _profile_confirm_and_ask_age(session))
+        return _finalize(chat_id, session, _profile_confirm_and_ask_age(session, text))
 
     # После передачи координатору не задаём повторно вопросы анкеты.
     if step == "escalated":
