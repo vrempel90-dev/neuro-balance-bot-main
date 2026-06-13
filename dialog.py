@@ -1781,7 +1781,7 @@ def _ask_age(session: dict[str, Any]) -> str:
 def _profile_confirm_and_ask_age(session: dict[str, Any]) -> str:
     return _tr(
         session,
-        "Здравствуйте! Да, это относится к нашему профилю 🌿 Подскажите, пожалуйста, сколько Вам лет?",
+        "Да, это относится к нашему профилю 🌿 Подскажите, пожалуйста, сколько Вам лет?",
         "Иә, бұл біздің клиниканың бағытына жатады 🌿 Жасыңыз нешеде?",
     )
 def _profile_confirm_next_step(session: dict[str, Any]) -> str:
@@ -1789,7 +1789,7 @@ def _profile_confirm_next_step(session: dict[str, Any]) -> str:
     if session.get("age"):
         return _tr(
             session,
-            "Здравствуйте! Да, это относится к нашему профилю 🌿",
+            "Да, это относится к нашему профилю 🌿",
             "Иә, бұл біздің клиниканың бағытына жатады 🌿",
         ) + "\n\n" + _ask_contra(session)
 
@@ -1822,7 +1822,7 @@ def _ask_age_contextual(session: dict[str, Any], text: str) -> str:
         parts_ru.append("Да, боль в пояснице, которая отдаёт в ногу, относится к нашему профилю 🌿 Подскажите, пожалуйста, сколько Вам лет?")
         parts_kk.append("Иә, бұл біздің клиниканың бағытына жатады 🌿 Жасыңыз нешеде?")
     else:
-        parts_ru.append("Здравствуйте! Да, это относится к нашему профилю 🌿 Подскажите, пожалуйста, сколько Вам лет?")
+        parts_ru.append("Да, это относится к нашему профилю 🌿 Подскажите, пожалуйста, сколько Вам лет?")
         parts_kk.append("Иә, бұл біздің клиниканың бағытына жатады 🌿 Жасыңыз нешеде?")
 
     return _tr(session, "\n\n".join(parts_ru), "\n\n".join(parts_kk))
