@@ -655,6 +655,58 @@ def test_combined_faq_and_slot_selection_asks_name() -> None:
     assert session["selected_slot"] == slots[0]
 
 
+def test_combined_faq_slot_selection_then_name_books_crm(monkeypatch: Any) -> None:
+    calls = setup_crm(monkeypatch)
+    slots = [
+        {
+            "doctor_login": "doctor1",
+            "doctorName": "Первый врач",
+            "date": "2099-01-01",
+            "time": "09:20",
+            "timeStart": "09:20",
+        },
+        {
+            "doctor_login": "doctor2",
+            "doctorName": "Второй врач",
+            "date": "2099-01-01",
+            "time": "10:00",
+            "timeStart": "10:00",
+        },
+    ]
+
+    reset(
+        "combined_address_slot_then_book",
+        {
+            "step": "time",
+            "language": "ru",
+            "language_locked": True,
+            "complaint": "болит спина",
+            "age": 36,
+            "contraindications_ok": True,
+            "contraindications_verdict": "proceed",
+            "last_slots": slots,
+        },
+    )
+
+    first_result = answer("combined_address_slot_then_book", "А адрес какой? И давайте 2 вариант")
+    session = state.get_session("combined_address_slot_then_book")
+    assert "Кабанбай" in first_result or "адрес" in first_result.lower()
+    assert session["step"] == "name"
+    assert session["selected_slot"] == slots[1]
+
+    second_result = answer("combined_address_slot_then_book", "Алия")
+    session = state.get_session("combined_address_slot_then_book")
+
+    assert len(calls["book"]) == 1
+    assert calls["book"][0]["doctor_login"] == "doctor2"
+    assert calls["book"][0]["doctor_name"] == "Второй врач"
+    assert calls["book"][0]["date"] == "2099-01-01"
+    assert calls["book"][0]["time_start"] == "10:00"
+    assert "запись подтверждена" in second_result.lower()
+    assert "передам администратору" not in second_result.lower()
+    assert session["status"] == "booked"
+
+
 def test_static_dialog_template_wiring_and_tr_arity() -> None:
     source = (PROJECT_ROOT / "dialog.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
