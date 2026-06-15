@@ -595,6 +595,50 @@ def test_production_fix_live_admin_regressions(monkeypatch: Any) -> None:
         assert answer(chat_id, text) == ""
 
 
+def test_non_surgical_question_without_documents_asks_complaint() -> None:
+    reset("non_surgical_plain")
+    result = answer("non_surgical_plain", "Можно лечить без операции?")
+    session = state.get_session("non_surgical_plain")
+
+    assert "безоперационные методы" in result
+    assert "что Вас беспокоит" in result
+    assert session["step"] == "complaint"
+    assert "по фото/документу" not in result.lower()
+    assert not session.get("escalated")
+
+
+def test_non_surgical_question_with_profile_complaint_asks_age() -> None:
+    reset("non_surgical_profile")
+    result = answer("non_surgical_profile", "Спина болит, можно без операции?")
+    session = state.get_session("non_surgical_profile")
+
+    assert "безоперационные методы" in result
+    assert "спин" in result.lower()
+    assert "сколько Вам лет" in result
+    assert session["step"] == "age"
+
+
+def test_non_surgical_question_by_mri_handoffs_to_doctor() -> None:
+    reset("non_surgical_mri")
+    result = answer("non_surgical_mri", "По МРТ можно понять, можно без операции?")
+    session = state.get_session("non_surgical_mri")
+
+    assert "по фото/снимку или документам" in result.lower() or "по снимку" in result.lower()
+    assert "врач" in result.lower()
+    assert session.get("escalated") is True or session.get("handoff_to_doctor") is True
+    assert "сколько Вам лет" not in result
+
+
+def test_non_surgical_kazakh_question_asks_complaint_in_kazakh() -> None:
+    reset("non_surgical_kz")
+    result = answer("non_surgical_kz", "Операциясыз емдейсіздер ме?")
+    session = state.get_session("non_surgical_kz")
+
+    assert "Иә" in result
+    assert "операциясыз" in result
+    assert session["step"] == "complaint"
+
+
 def test_old_bot_tool_gates_and_operator_templates(monkeypatch: Any) -> None:
     calls = setup_crm(monkeypatch)
 

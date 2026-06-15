@@ -125,6 +125,7 @@ MRI_WORDS = [
 METHOD_WORDS = [
     "что за методика", "какая методика", "методика", "методы лечения", "как лечите",
     "чем лечите", "какое лечение", "что делаете", "безоперацион", "без операции",
+    "операциясыз",
 ]
 
 DOCTOR_WORDS = [
@@ -1255,6 +1256,81 @@ def _is_doctor_can_treat_question(text: str) -> bool:
         "этот сможет", "это сможет", "по фото", "по снимку", "по документу",
         "осы емдей", "емдей аласыз",
     ])
+
+
+def _has_document_or_image_context(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    if not low:
+        return False
+
+    short_markers = ["мрт", "кт"]
+    if any(re.search(rf"(?<![а-яa-z]){marker}(?![а-яa-z])", low) for marker in short_markers):
+        return True
+
+    return any(p in low for p in [
+        "фото", "документ", "снимок", "снимк", "рентген", "заключение",
+        "заключен", "анализ", "сурет", "құжат", "кужат",
+    ])
+
+
+def _is_non_surgical_treatment_question(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    if not low:
+        return False
+
+    return any(p in low for p in [
+        "без операции", "безоперацион", "операциясыз",
+    ]) and any(p in low for p in [
+        "можно", "леч", "бола", "емде",
+    ])
+
+
+def _has_specific_profile_context(text: str) -> bool:
+    low = _low(_strip_quoted_bot_text(text))
+    if not low:
+        return False
+
+    excluded = {"операция", "операции", "операциясыз"}
+    profile_words = [w for w in PROFILE_COMPLAINT_WORDS if w not in excluded]
+    disease_words = [w for w in PROFILE_DISEASE_WORDS if "операц" not in w]
+    return any(w in low for w in profile_words) or any(w in low for w in disease_words)
+
+
+def _non_surgical_general_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Да, в нашей клинике применяются безоперационные методы лечения 🌿 Но подойдёт ли такой вариант именно Вам, врач сможет сказать после первичного осмотра и оценки состояния.\n\nПодскажите, пожалуйста, что Вас беспокоит: спина, шея, суставы, грыжа, протрузия или боль отдаёт в руку/ногу?",
+        "Иә, біздің клиникада операциясыз емдеу әдістері қолданылады 🌿 Бірақ бұл әдіс Сізге нақты сәйкес келе ме — дәрігер алғашқы қараудан кейін жағдайыңызды бағалап айтады.\n\nНақты не мазалайды: арқа, мойын, буын, грыжа/протрузия немесе ауырсыну қолға/аяққа беріле ме?",
+    )
+
+
+def _non_surgical_profile_context(text: str) -> str:
+    low = _low(text)
+    if any(p in low for p in ["спин", "поясниц", "арқа", "арка", "белім", "белим"]):
+        return "По спине"
+    if any(p in low for p in ["ше", "мойын"]):
+        return "По шее"
+    if any(p in low for p in ["сустав", "буын", "колен", "тізе", "тизе"]):
+        return "По суставам"
+    if any(p in low for p in ["грыж", "протруз"]):
+        return "По грыже/протрузии"
+    return "По Вашей жалобе"
+
+
+def _non_surgical_profile_answer(session: dict[str, Any], text: str) -> str:
+    return _tr(
+        session,
+        f"Да, в нашей клинике применяются безоперационные методы лечения 🌿 {_non_surgical_profile_context(text)} — это наш профиль. Подскажите, пожалуйста, сколько Вам лет?",
+        "Иә, біздің клиникада операциясыз емдеу әдістері қолданылады 🌿 Бұл біздің бағыт. Жасыңыз нешеде?",
+    )
+
+
+def _document_non_surgical_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "По фото/снимку или документам точно обещать лечение не будем, чтобы не вводить Вас в заблуждение 🌿 Врач сможет сориентировать после очного осмотра и оценки состояния. Передам информацию врачу, он ответит Вам в ближайшее время.",
+        "Фото/снимок немесе құжат бойынша нақты емдеуге уәде бермейміз, себебі алдымен дәрігер қарап, жағдайды бағалауы керек 🌿 Ақпаратты дәрігерге жіберемін, ол жақын уақытта жауап береді.",
+    )
 
 
 def _avoid_repeating_same_question(answer: str, session: dict[str, Any]) -> str:
@@ -3000,6 +3076,26 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["age"] = inline_age
         answer = await _continue_after_collected_age(chat_id, session, text, inline_age)
         return _finalize(chat_id, session, answer)
+
+    # 2.6) Вопросы про безоперационное лечение.
+    # Без контекста фото/МРТ/документов отвечаем продающе, но без гарантий.
+    # Если клиент просит оценить по снимкам/документам — передаём врачу и не продолжаем запись.
+    if _is_non_surgical_treatment_question(text):
+        if _has_document_or_image_context(text):
+            session["step"] = "escalated"
+            session["escalated"] = True
+            session["handoff_to_doctor"] = True
+            session["handoff_reason"] = "document_non_surgical_question"
+            return _finalize(chat_id, session, _document_non_surgical_answer(session))
+
+        if _has_specific_profile_context(text):
+            _record_complaint_tool(session, text, is_in_profile=True)
+            session["step"] = "age"
+            return _finalize(chat_id, session, _non_surgical_profile_answer(session, text))
+
+        session["step"] = "complaint"
+        session["escalated"] = False
+        return _finalize(chat_id, session, _non_surgical_general_answer(session))
 
     # 3) Типовые вопросы.
     # Если в сообщении есть жалоба, жалоба важнее FAQ.
