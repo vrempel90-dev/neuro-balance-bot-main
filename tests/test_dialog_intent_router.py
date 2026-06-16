@@ -134,6 +134,42 @@ def test_profile_age_answer_is_human_and_contextual() -> None:
             assert "сустав" in result.lower() or "суставам" in result.lower()
 
 
+def test_contraindications_clear_no_phrases_go_to_date(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+
+    cases = [
+        ("contra_clear_all_clean", "Все чисто"),
+        ("contra_clear_none_of_this", "ничего из этого нет"),
+        ("contra_clear_all_no", "по всем нет"),
+        ("contra_clear_all_normal", "все нормально"),
+    ]
+
+    for chat_id, text in cases:
+        reset(chat_id, {"step": "contraindications", "age": 34, "language": "ru", "language_locked": True})
+        result = answer(chat_id, text)
+        session = state.get_session(chat_id)
+
+        assert "На какой день" in result
+        assert session["contraindications_ok"] is True
+        assert session["contraindications_raw"] == text
+        assert session["contraindications_verdict"] == "proceed"
+        assert session["step"] == "date"
+        assert session["questionnaire_step"] == "date"
+
+
+def test_contraindications_real_contraindication_still_stops_booking(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+
+    reset("contra_real_stop", {"step": "contraindications", "age": 34, "language": "ru", "language_locked": True})
+    result = answer("contra_real_stop", "у меня кардиостимулятор")
+    session = state.get_session("contra_real_stop")
+
+    assert session["step"] == "stopped"
+    assert session["contraindications_ok"] is False
+    assert session["contraindications_verdict"] in {"stop", "refuse"}
+    assert "останавливаю" in result
+
+
 def test_standalone_thanks_ok_do_not_start_questionnaire(monkeypatch: Any) -> None:
     calls = setup_crm(monkeypatch)
 
