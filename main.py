@@ -14,7 +14,7 @@ from config import get_settings
 from dialog import handle_message
 from schedule import is_bot_work_time
 from voice import transcribe_wazzup_voice, transcribe_bytes, transcribe_upload, voice_text_for_bot
-from wazzup import extract_incoming_messages, send_text
+from wazzup import extract_incoming_messages, is_audio_message_payload, send_text
 
 try:
     from strict_prompt_guard import enforce_prompt_only
@@ -439,6 +439,18 @@ def _raw_wazzup_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [m for m in raw if isinstance(m, dict)]
 
 
+
+def _remember_ignored_voice_message(chat_id: str) -> None:
+    session = _get_session_safe(chat_id)
+    session["last_ignored_message_type"] = "voice"
+    state.save_session(chat_id, session)
+
+
+def _ignore_voice_message(chat_id: str, message_key: str, source: str) -> None:
+    _remember_ignored_voice_message(chat_id)
+    state.log_event(chat_id, "ignored_voice_message", {"message_key": message_key, "source": source})
+
+
 def _looks_like_outgoing_message(msg: dict[str, Any]) -> bool:
     return bool(
         msg.get("isEcho") is True
@@ -501,6 +513,23 @@ async def wazzup_webhook(request: Request, authorization: str | None = Header(de
 
     payload = await request.json()
     _mark_manual_admin_interventions(payload)
+    ignored_raw_message_keys: set[str] = set()
+    ignored_raw_count = 0
+    for raw_msg in _raw_wazzup_messages(payload):
+        if not is_audio_message_payload(raw_msg):
+            continue
+        chat_id = str(raw_msg.get("chatId") or raw_msg.get("chat_id") or raw_msg.get("from") or "").strip()
+        if not chat_id:
+            continue
+        message_key = str(raw_msg.get("id") or raw_msg.get("messageId") or raw_msg.get("message_id") or "")
+        if message_key and state.is_processed_message(message_key):
+            continue
+        if message_key:
+            state.mark_processed_message(message_key, chat_id)
+            ignored_raw_message_keys.add(message_key)
+        _ignore_voice_message(chat_id, message_key, "raw_payload")
+        ignored_raw_count += 1
+
     messages = extract_incoming_messages(payload)
 
     # voice_fallback_extractor:
@@ -522,15 +551,22 @@ async def wazzup_webhook(request: Request, authorization: str | None = Header(de
     except Exception as exc:
         state.log_event("system", "voice_payload_extract_error", {"error": str(exc)[:1000]})
 
-    accepted = 0
+    accepted = ignored_raw_count
     skipped = 0
 
     for message in messages:
         chat_id = str(message["chat_id"])
         message_key = str(message.get("message_key") or "")
 
-        if message_key and state.is_processed_message(message_key):
+        if message_key and (message_key in ignored_raw_message_keys or state.is_processed_message(message_key)):
             skipped += 1
+            continue
+
+        if is_audio_message_payload(message):
+            if message_key:
+                state.mark_processed_message(message_key, chat_id)
+            _ignore_voice_message(chat_id, message_key, "extracted_message")
+            accepted += 1
             continue
 
         if message_key:

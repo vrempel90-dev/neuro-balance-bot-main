@@ -22,6 +22,62 @@ AUDIO_EXT_BY_MIME = {
     "audio/m4a": "m4a",
 }
 
+_AUDIO_MESSAGE_TYPES = {"audio", "voice", "ptt", "voice_message"}
+_AUDIO_FILE_EXTENSIONS = (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav")
+
+
+def _iter_dicts(obj: Any):
+    if isinstance(obj, dict):
+        yield obj
+        for value in obj.values():
+            yield from _iter_dicts(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _iter_dicts(item)
+
+
+def _text_value(msg: dict[str, Any]) -> str:
+    return _message_text(msg)
+
+
+def is_audio_message_payload(msg: dict[str, Any]) -> bool:
+    """True, если Wazzup payload похож на voice/audio без обычного текста.
+
+    Обычный непустой текст имеет приоритет: такие сообщения продолжают идти
+    в диалоговый обработчик, даже если рядом есть служебные media-поля.
+    """
+    if _text_value(msg):
+        return False
+
+    for item in _iter_dicts(msg):
+        type_values = [
+            item.get("kind"),
+            item.get("type"),
+            item.get("messageType"),
+            item.get("contentType"),
+            item.get("payloadType"),
+        ]
+        if any(str(value or "").strip().lower() in _AUDIO_MESSAGE_TYPES for value in type_values):
+            return True
+
+        mime_values = [item.get("mimeType"), item.get("mime_type"), item.get("mime"), item.get("contentType")]
+        if any(str(value or "").strip().lower().startswith("audio/") for value in mime_values):
+            return True
+
+        media_type_values = [item.get("mediaType"), item.get("attachmentType"), item.get("type")]
+        if any("audio" in str(value or "").strip().lower() for value in media_type_values):
+            return True
+
+        filename_values = [
+            item.get("fileName"), item.get("filename"), item.get("name"),
+            item.get("url"), item.get("fileUrl"), item.get("mediaUrl"), item.get("downloadUrl"),
+        ]
+        if any(str(value or "").strip().lower().split("?", 1)[0].endswith(_AUDIO_FILE_EXTENSIONS) for value in filename_values):
+            return True
+
+    return False
+
+
 
 async def send_text(chat_id: str, text: str, chat_type: str = "whatsapp", channel_id: str | None = None) -> dict[str, Any]:
     settings = get_settings()
