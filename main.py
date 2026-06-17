@@ -588,13 +588,25 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
     if not force and not is_bot_work_time():
         answer = ""
     else:
+        if force:
+            session = state.get_session(chat_id)
+            for key in ("manual_admin_intervention", "manual_takeover", "ai_muted"):
+                session[key] = False
+            state.save_session(chat_id, session)
         raw_answer = await handle_message(chat_id=chat_id, phone=phone, user_text=text)
         answer = _guard_answer(chat_id, raw_answer)
+    session = state.get_session(chat_id)
 
     return {
         "answer": answer,
-        "session": state.get_session(chat_id),
+        "session": session,
         "bot_work_time_now": is_bot_work_time(),
+        "last_bot_question_type": session.get("last_bot_question_type"),
+        "inferred_context_action": session.get("inferred_context_action"),
+        "used_history_context": session.get("used_history_context"),
+        "no_reply_reason": session.get("no_reply_reason"),
+        "current_step": session.get("step"),
+        "prior_complaint_text": session.get("prior_complaint_text") or session.get("complaint"),
     }
 
 
@@ -674,4 +686,3 @@ async def debug_crm_check(date: str = "2026-06-12"):
             "error_type": type(exc).__name__,
             "error": str(exc),
         }
-
