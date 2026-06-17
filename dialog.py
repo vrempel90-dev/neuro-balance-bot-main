@@ -1535,15 +1535,156 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     return answer
 
 
-def _no_reply(chat_id: str, session: dict[str, Any]) -> str:
+def _no_reply(chat_id: str, session: dict[str, Any], reason: str = "") -> str:
     """Сохраняет состояние, но ничего не отправляет пациенту.
 
     Нужно после завершения записи: если пациент пишет "хорошо/спасибо/ок",
     бот не должен дублировать подтверждение и не должен запускать анкету заново.
     """
     session["last_assistant_answer"] = session.get("last_assistant_answer", "")
+    if reason:
+        session["no_reply_reason"] = reason
     _safe_save(chat_id, session)
     return ""
+
+
+def _classify_bot_question(text: str) -> str:
+    low = _low(text)
+    if not low:
+        return "unknown"
+    if any(x in low for x in ["что вас беспокоит", "чем можем помочь", "не мазалай", "мәселе мазалай", "меселе мазалай"]):
+        return "complaint"
+    if any(x in low for x in ["сколько вам лет", "жасыңыз", "жасыныз", "қанша жаста", "канша жаста"]):
+        return "age"
+    if any(x in low for x in ["противопоказ", "қарсы көрсет", "карсы корсет", "кардиостимулятор", "противопоказаний нет"]):
+        return "contraindications"
+    if any(x in low for x in ["какой день", "на какой день", "қай күн", "кай кун", "удобный день"]):
+        return "date"
+    if any(x in low for x in ["ваше имя", "атыңыз", "атыныз", "имя для оформления"]):
+        return "name"
+    if any(x in low for x in ["какое время", "қайсысы ыңғайлы", "кайсысы ынгайлы", "вариант", "окошк"]):
+        return "time"
+    if _has_mri_question(low) or any(x in low for x in ["сним", "мрт", "түсірілім", "тусирилим"]):
+        return "mri"
+    if _has_any(low, PRICE_WORDS):
+        return "price"
+    if _has_any(low, ADDRESS_WORDS):
+        return "address"
+    if _has_any(low, SCHEDULE_WORDS):
+        return "schedule"
+    if any(x in low for x in ["уже запис", "имеющейся записи", "бұрынғы жазба", "бурынгы жазба"]):
+        return "existing_appointment"
+    return "unknown"
+
+
+def _message_role(item: dict[str, Any]) -> str:
+    return _low(str(item.get("role") or item.get("type") or ""))
+
+
+def _build_conversation_context(chat_id: str, session: dict[str, Any], text: str) -> dict[str, Any]:
+    """Lightweight history layer: infer what the short incoming reply answers."""
+    history = state.get_history(chat_id, limit=20)
+    last_bot_question = ""
+    last_user_message = ""
+    last_admin_message = ""
+    prior_complaint_text = str(session.get("complaint") or "").strip()
+    has_prior_contra_question = False
+    awaiting_complaint_answer = False
+    for item in history:
+        role = _message_role(item)
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        if role in ("assistant", "bot"):
+            last_bot_question = content
+            classified = _classify_bot_question(content)
+            awaiting_complaint_answer = classified == "complaint"
+            if classified == "contraindications":
+                has_prior_contra_question = True
+        elif role in ("admin", "human", "operator", "manager"):
+            last_admin_message = content
+            qtype = _classify_bot_question(content)
+            if qtype != "unknown":
+                last_bot_question = content
+            awaiting_complaint_answer = qtype == "complaint"
+            if qtype == "contraindications":
+                has_prior_contra_question = True
+        elif role == "user":
+            if content != text:
+                last_user_message = content
+                if (
+                    not prior_complaint_text
+                    and (
+                        ((_has_complaint(content) or _has_medical_complaint_text(content)) and _profile_status(content) != "non_profile")
+                        or awaiting_complaint_answer
+                    )
+                ):
+                    prior_complaint_text = content
+            awaiting_complaint_answer = False
+
+    last_bot_question_type = _classify_bot_question(last_bot_question)
+    short_reply = len(re.findall(r"[a-zа-яәіңғүұқөһ0-9]+", _low(text))) <= 4
+    likely_reply = short_reply and last_bot_question_type != "unknown"
+    should_continue = bool(
+        prior_complaint_text
+        or session.get("age")
+        or session.get("contraindications_ok") is not None
+        or session.get("last_slots")
+        or (session.get("step") or "start") not in ("start", "", None)
+    )
+    ctx = {
+        "last_bot_question": last_bot_question,
+        "last_bot_question_type": last_bot_question_type,
+        "has_prior_complaint": bool(prior_complaint_text),
+        "prior_complaint_text": prior_complaint_text,
+        "has_prior_age": bool(session.get("age")),
+        "has_prior_contra_question": has_prior_contra_question,
+        "has_prior_slots": bool(session.get("last_slots")),
+        "last_user_message": last_user_message,
+        "last_admin_message": last_admin_message,
+        "was_manual_admin_recent": bool(last_admin_message or session.get("manual_admin_intervention") or session.get("manual_takeover")),
+        "should_continue_existing_flow": should_continue,
+        "likely_reply_to_previous_question": likely_reply,
+        "inferred_context_action": "",
+        "used_history_context": False,
+    }
+    return ctx
+
+
+def _apply_conversation_context(session: dict[str, Any], ctx: dict[str, Any], text: str) -> None:
+    qtype = str(ctx.get("last_bot_question_type") or "unknown")
+    if ctx.get("has_prior_complaint") and not session.get("complaint"):
+        session["complaint"] = ctx.get("prior_complaint_text") or ""
+        if session["complaint"]:
+            _record_complaint_tool(session, session["complaint"], is_in_profile=True)
+    if not ctx.get("likely_reply_to_previous_question"):
+        return
+    if qtype == "age":
+        session["step"] = "age"
+        ctx["inferred_context_action"] = "answer_age"
+        ctx["used_history_context"] = True
+    elif qtype == "contraindications":
+        session["step"] = "contraindications"
+        ctx["inferred_context_action"] = "answer_contraindications"
+        ctx["used_history_context"] = True
+    elif qtype == "date":
+        session["step"] = "date"
+        ctx["inferred_context_action"] = "answer_date"
+        ctx["used_history_context"] = True
+    elif qtype == "time" and session.get("last_slots"):
+        session["step"] = "time"
+        ctx["inferred_context_action"] = "select_slot"
+        ctx["used_history_context"] = True
+    elif qtype == "name":
+        session["step"] = "name"
+        ctx["inferred_context_action"] = "answer_name"
+        ctx["used_history_context"] = True
+    elif qtype == "mri" and ctx.get("has_prior_complaint"):
+        session["mri_answer"] = text
+        session["had_mri"] = any(w in _low(text) for w in ["да", "иа", "ия", "иә", "yes", "болды"])
+        session["step"] = "age" if not session.get("age") else "contraindications"
+        ctx["inferred_context_action"] = "answer_mri_continue_booking"
+        ctx["used_history_context"] = True
 
 
 def _last_answer_was_info(session: dict[str, Any]) -> bool:
@@ -2794,12 +2935,21 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     session["phone"] = phone or session.get("phone") or ""
     session["language"] = _detect_lang(text, session)
+    context = _build_conversation_context(chat_id, session, text)
+    _apply_conversation_context(session, context, text)
+    session["last_bot_question_type"] = context.get("last_bot_question_type", "unknown")
+    session["inferred_context_action"] = context.get("inferred_context_action", "")
+    session["used_history_context"] = bool(context.get("used_history_context"))
+    session["prior_complaint_text"] = context.get("prior_complaint_text", "")
+    session["current_step"] = session.get("step") or "start"
+    session["no_reply_reason"] = ""
 
     # human_takeover_guard: если живой админ уже вмешался, AI молчит и не продолжает старый сценарий.
     if _is_ai_muted(session):
         session["ai_muted"] = True
         session["manual_takeover"] = True
-        return _no_reply(chat_id, session)
+        reason = "thanks/manual_takeover" if _is_thanks_or_ok(text) else "manual_takeover"
+        return _no_reply(chat_id, session, reason)
 
     # language_lock_guard:
     # Фиксируем язык диалога, чтобы бот не прыгал RU/KZ от коротких ответов.
@@ -2811,14 +2961,14 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # Если пациент поблагодарил после адреса/цены/графика, не начинаем анкету заново.
     # В WhatsApp это должно выглядеть как молчание живого админа, а не как новый сценарий.
     if _is_thanks_or_ok(text) and _last_answer_was_info(session):
-        return _no_reply(chat_id, session)
+        return _no_reply(chat_id, session, "thanks/info")
 
     # no_duplicate_after_booking_guard:
     # После успешной записи короткие ответы "хорошо/спасибо/ок" не требуют ответа.
     # Так бот не дублирует подтверждение записи и не запускает сценарий заново.
     current_step = session.get("step") or "start"
     if (current_step in ("done", "booked") or session.get("booked")) and _is_thanks_or_ok(text):
-        return _no_reply(chat_id, session)
+        return _no_reply(chat_id, session, "thanks/done")
 
     # explicit_language_switch_guard:
     # Если клиент просит отвечать на другом языке — переключаем язык и подтверждаем.

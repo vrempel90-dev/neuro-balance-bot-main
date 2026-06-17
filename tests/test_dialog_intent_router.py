@@ -103,11 +103,112 @@ def answer(chat_id: str, text: str) -> str:
     return run(handle_message(chat_id, "77011234567", text))
 
 
+def add_history(chat_id: str, messages: list[tuple[str, str]]) -> None:
+    for role, content in messages:
+        state.add_message(chat_id, role, content)
+
+
 def test_thanks_ok_guard_does_not_match_substrings() -> None:
     assert dialog._is_thanks_or_ok("ок") is True
     assert dialog._is_thanks_or_ok("спасибо") is True
     assert dialog._is_thanks_or_ok("Поясничная область начала беспокоить") is False
     assert dialog._is_thanks_or_ok("спина беспокоит") is False
+
+
+def test_history_mri_yes_continues_booking_without_restart(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    chat_id = "ctx_mri_yes"
+    reset(chat_id, {"language": "kk", "language_locked": True})
+    add_history(
+        chat_id,
+        [
+            ("user", "ОСМС-пен емделуге болама?"),
+            ("admin", "Сәлеметсіз бе! Біз ОСМС жүйесі бойынша жұмыс істемейміз. Сізді қандай мәселе мазалайды?"),
+            ("user", "Белім мазалайды"),
+            ("admin", "Бұрын МРТ түсіріліміңіз өткен бе еді?"),
+        ],
+    )
+
+    result = answer(chat_id, "ия")
+    session = state.get_session(chat_id)
+
+    assert "қалай көмектесе" not in result.lower()
+    assert "чем можем помочь" not in result.lower()
+    assert session["step"] == "age"
+    assert session["complaint"] == "Белім мазалайды"
+    assert session["used_history_context"] is True
+    assert session["last_bot_question_type"] == "mri"
+
+
+def test_history_age_answer_moves_to_contraindications(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    chat_id = "ctx_age_34"
+    reset(chat_id, {"language": "ru", "language_locked": True, "complaint": "Спина болит"})
+    add_history(chat_id, [("user", "Спина болит"), ("assistant", "Подскажите, сколько Вам лет?")])
+
+    result = answer(chat_id, "34")
+    session = state.get_session(chat_id)
+
+    assert session["step"] == "contraindications"
+    assert session["questionnaire_step"] == "contra"
+    assert "Противопоказаний нет" in result
+
+
+def test_history_contra_clear_answer_moves_to_date(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    chat_id = "ctx_contra_clear"
+    reset(chat_id, {"language": "ru", "language_locked": True, "complaint": "болит спина", "age": 34})
+    add_history(chat_id, [("assistant", dialog._ask_contra({"language": "ru"}))])
+
+    result = answer(chat_id, "Все чисто")
+    session = state.get_session(chat_id)
+
+    assert session["contraindications_ok"] is True
+    assert session["step"] == "date"
+    assert "На какой день" in result
+
+
+def test_history_slot_choice_selects_second_slot(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    chat_id = "ctx_slot_second"
+    slots = [
+        {"doctor_login": "doctor1", "doctorName": "Первый врач", "date": "2099-01-01", "time": "09:20", "timeStart": "09:20"},
+        {"doctor_login": "doctor2", "doctorName": "Второй врач", "date": "2099-01-01", "time": "10:40", "timeStart": "10:40"},
+    ]
+    reset(
+        chat_id,
+        {
+            "language": "ru",
+            "language_locked": True,
+            "complaint": "болит спина",
+            "age": 34,
+            "contraindications_ok": True,
+            "contraindications_verdict": "proceed",
+            "last_slots": slots,
+        },
+    )
+    add_history(chat_id, [("assistant", "Есть варианты:\n1) 09:20\n2) 10:40\nКакое время из вариантов выше Вам удобно?")])
+
+    result = answer(chat_id, "2 вариант")
+    session = state.get_session(chat_id)
+
+    assert session["step"] == "name"
+    assert session["selected_slot"] == slots[1]
+    assert "имя" in result.lower()
+
+
+def test_manual_admin_thanks_stays_silent_with_reason(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    chat_id = "ctx_manual_thanks"
+    reset(chat_id, {"manual_admin_intervention": True, "manual_takeover": True, "ai_muted": True})
+    add_history(chat_id, [("admin", "Хорошо, ожидаем Вас завтра.")])
+
+    result = answer(chat_id, "рахмет")
+    session = state.get_session(chat_id)
+
+    assert result == ""
+    assert "thanks" in session["no_reply_reason"]
+
 
 
 def test_profile_age_answer_is_human_and_contextual() -> None:
