@@ -93,10 +93,14 @@ def setup_crm(monkeypatch: Any, *, lookup_error: bool = False, cancel_error: boo
 
 def reset(chat_id: str, preset: dict[str, Any] | None = None) -> None:
     state.reset_session(chat_id)
+    session = state.get_session(chat_id)
+    # This module exercises the legacy router after a lead has already entered
+    # the AI funnel. New/old-lead admission is covered separately by
+    # test_new_lead_safety_gate.py.
+    session["ai_lead_started"] = True
     if preset:
-        session = state.get_session(chat_id)
         session.update(preset)
-        state.save_session(chat_id, session)
+    state.save_session(chat_id, session)
 
 
 def answer(chat_id: str, text: str) -> str:
@@ -207,7 +211,7 @@ def test_manual_admin_thanks_stays_silent_with_reason(monkeypatch: Any) -> None:
     session = state.get_session(chat_id)
 
     assert result == ""
-    assert "thanks" in session["no_reply_reason"]
+    assert session["no_reply_reason"] == "manual_takeover"
 
 
 
@@ -383,7 +387,9 @@ def test_when_waiting_for_name_accepts_name_and_books(monkeypatch: Any) -> None:
     session = state.get_session("name_viktor")
     assert result
     assert session["patient_name"] == "Виктор"
-    assert session["step"] == "done"
+    assert session["step"] == "booked"
+    assert session["appointment_status"] == "booked"
+    assert session["ai_muted"] is True
     assert session["status"] == "booked"
     assert len(calls["book"]) == 1
 
@@ -478,17 +484,16 @@ def test_release_candidate_done_mode_and_language_regressions(monkeypatch: Any) 
 
     reset("rc_done_lookup", {"step": "done", "booked": True, "language": "ru", "language_locked": True})
     result = answer("rc_done_lookup", "На какое число записали")
-    assert "2099-01-01" in result and "18:00" in result
+    assert result == ""
+    assert state.get_session("rc_done_lookup")["no_reply_reason"] == "booked_session_ai_disabled"
 
     reset("rc_done_address", {"step": "done", "booked": True, "language": "ru", "language_locked": True})
     result = answer("rc_done_address", "Куда обращаться?")
-    assert "Кабанбай батыра 28" in result
-    assert "Ваша запись уже оформлена" not in result
+    assert result == ""
 
     reset("rc_done_advice", {"step": "done", "booked": True, "language": "ru", "language_locked": True})
     result = answer("rc_done_advice", "Посоветуйте")
-    assert "Ваша запись уже оформлена" not in result
-    assert "передам" in result.lower() or "уточ" in result.lower()
+    assert result == ""
 
     reset("rc_kk_switch")
     result = answer("rc_kk_switch", "Қазақша жоқпа")
