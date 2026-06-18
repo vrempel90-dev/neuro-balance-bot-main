@@ -65,12 +65,15 @@ def _prepare(monkeypatch, tmp_path):
 
 
 def test_wazzup_audio_type_is_ignored(monkeypatch, tmp_path):
+    events = []
+    monkeypatch.setattr(state, "log_event", lambda chat_id, event_type, payload: events.append(event_type))
     sent, handled = _prepare(monkeypatch, tmp_path)
     response = TestClient(main.app).post("/webhook/wazzup", json=_payload(type="audio"))
 
     assert response.status_code == 200
     assert sent == []
     assert handled == []
+    assert "ignored_voice_message" in events
 
 
 def test_wazzup_voice_type_is_ignored(monkeypatch, tmp_path):
