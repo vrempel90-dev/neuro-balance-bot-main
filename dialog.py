@@ -2312,7 +2312,11 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         )
         session["booked"] = True
         session["appointment"] = booked
-        session["step"] = "done"
+        session["step"] = "booked"
+        session["appointment_status"] = "booked"
+        session["ai_muted"] = True
+        session["manual_takeover"] = True
+        session["no_reply_reason"] = "booked_session_ai_disabled"
         session["status"] = "booked"
         session["crm_status"] = "Записан"
 
@@ -2889,6 +2893,98 @@ def _is_ai_muted(session: dict[str, Any]) -> bool:
     )
 
 
+def _is_booked_or_confirmed_session(session: dict[str, Any]) -> bool:
+    """Return True when a session contains any reliable booking marker."""
+    if _low(str(session.get("step") or "")) in {
+        "booked", "done", "confirmed", "appointment_confirmed",
+    }:
+        return True
+    if _low(str(session.get("appointment_status") or "")) in {
+        "booked", "confirmed", "active",
+    }:
+        return True
+    if any(session.get(key) for key in (
+        "existing_appointment", "appointment", "booked_date", "booked_time",
+        "appointment_date", "appointment_time", "booking_id", "appointment_id",
+    )):
+        return True
+
+    booking_result = session.get("booking_result")
+    if isinstance(booking_result, dict) and (
+        booking_result.get("success") is True
+        or booking_result.get("ok") is True
+        or _low(str(booking_result.get("status") or "")) in {"success", "booked", "confirmed"}
+    ):
+        return True
+
+    selected_slot = session.get("selected_slot")
+    patient_name = session.get("patient_name")
+    booking_state = " ".join(str(session.get(key) or "") for key in (
+        "booking_status", "status", "crm_status",
+    )).lower()
+    return bool(
+        selected_slot
+        and patient_name
+        and any(marker in booking_state for marker in ("success", "booked", "confirmed", "записан"))
+    )
+
+
+def _is_new_lead_text(text: str) -> bool:
+    """Recognise only explicit booking intent or a clinic-profile complaint."""
+    low = _low(text)
+    if not low or low in {
+        "да", "нет", "ок", "окей", "подтверждаю", "спасибо", "хорошо",
+        "ия", "иә", "жоқ", "рахмет", "рақмет",
+    }:
+        return False
+    lead_markers = (
+        "запис", "консультац", "диагност", "приём", "прием", "осмотр",
+        "жазыл", "қабылдау", "кабылдау",
+    )
+    return any(marker in low for marker in lead_markers) or _profile_status(text) == "profile"
+
+
+def _is_refund_or_claim_issue(text: str) -> bool:
+    """Recognise payment, installment, refund and formal-claim admin cases."""
+    low = _low(text)
+    markers = (
+        "возврат", "рассроч", "отмена рассрочки", "каспи ред", "kaspi red",
+        "каспи", "kaspi", "кредит", "заявление", "претенз", "жалоба",
+        "отдел забот", "отмена платежа", "отмена кредита", "деньги вернуть",
+        "верните деньги", "вернут деньги", "оплата", "оплатил", "оплатила",
+        "лечение на рассрочку", "когда будет отмена", "решите вопрос",
+        "мама проходила лечение", "родственник проходил лечение",
+    )
+    return any(marker in low for marker in markers)
+
+
+def _should_ai_handle_new_lead(session: dict[str, Any], text: str) -> tuple[bool, str]:
+    if _is_refund_or_claim_issue(text):
+        return False, "refund_claim_admin_required"
+    if _is_booked_or_confirmed_session(session):
+        return False, "booked_session_ai_disabled"
+    if session.get("ai_muted") or session.get("manual_takeover") or session.get("do_not_reply"):
+        return False, "manual_takeover"
+    if (
+        session.get("old_chat") is True
+        or session.get("imported") is True
+        or session.get("existing_chat") is True
+        or _low(str(session.get("source") or "")) == "old"
+        or _low(str(session.get("lead_source") or "")) == "old_chat"
+    ):
+        return False, "old_chat_ai_disabled"
+
+    step = _low(str(session.get("step") or "start"))
+    if session.get("ai_lead_started") is True and step in {
+        "start", "complaint", "age", "contraindications", "date",
+        "preferred_time", "time", "select_slot", "name", "phone",
+    }:
+        return True, "active_ai_lead"
+    if _is_new_lead_text(text):
+        return True, "new_lead"
+    return False, "not_new_lead"
+
+
 def _is_new_patient_consultation(session: dict[str, Any]) -> bool:
     if session.get("existing_patient") or session.get("is_existing_patient") or session.get("procedure_patient"):
         return False
@@ -2935,6 +3031,32 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     session["phone"] = phone or session.get("phone") or ""
     session["language"] = _detect_lang(text, session)
+    can_handle, reason = _should_ai_handle_new_lead(session, text)
+    if not can_handle:
+        session["ai_muted"] = True
+        session["no_reply_reason"] = reason
+        if reason == "refund_claim_admin_required":
+            session["manual_takeover"] = True
+            session["escalated"] = True
+        _safe_save(chat_id, session)
+        if reason == "refund_claim_admin_required":
+            answer = _tr(
+                session,
+                "Понимаю Вас. Вопрос по возврату/рассрочке передам ответственному администратору, чтобы проверили информацию и связались с Вами 🌿",
+                "Түсіндім. Қайтарым/бөліп төлеу бойынша сұрақты жауапты әкімшіге жіберемін, ақпаратты тексеріп, Сізбен байланысады 🌿",
+            )
+            session["last_assistant_answer"] = answer
+            _safe_save(chat_id, session)
+            _safe_add_message(chat_id, "assistant", answer)
+            return answer
+        return ""
+
+    if reason == "new_lead":
+        session["ai_lead_started"] = True
+        session["lead_source"] = "new_lead"
+        session["ai_started_at"] = datetime.now(timezone.utc).isoformat()
+        session.pop("no_reply_reason", None)
+
     context = _build_conversation_context(chat_id, session, text)
     _apply_conversation_context(session, context, text)
     session["last_bot_question_type"] = context.get("last_bot_question_type", "unknown")
