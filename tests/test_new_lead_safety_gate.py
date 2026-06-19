@@ -105,7 +105,41 @@ def test_short_reply_does_not_start_lead() -> None:
     _reset(chat_id, {"some_existing_context": True})
 
     assert _answer(chat_id, "да") == ""
-    assert state.get_session(chat_id)["no_reply_reason"] == "not_new_lead"
+    session = state.get_session(chat_id)
+    assert session["no_reply_reason"] == "not_new_lead"
+    assert session.get("ai_muted") is not True
+
+
+def test_active_city_reply_continues_and_asks_astana_visit() -> None:
+    chat_id = _chat_id("active-city")
+    _reset(chat_id, {
+        "step": "complaint",
+        "ai_lead_started": True,
+        "last_bot_answer": "Вы из какого города обращаетесь?",
+    })
+
+    answer = _answer(chat_id, "Караганда")
+    session = state.get_session(chat_id)
+
+    assert answer
+    assert "планируете приехать в Астану" in answer
+    assert session.get("ai_muted") is not True
+
+
+def test_active_greeting_reply_reasks_complaint_without_mute() -> None:
+    chat_id = _chat_id("active-greeting")
+    _reset(chat_id, {
+        "step": "complaint",
+        "ai_lead_started": True,
+        "last_bot_answer": "Подскажите, пожалуйста, что Вас беспокоит?",
+    })
+
+    answer = _answer(chat_id, "Доброе утро")
+    session = state.get_session(chat_id)
+
+    assert answer
+    assert "что Вас беспокоит" in answer
+    assert session.get("ai_muted") is not True
 
 
 def test_active_ai_lead_continues() -> None:
@@ -121,6 +155,37 @@ def test_active_ai_lead_continues() -> None:
 
     assert answer
     assert session["step"] == "contraindications"
+
+
+def test_active_clear_contraindications_continue_to_date() -> None:
+    chat_id = _chat_id("active-contra")
+    _reset(chat_id, {
+        "step": "contraindications",
+        "ai_lead_started": True,
+    })
+
+    answer = _answer(chat_id, "Все чисто")
+    session = state.get_session(chat_id)
+
+    assert "На какой день" in answer
+    assert session["step"] == "date"
+
+
+def test_active_date_reply_is_not_muted() -> None:
+    chat_id = _chat_id("active-date")
+    _reset(chat_id, {
+        "step": "date",
+        "ai_lead_started": True,
+        "contraindications_ok": True,
+        "contraindications_verdict": "proceed",
+    })
+
+    answer = _answer(chat_id, "завтра")
+    session = state.get_session(chat_id)
+
+    assert answer
+    assert session["step"] in ("time", "date", "escalated")
+    assert session.get("ai_muted") is not True
 
 
 def test_successful_booking_mutes_future_messages(monkeypatch: Any) -> None:
