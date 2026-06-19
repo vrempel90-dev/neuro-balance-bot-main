@@ -1552,6 +1552,10 @@ def _classify_bot_question(text: str) -> str:
     low = _low(text)
     if not low:
         return "unknown"
+    if any(x in low for x in ["из какого города", "какого города", "қай қаладан", "кай каладан"]):
+        return "city"
+    if any(x in low for x in ["планируете приехать в астану", "сможете приехать в астану", "астанаға кел", "астанага кел"]):
+        return "astana_visit"
     if any(x in low for x in ["что вас беспокоит", "чем можем помочь", "не мазалай", "мәселе мазалай", "меселе мазалай"]):
         return "complaint"
     if any(x in low for x in ["сколько вам лет", "жасыңыз", "жасыныз", "қанша жаста", "канша жаста"]):
@@ -1575,6 +1579,38 @@ def _classify_bot_question(text: str) -> str:
     if any(x in low for x in ["уже запис", "имеющейся записи", "бұрынғы жазба", "бурынгы жазба"]):
         return "existing_appointment"
     return "unknown"
+
+
+def _has_active_conversation_context(session: dict[str, Any]) -> bool:
+    """Detect an already-started lead funnel, including short replies to bot/admin questions."""
+    step = _low(str(session.get("step") or ""))
+    if step in {"complaint", "age", "contraindications", "date", "time", "name"}:
+        return True
+    if session.get("ai_lead_started") is True:
+        return True
+    qtype = str(session.get("last_bot_question_type") or "")
+    if qtype and qtype != "unknown":
+        return True
+    if session.get("complaint") or session.get("age") or session.get("last_slots"):
+        return True
+    if session.get("asked_city") or session.get("asked_complaint"):
+        return True
+    last_answer = str(session.get("last_bot_answer") or session.get("last_assistant_answer") or "")
+    return bool(last_answer and _classify_bot_question(last_answer) != "unknown")
+
+
+def _is_reply_to_active_question(session: dict[str, Any], text: str) -> bool:
+    """Return True for non-empty patient replies while the funnel is waiting for an answer."""
+    if not _clean(text):
+        return False
+    step = _low(str(session.get("step") or ""))
+    if step in {"complaint", "age", "contraindications", "date", "time", "name"}:
+        return True
+    qtype = str(session.get("last_bot_question_type") or "")
+    if qtype and qtype != "unknown":
+        return True
+    last_answer = str(session.get("last_bot_answer") or session.get("last_assistant_answer") or "")
+    return bool(last_answer and _classify_bot_question(last_answer) != "unknown")
 
 
 def _message_role(item: dict[str, Any]) -> str:
@@ -1773,7 +1809,7 @@ def _is_positive_confirm(text: str) -> bool:
 def _is_greeting_only(text: str) -> bool:
     low = _low(text)
     words = re.sub(r"[^\wа-яА-ЯәіңғүұқөһӘІҢҒҮҰҚӨҺ]+", " ", low).split()
-    return bool(words) and len(words) <= 3 and any(w in words for w in ["здравствуйте", "привет", "салем", "сәлем"])
+    return bool(words) and len(words) <= 3 and any(w in words for w in ["здравствуйте", "привет", "салем", "сәлем", "доброе"])
 
 
 def _parse_date(text: str) -> str | None:
@@ -2974,6 +3010,9 @@ def _should_ai_handle_new_lead(session: dict[str, Any], text: str) -> tuple[bool
     ):
         return False, "old_chat_ai_disabled"
 
+    if _has_active_conversation_context(session) or _is_reply_to_active_question(session, text):
+        return True, "active_conversation_reply"
+
     step = _low(str(session.get("step") or "start"))
     if session.get("ai_lead_started") is True and step in {
         "start", "complaint", "age", "contraindications", "date",
@@ -3032,9 +3071,23 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session["phone"] = phone or session.get("phone") or ""
     session["language"] = _detect_lang(text, session)
     can_handle, reason = _should_ai_handle_new_lead(session, text)
+    session["gate_reason"] = reason
+    session["active_conversation_detected"] = bool(
+        _has_active_conversation_context(session) or _is_reply_to_active_question(session, text)
+    )
+    if session.get("last_bot_question_type") in (None, ""):
+        session["last_bot_question_type"] = _classify_bot_question(
+            str(session.get("last_bot_answer") or session.get("last_assistant_answer") or "")
+        )
     if not can_handle:
-        session["ai_muted"] = True
         session["no_reply_reason"] = reason
+        if reason in {
+            "booked_session_ai_disabled",
+            "manual_takeover",
+            "refund_claim_admin_required",
+            "old_chat_ai_disabled",
+        }:
+            session["ai_muted"] = True
         if reason == "refund_claim_admin_required":
             session["manual_takeover"] = True
             session["escalated"] = True
@@ -3051,15 +3104,22 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return answer
         return ""
 
+    if reason in {"new_lead", "active_conversation_reply", "active_ai_lead"}:
+        session.pop("no_reply_reason", None)
+
     if reason == "new_lead":
         session["ai_lead_started"] = True
         session["lead_source"] = "new_lead"
         session["ai_started_at"] = datetime.now(timezone.utc).isoformat()
-        session.pop("no_reply_reason", None)
 
     context = _build_conversation_context(chat_id, session, text)
     _apply_conversation_context(session, context, text)
-    session["last_bot_question_type"] = context.get("last_bot_question_type", "unknown")
+    context_qtype = context.get("last_bot_question_type", "unknown")
+    if context_qtype == "unknown":
+        context_qtype = _classify_bot_question(
+            str(session.get("last_bot_answer") or session.get("last_assistant_answer") or "")
+        )
+    session["last_bot_question_type"] = context_qtype
     session["inferred_context_action"] = context.get("inferred_context_action", "")
     session["used_history_context"] = bool(context.get("used_history_context"))
     session["prior_complaint_text"] = context.get("prior_complaint_text", "")
@@ -3109,6 +3169,31 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # Intent-router запускается только после обязательных шагов, чтобы не перехватывать
     # возраст/противопоказания/дату/время/имя и не начинать анкету заново.
     step = session.get("step") or "start"
+
+    if step in ("start", "complaint") and session.get("last_bot_question_type") == "city" and text:
+        session["city"] = text
+        if "астан" not in _low(text):
+            session["last_bot_question_type"] = "astana_visit"
+            return _finalize(
+                chat_id,
+                session,
+                _tr(
+                    session,
+                    "Поняла Вас 🌿 Вы планируете приехать в Астану на консультацию?",
+                    "Түсіндім 🌿 Консультацияға Астанаға келуді жоспарлап отырсыз ба?",
+                ),
+            )
+
+    if step == "complaint" and _is_greeting_only(text) and not session.get("complaint"):
+        return _finalize(
+            chat_id,
+            session,
+            _tr(
+                session,
+                "Доброе утро 🌿 Подскажите, пожалуйста, что Вас беспокоит?",
+                "Қайырлы таң 🌿 Нақты не мазалайды?",
+            ),
+        )
 
     if _contra_has_hard_stop(text) and step not in ("done", "booked", "stopped"):
         bot_tools.verify_contraindications(session, bot_tools.CONTRA_REFUSE, text)
