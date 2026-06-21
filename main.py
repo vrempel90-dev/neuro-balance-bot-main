@@ -137,9 +137,9 @@ async def _maybe_humanize_answer(chat_id: str, user_text: str, base_answer: str,
     session["chat_id"] = chat_id
     if session.get("openai_brain_used") and (base_answer or "").strip():
         debug = {
-            "openai_used": False,
+            "openai_used": True,
             "openai_model": getattr(get_settings(), "openai_model", ""),
-            "openai_skip_reason": "brain_reply_no_humanize",
+            "openai_skip_reason": "",
             "openai_guard_failed": False,
             "base_answer_preview": _preview(base_answer, 160),
             "final_answer_preview": _preview(base_answer, 160),
