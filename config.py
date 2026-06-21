@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     openai_model: str = Field(default="gpt-4o-mini", validation_alias=AliasChoices("OPENAI_MODEL", "openai_model"))
     openai_voice_model: str = Field(default="whisper-1", validation_alias=AliasChoices("OPENAI_VOICE_MODEL", "openai_voice_model"))
     ai_enabled: bool = Field(default=True, validation_alias=AliasChoices("AI_ENABLED", "ai_enabled"))
+    openai_humanize_replies: bool = Field(default=True, validation_alias=AliasChoices("OPENAI_HUMANIZE_REPLIES", "openai_humanize_replies"))
 
     # Wazzup
     wazzup_api_key: str = Field(default="", validation_alias=AliasChoices("WAZZUP_API_KEY", "wazzup_api_key"))
