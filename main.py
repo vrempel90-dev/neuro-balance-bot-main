@@ -26,6 +26,41 @@ except Exception:
 app = FastAPI(title="Neuro Balance Hybrid WhatsApp Booking Bot")
 
 
+def _preview(value: Any, limit: int = 120) -> str:
+    return str(value or "").replace("\n", " ").strip()[:limit]
+
+
+def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
+    return {
+        "openai_used": bool(session.get("openai_used")),
+        "openai_model": session.get("openai_model") or "",
+        "openai_skip_reason": session.get("openai_skip_reason") or "",
+        "gate_reason": session.get("gate_reason") or "",
+        "no_reply_reason": session.get("no_reply_reason") or "",
+        "answer_empty": not bool(answer),
+        "step": session.get("step") or session.get("current_step") or "",
+        "ai_muted": bool(session.get("ai_muted")),
+        "manual_takeover": bool(session.get("manual_takeover") or session.get("manual_admin_intervention")),
+        "ai_lead_started": bool(session.get("ai_lead_started")),
+    }
+
+
+def _log_dialog_result(chat_id: str, phone: str, answer: str) -> None:
+    session = state.get_session(chat_id)
+    debug = _dialog_debug(session, answer)
+    state.log_event(chat_id, "dialog_result", {
+        "phone": phone,
+        "answer_empty": debug["answer_empty"],
+        "answer_preview": _preview(answer, 160),
+        **{k: debug[k] for k in ("step", "gate_reason", "no_reply_reason", "ai_muted", "manual_takeover", "ai_lead_started", "openai_used", "openai_skip_reason")},
+    })
+    if not answer:
+        state.log_event(chat_id, "bot_no_reply", {
+            "phone": phone,
+            **{k: debug[k] for k in ("no_reply_reason", "gate_reason", "step", "ai_muted", "manual_takeover")},
+        })
+
+
 @app.get("/")
 def root() -> dict[str, Any]:
     return {
@@ -329,8 +364,11 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
     else:
         user_text = str(message.get("text") or "")
 
+    state.log_event(chat_id, "dialog_start", {"phone": phone, "text_preview": _preview(user_text, 120), "force": False, "source": message.get("source") or "wazzup"})
     answer = await handle_message(chat_id=chat_id, phone=phone, user_text=user_text)
-    return _guard_answer(chat_id, answer)
+    answer = _guard_answer(chat_id, answer)
+    _log_dialog_result(chat_id, phone, answer)
+    return answer
 
 
 async def _send_answer_parts(
@@ -339,6 +377,7 @@ async def _send_answer_parts(
     answer: str,
     chat_type: str,
     channel_id: str | None,
+    phone: str = "",
 ) -> None:
     """Отправляет ответ частями через разделитель ---.
 
@@ -350,12 +389,19 @@ async def _send_answer_parts(
         safe_part = _guard_answer(chat_id, part)
         if not safe_part:
             continue
-        await send_text(
-            chat_id=chat_id,
-            text=safe_part,
-            chat_type=chat_type,
-            channel_id=channel_id,
-        )
+        state.log_event(chat_id, "wazzup_send_attempt", {"phone": phone, "answer_preview": _preview(safe_part, 160)})
+        try:
+            result = await send_text(
+                chat_id=chat_id,
+                text=safe_part,
+                chat_type=chat_type,
+                channel_id=channel_id,
+            )
+            state.log_event(chat_id, "wazzup_send_result", {"phone": phone, "ok": True, "status_code": result.get("status_code")})
+        except Exception as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            state.log_event(chat_id, "wazzup_send_result", {"phone": phone, "ok": False, "status_code": status_code, "error_preview": _preview(exc, 300)})
+            raise
 
 
 async def _debounced_process_and_send(message: dict[str, Any]) -> None:
@@ -401,6 +447,7 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
             answer=answer,
             chat_type=chat_type,
             channel_id=channel_id,
+            phone=str(message.get("phone") or ""),
         )
 
     except Exception as exc:
@@ -556,6 +603,13 @@ async def wazzup_webhook(request: Request, authorization: str | None = Header(de
 
     for message in messages:
         chat_id = str(message["chat_id"])
+        state.log_event(chat_id, "wazzup_received", {
+            "phone": str(message.get("phone") or chat_id),
+            "message_type": str(message.get("kind") or "text"),
+            "has_text": bool(message.get("text")),
+            "text_preview": _preview(message.get("text"), 120),
+            "source": "wazzup",
+        })
         message_key = str(message.get("message_key") or "")
 
         if message_key and (message_key in ignored_raw_message_keys or state.is_processed_message(message_key)):
@@ -593,8 +647,10 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
             for key in ("manual_admin_intervention", "manual_takeover", "ai_muted"):
                 session[key] = False
             state.save_session(chat_id, session)
+        state.log_event(chat_id, "dialog_start", {"phone": phone, "text_preview": _preview(text, 120), "force": force, "source": "debug"})
         raw_answer = await handle_message(chat_id=chat_id, phone=phone, user_text=text)
         answer = _guard_answer(chat_id, raw_answer)
+        _log_dialog_result(chat_id, phone, answer)
     session = state.get_session(chat_id)
 
     return {
@@ -607,6 +663,7 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
         "no_reply_reason": session.get("no_reply_reason"),
         "current_step": session.get("step"),
         "prior_complaint_text": session.get("prior_complaint_text") or session.get("complaint"),
+        "debug": _dialog_debug(session, answer),
     }
 
 
