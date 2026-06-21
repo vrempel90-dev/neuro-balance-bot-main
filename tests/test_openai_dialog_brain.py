@@ -296,3 +296,61 @@ def test_humanize_not_called_when_brain_reply_used(monkeypatch: Any) -> None:
     session = state.get_session(chat_id)
     assert session["openai_used"] is True
     assert session["openai_skip_reason"] == ""
+
+
+def test_production_age_clear_date_typo_flow_python_fallback(monkeypatch: Any) -> None:
+    chat_id = "production_multi_entity_fallback"
+    state.reset_session(chat_id)
+    calls: list[str] = []
+
+    async def fake_slots(date: str, doctor_login: str | None = None):
+        calls.append(date)
+        return {"availability": [{"doctorLogin": "d", "doctorName": "Врач", "date": date, "availableSlots": ["11:00", "15:00"]}]}
+
+    async def fallback_brain(**kwargs: Any):
+        return brain("fallback_rule_based", "", {}, "none")
+
+    monkeypatch.setattr(crm, "check_slots", fake_slots)
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fallback_brain)
+
+    first = run(handle_message(chat_id, "77011234567", "Здравствуйте, у меня поясница бкспокоит, иногда в ногу отдаёт. МРТ старое есть, надо новое делать?"))
+    session = state.get_session(chat_id)
+    assert session["step"] == "age"
+    assert session["ai_lead_started"] is True
+    assert "лет" in first.lower() or "жас" in first.lower()
+
+    second = run(handle_message(chat_id, "77011234567", "34, все чисто, можно в понеддельник не рано?"))
+    session = state.get_session(chat_id)
+    assert session["age"] == 34
+    assert session["contraindications_ok"] is True
+    assert session["time_preference"] == "не рано"
+    assert calls
+    assert session["step"] == "time"
+    assert session["last_slots"]
+    assert session["openai_brain_fallback_used"] is True
+    assert "противопоказ" not in second.lower()
+    assert "11:00" in second and "15:00" in second
+
+
+def test_production_age_date_without_clear_keeps_contra_gate(monkeypatch: Any) -> None:
+    chat_id = "production_no_clear_contra_gate"
+    reset(chat_id, {"step": "age", "complaint": "болит спина"})
+    calls: list[str] = []
+
+    async def fake_slots(date: str, doctor_login: str | None = None):
+        calls.append(date)
+        return {"availability": [{"doctorLogin": "d", "doctorName": "Врач", "date": date, "availableSlots": ["11:00"]}]}
+
+    async def fallback_brain(**kwargs: Any):
+        return brain("fallback_rule_based", "", {}, "none")
+
+    monkeypatch.setattr(crm, "check_slots", fake_slots)
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fallback_brain)
+
+    answer = run(handle_message(chat_id, "77011234567", "34, можно в понедельник?"))
+    session = state.get_session(chat_id)
+    assert session["age"] == 34
+    assert session.get("contraindications_ok") is not True
+    assert not calls
+    assert session["step"] == "contraindications"
+    assert "противопоказ" in answer.lower()
