@@ -37,6 +37,14 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "openai_model": session.get("openai_model") or "",
         "openai_skip_reason": session.get("openai_skip_reason") or "",
         "openai_guard_failed": bool(session.get("openai_guard_failed")),
+        "openai_brain_used": bool(session.get("openai_brain_used")),
+        "openai_brain_action": session.get("openai_brain_action") or "",
+        "openai_brain_needs_python_tool": session.get("openai_brain_needs_python_tool") or "",
+        "openai_brain_extracted": session.get("openai_brain_extracted") or {},
+        "openai_brain_guard_failed": bool(session.get("openai_brain_guard_failed")),
+        "openai_brain_guard_reason": session.get("openai_brain_guard_reason") or "",
+        "openai_brain_skip_reason": session.get("openai_brain_skip_reason") or "",
+        "openai_brain_fallback_used": bool(session.get("openai_brain_fallback_used")),
         "base_answer_preview": session.get("base_answer_preview") or _preview(answer, 160),
         "final_answer_preview": session.get("final_answer_preview") or _preview(answer, 160),
         "gate_reason": session.get("gate_reason") or "",
@@ -127,6 +135,18 @@ def _humanize_skip_reason(session: dict[str, Any], answer: str, *, voice_ignored
 async def _maybe_humanize_answer(chat_id: str, user_text: str, base_answer: str, *, voice_ignored: bool = False) -> str:
     session = _get_session_safe(chat_id)
     session["chat_id"] = chat_id
+    if session.get("openai_brain_used") and (base_answer or "").strip():
+        debug = {
+            "openai_used": False,
+            "openai_model": getattr(get_settings(), "openai_model", ""),
+            "openai_skip_reason": "brain_reply_no_humanize",
+            "openai_guard_failed": False,
+            "base_answer_preview": _preview(base_answer, 160),
+            "final_answer_preview": _preview(base_answer, 160),
+        }
+        _set_openai_debug(session, debug, base_answer, base_answer)
+        state.save_session(chat_id, session)
+        return base_answer
     reason = _humanize_skip_reason(session, base_answer, voice_ignored=voice_ignored)
     if reason:
         debug = {
