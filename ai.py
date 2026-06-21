@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from functools import lru_cache
+from typing import Any
 try:
     from openai import AsyncOpenAI
 except Exception:
@@ -246,3 +247,159 @@ async def generate_human_message(draft: str, user_text: str = "", lang: str = "r
         return _fallback_humanize(content)
     except Exception:
         return _fallback_humanize(draft)
+
+
+STRICT_HUMANIZE_REPLY_PROMPT = """
+Ты — живой администратор клиники Neuro Balance в WhatsApp.
+
+Твоя задача — только переформулировать готовый безопасный ответ клиники более живо и по-человечески.
+
+Нельзя менять смысл ответа.
+Нельзя менять этап диалога.
+Нельзя добавлять новые вопросы, кроме тех, которые уже есть в base_answer.
+Нельзя спрашивать имя, если base_answer не спрашивает имя.
+Нельзя предлагать дату или время, если base_answer этого не делает.
+Нельзя убирать вопрос про возраст, если он есть в base_answer.
+Нельзя убирать вопрос про противопоказания, если он есть в base_answer.
+Нельзя удалять пункты противопоказаний.
+Нельзя обещать лечение, результат, гарантию или точную стоимость курса.
+Нельзя говорить, что вылечим.
+Нельзя ставить диагноз.
+Нельзя советовать медицинское лечение.
+Нельзя отвечать на старые записи/возвраты/жалобы — если base_answer пустой, верни пусто.
+
+Пиши коротко, как администратор в WhatsApp.
+Стиль: спокойно, заботливо, без канцелярита.
+Можно использовать 1 emoji 🌿, но не больше.
+Не используй фразы:
+- “С такими жалобами к нам обращаются”
+- “это наша специализация” слишком часто
+- “Вижу Ваш запрос”
+- “передам врачу” без причины
+
+Верни только итоговый текст ответа, без комментариев.
+""".strip()
+
+
+def _has_age_question(text: str) -> bool:
+    low = _low_for_guard(text)
+    return any(x in low for x in ["сколько вам лет", "сколько вам полных лет", "ваш возраст", "жасыңыз", "жасыныз", "қаншада", "каншада"])
+
+
+def _has_name_question(text: str) -> bool:
+    low = _low_for_guard(text)
+    return any(x in low for x in ["ваше имя", "как вас зовут", "имя для записи", "атыңыз", "атыныз", "есіміңіз", "есиминиз"])
+
+
+def _has_date_question(text: str) -> bool:
+    low = _low_for_guard(text)
+    return any(x in low for x in ["на какой день", "когда удобно", "какая дата", "қай күн", "кай кун", "қашан ыңғайлы", "кашан ынгайлы"])
+
+
+def _has_contra_question(text: str) -> bool:
+    low = _low_for_guard(text)
+    return "противопоказаний нет" in low or "қарсы көрсетілім" in low or "карсы корсет" in low
+
+
+def _low_for_guard(text: str) -> str:
+    return (text or "").replace("ё", "е").lower()
+
+
+def _contra_markers(text: str) -> set[str]:
+    low = _low_for_guard(text)
+    markers = {
+        "кардиостимулятор": ["кардиостимулятор"],
+        "онкология": ["онколог", "онко"],
+        "беременность": ["беремен", "жүкт", "жукт"],
+        "острые инфекции": ["остр", "инфек", "қызу", "кызу"],
+    }
+    return {name for name, variants in markers.items() if any(v in low for v in variants)}
+
+
+def _humanize_guard_ok(base_answer: str, humanized: str) -> bool:
+    if not (base_answer or "").strip():
+        return not (humanized or "").strip()
+    if _has_age_question(base_answer) and not _has_age_question(humanized):
+        return False
+    if _has_contra_question(base_answer):
+        if not _has_contra_question(humanized):
+            return False
+        if not _contra_markers(base_answer).issubset(_contra_markers(humanized)):
+            return False
+    if not _has_name_question(base_answer) and _has_name_question(humanized):
+        return False
+    if not _has_date_question(base_answer) and _has_date_question(humanized):
+        return False
+    return True
+
+
+async def humanize_reply_with_openai(
+    *,
+    base_answer: str,
+    user_text: str,
+    session: dict[str, Any],
+    recent_history: list[dict[str, str]] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Safely rephrase a deterministic dialog answer without changing business logic."""
+    settings = get_settings()
+    model = settings.openai_model
+    debug: dict[str, Any] = {
+        "openai_used": False,
+        "openai_model": model,
+        "openai_skip_reason": "",
+        "openai_guard_failed": False,
+        "base_answer_preview": (base_answer or "").replace("\n", " ")[:160],
+        "final_answer_preview": (base_answer or "").replace("\n", " ")[:160],
+    }
+    base_answer = (base_answer or "").strip()
+    if not base_answer:
+        debug["openai_skip_reason"] = "empty_answer"
+        return "", debug
+    if not settings.ai_enabled or not settings.openai_humanize_replies or not settings.openai_api_key or AsyncOpenAI is None:
+        debug["openai_skip_reason"] = "config_missing"
+        return base_answer, debug
+
+    step = str(session.get("step") or session.get("current_step") or "start")
+    chat_id = str(session.get("chat_id") or session.get("phone") or "")
+    summary = {
+        "step": step,
+        "language": session.get("language"),
+        "complaint": session.get("complaint") or session.get("prior_complaint_text"),
+        "age": session.get("age"),
+        "contraindications_ok": session.get("contraindications_ok"),
+    }
+    try:
+        if state is not None:
+            state.log_event(chat_id or "system", "openai_called", {"chat_id": chat_id, "model": model, "purpose": "humanize_reply", "step": step})
+        client = _openai_client(settings.openai_api_key)
+        response = await client.chat.completions.create(
+            model=model,
+            temperature=0.35,
+            max_tokens=260,
+            messages=[
+                {"role": "system", "content": STRICT_HUMANIZE_REPLY_PROMPT},
+                {"role": "user", "content": (
+                    f"Текущий этап: {step}\n"
+                    f"Краткий контекст сессии: {json.dumps(summary, ensure_ascii=False)}\n"
+                    f"Сообщение клиента: {user_text or ''}\n"
+                    "Безопасный базовый ответ, который нельзя менять по смыслу:\n"
+                    f"{base_answer}\n\n"
+                    "Переформулируй базовый ответ живее, но сохрани смысл, этап и обязательные вопросы."
+                )},
+            ],
+        )
+        humanized = (response.choices[0].message.content or "").strip().strip('"')
+        debug["openai_used"] = True
+        if not _humanize_guard_ok(base_answer, humanized):
+            debug["openai_guard_failed"] = True
+            debug["openai_skip_reason"] = "guard_failed_returned_base"
+            return base_answer, debug
+        final = humanized or base_answer
+        debug["final_answer_preview"] = final.replace("\n", " ")[:160]
+        if state is not None:
+            state.log_event(chat_id or "system", "openai_humanized", {"chat_id": chat_id, "model": model, "step": step, "base_preview": debug["base_answer_preview"], "humanized_preview": debug["final_answer_preview"]})
+        return final, debug
+    except Exception as exc:
+        debug["openai_skip_reason"] = "openai_error"
+        debug["openai_error_preview"] = str(exc)[:300]
+        return base_answer, debug

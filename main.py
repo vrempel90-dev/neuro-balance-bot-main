@@ -12,6 +12,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File
 import state
 from config import get_settings
 from dialog import handle_message
+from ai import humanize_reply_with_openai
 from schedule import is_bot_work_time
 from voice import transcribe_wazzup_voice, transcribe_bytes, transcribe_upload, voice_text_for_bot
 from wazzup import extract_incoming_messages, is_audio_message_payload, send_text
@@ -35,6 +36,9 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "openai_used": bool(session.get("openai_used")),
         "openai_model": session.get("openai_model") or "",
         "openai_skip_reason": session.get("openai_skip_reason") or "",
+        "openai_guard_failed": bool(session.get("openai_guard_failed")),
+        "base_answer_preview": session.get("base_answer_preview") or _preview(answer, 160),
+        "final_answer_preview": session.get("final_answer_preview") or _preview(answer, 160),
         "gate_reason": session.get("gate_reason") or "",
         "no_reply_reason": session.get("no_reply_reason") or "",
         "answer_empty": not bool(answer),
@@ -82,6 +86,68 @@ def health() -> dict[str, Any]:
         "mode": "gpt4o-mini-night-only",
         "bot_work_time_now": is_bot_work_time(),
     }
+
+
+_ALLOWED_HUMANIZE_STEPS = {"start", "complaint", "age", "contraindications", "date", "time", "name"}
+_ALLOWED_HUMANIZE_GATE_REASONS = {"new_lead", "active_ai_lead", "active_conversation_reply"}
+
+def _set_openai_debug(session: dict[str, Any], debug: dict[str, Any], base_answer: str, final_answer: str) -> None:
+    session["openai_used"] = bool(debug.get("openai_used"))
+    session["openai_model"] = str(debug.get("openai_model") or "")
+    session["openai_skip_reason"] = str(debug.get("openai_skip_reason") or "")
+    session["openai_guard_failed"] = bool(debug.get("openai_guard_failed"))
+    session["base_answer_preview"] = str(debug.get("base_answer_preview") or _preview(base_answer, 160))
+    session["final_answer_preview"] = str(debug.get("final_answer_preview") or _preview(final_answer, 160))
+
+
+def _humanize_skip_reason(session: dict[str, Any], answer: str, *, voice_ignored: bool = False) -> str:
+    if not (answer or "").strip():
+        return "empty_answer"
+    if voice_ignored or session.get("last_ignored_message_type") in {"voice", "audio"}:
+        return "handoff"
+    step = str(session.get("step") or session.get("current_step") or "start")
+    if step in {"booked", "confirmed", "done"} or session.get("booked") or session.get("ai_muted"):
+        return "booked_or_muted"
+    if session.get("manual_takeover") or session.get("manual_admin_intervention") or session.get("do_not_reply"):
+        return "handoff"
+    if session.get("refund_claim_admin_required") or session.get("gate_reason") == "refund_claim_admin_required":
+        return "refund_or_claim"
+    if session.get("old_chat_ai_disabled") or session.get("gate_reason") == "old_chat_ai_disabled":
+        return "handoff"
+    if step in {"stopped"} or session.get("hard_contraindication_stop") or session.get("contraindication_hard_stop"):
+        return "hard_stop"
+    if step not in _ALLOWED_HUMANIZE_STEPS:
+        return "not_allowed_step"
+    gate_reason = str(session.get("gate_reason") or "")
+    if not (session.get("ai_lead_started") is True or gate_reason in _ALLOWED_HUMANIZE_GATE_REASONS):
+        return "not_ai_lead"
+    return ""
+
+
+async def _maybe_humanize_answer(chat_id: str, user_text: str, base_answer: str, *, voice_ignored: bool = False) -> str:
+    session = _get_session_safe(chat_id)
+    session["chat_id"] = chat_id
+    reason = _humanize_skip_reason(session, base_answer, voice_ignored=voice_ignored)
+    if reason:
+        debug = {
+            "openai_used": False,
+            "openai_model": getattr(get_settings(), "openai_model", ""),
+            "openai_skip_reason": reason,
+            "openai_guard_failed": False,
+            "base_answer_preview": _preview(base_answer, 160),
+            "final_answer_preview": _preview(base_answer, 160),
+        }
+        _set_openai_debug(session, debug, base_answer, base_answer)
+        state.save_session(chat_id, session)
+        state.log_event(chat_id, "openai_skipped", {"chat_id": chat_id, "reason": reason, "step": session.get("step") or session.get("current_step") or ""})
+        return base_answer
+
+    final_answer, debug = await humanize_reply_with_openai(base_answer=base_answer, user_text=user_text, session=session)
+    _set_openai_debug(session, debug, base_answer, final_answer)
+    state.save_session(chat_id, session)
+    if not debug.get("openai_used"):
+        state.log_event(chat_id, "openai_skipped", {"chat_id": chat_id, "reason": debug.get("openai_skip_reason") or "config_missing", "step": session.get("step") or session.get("current_step") or ""})
+    return final_answer
 
 
 def _get_session_safe(chat_id: str) -> dict[str, Any]:
@@ -365,7 +431,8 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
         user_text = str(message.get("text") or "")
 
     state.log_event(chat_id, "dialog_start", {"phone": phone, "text_preview": _preview(user_text, 120), "force": False, "source": message.get("source") or "wazzup"})
-    answer = await handle_message(chat_id=chat_id, phone=phone, user_text=user_text)
+    base_answer = await handle_message(chat_id=chat_id, phone=phone, user_text=user_text)
+    answer = await _maybe_humanize_answer(chat_id, user_text, base_answer)
     answer = _guard_answer(chat_id, answer)
     _log_dialog_result(chat_id, phone, answer)
     return answer
@@ -649,7 +716,8 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
             state.save_session(chat_id, session)
         state.log_event(chat_id, "dialog_start", {"phone": phone, "text_preview": _preview(text, 120), "force": force, "source": "debug"})
         raw_answer = await handle_message(chat_id=chat_id, phone=phone, user_text=text)
-        answer = _guard_answer(chat_id, raw_answer)
+        answer = await _maybe_humanize_answer(chat_id, text, raw_answer)
+        answer = _guard_answer(chat_id, answer)
         _log_dialog_result(chat_id, phone, answer)
     session = state.get_session(chat_id)
 

@@ -3071,8 +3071,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session["phone"] = phone or session.get("phone") or ""
     session["openai_used"] = False
     session["openai_model"] = ""
-    session["openai_skip_reason"] = "not_used_in_dialog"
-    state.log_event(chat_id, "openai_skipped", {"reason": "not_used_in_dialog"})
+    session["openai_skip_reason"] = ""
+    session["openai_guard_failed"] = False
+    session.pop("base_answer_preview", None)
+    session.pop("final_answer_preview", None)
     session["language"] = _detect_lang(text, session)
     can_handle, reason = _should_ai_handle_new_lead(session, text)
     session["gate_reason"] = reason
