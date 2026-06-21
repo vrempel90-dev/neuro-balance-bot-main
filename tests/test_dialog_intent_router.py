@@ -939,6 +939,81 @@ def test_combined_faq_slot_selection_then_name_books_crm(monkeypatch: Any) -> No
     assert session["status"] == "booked"
 
 
+
+def test_combined_video_faq_and_second_slot_selection_asks_name() -> None:
+    slots = [
+        {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "09:20"},
+        {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "10:00"},
+    ]
+    reset(
+        "combined_video_second_slot",
+        {
+            "step": "time",
+            "language": "ru",
+            "language_locked": True,
+            "last_slots": slots,
+        },
+    )
+
+    result = answer("combined_video_second_slot", "А это будет как на видео в инстаграме? Если да, давайте 2 вариант")
+    session = state.get_session("combined_video_second_slot")
+
+    assert "видео" in result.lower()
+    assert "имя" in result.lower()
+    assert "Когда вам будет удобно прийти" not in result
+    assert "На какой день Вам удобно прийти" not in result
+    assert session["step"] == "name"
+    assert session["questionnaire_step"] == "name"
+    assert session["selected_slot"] == slots[1]
+
+
+def test_combined_video_faq_and_first_slot_selection_asks_name() -> None:
+    slots = [
+        {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "09:20"},
+        {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "10:00"},
+    ]
+    reset(
+        "combined_video_first_slot",
+        {
+            "step": "time",
+            "language": "ru",
+            "language_locked": True,
+            "last_slots": slots,
+        },
+    )
+
+    result = answer("combined_video_first_slot", "Так же будет да? Давайте первый")
+    session = state.get_session("combined_video_first_slot")
+
+    assert "видео" in result.lower() or "процедуры" in result.lower()
+    assert "имя" in result.lower()
+    assert session["selected_slot"] == slots[0]
+    assert session["step"] == "name"
+
+
+def test_video_faq_without_slot_keeps_time_step_and_asks_slot() -> None:
+    slots = [
+        {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "09:20"},
+        {"doctor_login": "doctor1", "doctor_name": "Тестовый врач", "date": "2099-01-01", "time": "10:00"},
+    ]
+    reset(
+        "video_without_slot_keeps_time",
+        {
+            "step": "time",
+            "language": "ru",
+            "language_locked": True,
+            "last_slots": slots,
+        },
+    )
+
+    result = answer("video_without_slot_keeps_time", "как на видео?")
+    session = state.get_session("video_without_slot_keeps_time")
+
+    assert "видео" in result.lower()
+    assert session["step"] == "time"
+    assert "Какое время" in result or "вариант" in result
+    assert "selected_slot" not in session
+
 def test_video_question_with_date_answers_then_shows_slots(monkeypatch: Any) -> None:
     setup_crm(monkeypatch)
     reset(
