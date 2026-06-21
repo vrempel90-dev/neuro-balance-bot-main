@@ -65,7 +65,6 @@ def _apply_openai_brain_debug(session: dict[str, Any], debug: dict[str, Any]) ->
 
 def _openai_brain_skip_reason(session: dict[str, Any], text: str) -> str:
     step = str(session.get("step") or session.get("current_step") or "start")
-    gate = str(session.get("gate_reason") or "")
     if not (text or "").strip():
         return "empty_answer"
     if step in {"booked", "confirmed", "done", "appointment_confirmed", "escalated", "stopped"} or session.get("booked"):
@@ -74,16 +73,18 @@ def _openai_brain_skip_reason(session: dict[str, Any], text: str) -> str:
         return "python_owned_booking"
     if session.get("manual_takeover") or session.get("manual_admin_intervention") or session.get("ai_muted") or session.get("do_not_reply"):
         return "manual_or_muted"
-    if session.get("refund_claim_admin_required") or gate == "refund_claim_admin_required":
+    if session.get("refund_claim_admin_required") or session.get("gate_reason") == "refund_claim_admin_required":
         return "refund_or_claim"
-    if session.get("old_chat_ai_disabled") or gate == "old_chat_ai_disabled":
+    if session.get("old_chat_ai_disabled") or session.get("gate_reason") == "old_chat_ai_disabled":
         return "old_chat_ai_disabled"
     if session.get("last_ignored_message_type") in {"voice", "audio"} or session.get("voice_ignored") or session.get("last_message_type") in {"voice", "audio"}:
         return "voice_or_audio"
     if session.get("hard_contraindication_stop") or session.get("contraindication_hard_stop"):
         return "hard_contraindication_stop"
-    if not (session.get("ai_lead_started") is True or gate in OPENAI_BRAIN_ALLOWED_GATES or step in OPENAI_BRAIN_ALLOWED_STEPS):
+    if session.get("ai_lead_started") is not True:
         return "not_ai_lead"
+    if step not in {"complaint", "age", "contraindications", "date", "time"}:
+        return "not_allowed_step"
     return ""
 
 
@@ -132,8 +133,10 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         session["openai_brain_skip_reason"] = reason
         _safe_log(chat_id, "openai_brain_skipped", {"chat_id": chat_id, "reason": reason, "step": session.get("step") or "start", "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "fallback_reason": reason, "extracted_preview": {}})
         return None
+    _safe_log(chat_id, "openai_brain_called", {"chat_id": chat_id, "step": session.get("step") or "start", "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "extracted_preview": {}})
     decision, debug = await run_openai_dialog_brain(user_text=text, session={**session, "chat_id": chat_id}, recent_history=state.get_history(chat_id)[-6:] if hasattr(state, "get_history") else None, available_slots=session.get("last_slots") or None)
     _apply_openai_brain_debug(session, debug)
+    _safe_log(chat_id, "openai_brain_decision", {"chat_id": chat_id, "step": session.get("step") or "start", "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": False, "guard_reason": "", "extracted_preview": {k: v for k, v in (decision.get("extracted") or {}).items() if v not in (None, "", [], {})}})
     if decision.get("action") == "fallback_rule_based":
         session["openai_brain_fallback_used"] = True
         _safe_log(chat_id, "openai_brain_fallback_rule_based", {"chat_id": chat_id, "step": session.get("step") or "start", "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": False, "guard_reason": "", "fallback_reason": debug.get("openai_brain_skip_reason") or "fallback", "extracted_preview": decision.get("extracted") or {}})
@@ -221,6 +224,73 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         session["escalated"] = True
         return _finalize(chat_id, session, reply or _crm_fallback_answer(session))
     return None
+
+
+def _multi_entity_safe_date_text(text: str) -> str:
+    low = _low(text)
+    replacements = {
+        "понеддельник": "понедельник",
+        "понеделник": "понедельник",
+        "понедельникк": "понедельник",
+        "пандельник": "понедельник",
+    }
+    for bad, good in replacements.items():
+        low = low.replace(bad, good)
+    if "понедельник" in low:
+        return "в понедельник"
+    if "послезавтра" in low:
+        return "послезавтра"
+    if "завтра" in low:
+        return "завтра"
+    return text
+
+
+def _has_multi_entity_safe_date(text: str) -> bool:
+    low = _low(text)
+    return any(p in low for p in [
+        "понеддельник", "понеделник", "понедельникк", "пандельник",
+        "понедельник", "завтра", "послезавтра",
+    ])
+
+
+async def _try_python_multi_entity_fallback(chat_id: str, session: dict[str, Any], text: str) -> str | None:
+    step = str(session.get("step") or "start")
+    if step not in {"age", "contraindications"}:
+        return None
+    age = _extract_age(text, step="age") or (int(session["age"]) if str(session.get("age") or "").isdigit() else None)
+    if not age:
+        return None
+    if not (_is_no_contra_answer(text) or _contra_is_clear_no(text)):
+        return None
+    if _contra_has_hard_stop(text) or not _has_multi_entity_safe_date(text):
+        return None
+    date_text = _multi_entity_safe_date_text(text)
+    date_iso = _parse_date(date_text) or _parse_date(text)
+    if not date_iso:
+        return None
+
+    session["age"] = age
+    _accept_no_contraindications(session, text or "нет")
+    if "не рано" in _low(text):
+        session["time_preference"] = "не рано"
+    session["openai_brain_fallback_used"] = True
+    session["openai_brain_skip_reason"] = session.get("openai_brain_skip_reason") or "python_multi_entity_fallback"
+    _safe_log(chat_id, "openai_brain_fallback_rule_based", {
+        "chat_id": chat_id,
+        "step": step,
+        "action": "show_slots",
+        "needs_python_tool": "check_slots",
+        "guard_failed": False,
+        "guard_reason": "",
+        "fallback_reason": session["openai_brain_skip_reason"],
+        "extracted_preview": {
+            "age": age,
+            "contraindications_clear": True,
+            "preferred_date_text": date_text,
+            "time_preference": session.get("time_preference") or "",
+        },
+    })
+    return _finalize(chat_id, session, await _show_slots(chat_id, session, date_iso))
 
 # ============================================================
 # Neuro Balance dialog.py
@@ -2006,6 +2076,8 @@ def _parse_date(text: str) -> str | None:
 
     if any(w in low for w in ["сегодня", "бүгін", "бугин"]):
         return today.isoformat()
+    if "послезавтра" in low:
+        return (today + timedelta(days=2)).isoformat()
     if any(w in low for w in ["завтра", "ертең", "ертен"]):
         return (today + timedelta(days=1)).isoformat()
 
@@ -3404,6 +3476,12 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["openai_used"] = True
         session["openai_skip_reason"] = ""
         return brain_answer
+
+    fallback_answer = await _try_python_multi_entity_fallback(chat_id, session, text)
+    if fallback_answer is not None:
+        session["openai_used"] = False
+        session["openai_skip_reason"] = "openai_brain_fallback_rule_based"
+        return fallback_answer
 
     if _contra_has_hard_stop(text) and step not in ("done", "booked", "stopped"):
         bot_tools.verify_contraindications(session, bot_tools.CONTRA_REFUSE, text)
