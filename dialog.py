@@ -38,6 +38,7 @@ except Exception:
 
 
 OPENAI_BRAIN_ALLOWED_STEPS = {"complaint", "age", "contraindications", "date", "time", "select_slot", "name"}
+OPENAI_BRAIN_MULTI_ENTITY_STEPS = {"age", "contraindications", "date"}
 OPENAI_BRAIN_ALLOWED_GATES = {"new_lead", "active_ai_lead", "active_conversation_reply"}
 
 
@@ -92,6 +93,9 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
     extracted = decision.get("extracted") if isinstance(decision.get("extracted"), dict) else {}
     reply = str(decision.get("reply") or "")
     step = str(session.get("step") or "start")
+    red_flags = extracted.get("contraindication_red_flags")
+    if isinstance(red_flags, list) and red_flags:
+        return False, "contraindication_red_flags"
     if session.get("booked") or session.get("manual_takeover") or session.get("ai_muted") or session.get("refund_claim_admin_required") or session.get("old_chat_ai_disabled"):
         return False, "protected_flow"
     if action == "ask_name" and not session.get("selected_slot"):
@@ -100,6 +104,12 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
         return False, "ask_date_before_contra"
     if action == "show_slots" and not extracted.get("preferred_date_text"):
         return False, "show_slots_without_date"
+    if action == "show_slots" and (
+        step not in OPENAI_BRAIN_MULTI_ENTITY_STEPS
+        or session.get("ai_lead_started") is not True
+        or (session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not (_is_no_contra_answer(user_text) or _contra_is_clear_no(user_text)))
+    ):
+        return False, "show_slots_multi_entity_guard"
     if tool == "book_appointment" and not (session.get("selected_slot") and (session.get("patient_name") or extracted.get("patient_name"))):
         return False, "book_without_slot_or_name"
     low_reply = _low(reply)
@@ -137,6 +147,10 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         return None
     action = decision.get("action")
     extracted = decision.get("extracted") or {}
+    if extracted.get("time_preference"):
+        session["time_preference"] = str(extracted.get("time_preference") or "")
+    elif "не рано" in _low(text):
+        session["time_preference"] = "не рано"
     reply = str(decision.get("reply") or "").strip()
     if action == "no_reply":
         session["openai_used"] = False
@@ -160,6 +174,17 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         session["questionnaire_step"] = "date"
         return _finalize(chat_id, session, reply or _ask_date(session))
     if action == "show_slots" or decision.get("needs_python_tool") == "check_slots":
+        if extracted.get("age"):
+            try:
+                session["age"] = int(extracted.get("age"))
+            except Exception:
+                pass
+        if extracted.get("contraindications_clear") is True or _is_no_contra_answer(text) or _contra_is_clear_no(text):
+            _accept_no_contraindications(session, text or "нет")
+        if session.get("contraindications_ok") is not True:
+            session["step"] = "contraindications"
+            session["questionnaire_step"] = "contra"
+            return _finalize(chat_id, session, _ask_contra(session))
         date_text = str(extracted.get("preferred_date_text") or text)
         date_iso = _parse_date(date_text) or _parse_date(text)
         if not date_iso:

@@ -272,6 +272,11 @@ def _dialog_brain_fallback(reason: str) -> tuple[dict, dict]:
             "offered_date_before_contra": False, "medical_diagnosis": False,
         },
     }
+    if state is not None:
+        try:
+            state.log_event("system", "openai_brain_fallback_rule_based", {"reason": reason})
+        except Exception:
+            pass
     return decision, {"openai_brain_used": False, "openai_brain_fallback_used": True, "openai_brain_skip_reason": reason}
 
 

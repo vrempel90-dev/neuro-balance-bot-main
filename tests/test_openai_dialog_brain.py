@@ -3,12 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import tempfile
+from pathlib import Path
 from typing import Any
 
 os.environ["SQLITE_PATH"] = tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite3").name
 os.environ.setdefault("CRM_BOT_SECRET", "test")
 os.environ.setdefault("OPENAI_API_KEY", "")
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import ai
 import crm
@@ -147,6 +152,82 @@ def test_date_address_checks_slots_and_video_selects_second(monkeypatch: Any) ->
     session = state.get_session(chat_id)
     assert session["selected_slot"] == session["last_slots"][1]
     assert session["step"] == "name"
+
+
+def test_age_message_with_clear_contra_and_date_checks_slots(monkeypatch: Any) -> None:
+    chat_id = "brain_real_test_1"
+    reset(chat_id, {"step": "age", "complaint": "болит спина"})
+    calls: list[str] = []
+
+    async def fake_slots(date: str, doctor_login: str | None = None):
+        calls.append(date)
+        return {"availability": [{"doctorLogin": "d", "doctorName": "Врач", "availableSlots": ["11:00", "15:00"]}]}
+
+    async def fake_brain(**kwargs: Any):
+        return brain(
+            "show_slots",
+            "Спасибо, поняла 🌿 Проверю свободные окошки на понедельник, не самые ранние.",
+            {
+                "age": 34,
+                "contraindications_clear": True,
+                "preferred_date_text": "в понедельник",
+                "slot_choice": None,
+                "patient_name": "",
+                "faq_type": "",
+                "language": "ru",
+            },
+            "check_slots",
+        )
+
+    async def should_not_humanize(**kwargs: Any):
+        raise AssertionError("humanize called")
+
+    monkeypatch.setattr(crm, "check_slots", fake_slots)
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+    monkeypatch.setattr(main, "humanize_reply_with_openai", should_not_humanize)
+
+    raw = run(handle_message(chat_id, "77011234567", "34, все чисто, можно в понеддельник не рано?"))
+    answer = run(main._maybe_humanize_answer(chat_id, "34, все чисто, можно в понеддельник не рано?", raw))
+    session = state.get_session(chat_id)
+
+    assert session["age"] == 34
+    assert session["contraindications_ok"] is True
+    assert calls
+    assert session["step"] == "time"
+    assert "противопоказ" not in answer.lower()
+    assert "11:00" in answer and "15:00" in answer
+    assert session["openai_brain_used"] is True
+    assert session["openai_brain_action"] == "show_slots"
+    assert session["openai_skip_reason"] == "brain_reply_no_humanize"
+
+
+def test_age_message_with_date_without_clear_contra_asks_contra(monkeypatch: Any) -> None:
+    chat_id = "brain_age_date_no_clear"
+    reset(chat_id, {"step": "age", "complaint": "болит спина"})
+    calls: list[str] = []
+
+    async def fake_slots(date: str, doctor_login: str | None = None):
+        calls.append(date)
+        return {"availability": [{"doctorLogin": "d", "doctorName": "Врач", "availableSlots": ["11:00"]}]}
+
+    async def fake_brain(**kwargs: Any):
+        return brain(
+            "show_slots",
+            "Проверю понедельник.",
+            {"age": 34, "contraindications_clear": None, "preferred_date_text": "в понедельник"},
+            "check_slots",
+        )
+
+    monkeypatch.setattr(crm, "check_slots", fake_slots)
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+
+    answer = run(handle_message(chat_id, "77011234567", "34, можно в понедельник?"))
+    session = state.get_session(chat_id)
+
+    assert session["age"] == 34
+    assert session["step"] == "contraindications"
+    assert not calls
+    assert "противопоказ" in answer.lower()
 
 
 def test_guard_blocks_bad_ask_name(monkeypatch: Any) -> None:
