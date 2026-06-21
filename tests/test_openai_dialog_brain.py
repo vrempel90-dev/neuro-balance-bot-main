@@ -44,7 +44,7 @@ def brain(action: str, reply: str = "ок", extracted: dict[str, Any] | None = N
         "reply": reply,
         "extracted": {
             "complaint": "", "age": None, "contraindications_clear": None,
-            "contraindication_red_flags": [], "preferred_date_text": "", "slot_choice": None,
+            "contraindication_red_flags": [], "preferred_date_text": "", "time_preference": "", "slot_choice": None,
             "patient_name": "", "faq_type": "", "language": "ru",
             **(extracted or {}),
         },
@@ -171,6 +171,7 @@ def test_age_message_with_clear_contra_and_date_checks_slots(monkeypatch: Any) -
                 "age": 34,
                 "contraindications_clear": True,
                 "preferred_date_text": "в понедельник",
+                "time_preference": "не рано",
                 "slot_choice": None,
                 "patient_name": "",
                 "faq_type": "",
@@ -192,13 +193,15 @@ def test_age_message_with_clear_contra_and_date_checks_slots(monkeypatch: Any) -
 
     assert session["age"] == 34
     assert session["contraindications_ok"] is True
+    assert session["time_preference"] == "не рано"
     assert calls
     assert session["step"] == "time"
     assert "противопоказ" not in answer.lower()
     assert "11:00" in answer and "15:00" in answer
     assert session["openai_brain_used"] is True
     assert session["openai_brain_action"] == "show_slots"
-    assert session["openai_skip_reason"] == "brain_reply_no_humanize"
+    assert session["openai_used"] is True
+    assert session["openai_skip_reason"] == ""
 
 
 def test_age_message_with_date_without_clear_contra_asks_contra(monkeypatch: Any) -> None:
@@ -290,4 +293,6 @@ def test_humanize_not_called_when_brain_reply_used(monkeypatch: Any) -> None:
     raw = run(handle_message(chat_id, "77011234567", "спина болит"))
     answer = run(main._maybe_humanize_answer(chat_id, "спина болит", raw))
     assert answer == raw
-    assert state.get_session(chat_id)["openai_skip_reason"] == "brain_reply_no_humanize"
+    session = state.get_session(chat_id)
+    assert session["openai_used"] is True
+    assert session["openai_skip_reason"] == ""

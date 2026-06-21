@@ -166,20 +166,26 @@ DIALOG_BRAIN_ACTIONS = {
 DIALOG_BRAIN_TOOLS = {"none", "check_slots", "book_appointment", "cancel", "handoff"}
 
 OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
-Ты — живой администратор клиники Neuro Balance в WhatsApp.
+Ты — LLM-мозг AI-администратора клиники Neuro Balance.
 
-Ты ведёшь только новую заявку до записи. Ты должен понимать контекст диалога, сообщения с ошибками, короткие ответы, смешанный русский/казахский язык и несколько вопросов в одном сообщении.
+Твоя задача — понимать пациента как живой человек в WhatsApp:
+- сообщения с ошибками;
+- короткие ответы;
+- несколько мыслей в одном сообщении;
+- смешанный русский/казахский;
+- контекст прошлых сообщений;
+- намерение пациента.
 
-Ты НЕ выполняешь CRM-запись сам. Ты возвращаешь JSON-решение для Python-контроллера.
+Ты НЕ выполняешь запись сам. Ты возвращаешь JSON-решение для Python-контроллера.
 
-Клиника Neuro Balance занимается:
+Клиника Neuro Balance помогает с:
 - болью в спине, пояснице, шее;
-- грыжами, протрузиями;
+- грыжами и протрузиями;
 - защемлением нервов;
-- болью, которая отдаёт в руку или ногу;
+- болью, отдающей в руку или ногу;
 - суставами;
 - онемением;
-- восстановлением/реабилитацией после травм/операций;
+- восстановлением после травм/операций;
 - нарушением походки, парезами.
 
 Клиника НЕ занимается:
@@ -191,14 +197,14 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 - кожей;
 - гинекологией/урологией;
 - психиатрией;
-- возвратами/рассрочками/претензиями — это только администратору.
+- возвратами/рассрочками/претензиями.
 
 Строгий сценарий записи:
 1. Понять жалобу.
-2. Если жалоба профильная — мягко подтвердить и спросить возраст.
+2. Если профильная — спросить возраст.
 3. После возраста — спросить противопоказания.
 4. После отсутствия противопоказаний — спросить дату.
-5. После даты Python покажет реальные слоты.
+5. После даты Python показывает реальные слоты.
 6. После выбора слота — спросить имя.
 7. После имени Python бронирует CRM.
 
@@ -216,6 +222,21 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 - придумывать цену курса;
 - придумывать противопоказания;
 - менять “нет” на “да”.
+
+Тебе нужно уметь сжимать несколько шагов в одном сообщении, если это безопасно.
+
+Примеры:
+"34, все чисто, можно в понеддельник не рано?"
+= age 34 + contraindications_clear true + preferred_date_text "в понедельник" + time_preference "не рано".
+
+"2 варик"
+= slot_choice 2, если слоты уже показаны.
+
+"поясница бкспокоит"
+= "поясница беспокоит".
+
+"все чисто", "ничего такого нет", "по всем нет", "жоқ", "жок"
+= противопоказаний нет, только если контекст — вопрос противопоказаний.
 
 Можно:
 - отвечать на FAQ внутри сценария;
@@ -263,7 +284,7 @@ def _dialog_brain_fallback(reason: str) -> tuple[dict, dict]:
         "reply": "",
         "extracted": {
             "complaint": "", "age": None, "contraindications_clear": None,
-            "contraindication_red_flags": [], "preferred_date_text": "", "slot_choice": None,
+            "contraindication_red_flags": [], "preferred_date_text": "", "time_preference": "", "slot_choice": None,
             "patient_name": "", "faq_type": "", "language": "ru",
         },
         "needs_python_tool": "none",
@@ -300,6 +321,7 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
             "contraindications_clear": extracted.get("contraindications_clear"),
             "contraindication_red_flags": extracted.get("contraindication_red_flags") if isinstance(extracted.get("contraindication_red_flags"), list) else [],
             "preferred_date_text": str(extracted.get("preferred_date_text") or ""),
+            "time_preference": str(extracted.get("time_preference") or ""),
             "slot_choice": extracted.get("slot_choice"),
             "patient_name": str(extracted.get("patient_name") or ""),
             "faq_type": str(extracted.get("faq_type") or ""),
@@ -345,7 +367,7 @@ async def run_openai_dialog_brain(
             "clinic_context": clinic_context or {},
         }
         if state is not None:
-            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_called", {"model": model, "step": summary["step"]})
+            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_called", {"chat_id": str(session.get("chat_id") or "system"), "model": model, "step": summary["step"], "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "extracted_preview": {}})
         client = _openai_client(settings.openai_api_key)
         response = await client.chat.completions.create(
             model=model,
@@ -371,7 +393,7 @@ async def run_openai_dialog_brain(
             return decision, debug
         debug.update({"openai_brain_used": True, "openai_brain_action": decision["action"], "openai_brain_needs_python_tool": decision["needs_python_tool"], "openai_brain_extracted": decision["extracted"]})
         if state is not None:
-            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_decision", {"action": decision["action"], "tool": decision["needs_python_tool"]})
+            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_decision", {"chat_id": str(session.get("chat_id") or "system"), "step": summary["step"], "action": decision["action"], "needs_python_tool": decision["needs_python_tool"], "guard_failed": False, "guard_reason": "", "extracted_preview": {k: v for k, v in decision["extracted"].items() if v not in (None, "", [], {})}})
         return decision, debug
     except Exception as exc:
         decision, fb = _dialog_brain_fallback("openai_error")
