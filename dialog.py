@@ -15,6 +15,7 @@ from typing import Any
 import bot_tools
 import crm
 import state
+from ai import run_openai_dialog_brain
 
 try:
     from phone import sanitize_kz_phone
@@ -35,6 +36,166 @@ try:
 except Exception:
     get_settings = None
 
+
+OPENAI_BRAIN_ALLOWED_STEPS = {"complaint", "age", "contraindications", "date", "time", "select_slot", "name"}
+OPENAI_BRAIN_ALLOWED_GATES = {"new_lead", "active_ai_lead", "active_conversation_reply"}
+
+
+def _reset_openai_brain_debug(session: dict[str, Any]) -> None:
+    session["openai_brain_used"] = False
+    session["openai_brain_action"] = ""
+    session["openai_brain_needs_python_tool"] = ""
+    session["openai_brain_extracted"] = {}
+    session["openai_brain_guard_failed"] = False
+    session["openai_brain_guard_reason"] = ""
+    session["openai_brain_skip_reason"] = ""
+    session["openai_brain_fallback_used"] = False
+
+
+def _apply_openai_brain_debug(session: dict[str, Any], debug: dict[str, Any]) -> None:
+    for key in (
+        "openai_brain_used", "openai_brain_action", "openai_brain_needs_python_tool",
+        "openai_brain_extracted", "openai_brain_guard_failed", "openai_brain_guard_reason",
+        "openai_brain_skip_reason", "openai_brain_fallback_used",
+    ):
+        if key in debug:
+            session[key] = debug[key]
+
+
+def _openai_brain_skip_reason(session: dict[str, Any], text: str) -> str:
+    step = str(session.get("step") or session.get("current_step") or "start")
+    gate = str(session.get("gate_reason") or "")
+    if not (text or "").strip():
+        return "empty_answer"
+    if step in {"booked", "confirmed", "done", "appointment_confirmed", "escalated", "stopped"} or session.get("booked"):
+        return "booked_or_handoff"
+    if step == "name" and session.get("selected_slot"):
+        return "python_owned_booking"
+    if session.get("manual_takeover") or session.get("manual_admin_intervention") or session.get("ai_muted") or session.get("do_not_reply"):
+        return "manual_or_muted"
+    if session.get("refund_claim_admin_required") or gate == "refund_claim_admin_required":
+        return "refund_or_claim"
+    if session.get("old_chat_ai_disabled") or gate == "old_chat_ai_disabled":
+        return "old_chat_ai_disabled"
+    if session.get("last_ignored_message_type") in {"voice", "audio"}:
+        return "voice_or_audio"
+    if session.get("hard_contraindication_stop") or session.get("contraindication_hard_stop"):
+        return "hard_contraindication_stop"
+    if not (session.get("ai_lead_started") is True or gate in OPENAI_BRAIN_ALLOWED_GATES or step in OPENAI_BRAIN_ALLOWED_STEPS):
+        return "not_ai_lead"
+    return ""
+
+
+def validate_openai_dialog_decision(decision: dict, session: dict, user_text: str) -> tuple[bool, str]:
+    action = str(decision.get("action") or "")
+    tool = str(decision.get("needs_python_tool") or "none")
+    extracted = decision.get("extracted") if isinstance(decision.get("extracted"), dict) else {}
+    reply = str(decision.get("reply") or "")
+    step = str(session.get("step") or "start")
+    if session.get("booked") or session.get("manual_takeover") or session.get("ai_muted") or session.get("refund_claim_admin_required") or session.get("old_chat_ai_disabled"):
+        return False, "protected_flow"
+    if action == "ask_name" and not session.get("selected_slot"):
+        return False, "ask_name_without_slot"
+    if action == "ask_date" and session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not (_is_no_contra_answer(user_text) or _contra_is_clear_no(user_text)):
+        return False, "ask_date_before_contra"
+    if action == "show_slots" and not extracted.get("preferred_date_text"):
+        return False, "show_slots_without_date"
+    if tool == "book_appointment" and not (session.get("selected_slot") and (session.get("patient_name") or extracted.get("patient_name"))):
+        return False, "book_without_slot_or_name"
+    low_reply = _low(reply)
+    if any(bad in low_reply for bad in ["гарантируем", "точно вылечим", "100%", "полностью вылечим"]):
+        return False, "unsafe_promise"
+    if action == "ask_name" or any(x in low_reply for x in ["как вас зовут", "ваше имя", "имя для записи"]):
+        if not session.get("selected_slot"):
+            return False, "asked_name_too_early"
+    if action in {"ask_date", "show_slots"} and session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not (_is_no_contra_answer(user_text) or _contra_is_clear_no(user_text)):
+        return False, "offered_date_before_contra"
+    if step == "contraindications" and session.get("contraindications_ok") is not True and action not in {"ask_date", "stop_contraindication", "handoff_admin", "fallback_rule_based", "no_reply"}:
+        if "противопоказ" not in low_reply and "қарсы" not in low_reply:
+            return False, "contra_question_missing"
+    return True, ""
+
+
+async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, Any], text: str) -> str | None:
+    reason = _openai_brain_skip_reason(session, text)
+    if reason:
+        session["openai_brain_skip_reason"] = reason
+        _safe_log(chat_id, "openai_brain_skipped", {"reason": reason, "step": session.get("step") or "start"})
+        return None
+    decision, debug = await run_openai_dialog_brain(user_text=text, session={**session, "chat_id": chat_id}, recent_history=state.get_history(chat_id)[-6:] if hasattr(state, "get_history") else None, available_slots=session.get("last_slots") or None)
+    _apply_openai_brain_debug(session, debug)
+    if decision.get("action") == "fallback_rule_based":
+        session["openai_brain_fallback_used"] = True
+        _safe_log(chat_id, "openai_brain_fallback_rule_based", {"reason": debug.get("openai_brain_skip_reason") or "fallback"})
+        return None
+    ok, guard_reason = validate_openai_dialog_decision(decision, session, text)
+    if not ok:
+        session["openai_brain_guard_failed"] = True
+        session["openai_brain_guard_reason"] = guard_reason
+        session["openai_brain_fallback_used"] = True
+        _safe_log(chat_id, "openai_brain_guard_failed", {"reason": guard_reason, "action": decision.get("action")})
+        return None
+    action = decision.get("action")
+    extracted = decision.get("extracted") or {}
+    reply = str(decision.get("reply") or "").strip()
+    if action == "no_reply":
+        session["openai_used"] = False
+        return _no_reply(chat_id, session, "openai_brain_no_reply")
+    if action == "ask_age":
+        if extracted.get("complaint"):
+            session["complaint"] = extracted.get("complaint")
+            _record_complaint_tool(session, str(extracted.get("complaint")), is_in_profile=True)
+        session["step"] = "age"
+        return _finalize(chat_id, session, reply or _ask_age(session))
+    if action == "ask_contraindications":
+        if extracted.get("age"):
+            session["age"] = int(extracted.get("age"))
+        session["step"] = "contraindications"
+        session["questionnaire_step"] = "contra"
+        return _finalize(chat_id, session, reply or _ask_contra(session))
+    if action == "ask_date":
+        if extracted.get("contraindications_clear") is True or _is_no_contra_answer(text) or _contra_is_clear_no(text):
+            _accept_no_contraindications(session, text or "нет")
+        session["step"] = "date"
+        session["questionnaire_step"] = "date"
+        return _finalize(chat_id, session, reply or _ask_date(session))
+    if action == "show_slots" or decision.get("needs_python_tool") == "check_slots":
+        date_text = str(extracted.get("preferred_date_text") or text)
+        date_iso = _parse_date(date_text) or _parse_date(text)
+        if not date_iso:
+            session["step"] = "date"
+            return _finalize(chat_id, session, (reply + "\n\n" if reply else "") + _ask_date(session))
+        slots_answer = await _show_slots(chat_id, session, date_iso)
+        return _finalize(chat_id, session, (reply + "\n\n" if reply else "") + slots_answer)
+    if action == "select_slot":
+        slots = session.get("last_slots") or []
+        choice = extracted.get("slot_choice")
+        slot = None
+        if isinstance(choice, int) and 1 <= choice <= len(slots):
+            slot = slots[choice - 1]
+        slot = slot or _select_slot(text, slots)
+        if not slot:
+            return _finalize(chat_id, session, _mandatory_step_prompt(session, "time"))
+        _remember_selected_slot(session, slot)
+        session["step"] = "name"
+        session["questionnaire_step"] = "name"
+        ask = _ask_name(session)
+        return _finalize(chat_id, session, reply + ("\n\n" + ask if ask not in reply else ""))
+    if action == "ask_name":
+        session["step"] = "name"
+        return _finalize(chat_id, session, reply or _ask_name(session))
+    if action == "answer_faq_and_continue":
+        return _finalize(chat_id, session, reply + ("\n\n" + _mandatory_step_prompt(session, session.get("step") or "complaint") if reply else ""))
+    if action == "stop_contraindication":
+        session["step"] = "stopped"
+        session["escalated"] = True
+        return _finalize(chat_id, session, reply or _stop_booking_text(session, "contra"))
+    if action == "handoff_admin":
+        session["step"] = "escalated"
+        session["manual_takeover"] = True
+        session["escalated"] = True
+        return _finalize(chat_id, session, reply or _crm_fallback_answer(session))
+    return None
 
 # ============================================================
 # Neuro Balance dialog.py
@@ -3077,9 +3238,15 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session["openai_model"] = ""
     session["openai_skip_reason"] = ""
     session["openai_guard_failed"] = False
+    _reset_openai_brain_debug(session)
     session.pop("base_answer_preview", None)
     session.pop("final_answer_preview", None)
     session["language"] = _detect_lang(text, session)
+    if (session.get("step") == "escalated" or session.get("escalated")) and not session.get("booked"):
+        session["no_reply_reason"] = "escalated_ai_disabled"
+        _reset_openai_brain_debug(session)
+        session["openai_brain_skip_reason"] = "escalated_ai_disabled"
+        return _no_reply(chat_id, session, "escalated_ai_disabled")
     can_handle, reason = _should_ai_handle_new_lead(session, text)
     session["gate_reason"] = reason
     session["active_conversation_detected"] = bool(
@@ -3204,6 +3371,12 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
                 "Қайырлы таң 🌿 Нақты не мазалайды?",
             ),
         )
+
+    brain_answer = await _try_openai_dialog_brain(chat_id, phone, session, text)
+    if brain_answer is not None:
+        session["openai_used"] = True
+        session["openai_skip_reason"] = "brain_reply_no_humanize"
+        return brain_answer
 
     if _contra_has_hard_stop(text) and step not in ("done", "booked", "stopped"):
         bot_tools.verify_contraindications(session, bot_tools.CONTRA_REFUSE, text)

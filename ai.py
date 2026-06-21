@@ -157,6 +157,224 @@ async def generate_complaint_ack(text: str, lang: str = "ru", chat_id: str = "")
         return _fallback_ack(text, lang)
 
 
+
+DIALOG_BRAIN_ACTIONS = {
+    "ask_complaint", "ask_age", "ask_contraindications", "ask_date", "show_slots",
+    "select_slot", "ask_name", "answer_faq_and_continue", "stop_contraindication",
+    "handoff_admin", "no_reply", "fallback_rule_based",
+}
+DIALOG_BRAIN_TOOLS = {"none", "check_slots", "book_appointment", "cancel", "handoff"}
+
+OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
+Ты — живой администратор клиники Neuro Balance в WhatsApp.
+
+Ты ведёшь только новую заявку до записи. Ты должен понимать контекст диалога, сообщения с ошибками, короткие ответы, смешанный русский/казахский язык и несколько вопросов в одном сообщении.
+
+Ты НЕ выполняешь CRM-запись сам. Ты возвращаешь JSON-решение для Python-контроллера.
+
+Клиника Neuro Balance занимается:
+- болью в спине, пояснице, шее;
+- грыжами, протрузиями;
+- защемлением нервов;
+- болью, которая отдаёт в руку или ногу;
+- суставами;
+- онемением;
+- восстановлением/реабилитацией после травм/операций;
+- нарушением походки, парезами.
+
+Клиника НЕ занимается:
+- зубами;
+- животом/ЖКТ;
+- сердцем/скорой;
+- ЛОР;
+- глазами;
+- кожей;
+- гинекологией/урологией;
+- психиатрией;
+- возвратами/рассрочками/претензиями — это только администратору.
+
+Строгий сценарий записи:
+1. Понять жалобу.
+2. Если жалоба профильная — мягко подтвердить и спросить возраст.
+3. После возраста — спросить противопоказания.
+4. После отсутствия противопоказаний — спросить дату.
+5. После даты Python покажет реальные слоты.
+6. После выбора слота — спросить имя.
+7. После имени Python бронирует CRM.
+
+Нельзя:
+- спрашивать имя до выбора слота;
+- предлагать дату до противопоказаний;
+- записывать без противопоказаний;
+- обещать лечение/результат/гарантию;
+- ставить диагноз;
+- говорить “точно вылечим”;
+- отвечать booked/manual/refund/old-chat сценариям;
+- начинать новую запись, если пациент уже записан;
+- придумывать слоты;
+- придумывать врачей;
+- придумывать цену курса;
+- придумывать противопоказания;
+- менять “нет” на “да”.
+
+Можно:
+- отвечать на FAQ внутри сценария;
+- исправлять опечатки по смыслу;
+- понимать “все чисто” как “противопоказаний нет” только на этапе противопоказаний;
+- понимать “2 варик” как выбор второго слота, если слоты уже показаны;
+- понимать “в понеддельник” как “в понедельник”;
+- понимать “как на видео?” как вопрос о процедуре, без гарантии 1 в 1;
+- понимать “жоқ/жок” как “нет” по контексту;
+- отвечать на языке клиента: русский или казахский.
+
+Цена:
+Первичный приём — 5 000 тг.
+Курс лечения рассчитывается только после осмотра врача.
+
+МРТ:
+МРТ/снимки заранее делать не обязательно. Если есть старые снимки/заключения — можно взять с собой. Врач на осмотре скажет, нужно ли новое обследование.
+
+Без операции:
+В клинике применяются безоперационные методы, но подойдёт ли пациенту такой вариант — врач скажет после осмотра.
+
+Адрес:
+Астана, Кабанбай батыра 28, внутренний двор, подъезд 3. Заезд со стороны Кунаева, после ворот направо.
+
+Выходные:
+Суббота/воскресенье — процедурные дни. Первичных пациентов лучше записывать в будние дни.
+
+Стиль:
+Пиши как живой администратор в WhatsApp.
+Коротко, спокойно, понятно.
+Без канцелярита.
+Не пиши длинные простыни.
+Можно использовать 🌿, но не чаще одного раза.
+Не повторяй “Здравствуйте” в каждом сообщении.
+Не используй фразу “С такими жалобами к нам обращаются”.
+Не используй фразу “Вижу Ваш запрос” без необходимости.
+
+Верни только JSON строго по схеме.
+""".strip()
+
+
+def _dialog_brain_fallback(reason: str) -> tuple[dict, dict]:
+    decision = {
+        "action": "fallback_rule_based",
+        "reply": "",
+        "extracted": {
+            "complaint": "", "age": None, "contraindications_clear": None,
+            "contraindication_red_flags": [], "preferred_date_text": "", "slot_choice": None,
+            "patient_name": "", "faq_type": "", "language": "ru",
+        },
+        "needs_python_tool": "none",
+        "safety_flags": {
+            "promised_cure": False, "asked_name_too_early": False,
+            "offered_date_before_contra": False, "medical_diagnosis": False,
+        },
+    }
+    return decision, {"openai_brain_used": False, "openai_brain_fallback_used": True, "openai_brain_skip_reason": reason}
+
+
+def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
+    if not isinstance(raw, dict):
+        return {}, "not_object"
+    action = str(raw.get("action") or "")
+    if action not in DIALOG_BRAIN_ACTIONS:
+        return {}, "invalid_action"
+    tool = str(raw.get("needs_python_tool") or "none")
+    if tool not in DIALOG_BRAIN_TOOLS:
+        return {}, "invalid_tool"
+    extracted = raw.get("extracted") if isinstance(raw.get("extracted"), dict) else {}
+    safety = raw.get("safety_flags") if isinstance(raw.get("safety_flags"), dict) else {}
+    decision = {
+        "action": action,
+        "reply": str(raw.get("reply") or ""),
+        "extracted": {
+            "complaint": str(extracted.get("complaint") or ""),
+            "age": extracted.get("age"),
+            "contraindications_clear": extracted.get("contraindications_clear"),
+            "contraindication_red_flags": extracted.get("contraindication_red_flags") if isinstance(extracted.get("contraindication_red_flags"), list) else [],
+            "preferred_date_text": str(extracted.get("preferred_date_text") or ""),
+            "slot_choice": extracted.get("slot_choice"),
+            "patient_name": str(extracted.get("patient_name") or ""),
+            "faq_type": str(extracted.get("faq_type") or ""),
+            "language": str(extracted.get("language") or "ru"),
+        },
+        "needs_python_tool": tool,
+        "safety_flags": {
+            "promised_cure": bool(safety.get("promised_cure")),
+            "asked_name_too_early": bool(safety.get("asked_name_too_early")),
+            "offered_date_before_contra": bool(safety.get("offered_date_before_contra")),
+            "medical_diagnosis": bool(safety.get("medical_diagnosis")),
+        },
+    }
+    if action not in {"no_reply", "fallback_rule_based", "show_slots", "select_slot"} and not decision["reply"].strip():
+        return {}, "empty_reply"
+    return decision, ""
+
+
+async def run_openai_dialog_brain(
+    *,
+    user_text: str,
+    session: dict,
+    recent_history: list | None = None,
+    available_slots: list | None = None,
+    clinic_context: dict | None = None,
+) -> tuple[dict, dict]:
+    settings = get_settings()
+    model = getattr(settings, "openai_model", "")
+    debug = {"openai_brain_used": False, "openai_brain_action": "", "openai_brain_needs_python_tool": "", "openai_brain_extracted": {}, "openai_brain_guard_failed": False, "openai_brain_guard_reason": "", "openai_brain_skip_reason": "", "openai_brain_fallback_used": False, "openai_model": model}
+    if not getattr(settings, "ai_enabled", True) or not getattr(settings, "openai_api_key", "") or AsyncOpenAI is None:
+        decision, fb = _dialog_brain_fallback("config_missing")
+        debug.update(fb)
+        return decision, debug
+    try:
+        summary = {
+            "step": session.get("step") or session.get("current_step") or "start",
+            "complaint": session.get("complaint") or "",
+            "age": session.get("age"),
+            "contraindications_ok": session.get("contraindications_ok"),
+            "last_slots": available_slots if available_slots is not None else session.get("last_slots") or [],
+            "selected_slot": session.get("selected_slot") or {},
+            "language": session.get("language") or "ru",
+            "clinic_context": clinic_context or {},
+        }
+        if state is not None:
+            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_called", {"model": model, "step": summary["step"]})
+        client = _openai_client(settings.openai_api_key)
+        response = await client.chat.completions.create(
+            model=model,
+            temperature=0.2,
+            max_tokens=700,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps({"user_text": user_text or "", "session": summary, "recent_history": recent_history or []}, ensure_ascii=False)},
+            ],
+        )
+        content = response.choices[0].message.content or ""
+        try:
+            raw = json.loads(content)
+        except Exception:
+            decision, fb = _dialog_brain_fallback("invalid_json")
+            debug.update(fb)
+            return decision, debug
+        decision, reason = _normalize_dialog_brain_decision(raw)
+        if reason:
+            decision, fb = _dialog_brain_fallback(reason)
+            debug.update(fb)
+            return decision, debug
+        debug.update({"openai_brain_used": True, "openai_brain_action": decision["action"], "openai_brain_needs_python_tool": decision["needs_python_tool"], "openai_brain_extracted": decision["extracted"]})
+        if state is not None:
+            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_decision", {"action": decision["action"], "tool": decision["needs_python_tool"]})
+        return decision, debug
+    except Exception as exc:
+        decision, fb = _dialog_brain_fallback("openai_error")
+        debug.update(fb)
+        debug["openai_error_preview"] = str(exc)[:200]
+        return decision, debug
+
+
 HUMANIZE_REPLY_PROMPT = """
 Ты живой WhatsApp-ассистент клиники Neuro Balance.
 Твоя задача — переписать черновик ответа так, чтобы он звучал как человек, а не как скрипт.
