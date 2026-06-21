@@ -2237,12 +2237,16 @@ def _has_video_procedure_question(text: str) -> bool:
     compact = re.sub(r"\s+", " ", compact).strip()
     patterns = [
         "так же будет",
+        "так же делают",
         "как на видео",
         "как в видео",
         "точно так делают",
         "это будут делать",
         "все как на видео",
         "процедура такая же",
+        "процедуры как на видео",
+        "в инстаграме",
+        "в instagram",
         "осылай болады ма",
         "видеодагыдай болады ма",
         "видеодағыдай болады ма",
@@ -3233,6 +3237,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             if slot:
                 _remember_selected_slot(session, slot)
                 session["step"] = "name"
+                session["questionnaire_step"] = "name"
                 return _finalize(chat_id, session, faq_info + "\n\n" + _ask_name(session))
 
         if step == "age" and faq_info:
@@ -3340,7 +3345,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session["selected_date"] = _slot_date(slot) or session.get("preferred_date")
             session["selected_time"] = _slot_time(slot)
             session["step"] = "name"
-            return _finalize(chat_id, session, _ask_name(session))
+            session["questionnaire_step"] = "name"
+            answer = _ask_name(session)
+            if _has_video_procedure_question(text):
+                answer = _video_procedure_answer(session) + "\n\n" + answer
+            return _finalize(chat_id, session, answer)
 
         if step == "name":
             name = _extract_name(text)
@@ -3975,7 +3984,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
         _remember_selected_slot(session, slot)
         session["step"] = "name"
-        return _finalize(chat_id, session, _ask_name(session))
+        session["questionnaire_step"] = "name"
+        answer = _ask_name(session)
+        if _has_video_procedure_question(text):
+            answer = _video_procedure_answer(session) + "\n\n" + answer
+        return _finalize(chat_id, session, answer)
 
     # 10) Имя.
     if step == "name":
