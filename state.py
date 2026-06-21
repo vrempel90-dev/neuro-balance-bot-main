@@ -1,11 +1,49 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from config import get_settings
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("production_events")
+
+_SECRET_KEY_PARTS = ("secret", "api_key", "apikey", "token", "authorization", "password")
+_STDOUT_EVENTS = {
+    "wazzup_received",
+    "dialog_start",
+    "dialog_result",
+    "bot_no_reply",
+    "wazzup_send_attempt",
+    "wazzup_send_result",
+    "openai_called",
+    "openai_skipped",
+}
+
+
+def _safe_log_value(key: str, value: Any) -> Any:
+    key_low = key.lower()
+    if any(part in key_low for part in _SECRET_KEY_PARTS):
+        return "***"
+    if isinstance(value, dict):
+        return {str(k): _safe_log_value(str(k), v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_safe_log_value(key, item) for item in value[:20]]
+    if isinstance(value, str):
+        limit = 120 if key_low in {"text", "content", "transcript", "answer"} else 500
+        return value.replace("\n", " ").strip()[:limit]
+    return value
+
+
+def _safe_log_payload(chat_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    safe = {"event": event_type, "chat_id": chat_id}
+    for key, value in (payload or {}).items():
+        out_key = "text_preview" if str(key).lower() in {"text", "content", "transcript"} else str(key)
+        safe[out_key] = _safe_log_value(str(key), value)
+    return safe
 
 
 DEFAULT_SESSION = {
@@ -82,6 +120,8 @@ def add_message(chat_id: str, role: str, content: str) -> None:
 
 
 def log_event(chat_id: str, event_type: str, payload: dict[str, Any]) -> None:
+    if event_type in _STDOUT_EVENTS:
+        logger.info(json.dumps(_safe_log_payload(chat_id, event_type, payload), ensure_ascii=False, default=str))
     with _connect() as conn:
         conn.execute(
             "INSERT INTO events(chat_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",

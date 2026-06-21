@@ -98,7 +98,10 @@ async def send_text(chat_id: str, text: str, chat_type: str = "whatsapp", channe
         },
     )
     response.raise_for_status()
-    return response.json() if response.text else {"ok": True}
+    data = response.json() if response.text else {"ok": True}
+    if isinstance(data, dict):
+        data.setdefault("status_code", response.status_code)
+    return data
 
 
 def _dig(obj: dict[str, Any], *paths: str) -> Any:

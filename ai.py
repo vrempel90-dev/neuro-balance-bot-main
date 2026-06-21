@@ -9,6 +9,11 @@ except Exception:
     AsyncOpenAI = None
 
 from config import get_settings
+
+try:
+    import state
+except Exception:
+    state = None
 from services import classify_by_keywords
 
 
@@ -120,7 +125,7 @@ def _clean_model_text(text: str) -> str:
     return content
 
 
-async def generate_complaint_ack(text: str, lang: str = "ru") -> str:
+async def generate_complaint_ack(text: str, lang: str = "ru", chat_id: str = "") -> str:
     """Живой ответ по жалобе через GPT.
 
     GPT отвечает только за человеческую формулировку.
@@ -128,8 +133,12 @@ async def generate_complaint_ack(text: str, lang: str = "ru") -> str:
     """
     settings = get_settings()
     if not settings.openai_api_key or not settings.ai_enabled:
+        if state is not None:
+            state.log_event(chat_id or "system", "openai_skipped", {"chat_id": chat_id, "reason": "disabled_or_missing_api_key"})
         return _fallback_ack(text, lang)
     try:
+        if state is not None:
+            state.log_event(chat_id or "system", "openai_called", {"chat_id": chat_id, "model": settings.openai_model, "purpose": "complaint_ack"})
         client = _openai_client(settings.openai_api_key)
         language_name = "казахский" if lang == "kk" else "русский"
         response = await client.chat.completions.create(
@@ -188,7 +197,7 @@ def _fallback_humanize(draft: str) -> str:
     return text or "Спасибо 🌿 Подскажите, пожалуйста, чем можем помочь?"
 
 
-async def generate_human_message(draft: str, user_text: str = "", lang: str = "ru", step: str = "") -> str:
+async def generate_human_message(draft: str, user_text: str = "", lang: str = "ru", step: str = "", chat_id: str = "") -> str:
     """Делает ответ более живым, но не меняет бизнес-логику.
 
     Важно: GPT здесь не решает, кого записывать и когда. Он только переписывает уже готовый безопасный ответ.
@@ -196,14 +205,21 @@ async def generate_human_message(draft: str, user_text: str = "", lang: str = "r
     settings = get_settings()
     draft = (draft or "").strip()
     if not draft or not settings.openai_api_key or not settings.ai_enabled:
+        if state is not None:
+            reason = "empty_draft" if not draft else "disabled_or_missing_api_key"
+            state.log_event(chat_id or "system", "openai_skipped", {"chat_id": chat_id, "reason": reason})
         return _fallback_humanize(draft)
 
     # Не тратим GPT на большие списки слотов/финальные подтверждения, где важна дословность.
     lower = draft.lower()
     if len(draft) > 1200 or "📅" in draft or "⏰" in draft or "есть свободное время" in lower or "бос уақыт" in lower:
+        if state is not None:
+            state.log_event(chat_id or "system", "openai_skipped", {"chat_id": chat_id, "reason": "deterministic_reply"})
         return _fallback_humanize(draft)
 
     try:
+        if state is not None:
+            state.log_event(chat_id or "system", "openai_called", {"chat_id": chat_id, "model": settings.openai_model, "purpose": "humanize_reply"})
         client = _openai_client(settings.openai_api_key)
         language_name = "казахский" if lang == "kk" else "русский"
         response = await client.chat.completions.create(
