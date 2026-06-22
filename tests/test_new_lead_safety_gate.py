@@ -62,12 +62,69 @@ def test_profile_complaint_starts_ai_flow_and_asks_age() -> None:
     assert session["step"] == "age"
 
 
-def test_old_chat_is_silent() -> None:
+def test_old_chat_with_admin_history_is_silent() -> None:
     chat_id = _chat_id("old")
-    _reset(chat_id, {"old_chat": True})
+    _reset(chat_id, {"old_chat": True, "manual_admin_intervention": True})
 
     assert _answer(chat_id, "Здравствуйте") == ""
     assert state.get_session(chat_id)["no_reply_reason"] == "old_chat_ai_disabled"
+
+
+def test_old_chat_without_admin_history_can_start_on_lead_like_message() -> None:
+    chat_id = _chat_id("old-lead-like")
+    _reset(chat_id, {"old_chat": True})
+
+    answer = _answer(chat_id, "Здравствуйте")
+    session = state.get_session(chat_id)
+
+    assert answer
+    assert session["gate_reason"] == "new_lead_like_message"
+    assert session["ai_lead_started"] is True
+
+
+def test_fresh_wazzup_address_typo_starts_and_answers_address() -> None:
+    chat_id = _chat_id("addr")
+    _reset(chat_id)
+
+    answer = _answer(chat_id, "Адресс какой")
+    session = state.get_session(chat_id)
+
+    assert answer
+    assert "Кабанбай батыра 28" in answer
+    assert session["gate_reason"] == "new_lead_like_message"
+    assert session["ai_lead_started"] is True
+
+
+def test_fresh_greeting_starts_ai_flow() -> None:
+    chat_id = _chat_id("hello")
+    _reset(chat_id)
+
+    answer = _answer(chat_id, "Здравствуйте")
+    session = state.get_session(chat_id)
+
+    assert answer
+    assert session["gate_reason"] == "new_lead_like_message"
+    assert session["ai_lead_started"] is True
+
+
+def test_fresh_kazakh_greeting_starts_ai_flow() -> None:
+    chat_id = _chat_id("kz-hello")
+    _reset(chat_id)
+
+    answer = _answer(chat_id, "Қайырлы кеш")
+    session = state.get_session(chat_id)
+
+    assert answer
+    assert session["gate_reason"] == "new_lead_like_message"
+    assert session["ai_lead_started"] is True
+
+
+def test_booked_address_question_is_silent() -> None:
+    chat_id = _chat_id("booked-address")
+    _reset(chat_id, {"step": "booked", "appointment_status": "booked"})
+
+    assert _answer(chat_id, "адрес?") == ""
+    assert state.get_session(chat_id)["no_reply_reason"] == "booked_session_ai_disabled"
 
 
 def test_booked_session_is_always_silent() -> None:

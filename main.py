@@ -97,7 +97,7 @@ def health() -> dict[str, Any]:
 
 
 _ALLOWED_HUMANIZE_STEPS = {"start", "complaint", "age", "contraindications", "date", "time", "name"}
-_ALLOWED_HUMANIZE_GATE_REASONS = {"new_lead", "active_ai_lead", "active_conversation_reply"}
+_ALLOWED_HUMANIZE_GATE_REASONS = {"new_lead", "new_lead_like_message", "active_ai_lead", "active_conversation_reply"}
 
 def _set_openai_debug(session: dict[str, Any], debug: dict[str, Any], base_answer: str, final_answer: str) -> None:
     session["openai_used"] = bool(debug.get("openai_used"))

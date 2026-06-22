@@ -39,7 +39,7 @@ except Exception:
 
 OPENAI_BRAIN_ALLOWED_STEPS = {"complaint", "age", "contraindications", "date", "time", "select_slot", "name"}
 OPENAI_BRAIN_MULTI_ENTITY_STEPS = {"age", "contraindications", "date"}
-OPENAI_BRAIN_ALLOWED_GATES = {"new_lead", "active_ai_lead", "active_conversation_reply"}
+OPENAI_BRAIN_ALLOWED_GATES = {"new_lead", "new_lead_like_message", "active_ai_lead", "active_conversation_reply"}
 
 
 def _reset_openai_brain_debug(session: dict[str, Any]) -> None:
@@ -3230,7 +3230,7 @@ def _is_booked_or_confirmed_session(session: dict[str, Any]) -> bool:
 
 
 def _is_new_lead_text(text: str) -> bool:
-    """Recognise only explicit booking intent or a clinic-profile complaint."""
+    """Recognise explicit booking intent or a clinic-profile complaint."""
     low = _low(text)
     if not low or low in {
         "да", "нет", "ок", "окей", "подтверждаю", "спасибо", "хорошо",
@@ -3242,6 +3242,34 @@ def _is_new_lead_text(text: str) -> bool:
         "жазыл", "қабылдау", "кабылдау",
     )
     return any(marker in low for marker in lead_markers) or _profile_status(text) == "profile"
+
+
+def _is_new_lead_like_message(text: str) -> bool:
+    """Return True for greetings, clinic questions, and profile requests worth starting AI."""
+    low = _low(text)
+    if not low or low in {
+        "да", "нет", "ок", "окей", "подтверждаю", "спасибо", "хорошо",
+        "ия", "иә", "жоқ", "рахмет", "рақмет",
+    }:
+        return False
+
+    lead_like_markers = (
+        # greetings
+        "здравствуйте", "добрый день", "добрый вечер", "қайырлы кеш",
+        "кайырлы кеш", "сәлеметсіз бе", "салеметсиз бе", "привет",
+        # booking / consultation intent
+        "хочу записаться", "можно записаться", "на консультацию", "на диагностику",
+        "прием", "приём", "записаться на прием", "записаться на приём",
+        # profile complaints
+        "спина болит", "поясница", "шея", "грыжа", "протрузия",
+        "отдаёт в ногу", "отдает в ногу", "отдаёт в руку", "отдает в руку",
+        "сустав", "онемение", "защемление", "радикулит",
+        # clinic questions
+        "адрес", "адресс", "где вы находитесь", "где находитесь", "цена",
+        "сколько стоит", "график", "режим", "мрт", "снимки",
+        "без операции", "как на видео",
+    )
+    return any(marker in low for marker in lead_like_markers) or _profile_status(text) == "profile"
 
 
 def _is_refund_or_claim_issue(text: str) -> bool:
@@ -3265,13 +3293,21 @@ def _should_ai_handle_new_lead(session: dict[str, Any], text: str) -> tuple[bool
         return False, "booked_session_ai_disabled"
     if session.get("ai_muted") or session.get("manual_takeover") or session.get("do_not_reply"):
         return False, "manual_takeover"
-    if (
+    is_old_chat = (
         session.get("old_chat") is True
         or session.get("imported") is True
         or session.get("existing_chat") is True
         or _low(str(session.get("source") or "")) == "old"
         or _low(str(session.get("lead_source") or "")) == "old_chat"
-    ):
+    )
+    has_human_admin_history = bool(
+        session.get("manual_admin_intervention")
+        or session.get("manual_takeover")
+        or session.get("last_admin_message")
+        or session.get("has_admin_history")
+        or session.get("was_manual_admin_recent")
+    )
+    if is_old_chat and has_human_admin_history:
         return False, "old_chat_ai_disabled"
 
     if _has_active_conversation_context(session) or _is_reply_to_active_question(session, text):
@@ -3285,6 +3321,8 @@ def _should_ai_handle_new_lead(session: dict[str, Any], text: str) -> tuple[bool
         return True, "active_ai_lead"
     if _is_new_lead_text(text):
         return True, "new_lead"
+    if _is_new_lead_like_message(text):
+        return True, "new_lead_like_message"
     return False, "not_new_lead"
 
 
@@ -3380,12 +3418,12 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return answer
         return ""
 
-    if reason in {"new_lead", "active_conversation_reply", "active_ai_lead"}:
+    if reason in {"new_lead", "new_lead_like_message", "active_conversation_reply", "active_ai_lead"}:
         session.pop("no_reply_reason", None)
 
-    if reason == "new_lead":
+    if reason in {"new_lead", "new_lead_like_message"}:
         session["ai_lead_started"] = True
-        session["lead_source"] = "new_lead"
+        session["lead_source"] = reason
         session["ai_started_at"] = datetime.now(timezone.utc).isoformat()
 
     context = _build_conversation_context(chat_id, session, text)
