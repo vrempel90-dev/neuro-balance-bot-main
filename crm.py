@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Any
+import logging
 import time
 import re
 
@@ -12,6 +13,20 @@ from config import get_settings
 
 class CRMError(Exception):
     pass
+
+
+class CRMResponseError(CRMError):
+    def __init__(self, label: str, response: httpx.Response, data: dict[str, Any] | None = None):
+        self.label = label
+        self.status_code = response.status_code
+        self.response_text = response.text
+        self.data = data or {}
+        self.code = str(self.data.get("code") or "")
+        message = self.data.get("error") or self.data.get("message") or self.response_text
+        super().__init__(f"CRM {label} error {self.status_code}: {message}")
+
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -39,28 +54,39 @@ def _url(path: str) -> str:
     return f"{str(base).rstrip('/')}{path}"
 
 
+def _response_json(response: httpx.Response) -> dict[str, Any] | None:
+    try:
+        data = response.json()
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _log_crm_response(response: httpx.Response, label: str) -> dict[str, Any] | None:
+    data = _response_json(response)
+    logger.info(
+        "CRM %s response status=%s text=%s json=%s",
+        label,
+        response.status_code,
+        response.text[:2000],
+        data,
+    )
+    return data
+
+
 def _raise_for_crm(response: httpx.Response, label: str) -> None:
-    if response.status_code == 401:
-        raise CRMError("CRM вернула 401: неверный CRM_BOT_SECRET / EXTERNAL_BOOKING_API_SECRET")
-    if response.status_code == 403:
-        raise CRMError(f"CRM {label} error 403: запись не принадлежит этому телефону")
-    if response.status_code == 404:
-        raise CRMError(f"CRM {label} error 404: endpoint/запись не найдены")
-    if response.status_code == 409:
-        raise CRMError(f"CRM {label} error 409: слот уже занят или вне расписания")
-    if response.status_code == 410:
-        raise CRMError(f"CRM {label} error 410: запись уже неактивна или отменена")
-    if response.status_code == 429:
-        try:
-            retry = response.json().get("retryAfterSec")
-        except Exception:
-            retry = None
-        raise CRMError(
-            f"CRM {label} error 429: превышен лимит"
-            + (f", повтор через {retry} сек" if retry else "")
-        )
+    data = _log_crm_response(response, label)
     if response.status_code >= 400:
-        raise CRMError(f"CRM {label} error {response.status_code}: {response.text}")
+        raise CRMResponseError(label, response, data)
+
+
+def clear_slots_cache(date: str | None = None) -> None:
+    if not date:
+        _SLOTS_CACHE.clear()
+        return
+    for key in list(_SLOTS_CACHE.keys()):
+        if key[0] == date:
+            _SLOTS_CACHE.pop(key, None)
 
 
 _SLOTS_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
@@ -252,9 +278,7 @@ async def book_appointment(
     )
     _raise_for_crm(response, "book")
 
-    for key in list(_SLOTS_CACHE.keys()):
-        if key[0] == date:
-            _SLOTS_CACHE.pop(key, None)
+    clear_slots_cache(date)
 
     data = response.json()
     data.setdefault("ok", True)
