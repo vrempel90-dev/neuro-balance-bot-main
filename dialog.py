@@ -200,6 +200,8 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
             session["step"] = "date"
             return _finalize(chat_id, session, (reply + "\n\n" if reply else "") + _ask_date(session))
         slots_answer = await _show_slots(chat_id, session, date_iso)
+        if session.get("step") != "time" or not (session.get("last_slots") or []):
+            return _finalize(chat_id, session, slots_answer)
         return _finalize(chat_id, session, (reply + "\n\n" if reply else "") + slots_answer)
     if action == "select_slot":
         slots = session.get("last_slots") or []
@@ -393,6 +395,8 @@ METHOD_WORDS = [
 DOCTOR_WORDS = [
     "у вас врачи", "врачи или как", "врач или как", "консультацию проводит врач",
     "кто консультирует", "кто смотрит", "врач смотрит", "доктор", "доктора",
+    "а врачи кто", "врачи кто", "имена врачей", "имена их", "какой врач",
+    "к кому запишете", "как зовут врача", "как зовут врачей", "имя врача",
 ]
 
 COURSE_DURATION_WORDS = [
@@ -1769,8 +1773,39 @@ def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
         cleaned = " ".join(sentences[:2]).strip()
 
     return cleaned.strip()
+
+_TIME_PATTERN = re.compile(r"\b(?:[01]?\d|2[0-3])[:.][0-5]\d\b")
+_FORBIDDEN_EMPTY_SLOT_PHRASES = (
+    "есть свободные слоты",
+    "есть такие свободные",
+    "показываю свободные слоты",
+    "свободные слоты",
+    "выберите подходящий",
+    "выберите удобный",
+)
+
+
+def _validate_final_fact_answer(chat_id: str, session: dict[str, Any], answer: str) -> str:
+    """Python/CRM remains the only source of truth for slots and availability."""
+    text = _clean(answer)
+    low = _low(text)
+    slots = session.get("last_slots") or []
+    step = _low(str(session.get("step") or ""))
+    crm_empty = session.get("crm_availability_empty") is True
+    slot_display_context = step in {"date", "preferred_time", "time", "select_slot"} and not session.get("selected_slot") and not session.get("booked")
+    has_time = bool(_TIME_PATTERN.search(text))
+    forbidden_phrase = any(p in low for p in _FORBIDDEN_EMPTY_SLOT_PHRASES)
+    if (crm_empty or (slot_display_context and not slots)) and (has_time or forbidden_phrase):
+        _safe_log(chat_id, "llm_slot_hallucination_blocked", {"chat_id": chat_id, "date": session.get("preferred_date") or "", "step": session.get("step") or "", "slots_count": len(slots) if isinstance(slots, list) else 0})
+        session["last_slots"] = []
+        session["step"] = "date"
+        return _no_slots_text(session)
+    return text
+
+
 def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     answer = _clean(answer)
+    answer = _validate_final_fact_answer(chat_id, session, answer)
     answer = _remove_name_addressing(answer, session)
     answer = _strict_trim_extra(answer, session)
     if not answer:
@@ -2317,7 +2352,30 @@ def _method_answer(session: dict[str, Any]) -> str:
     )
 
 
-def _doctor_answer(session: dict[str, Any]) -> str:
+def _doctor_answer(session: dict[str, Any], chat_id: str = "") -> str:
+    step = _low(str(session.get("step") or ""))
+    slots = session.get("last_slots") or []
+    if step in {"date", "time", "select_slot"}:
+        names: list[str] = []
+        for slot in slots if isinstance(slots, list) else []:
+            if not isinstance(slot, dict):
+                continue
+            name = _slot_doctor_name(slot).strip()
+            if name and name not in names and name.lower() != "врач клиники":
+                names.append(name)
+        if names:
+            _safe_log(chat_id or str(session.get("chat_id") or "system"), "doctor_names_from_slots", {"chat_id": chat_id or str(session.get("chat_id") or ""), "date": session.get("preferred_date") or "", "step": step, "slots_count": len(slots)})
+            return _tr(
+                session,
+                "По актуальным свободным окошкам доступны специалисты: " + ", ".join(names) + " 🌿 Выберите, пожалуйста, удобное время из вариантов выше.",
+                "Актуалды бос уақыттар бойынша мамандар: " + ", ".join(names) + " 🌿 Жоғарыдағы ыңғайлы уақытты таңдаңызшы.",
+            )
+        _safe_log(chat_id or str(session.get("chat_id") or "system"), "doctor_names_unavailable_without_slots", {"chat_id": chat_id or str(session.get("chat_id") or ""), "date": session.get("preferred_date") or "", "step": step, "slots_count": 0})
+        return _tr(
+            session,
+            "Врач зависит от выбранного дня и доступного расписания. Когда подберём свободное окошко, я покажу варианты по актуальному расписанию 🌿 Подскажите, пожалуйста, какой день Вам удобен?",
+            "Дәрігер таңдалған күнге және актуалды кестеге байланысты. Бос уақытты таңдағанда актуалды кесте бойынша нұсқаларды көрсетемін 🌿 Қай күн ыңғайлы?",
+        )
     return _tr(
         session,
         "Да, консультацию проводит врач 🌿 Он осматривает, оценивает состояние и подбирает индивидуальный план лечения.",
@@ -2501,8 +2559,8 @@ def _ask_name(session: dict[str, Any]) -> str:
 def _no_slots_text(session: dict[str, Any]) -> str:
     return _tr(
         session,
-        "На эту дату свободных окошек не нашла. Напишите, пожалуйста, другую дату — проверю расписание.",
-        "Бұл күнге бос уақыт табылмады. Басқа күнді жазыңызшы — кестені тексеремін.",
+        "На выбранный день свободных окошек не нашла 🌿 Подскажите, пожалуйста, другой удобный день — проверю актуальное расписание.",
+        "Таңдалған күнге бос уақыт таппадым 🌿 Басқа ыңғайлы күнді жазыңызшы — актуалды кестені тексеремін.",
     )
 
 
@@ -2558,9 +2616,14 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
         return _crm_fallback_answer(session)
 
     if not slots:
+        session["last_slots"] = []
+        session.pop("selected_slot", None)
         session["step"] = "date"
+        session["crm_availability_empty"] = True
+        _safe_log(chat_id, "crm_slots_empty", {"chat_id": chat_id, "date": date_iso, "step": session.get("step") or "date", "slots_count": 0})
         return _no_slots_text(session)
 
+    session["crm_availability_empty"] = False
     session["last_slots"] = slots
     session["step"] = "time"
     return _tr(
@@ -3609,6 +3672,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             ),
         )
 
+    if step in ("date", "preferred_time", "time", "select_slot") and _has_any(text, DOCTOR_WORDS):
+        return _finalize(chat_id, session, _doctor_answer(session, chat_id))
+
     brain_answer = await _try_openai_dialog_brain(chat_id, phone, session, text)
     if brain_answer is not None:
         session["openai_used"] = True
@@ -3645,7 +3711,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if step in ("age", "contraindications", "date", "preferred_time", "time", "select_slot", "name"):
         if _is_thanks_or_ok(text) and step in ("date", "preferred_time", "time", "select_slot"):
             return _no_reply(chat_id, session)
-        faq_info = _faq_answer(text, session)
+        faq_info = _doctor_answer(session, chat_id) if _has_any(text, DOCTOR_WORDS) else _faq_answer(text, session)
 
         if step in ("time", "select_slot") and faq_info:
             slots = session.get("last_slots") or []
