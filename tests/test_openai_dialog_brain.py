@@ -448,3 +448,84 @@ def test_slot_slang_second_variant_selects_second_slot(monkeypatch: Any) -> None
     session = state.get_session(chat_id)
     assert session["selected_slot"] == slots[1]
     assert session["step"] == "name"
+
+
+def test_crm_empty_availability_keeps_date_and_clears_slots(monkeypatch: Any) -> None:
+    chat_id = "reg_empty_availability"
+    reset(chat_id, {"step": "date", "contraindications_ok": True, "last_slots": [{"time": "10:00"}]})
+
+    async def fake_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
+        return {"availability": []}
+
+    monkeypatch.setattr(crm, "check_slots", fake_slots)
+    session = state.get_session(chat_id)
+    answer = run(dialog._show_slots(chat_id, session, "2026-06-28"))
+    assert "10:00" not in answer and "12:00" not in answer and "14:00" not in answer
+    assert "есть свободные слоты" not in answer.lower()
+    assert "свободных окошек не нашла" in answer or "другой" in answer.lower()
+    assert session["step"] == "date"
+    assert session.get("last_slots") == []
+
+
+def test_llm_hallucinated_slots_blocked_when_crm_empty(monkeypatch: Any) -> None:
+    chat_id = "reg_llm_hallucinated_slots"
+    reset(chat_id, {"step": "date", "contraindications_ok": True})
+    events: list[str] = []
+    monkeypatch.setattr(state, "log_event", lambda chat_id, event, payload: events.append(event))
+
+    async def fake_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
+        return {"availability": []}
+
+    async def fake_brain(**kwargs: Any):
+        return brain(
+            "show_slots",
+            "Показываю свободные слоты: 10:00, 12:00, 14:00",
+            {"preferred_date_text": "в понедельник"},
+            "check_slots",
+        )
+
+    monkeypatch.setattr(crm, "check_slots", fake_slots)
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+    answer = run(handle_message(chat_id, "77011234567", "в понедельник"))
+    assert "10:00" not in answer and "12:00" not in answer and "14:00" not in answer
+    assert "свободных окошек не нашла" in answer
+    assert "llm_slot_hallucination_blocked" in events or "crm_slots_empty" in events
+    assert state.get_session(chat_id)["step"] == "date"
+
+
+def test_real_crm_slots_only_are_saved(monkeypatch: Any) -> None:
+    chat_id = "reg_real_slots_only"
+    reset(chat_id, {"step": "date", "contraindications_ok": True})
+
+    async def fake_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
+        return {"availability": [{"doctorLogin": "zhuma_md", "doctorName": "Жумабеков М.", "date": "2026-06-22", "availableSlots": ["09:20", "10:40"]}]}
+
+    monkeypatch.setattr(crm, "check_slots", fake_slots)
+    session = state.get_session(chat_id)
+    answer = run(dialog._show_slots(chat_id, session, "2026-06-22"))
+    assert "09:20" in answer and "10:40" in answer
+    for fake_time in ("10:00", "12:00", "14:00"):
+        assert fake_time not in answer
+    assert session["step"] == "time"
+    assert len(session["last_slots"]) == 2
+    assert all(slot["doctorLogin"] == "zhuma_md" and slot["date"] == "2026-06-22" and slot["timeStart"] in {"09:20", "10:40"} for slot in session["last_slots"])
+
+
+def test_doctor_names_without_slots_are_safe() -> None:
+    chat_id = "reg_doctor_names_without_slots"
+    reset(chat_id, {"step": "date", "last_slots": []})
+    answer = run(handle_message(chat_id, "77011234567", "а имена их можно?"))
+    assert "Врач зависит от выбранного дня" in answer
+    assert "какой день" in answer
+    assert "Жумабеков" not in answer and "Иван" not in answer
+
+
+def test_doctor_names_from_last_slots_only() -> None:
+    chat_id = "reg_doctor_names_with_slots"
+    reset(chat_id, {"step": "time", "last_slots": [
+        {"doctorName": "Жумабеков М.", "doctorLogin": "zhuma_md", "date": "2026-06-22", "timeStart": "09:20", "time": "09:20"},
+        {"doctorName": "Садыкова А.", "doctorLogin": "sad", "date": "2026-06-22", "timeStart": "10:40", "time": "10:40"},
+    ]})
+    answer = run(handle_message(chat_id, "77011234567", "а врачи кто?"))
+    assert "Жумабеков М." in answer and "Садыкова А." in answer
+    assert "Иван" not in answer
