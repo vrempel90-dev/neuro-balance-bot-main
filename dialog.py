@@ -44,6 +44,7 @@ OPENAI_BRAIN_ALLOWED_GATES = {"new_lead", "new_lead_like_message", "active_ai_le
 
 def _reset_openai_brain_debug(session: dict[str, Any]) -> None:
     session["openai_brain_used"] = False
+    session["openai_brain_intent"] = ""
     session["openai_brain_action"] = ""
     session["openai_brain_needs_python_tool"] = ""
     session["openai_brain_extracted"] = {}
@@ -56,7 +57,7 @@ def _reset_openai_brain_debug(session: dict[str, Any]) -> None:
 def _apply_openai_brain_debug(session: dict[str, Any], debug: dict[str, Any]) -> None:
     for key in (
         "openai_brain_used", "openai_brain_action", "openai_brain_needs_python_tool",
-        "openai_brain_extracted", "openai_brain_guard_failed", "openai_brain_guard_reason",
+        "openai_brain_intent", "openai_brain_extracted", "openai_brain_guard_failed", "openai_brain_guard_reason",
         "openai_brain_skip_reason", "openai_brain_fallback_used",
     ):
         if key in debug:
@@ -97,6 +98,9 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
     red_flags = extracted.get("contraindication_red_flags")
     if isinstance(red_flags, list) and red_flags:
         return False, "contraindication_red_flags"
+    safety = decision.get("safety") if isinstance(decision.get("safety"), dict) else {}
+    if safety.get("unsafe_medical_claim") or safety.get("tries_to_book_without_rules"):
+        return False, "unsafe_decision"
     if session.get("booked") or session.get("manual_takeover") or session.get("ai_muted") or session.get("refund_claim_admin_required") or session.get("old_chat_ai_disabled"):
         return False, "protected_flow"
     if action == "ask_name" and not session.get("selected_slot"):
@@ -136,7 +140,9 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
     _safe_log(chat_id, "openai_brain_called", {"chat_id": chat_id, "step": session.get("step") or "start", "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "extracted_preview": {}})
     decision, debug = await run_openai_dialog_brain(user_text=text, session={**session, "chat_id": chat_id}, recent_history=state.get_history(chat_id)[-6:] if hasattr(state, "get_history") else None, available_slots=session.get("last_slots") or None)
     _apply_openai_brain_debug(session, debug)
-    _safe_log(chat_id, "openai_brain_decision", {"chat_id": chat_id, "step": session.get("step") or "start", "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": False, "guard_reason": "", "extracted_preview": {k: v for k, v in (decision.get("extracted") or {}).items() if v not in (None, "", [], {})}})
+    if decision.get("intent"):
+        session["openai_brain_intent"] = decision.get("intent")
+    _safe_log(chat_id, "openai_brain_decision", {"chat_id": chat_id, "step": session.get("step") or "start", "intent": decision.get("intent"), "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": False, "guard_reason": "", "extracted_preview": {k: v for k, v in (decision.get("extracted") or {}).items() if v not in (None, "", [], {})}})
     if decision.get("action") == "fallback_rule_based":
         session["openai_brain_fallback_used"] = True
         _safe_log(chat_id, "openai_brain_fallback_rule_based", {"chat_id": chat_id, "step": session.get("step") or "start", "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": False, "guard_reason": "", "fallback_reason": debug.get("openai_brain_skip_reason") or "fallback", "extracted_preview": decision.get("extracted") or {}})
@@ -601,9 +607,9 @@ YES_WORDS = [
 ]
 
 HARD_CONTRA_WORDS = [
-    "кардиостимулятор", "имплант", "металл", "метал", "металлоконструк",
+    "кардиостимулятор", "кардиостемулятор", "имплант", "кохлеар", "помпа", "инсулиновая помпа", "металл", "метал", "металлоконструк",
     "беремен", "беременность", "жүктілік", "жукцилик",
-    "онколог", "онкология", "рак", "эпилеп", "эпилепсия",
+    "онколог", "онкология", "рак", "эпилеп", "эпилепсия", "тромб", "тромбоз",
     "коляск", "костыл", "костыли", "ограниченная подвижность", "ограниченной подвижностью",
     "мүгедек арба", "арбамен", "таяқ", "балдақ",
 ]
@@ -2890,6 +2896,8 @@ async def _handle_cancel_appointment(chat_id: str, phone: str, session: dict[str
 
 def _contra_has_hard_stop(text: str) -> bool:
     low = _low(text)
+    if _looks_like_contra_term_question(low):
+        return False
 
     # Отрицания считаем только если "нет/жоқ" стоит рядом с конкретным словом.
     direct_neg_patterns = [
@@ -2912,9 +2920,46 @@ def _contra_has_hard_stop(text: str) -> bool:
         if negated:
             continue
 
-        return True
+        # Hard stop only when patient clearly confirms that the contraindication
+        # applies to them, not when they ask what a term means.
+        if len(low.split()) <= 3:
+            return True
+        explicit_confirm = (
+            re.search(rf"\b(?:у\s+меня|у\s+нас|мне|я|да|есть|имеется|беременна|беременен|беременность)\b[^?.!]*{w}", low)
+            or re.search(rf"{w}[^?.!]*\b(?:есть|имеется|бар)\b", low)
+            or (word.startswith("беремен") and re.search(r"\b(?:беременна|я\s+беременна|беременность\s+есть)\b", low))
+        )
+        if explicit_confirm:
+            return True
 
     return False
+
+
+def _looks_like_contra_term_question(low: str) -> bool:
+    return bool(re.search(r"\b(?:что\s+такое|что\s+значит|это\s+что|что\s+это|объясните|расскажите)\b", low)) and any(
+        word in low for word in HARD_CONTRA_WORDS
+    )
+
+
+def _contra_term_answer(text: str, session: dict[str, Any]) -> str | None:
+    low = _low(text)
+    if not _looks_like_contra_term_question(low):
+        return None
+    if "кохлеар" in low or "имплант" in low:
+        explanation = "Кохлеарный имплант — это электронное устройство для слуха, его ставят хирургически при выраженной потере слуха."
+    elif "тромб" in low:
+        explanation = "Тромбоз — это состояние, когда в сосуде образуется сгусток крови."
+    elif "помп" in low:
+        explanation = "Инсулиновая помпа — это устройство, которое подаёт инсулин пациентам с диабетом."
+    elif "металл" in low or "метал" in low:
+        explanation = "Металл в зоне лечения — это пластины, винты, штифты или другие металлические конструкции именно в области, где планируется процедура."
+    else:
+        explanation = "Это один из пунктов противопоказаний, который важен для безопасности перед записью."
+    return _tr(
+        session,
+        f"{explanation}\n\nПодскажите, пожалуйста, у Вас этого нет?",
+        f"{explanation}\n\nСізде осы жоқ па?",
+    )
 
 
 def _age_block_reason(age: int | None) -> str | None:
@@ -3663,6 +3708,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return _finalize(chat_id, session, answer)
 
         if step == "contraindications":
+            term_answer = _contra_term_answer(text, session)
+            if term_answer:
+                session["step"] = "contraindications"
+                session["questionnaire_step"] = "contra"
+                return _finalize(chat_id, session, term_answer)
             if _is_no_contra_answer(text) or _contra_is_clear_no(text):
                 _accept_no_contraindications(session, text or "нет")
                 session["step"] = "date"

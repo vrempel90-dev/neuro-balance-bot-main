@@ -158,25 +158,42 @@ async def generate_complaint_ack(text: str, lang: str = "ru", chat_id: str = "")
 
 
 
+DIALOG_BRAIN_INTENTS = {
+    "medical_question", "faq", "complaint", "age_answer", "contraindications_answer",
+    "contraindication_term_question", "date_preference", "slot_choice", "ask_human",
+    "booking_name", "unknown",
+}
+DIALOG_BRAIN_NEXT_STEPS = {
+    "complaint", "age", "contraindications", "date", "time", "name", "booked",
+    "escalated", "keep_current",
+}
 DIALOG_BRAIN_ACTIONS = {
     "ask_complaint", "ask_age", "ask_contraindications", "ask_date", "show_slots",
     "select_slot", "ask_name", "answer_faq_and_continue", "stop_contraindication",
     "handoff_admin", "no_reply", "fallback_rule_based",
 }
-DIALOG_BRAIN_TOOLS = {"none", "check_slots", "book_appointment", "cancel", "handoff"}
+DIALOG_BRAIN_TOOLS = {"none", "check_slots", "book_appointment", "refresh_slots", "handoff_admin", "cancel", "handoff"}
 
 OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
-Ты — LLM-мозг AI-администратора клиники Neuro Balance.
+Ты — живой AI-администратор клиники Neuro Balance в WhatsApp.
 
-Твоя задача — понимать пациента как живой человек в WhatsApp:
-- сообщения с ошибками;
-- короткие ответы;
-- несколько мыслей в одном сообщении;
-- смешанный русский/казахский;
-- контекст прошлых сообщений;
-- намерение пациента.
+Твоя задача — понимать пациента как нормальный живой человек, а не по ключевым словам.
 
-Ты НЕ выполняешь запись сам. Ты возвращаешь JSON-решение для Python-контроллера.
+Ты читаешь историю диалога и текущее сообщение. Пациент может писать:
+- с ошибками;
+- коротко;
+- не по порядку;
+- несколько вопросов в одном сообщении;
+- на русском, казахском или смешанно;
+- с уточнениями, сомнениями и бытовыми фразами.
+
+Ты должен понять смысл и вернуть JSON-решение для Python.
+
+Ты НЕ выполняешь CRM-запись сам.
+Ты НЕ придумываешь слоты.
+Ты НЕ ставишь диагноз.
+Ты НЕ обещаешь лечение.
+Ты НЕ нарушаешь порядок записи.
 
 Клиника Neuro Balance помогает с:
 - болью в спине, пояснице, шее;
@@ -199,14 +216,14 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 - психиатрией;
 - возвратами/рассрочками/претензиями.
 
-Строгий сценарий записи:
+Строгий сценарий:
 1. Понять жалобу.
-2. Если профильная — спросить возраст.
-3. После возраста — спросить противопоказания.
-4. После отсутствия противопоказаний — спросить дату.
-5. После даты Python показывает реальные слоты.
-6. После выбора слота — спросить имя.
-7. После имени Python бронирует CRM.
+2. Спросить возраст.
+3. Спросить противопоказания.
+4. После отсутствия противопоказаний спросить дату.
+5. Python показывает реальные слоты.
+6. После выбора слота спросить имя.
+7. Python бронирует запись.
 
 Нельзя:
 - спрашивать имя до выбора слота;
@@ -223,7 +240,24 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 - придумывать противопоказания;
 - менять “нет” на “да”.
 
-Тебе нужно уметь сжимать несколько шагов в одном сообщении, если это безопасно.
+Важное правило:
+Отличай вопрос о термине от подтверждения противопоказания.
+
+Пример:
+Пациент: "Что такое кохлеарный имплант?"
+Это НЕ значит, что он у него есть.
+Нужно объяснить термин и снова уточнить, есть ли это у пациента.
+
+Пациент: "У меня есть кохлеарный имплант"
+Это уже противопоказание / hard stop.
+
+Пример:
+Пациент: "А сколько длится процедура?"
+Это FAQ. Ответь на вопрос и вернись к текущему шагу.
+
+Пример:
+Пациент: "Позови человека"
+Это запрос живого администратора. Нужно handoff_admin.
 
 Примеры:
 "34, все чисто, можно в понеддельник не рано?"
@@ -274,20 +308,52 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 Не используй фразу “С такими жалобами к нам обращаются”.
 Не используй фразу “Вижу Ваш запрос” без необходимости.
 
-Верни только JSON строго по схеме.
+Верни только JSON строго по схеме:
+{
+  "intent": "medical_question | faq | complaint | age_answer | contraindications_answer | contraindication_term_question | date_preference | slot_choice | ask_human | booking_name | unknown",
+  "patient_meaning": "что пациент имел в виду",
+  "reply": "живой ответ пациенту",
+  "next_step": "complaint | age | contraindications | date | time | name | booked | escalated | keep_current",
+  "extracted": {
+    "complaint": "",
+    "age": null,
+    "contraindications_clear": null,
+    "contraindication_confirmed": false,
+    "contraindication_term_asked": "",
+    "preferred_date_text": "",
+    "time_preference": "",
+    "slot_choice": null,
+    "patient_name": "",
+    "wants_human": false,
+    "faq_type": "",
+    "language": "ru"
+  },
+  "needs_python_tool": "none | check_slots | book_appointment | refresh_slots | handoff_admin",
+  "safety": {
+    "hard_stop": false,
+    "reason": "",
+    "unsafe_medical_claim": false,
+    "tries_to_book_without_rules": false
+  }
+}
 """.strip()
 
 
 def _dialog_brain_fallback(reason: str) -> tuple[dict, dict]:
     decision = {
+        "intent": "unknown",
         "action": "fallback_rule_based",
+        "next_step": "keep_current",
+        "patient_meaning": "",
         "reply": "",
         "extracted": {
             "complaint": "", "age": None, "contraindications_clear": None,
+            "contraindication_confirmed": False, "contraindication_term_asked": "",
             "contraindication_red_flags": [], "preferred_date_text": "", "time_preference": "", "slot_choice": None,
-            "patient_name": "", "faq_type": "", "language": "ru",
+            "patient_name": "", "wants_human": False, "faq_type": "", "language": "ru",
         },
         "needs_python_tool": "none",
+        "safety": {"hard_stop": False, "reason": "", "unsafe_medical_claim": False, "tries_to_book_without_rules": False},
         "safety_flags": {
             "promised_cure": False, "asked_name_too_early": False,
             "offered_date_before_contra": False, "medical_diagnosis": False,
@@ -298,41 +364,95 @@ def _dialog_brain_fallback(reason: str) -> tuple[dict, dict]:
             state.log_event("system", "openai_brain_fallback_rule_based", {"reason": reason})
         except Exception:
             pass
-    return decision, {"openai_brain_used": False, "openai_brain_fallback_used": True, "openai_brain_skip_reason": reason}
+    return decision, {"openai_brain_used": False, "openai_brain_intent": "unknown", "openai_brain_fallback_used": True, "openai_brain_skip_reason": reason}
+
+
+def _action_from_structured(intent: str, next_step: str, tool: str, safety: dict, extracted: dict) -> str:
+    if safety.get("hard_stop") or extracted.get("contraindication_confirmed") is True:
+        return "stop_contraindication"
+    if intent == "ask_human" or extracted.get("wants_human") is True or tool in {"handoff_admin", "handoff"} or next_step == "escalated":
+        return "handoff_admin"
+    if intent == "contraindication_term_question":
+        return "answer_faq_and_continue"
+    if intent == "faq":
+        return "answer_faq_and_continue"
+    if intent == "complaint" or next_step == "age":
+        return "ask_age"
+    if intent == "age_answer" or next_step == "contraindications":
+        return "ask_contraindications"
+    if tool == "check_slots" or next_step == "time":
+        return "show_slots"
+    if intent == "date_preference" or next_step == "date":
+        return "ask_date"
+    if intent == "slot_choice" or next_step == "name":
+        return "select_slot" if extracted.get("slot_choice") else "ask_name"
+    if intent == "booking_name" or next_step == "booked":
+        return "ask_name"
+    return "fallback_rule_based" if intent == "unknown" else "answer_faq_and_continue"
 
 
 def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
     if not isinstance(raw, dict):
         return {}, "not_object"
+    intent = str(raw.get("intent") or "")
+    next_step = str(raw.get("next_step") or "keep_current")
+    extracted = raw.get("extracted") if isinstance(raw.get("extracted"), dict) else {}
+    safety = raw.get("safety") if isinstance(raw.get("safety"), dict) else {}
+    tool = str(raw.get("needs_python_tool") or "none")
     action = str(raw.get("action") or "")
+    if not action and intent:
+        if intent not in DIALOG_BRAIN_INTENTS:
+            return {}, "invalid_intent"
+        if next_step not in DIALOG_BRAIN_NEXT_STEPS:
+            return {}, "invalid_next_step"
+        action = _action_from_structured(intent, next_step, tool, safety, extracted)
+    if not intent:
+        intent = {
+            "ask_age": "complaint", "ask_contraindications": "age_answer", "ask_date": "contraindications_answer",
+            "show_slots": "date_preference", "select_slot": "slot_choice", "ask_name": "booking_name",
+            "answer_faq_and_continue": "faq", "stop_contraindication": "contraindications_answer",
+            "handoff_admin": "ask_human", "fallback_rule_based": "unknown", "no_reply": "unknown",
+        }.get(action, "unknown")
+    if intent not in DIALOG_BRAIN_INTENTS:
+        return {}, "invalid_intent"
     if action not in DIALOG_BRAIN_ACTIONS:
         return {}, "invalid_action"
-    tool = str(raw.get("needs_python_tool") or "none")
     if tool not in DIALOG_BRAIN_TOOLS:
         return {}, "invalid_tool"
-    extracted = raw.get("extracted") if isinstance(raw.get("extracted"), dict) else {}
-    safety = raw.get("safety_flags") if isinstance(raw.get("safety_flags"), dict) else {}
+    safety_flags = raw.get("safety_flags") if isinstance(raw.get("safety_flags"), dict) else {}
     decision = {
+        "intent": intent,
         "action": action,
+        "next_step": next_step,
+        "patient_meaning": str(raw.get("patient_meaning") or ""),
         "reply": str(raw.get("reply") or ""),
         "extracted": {
             "complaint": str(extracted.get("complaint") or ""),
             "age": extracted.get("age"),
             "contraindications_clear": extracted.get("contraindications_clear"),
+            "contraindication_confirmed": bool(extracted.get("contraindication_confirmed")),
+            "contraindication_term_asked": str(extracted.get("contraindication_term_asked") or ""),
             "contraindication_red_flags": extracted.get("contraindication_red_flags") if isinstance(extracted.get("contraindication_red_flags"), list) else [],
             "preferred_date_text": str(extracted.get("preferred_date_text") or ""),
             "time_preference": str(extracted.get("time_preference") or ""),
             "slot_choice": extracted.get("slot_choice"),
             "patient_name": str(extracted.get("patient_name") or ""),
+            "wants_human": bool(extracted.get("wants_human")),
             "faq_type": str(extracted.get("faq_type") or ""),
             "language": str(extracted.get("language") or "ru"),
         },
         "needs_python_tool": tool,
+        "safety": {
+            "hard_stop": bool(safety.get("hard_stop")),
+            "reason": str(safety.get("reason") or ""),
+            "unsafe_medical_claim": bool(safety.get("unsafe_medical_claim")),
+            "tries_to_book_without_rules": bool(safety.get("tries_to_book_without_rules")),
+        },
         "safety_flags": {
-            "promised_cure": bool(safety.get("promised_cure")),
-            "asked_name_too_early": bool(safety.get("asked_name_too_early")),
-            "offered_date_before_contra": bool(safety.get("offered_date_before_contra")),
-            "medical_diagnosis": bool(safety.get("medical_diagnosis")),
+            "promised_cure": bool(safety_flags.get("promised_cure") or safety.get("unsafe_medical_claim")),
+            "asked_name_too_early": bool(safety_flags.get("asked_name_too_early")),
+            "offered_date_before_contra": bool(safety_flags.get("offered_date_before_contra") or safety.get("tries_to_book_without_rules")),
+            "medical_diagnosis": bool(safety_flags.get("medical_diagnosis")),
         },
     }
     if action not in {"no_reply", "fallback_rule_based", "show_slots", "select_slot"} and not decision["reply"].strip():
@@ -350,7 +470,7 @@ async def run_openai_dialog_brain(
 ) -> tuple[dict, dict]:
     settings = get_settings()
     model = getattr(settings, "openai_model", "")
-    debug = {"openai_brain_used": False, "openai_brain_action": "", "openai_brain_needs_python_tool": "", "openai_brain_extracted": {}, "openai_brain_guard_failed": False, "openai_brain_guard_reason": "", "openai_brain_skip_reason": "", "openai_brain_fallback_used": False, "openai_model": model}
+    debug = {"openai_brain_used": False, "openai_brain_intent": "", "openai_brain_action": "", "openai_brain_needs_python_tool": "", "openai_brain_extracted": {}, "openai_brain_guard_failed": False, "openai_brain_guard_reason": "", "openai_brain_skip_reason": "", "openai_brain_fallback_used": False, "openai_model": model}
     if not getattr(settings, "ai_enabled", True) or not getattr(settings, "openai_api_key", "") or AsyncOpenAI is None:
         decision, fb = _dialog_brain_fallback("config_missing")
         debug.update(fb)
@@ -391,7 +511,7 @@ async def run_openai_dialog_brain(
             decision, fb = _dialog_brain_fallback(reason)
             debug.update(fb)
             return decision, debug
-        debug.update({"openai_brain_used": True, "openai_brain_action": decision["action"], "openai_brain_needs_python_tool": decision["needs_python_tool"], "openai_brain_extracted": decision["extracted"]})
+        debug.update({"openai_brain_used": True, "openai_brain_intent": decision["intent"], "openai_brain_action": decision["action"], "openai_brain_needs_python_tool": decision["needs_python_tool"], "openai_brain_extracted": decision["extracted"]})
         if state is not None:
             state.log_event(str(session.get("chat_id") or "system"), "openai_brain_decision", {"chat_id": str(session.get("chat_id") or "system"), "step": summary["step"], "action": decision["action"], "needs_python_tool": decision["needs_python_tool"], "guard_failed": False, "guard_reason": "", "extracted_preview": {k: v for k, v in decision["extracted"].items() if v not in (None, "", [], {})}})
         return decision, debug
