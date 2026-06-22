@@ -1117,3 +1117,158 @@ def test_static_dialog_template_wiring_and_tr_arity() -> None:
     returning = dialog._clinic_answer("Я уже была у вас раньше", escalated_session)
     assert returning and "когда Вы у нас были" in returning
     assert escalated_session["step"] == "escalated"
+
+
+def _crm_response_error(status: int, data: dict[str, Any]) -> crm.CRMResponseError:
+    import httpx
+
+    response = httpx.Response(status, json=data, request=httpx.Request("POST", "https://crm.test/api/bot/book"))
+    return crm.CRMResponseError("book", response, data)
+
+
+def test_crm_book_new_contract_success_and_payload(monkeypatch: Any) -> None:
+    calls = setup_crm(monkeypatch)
+    chat_id = "crm_new_contract_success"
+    reset(chat_id, {
+        "step": "name",
+        "language": "ru",
+        "language_locked": True,
+        "complaint": "спина",
+        "age": 31,
+        "contraindications_ok": True,
+        "selected_slot": {"doctorLogin": "zhuma_md", "doctorName": "Жумабеков М.", "date": "2026-06-22", "timeStart": "10:40"},
+    })
+
+    result = answer(chat_id, "Алия")
+    session = state.get_session(chat_id)
+
+    assert "запись подтверждена" in result.lower()
+    assert session["step"] == "booked"
+    assert session["ai_muted"] is True
+    assert session["appointment"]["appointmentId"] == 999
+    assert calls["book"] == [{
+        "patient_name": "Алия",
+        "phone": "77011234567",
+        "doctor_login": "zhuma_md",
+        "doctor_name": "Жумабеков М.",
+        "date": "2026-06-22",
+        "time_start": "10:40",
+        "notes": calls["book"][0]["notes"],
+    }]
+    assert "doctor_id" not in calls["book"][0]
+    assert "service_id" not in calls["book"][0]
+
+
+def test_format_slots_maps_availability_to_booking_contract_object() -> None:
+    slots = dialog._format_slots({"availability": [{"doctorLogin": "zhuma_md", "doctorName": "Жумабеков М.", "date": "2026-06-22", "availableSlots": ["09:00"]}]})
+    assert slots[0]["doctorLogin"] == "zhuma_md"
+    assert slots[0]["doctorName"] == "Жумабеков М."
+    assert slots[0]["date"] == "2026-06-22"
+    assert slots[0]["timeStart"] == "09:00"
+
+
+def test_crm_book_409_slot_conflict_refreshes_slots(monkeypatch: Any) -> None:
+    calls = {"book": [], "slots": []}
+
+    async def fake_book_appointment(**kwargs: Any) -> dict[str, Any]:
+        calls["book"].append(kwargs)
+        raise _crm_response_error(409, {"error": "Этот слот уже занят", "code": "slot_conflict", "conflicts": []})
+
+    async def fake_check_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
+        calls["slots"].append({"date": date, "doctor_login": doctor_login})
+        return {"availability": [{"doctorLogin": "zhuma_md", "doctorName": "Жумабеков М.", "date": date, "availableSlots": ["11:20", "12:00"]}]}
+
+    monkeypatch.setattr(crm, "book_appointment", fake_book_appointment)
+    monkeypatch.setattr(crm, "check_slots", fake_check_slots)
+    chat_id = "crm_conflict_refresh"
+    reset(chat_id, {"step": "name", "language": "ru", "language_locked": True, "complaint": "спина", "age": 31, "contraindications_ok": True, "selected_slot": {"doctorLogin": "zhuma_md", "doctorName": "Жумабеков М.", "date": "2026-06-22", "timeStart": "10:40"}})
+
+    result = answer(chat_id, "Алия")
+    session = state.get_session(chat_id)
+
+    assert "окошко уже заняли" in result.lower()
+    assert "11:20" in result
+    assert calls["slots"] == [{"date": "2026-06-22", "doctor_login": None}]
+    assert session["step"] == "time"
+    assert "selected_slot" not in session
+
+
+def test_crm_book_409_doctor_not_scheduled_refreshes_slots(monkeypatch: Any) -> None:
+    async def fake_book_appointment(**kwargs: Any) -> dict[str, Any]:
+        raise _crm_response_error(409, {"error": "Врач вне расписания", "code": "doctor_not_scheduled"})
+
+    async def fake_check_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
+        return {"availability": [{"doctorLogin": "other", "doctorName": "Другой врач", "date": date, "availableSlots": ["14:00"]}]}
+
+    monkeypatch.setattr(crm, "book_appointment", fake_book_appointment)
+    monkeypatch.setattr(crm, "check_slots", fake_check_slots)
+    chat_id = "crm_doctor_not_scheduled"
+    reset(chat_id, {"step": "name", "language": "ru", "language_locked": True, "complaint": "спина", "age": 31, "contraindications_ok": True, "selected_slot": {"doctorLogin": "zhuma_md", "doctorName": "Жумабеков М.", "date": "2026-06-22", "timeStart": "10:40"}})
+
+    result = answer(chat_id, "Алия")
+    session = state.get_session(chat_id)
+
+    assert "14:00" in result
+    assert session["step"] == "time"
+    assert "selected_slot" not in session
+
+
+def test_crm_book_500_logs_body_and_escalates(monkeypatch: Any) -> None:
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def fake_book_appointment(**kwargs: Any) -> dict[str, Any]:
+        raise _crm_response_error(500, {"error": "boom"})
+
+    monkeypatch.setattr(crm, "book_appointment", fake_book_appointment)
+    monkeypatch.setattr(state, "log_event", lambda chat_id, event, payload: events.append((chat_id, event, payload)))
+    chat_id = "crm_500_escalates"
+    reset(chat_id, {"step": "name", "language": "ru", "language_locked": True, "complaint": "спина", "age": 31, "contraindications_ok": True, "selected_slot": {"doctorLogin": "zhuma_md", "doctorName": "Жумабеков М.", "date": "2026-06-22", "timeStart": "10:40"}})
+
+    result = answer(chat_id, "Алия")
+    session = state.get_session(chat_id)
+
+    assert "администратору" in result.lower()
+    assert session["step"] == "escalated"
+    assert session.get("escalated") is True
+    assert any(item.get("name") == "escalate_to_human" for item in session.get("tool_history", []))
+    assert events[-1][1] == "crm_book_error"
+    assert events[-1][2]["status_code"] == 500
+    assert "boom" in events[-1][2]["response_text"]
+
+
+def test_crm_book_http_payload_uses_new_contract(monkeypatch: Any) -> None:
+    import httpx
+
+    captured: dict[str, Any] = {}
+
+    class FakeClient:
+        async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+            captured["url"] = url
+            captured.update(kwargs)
+            return httpx.Response(201, json={"appointmentId": 789, "doctorName": "Жумабеков М.", "date": "2026-06-22", "timeStart": "10:40", "timeEnd": "11:20"}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(crm, "_client", lambda: FakeClient())
+
+    booked = run(crm.book_appointment(
+        patient_name="Айгерим",
+        phone="+77021234567",
+        doctor_login="zhuma_md",
+        doctor_name="Жумабеков М.",
+        date="2026-06-22",
+        time_start="10:40",
+        notes="комментарий",
+    ))
+
+    assert booked["appointmentId"] == 789
+    assert captured["url"].endswith("/api/bot/book")
+    assert captured["json"] == {
+        "patientName": "Айгерим",
+        "phone": "77021234567",
+        "doctorLogin": "zhuma_md",
+        "date": "2026-06-22",
+        "timeStart": "10:40",
+        "doctorName": "Жумабеков М.",
+        "notes": "комментарий",
+    }
+    assert "doctorId" not in captured["json"]
+    assert "serviceId" not in captured["json"]

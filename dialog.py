@@ -2148,9 +2148,12 @@ def _format_slots(slots_data: dict[str, Any], max_count: int = 5) -> list[dict[s
             if not time_start:
                 continue
             result.append({
+                "doctorLogin": str(doctor_login),
+                "doctorName": str(doctor_name),
+                "date": str(date),
+                "timeStart": str(time_start),
                 "doctor_login": str(doctor_login),
                 "doctor_name": str(doctor_name),
-                "date": str(date),
                 "time": str(time_start),
             })
             if len(result) >= max_count:
@@ -2159,13 +2162,19 @@ def _format_slots(slots_data: dict[str, Any], max_count: int = 5) -> list[dict[s
     # Fallback format: {"slots":[...]}
     for item in slots_data.get("slots", []) or []:
         if isinstance(item, str):
-            result.append({"doctor_login": "", "doctor_name": "Врач клиники", "date": "", "time": item})
+            result.append({"doctorLogin": "", "doctorName": "Врач клиники", "date": "", "timeStart": item, "doctor_login": "", "doctor_name": "Врач клиники", "time": item})
         elif isinstance(item, dict):
+            doctor_login = str(item.get("doctorLogin") or item.get("doctor_login") or "")
+            doctor_name = str(item.get("doctorName") or item.get("doctor_name") or "Врач клиники")
+            time_start = str(item.get("timeStart") or item.get("time_start") or item.get("time") or "")
             result.append({
-                "doctor_login": str(item.get("doctorLogin") or item.get("doctor_login") or ""),
-                "doctor_name": str(item.get("doctorName") or item.get("doctor_name") or "Врач клиники"),
+                "doctorLogin": doctor_login,
+                "doctorName": doctor_name,
                 "date": str(item.get("date") or ""),
-                "time": str(item.get("timeStart") or item.get("time") or ""),
+                "timeStart": time_start,
+                "doctor_login": doctor_login,
+                "doctor_name": doctor_name,
+                "time": time_start,
             })
         if len(result) >= max_count:
             return result
@@ -2555,6 +2564,26 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
     )
 
 
+
+
+async def _refresh_slots_after_book_conflict(chat_id: str, session: dict[str, Any], date_iso: str) -> str:
+    try:
+        crm.clear_slots_cache(date_iso)
+    except Exception:
+        pass
+
+    prefix = _tr(
+        session,
+        "К сожалению, это окошко уже заняли 🌿 Сейчас покажу актуальные свободные варианты.",
+        "Өкінішке қарай, бұл уақытты жаңа ғана алып қойды 🌿 Қазір өзекті бос уақыттарды көрсетемін.",
+    )
+    session.pop("selected_slot", None)
+    session.pop("selected_time", None)
+    session["step"] = "time"
+    refreshed = await _show_slots(chat_id, session, date_iso)
+    session["step"] = "time"
+    return prefix + "\n\n" + refreshed
+
 async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
     normalized_phone = sanitize_kz_phone(phone or session.get("phone") or "")
     slot = session.get("selected_slot") or {}
@@ -2647,6 +2676,31 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
                 "Егер жоқ болса — ештеңе етпейді, дәрігер қажет болса өзі айтады."
             ),
         )
+    except crm.CRMResponseError as exc:
+        log_payload = {
+            "error": str(exc)[:500],
+            "status_code": exc.status_code,
+            "response_text": exc.response_text[:2000],
+            "response_json": exc.data,
+            "code": exc.code,
+            "gate": bot_tools.booking_gate_status(session),
+            "doctor_login": _slot_doctor_login(slot),
+            "date": _slot_date(slot) or session.get("preferred_date"),
+            "time_start": _slot_time(slot),
+            "selected_slot": slot,
+        }
+        _safe_log(chat_id, "crm_book_error", log_payload)
+
+        if exc.status_code == 409 and exc.code in {"slot_conflict", "doctor_not_scheduled"}:
+            return await _refresh_slots_after_book_conflict(
+                chat_id, session, _slot_date(slot) or session.get("preferred_date") or ""
+            )
+
+        session["step"] = "escalated"
+        session["escalated"] = True
+        session["handoff_reason"] = f"crm_book_{exc.status_code}"
+        bot_tools.escalate_to_human(session, session["handoff_reason"])
+        return _crm_fallback_answer(session)
     except Exception as exc:
         _safe_log(
             chat_id,
@@ -2662,6 +2716,7 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         )
         session["step"] = "escalated"
         session["escalated"] = True
+        bot_tools.escalate_to_human(session, "crm_book_exception")
         return _crm_fallback_answer(session)
 
 
@@ -3657,9 +3712,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
                         + _tr(session, "Какое время из вариантов выше Вам удобно?", "Жоғарыдағы уақыттардың қайсысы ыңғайлы?"),
                     )
                 return _finalize(chat_id, session, _mandatory_step_prompt(session, "time"))
-            session["selected_slot"] = slot
-            session["selected_date"] = _slot_date(slot) or session.get("preferred_date")
-            session["selected_time"] = _slot_time(slot)
+            _remember_selected_slot(session, slot)
             session["step"] = "name"
             session["questionnaire_step"] = "name"
             answer = _ask_name(session)
