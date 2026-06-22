@@ -38,6 +38,7 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "openai_skip_reason": session.get("openai_skip_reason") or "",
         "openai_guard_failed": bool(session.get("openai_guard_failed")),
         "openai_brain_used": bool(session.get("openai_brain_used")),
+        "openai_brain_intent": session.get("openai_brain_intent") or "",
         "openai_brain_action": session.get("openai_brain_action") or "",
         "openai_brain_needs_python_tool": session.get("openai_brain_needs_python_tool") or "",
         "openai_brain_extracted": session.get("openai_brain_extracted") or {},

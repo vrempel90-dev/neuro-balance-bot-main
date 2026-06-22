@@ -354,3 +354,97 @@ def test_production_age_date_without_clear_keeps_contra_gate(monkeypatch: Any) -
     assert not calls
     assert session["step"] == "contraindications"
     assert "противопоказ" in answer.lower()
+
+
+def test_contraindication_term_question_is_not_hard_stop(monkeypatch: Any) -> None:
+    chat_id = "brain_term_question"
+    reset(chat_id, {"step": "contraindications", "age": 34})
+
+    async def fake_brain(**kwargs: Any):
+        return brain(
+            "answer_faq_and_continue",
+            "Кохлеарный имплант — это электронное устройство для слуха. Подскажите, у Вас его нет?",
+            {"contraindication_term_asked": "кохлеарный имплант"},
+        )
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+    answer = run(handle_message(chat_id, "77011234567", "Что такое кохлеарный имплант?"))
+    session = state.get_session(chat_id)
+    assert session["step"] == "contraindications"
+    assert session.get("manual_takeover") is not True
+    assert session.get("hard_contraindication_stop") is not True
+    assert "устройство" in answer.lower()
+    assert "у вас" in answer.lower()
+
+
+def test_real_contraindication_stops_booking_after_brain_fallback(monkeypatch: Any) -> None:
+    chat_id = "brain_real_contra"
+    reset(chat_id, {"step": "contraindications", "age": 34})
+
+    async def fallback_brain(**kwargs: Any):
+        return brain("fallback_rule_based", "", {}, "none")
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fallback_brain)
+    answer = run(handle_message(chat_id, "77011234567", "У меня есть кохлеарный имплант"))
+    session = state.get_session(chat_id)
+    assert session["step"] == "stopped"
+    assert session.get("contraindications_ok") is False
+    assert "противопоказ" in answer.lower()
+
+
+def test_faq_on_time_step_preserves_slots(monkeypatch: Any) -> None:
+    chat_id = "brain_time_faq"
+    slots = [
+        {"date": "2099-01-01", "time": "10:00", "doctorLogin": "d", "doctorName": "Врач"},
+        {"date": "2099-01-01", "time": "12:00", "doctorLogin": "d", "doctorName": "Врач"},
+    ]
+    reset(chat_id, {"step": "time", "last_slots": slots, "contraindications_ok": True})
+
+    async def fake_brain(**kwargs: Any):
+        return brain(
+            "answer_faq_and_continue",
+            "Длительность зависит от врача и процедуры, обычно точнее скажут после осмотра.",
+            {"faq_type": "duration"},
+        )
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+    answer = run(handle_message(chat_id, "77011234567", "А сколько длится процедура?"))
+    session = state.get_session(chat_id)
+    assert session["step"] == "time"
+    assert session["last_slots"] == slots
+    assert "длительность" in answer.lower()
+    assert "какое время" in answer.lower()
+
+
+def test_ask_human_sets_manual_takeover_and_next_message_silent(monkeypatch: Any) -> None:
+    chat_id = "brain_ask_human"
+    reset(chat_id, {"step": "age", "complaint": "спина"})
+
+    async def fake_brain(**kwargs: Any):
+        return brain("handoff_admin", "Хорошо, передаю администратору. Он подключится и ответит Вам 🌿", {"wants_human": True}, "handoff_admin")
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+    answer = run(handle_message(chat_id, "77011234567", "Позови человека"))
+    session = state.get_session(chat_id)
+    assert session["manual_takeover"] is True
+    assert session["step"] == "escalated"
+    assert "администратор" in answer.lower()
+    assert run(handle_message(chat_id, "77011234567", "вы тут?")) == ""
+
+
+def test_slot_slang_second_variant_selects_second_slot(monkeypatch: Any) -> None:
+    chat_id = "brain_slot_slang"
+    slots = [
+        {"date": "2099-01-01", "time": "10:00", "doctorLogin": "d", "doctorName": "Врач"},
+        {"date": "2099-01-01", "time": "12:00", "doctorLogin": "d", "doctorName": "Врач"},
+    ]
+    reset(chat_id, {"step": "time", "last_slots": slots, "contraindications_ok": True})
+
+    async def fallback_brain(**kwargs: Any):
+        return brain("fallback_rule_based", "", {}, "none")
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fallback_brain)
+    run(handle_message(chat_id, "77011234567", "2 варик"))
+    session = state.get_session(chat_id)
+    assert session["selected_slot"] == slots[1]
+    assert session["step"] == "name"
