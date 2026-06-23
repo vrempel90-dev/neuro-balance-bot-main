@@ -435,9 +435,17 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
     phone = str(message.get("phone") or chat_id)
     kind = str(message.get("kind") or "text")
 
-    # Вне рабочего времени бот полностью молчит.
+    # AI-админ работает только в night-only окне (20:00–08:00 Astana).
+    # В рабочее время (08:00–20:00) Wazzup/webhook полностью молчит:
+    # не запускаем Dialog Brain и не вызываем humanize_reply.
     if not is_bot_work_time():
-        state.log_event(chat_id, "silent_outside_work_time", {"kind": kind})
+        session = _get_session_safe(chat_id)
+        session["no_reply_reason"] = "working_hours_ai_disabled"
+        session["openai_used"] = False
+        session["openai_brain_used"] = False
+        session["openai_brain_skip_reason"] = "working_hours_ai_disabled"
+        state.save_session(chat_id, session)
+        state.log_event(chat_id, "working_hours_ai_disabled", {"kind": kind, "source": message.get("source") or "wazzup"})
         return ""
 
     if kind == "voice" or _message_has_voice_url(message):
@@ -728,6 +736,13 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
     force = bool(data.get("force") or False)
 
     if not force and not is_bot_work_time():
+        session = state.get_session(chat_id)
+        session["no_reply_reason"] = "working_hours_ai_disabled"
+        session["openai_used"] = False
+        session["openai_brain_used"] = False
+        session["openai_brain_skip_reason"] = "working_hours_ai_disabled"
+        state.save_session(chat_id, session)
+        state.log_event(chat_id, "working_hours_ai_disabled", {"phone": phone, "text_preview": _preview(text, 120), "force": force, "source": "debug"})
         answer = ""
     else:
         if force:
