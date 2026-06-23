@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 try:
     from openai import AsyncOpenAI
@@ -16,6 +17,16 @@ try:
 except Exception:
     state = None
 from services import classify_by_keywords
+
+
+@lru_cache(maxsize=1)
+def _rendered_system_prompt() -> str:
+    """Load the rendered prompt as the canonical clinic source of truth."""
+    path = Path(__file__).resolve().parent / "SYSTEM_PROMPT_rendered.md"
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
 
 
 @lru_cache(maxsize=1)
@@ -339,6 +350,25 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 """.strip()
 
 
+def _full_dialog_brain_system_prompt() -> str:
+    rendered = _rendered_system_prompt()
+    if not rendered:
+        return OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
+    overrides = """
+
+PROJECT OVERRIDES — Python enforces these above any older prompt text:
+- AI works only outside contact-center hours: 20:00–08:00 Astana.
+- Ask name only after a CRM slot was selected.
+- Booking order: complaint → age → contraindications → date → CRM slots → time choice → name → CRM booking.
+- Contraindications are always before slots.
+- CRM is the only source of slots/availability; session.last_slots is the only source of shown slots.
+- selected_slot is the only source of booking payload.
+- Contraindication term questions are not hard stops.
+- booked/manual/refund/voice/escalated/old-chat states must not call OpenAI.
+"""
+    return rendered + overrides + "\n\n" + OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
+
+
 def _dialog_brain_fallback(reason: str) -> tuple[dict, dict]:
     decision = {
         "intent": "unknown",
@@ -394,10 +424,23 @@ def _action_from_structured(intent: str, next_step: str, tool: str, safety: dict
 def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
     if not isinstance(raw, dict):
         return {}, "not_object"
+    allowed_top = {"intent", "action", "next_step", "patient_meaning", "reply", "extracted", "needs_python_tool", "safety", "safety_flags"}
+    if any(k not in allowed_top for k in raw.keys()):
+        return {}, "schema_extra_top_level"
     intent = str(raw.get("intent") or "")
     next_step = str(raw.get("next_step") or "keep_current")
     extracted = raw.get("extracted") if isinstance(raw.get("extracted"), dict) else {}
     safety = raw.get("safety") if isinstance(raw.get("safety"), dict) else {}
+    allowed_extracted = {
+        "complaint", "age", "contraindications_clear", "contraindication_confirmed",
+        "contraindication_term_asked", "contraindication_red_flags", "preferred_date_text",
+        "time_preference", "slot_choice", "patient_name", "wants_human", "faq_type", "language",
+    }
+    allowed_safety = {"hard_stop", "reason", "unsafe_medical_claim", "tries_to_book_without_rules"}
+    if any(k not in allowed_extracted for k in extracted.keys()):
+        return {}, "schema_extra_extracted"
+    if any(k not in allowed_safety for k in safety.keys()):
+        return {}, "schema_extra_safety"
     tool = str(raw.get("needs_python_tool") or "none")
     action = str(raw.get("action") or "")
     if not action and intent:
@@ -495,7 +538,7 @@ async def run_openai_dialog_brain(
             max_tokens=700,
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT},
+                {"role": "system", "content": _full_dialog_brain_system_prompt()},
                 {"role": "user", "content": json.dumps({"user_text": user_text or "", "session": summary, "recent_history": recent_history or []}, ensure_ascii=False)},
             ],
         )
