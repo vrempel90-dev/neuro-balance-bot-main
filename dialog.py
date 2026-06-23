@@ -40,6 +40,11 @@ except Exception:
 OPENAI_BRAIN_ALLOWED_STEPS = {"complaint", "age", "contraindications", "date", "time", "select_slot", "name"}
 OPENAI_BRAIN_MULTI_ENTITY_STEPS = {"age", "contraindications", "date"}
 OPENAI_BRAIN_ALLOWED_GATES = {"new_lead", "new_lead_like_message", "active_ai_lead", "active_conversation_reply"}
+APPROVED_CONTRA_TERMS = {
+    "кардиостимулятор", "беременность", "онкология", "металл", "металлическ",
+    "имплант", "кохлеар", "эпилепсия", "тромбоз", "кровотеч", "температур",
+    "инфекц", "сердеч", "дыхательн", "психическ",
+}
 
 
 def _reset_openai_brain_debug(session: dict[str, Any]) -> None:
@@ -72,7 +77,7 @@ def _openai_brain_skip_reason(session: dict[str, Any], text: str) -> str:
         return "booked_or_handoff"
     if step == "name" and session.get("selected_slot"):
         return "python_owned_booking"
-    if session.get("manual_takeover") or session.get("manual_admin_intervention") or session.get("ai_muted") or session.get("do_not_reply"):
+    if session.get("manual_takeover") or session.get("manual_admin_intervention") or session.get("ai_muted") or session.get("do_not_reply") or session.get("escalated"):
         return "manual_or_muted"
     if session.get("refund_claim_admin_required") or session.get("gate_reason") == "refund_claim_admin_required":
         return "refund_or_claim"
@@ -95,9 +100,25 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
     extracted = decision.get("extracted") if isinstance(decision.get("extracted"), dict) else {}
     reply = str(decision.get("reply") or "")
     step = str(session.get("step") or "start")
+    next_step = str(decision.get("next_step") or "")
+    if action == "show_slots" and tool != "check_slots":
+        return False, "slots_without_crm_tool"
+    if tool == "check_slots" and action != "show_slots":
+        return False, "crm_tool_action_mismatch"
+    if action == "select_slot" and not (session.get("last_slots") or []):
+        return False, "select_slot_without_last_slots"
+    if next_step == "booked" or tool == "book_appointment":
+        return False, "llm_attempted_booking"
+    if extracted.get("patient_name") and not session.get("selected_slot"):
+        return False, "extracted_name_before_slot"
     red_flags = extracted.get("contraindication_red_flags")
     if isinstance(red_flags, list) and red_flags:
+        bad = [str(x).lower() for x in red_flags if not any(term in str(x).lower() for term in APPROVED_CONTRA_TERMS)]
+        if bad:
+            return False, "unapproved_contraindication_terms"
         return False, "contraindication_red_flags"
+    if extracted.get("contraindication_confirmed") and _looks_like_contra_term_question(_low(user_text)):
+        return False, "contra_term_question_not_hard_stop"
     safety = decision.get("safety") if isinstance(decision.get("safety"), dict) else {}
     if safety.get("unsafe_medical_claim") or safety.get("tries_to_book_without_rules"):
         return False, "unsafe_decision"
@@ -1786,7 +1807,7 @@ _FORBIDDEN_EMPTY_SLOT_PHRASES = (
 
 
 def _validate_final_fact_answer(chat_id: str, session: dict[str, Any], answer: str) -> str:
-    """Python/CRM remains the only source of truth for slots and availability."""
+    """Python/CRM remains the only source of truth for clinic facts and slots."""
     text = _clean(answer)
     low = _low(text)
     slots = session.get("last_slots") or []
@@ -1800,6 +1821,22 @@ def _validate_final_fact_answer(chat_id: str, session: dict[str, Any], answer: s
         session["last_slots"] = []
         session["step"] = "date"
         return _no_slots_text(session)
+    price_mentions = re.findall(r"\b(?:[1-9]\d{0,2}\s?000|[1-9]\d{3,})\s*(?:тг|тенге|₸)", low)
+    allowed_prices = {"5 000", "5000", "2 000", "2000", "3 000", "3000"}
+    if price_mentions and any(re.sub(r"\D+", "", mention) not in {re.sub(r'\D+', '', p) for p in allowed_prices} for mention in price_mentions):
+        _safe_log(chat_id, "llm_price_fact_blocked", {"chat_id": chat_id, "step": session.get("step") or "", "answer_preview": text[:180]})
+        return _tr(
+            session,
+            "Первичный приём — 5 000 тг. Стоимость курса врач рассчитывает только после осмотра 🌿",
+            "Алғашқы қабылдау — 5 000 тг. Ем курсының құнын дәрігер тек қараудан кейін есептейді 🌿",
+        )
+    if "кабанбай" in low and "28" not in low:
+        _safe_log(chat_id, "llm_address_fact_blocked", {"chat_id": chat_id, "step": session.get("step") or "", "answer_preview": text[:180]})
+        return _tr(
+            session,
+            "Адрес: Астана, Кабанбай батыра 28, внутренний двор, подъезд 3. Заезд со стороны Кунаева, после ворот направо.",
+            "Мекенжай: Астана, Қабанбай батыр 28, ішкі аула, 3-подъезд. Қонаев жағынан кіріп, шлагбаумнан кейін оңға бұрыласыз.",
+        )
     return text
 
 
@@ -2293,6 +2330,11 @@ def _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | Non
 
 def _remember_selected_slot(session: dict[str, Any], slot: dict[str, Any]) -> None:
     """Persist the exact CRM slot payload and denormalized booking fields."""
+    last_slots = session.get("last_slots") or []
+    if last_slots and not any(existing == slot for existing in last_slots if isinstance(existing, dict)):
+        session.pop("selected_slot", None)
+        session["slot_selection_rejected_reason"] = "not_in_session_last_slots"
+        return
     if session.get("contraindications_ok") is True and not session.get("contraindications_verdict"):
         # Keep in-flight sessions created before the tool-gate markers bookable
         # as soon as the patient chooses a concrete slot.
@@ -2668,6 +2710,14 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
     if not slot:
         session["step"] = "date"
         return _ask_date(session)
+    last_slots = session.get("last_slots") or []
+    if last_slots and not any(existing == slot for existing in last_slots if isinstance(existing, dict)):
+        session.pop("selected_slot", None)
+        session["step"] = "time" if last_slots else "date"
+        _safe_log(chat_id, "booking_payload_blocked_not_from_last_slots", {"chat_id": chat_id, "step": session.get("step") or "", "slots_count": len(last_slots) if isinstance(last_slots, list) else 0})
+        return _mandatory_step_prompt(session, session["step"])
+    if not last_slots:
+        _safe_log(chat_id, "booking_payload_legacy_selected_slot_without_last_slots", {"chat_id": chat_id, "step": session.get("step") or ""})
 
     if session.get("contraindications_ok") is True and not session.get("contraindications_verdict"):
         # Backward-compatible migration for existing sessions created before tool gates.
