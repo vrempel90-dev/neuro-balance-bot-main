@@ -41,10 +41,23 @@ OPENAI_BRAIN_ALLOWED_STEPS = {"complaint", "age", "contraindications", "date", "
 OPENAI_BRAIN_MULTI_ENTITY_STEPS = {"age", "contraindications", "date"}
 OPENAI_BRAIN_ALLOWED_GATES = {"new_lead", "new_lead_like_message", "active_ai_lead", "active_conversation_reply"}
 APPROVED_CONTRA_TERMS = {
-    "кардиостимулятор", "беременность", "онкология", "металл", "металлическ",
-    "имплант", "кохлеар", "эпилепсия", "тромбоз", "кровотеч", "температур",
-    "инфекц", "сердеч", "дыхательн", "психическ",
+    "кардиостимулятор", "дефибриллятор", "инсулиновая помпа", "помпа",
+    "кохлеар", "кохлеарный имплант", "тромбофлебит", "тромбоз",
+    "свертываем", "свёртываем", "онколог", "онкология", "рак",
+    "подозрение на онкологию", "эпилеп", "судорог", "судороги",
+    "декомпенсированный сахарный диабет", "декомпенсированн", "тиреотоксикоз",
+    "беремен", "беременность", "температур", "орви", "грипп", "острая инфекц",
+    "тяжелые проблемы с сердцем", "тяжёлые проблемы с сердцем",
+    "тяжелые проблемы с дыханием", "тяжёлые проблемы с дыханием",
+    "тяжелое психическое", "тяжёлое психическое",
+    "коляск", "костыл", "лежач", "ограниченная подвижность",
 }
+
+UNKNOWN_CONTRA_SAFE_ANSWER_RU = (
+    "Спасибо, поняла. Этого пункта нет в нашем основном чек-листе противопоказаний, "
+    "но чтобы не ошибиться по медицинской части, передам информацию администратору "
+    "для уточнения 🌿\n\nПодскажите, пожалуйста, других противопоказаний из списка нет?"
+)
 
 
 def _reset_openai_brain_debug(session: dict[str, Any]) -> None:
@@ -120,6 +133,8 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
     if extracted.get("contraindication_confirmed") and _looks_like_contra_term_question(_low(user_text)):
         return False, "contra_term_question_not_hard_stop"
     safety = decision.get("safety") if isinstance(decision.get("safety"), dict) else {}
+    if _llm_claims_contraindication_stop(decision) and not _contra_has_hard_stop(user_text):
+        return False, "llm_unknown_contraindication_blocked"
     if safety.get("unsafe_medical_claim") or safety.get("tries_to_book_without_rules"):
         return False, "unsafe_decision"
     if session.get("booked") or session.get("manual_takeover") or session.get("ai_muted") or session.get("refund_claim_admin_required") or session.get("old_chat_ai_disabled"):
@@ -173,7 +188,13 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         session["openai_brain_guard_failed"] = True
         session["openai_brain_guard_reason"] = guard_reason
         session["openai_brain_fallback_used"] = True
-        _safe_log(chat_id, "openai_brain_guard_failed", {"chat_id": chat_id, "step": session.get("step") or "start", "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": True, "guard_reason": guard_reason, "fallback_reason": guard_reason, "extracted_preview": {k: v for k, v in (decision.get("extracted") or {}).items() if v not in (None, "", [], {})}})
+        event_name = "llm_unknown_contraindication_blocked" if guard_reason == "llm_unknown_contraindication_blocked" else "openai_brain_guard_failed"
+        _safe_log(chat_id, event_name, {"chat_id": chat_id, "step": session.get("step") or "start", "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": True, "guard_reason": guard_reason, "fallback_reason": guard_reason, "extracted_preview": {k: v for k, v in (decision.get("extracted") or {}).items() if v not in (None, "", [], {})}})
+        if guard_reason == "llm_unknown_contraindication_blocked":
+            session["contraindications_ok"] = False
+            session["contraindications_verdict"] = "admin_contact"
+            session["step"] = "contraindications"
+            return _finalize(chat_id, session, _unknown_contra_safe_answer(session))
         return None
     action = decision.get("action")
     extracted = decision.get("extracted") or {}
@@ -244,6 +265,12 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
     if action == "answer_faq_and_continue":
         return _finalize(chat_id, session, reply + ("\n\n" + _mandatory_step_prompt(session, session.get("step") or "complaint") if reply else ""))
     if action == "stop_contraindication":
+        if not _contra_has_hard_stop(text):
+            _safe_log(chat_id, "llm_unknown_contraindication_blocked", {"chat_id": chat_id, "step": session.get("step") or "start", "answer_preview": reply[:180]})
+            session["contraindications_ok"] = False
+            session["contraindications_verdict"] = "admin_contact"
+            session["step"] = "contraindications"
+            return _finalize(chat_id, session, _unknown_contra_safe_answer(session))
         session["step"] = "stopped"
         session["escalated"] = True
         return _finalize(chat_id, session, reply or _stop_booking_text(session, "contra"))
@@ -632,10 +659,18 @@ YES_WORDS = [
 ]
 
 HARD_CONTRA_WORDS = [
-    "кардиостимулятор", "кардиостемулятор", "имплант", "кохлеар", "помпа", "инсулиновая помпа", "металл", "метал", "металлоконструк",
+    "кардиостимулятор", "кардиостемулятор", "дефибриллятор",
+    "кохлеар", "инсулиновая помпа", "помпа",
+    "тромбофлебит", "тромбоз", "тромб", "свертываем", "свёртываем",
     "беремен", "беременность", "жүктілік", "жукцилик",
-    "онколог", "онкология", "рак", "эпилеп", "эпилепсия", "тромб", "тромбоз",
-    "коляск", "костыл", "костыли", "ограниченная подвижность", "ограниченной подвижностью",
+    "онколог", "онкология", "рак", "подозрение на онколог",
+    "эпилеп", "эпилепсия", "судорог", "судороги",
+    "декомпенсирован", "тиреотоксикоз",
+    "температура", "орви", "грипп", "острая инфек",
+    "тяжелые проблемы с сердцем", "тяжёлые проблемы с сердцем",
+    "тяжелые проблемы с дыханием", "тяжёлые проблемы с дыханием",
+    "тяжелое психическое", "тяжёлое психическое",
+    "коляск", "костыл", "костыли", "лежач", "ограниченная подвижность", "ограниченной подвижностью",
     "мүгедек арба", "арбамен", "таяқ", "балдақ",
 ]
 
@@ -3007,6 +3042,30 @@ async def _handle_cancel_appointment(chat_id: str, phone: str, session: dict[str
         )
 
 
+def _llm_claims_contraindication_stop(decision: dict[str, Any]) -> bool:
+    extracted = decision.get("extracted") if isinstance(decision.get("extracted"), dict) else {}
+    safety = decision.get("safety") if isinstance(decision.get("safety"), dict) else {}
+    reply = _low(str(decision.get("reply") or ""))
+    return (
+        bool(safety.get("hard_stop"))
+        or bool(extracted.get("contraindication_confirmed"))
+        or any(phrase in reply for phrase in [
+            "является противопоказанием",
+            "процесс записи останавливаю",
+            "не можем записать из-за противопоказания",
+            "не можем вас записать из-за противопоказания",
+        ])
+    )
+
+
+def _unknown_contra_safe_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        UNKNOWN_CONTRA_SAFE_ANSWER_RU,
+        "Рақмет, түсіндім. Бұл тармақ біздің негізгі қарсы көрсетілімдер чек-листінде жоқ, бірақ медициналық жағынан қателеспеу үшін ақпаратты әкімшіге нақтылауға жіберемін 🌿\n\nТізімдегі басқа қарсы көрсетілімдер жоқ па?",
+    )
+
+
 def _contra_has_hard_stop(text: str) -> bool:
     low = _low(text)
     if _looks_like_contra_term_question(low):
@@ -3724,6 +3783,15 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     if step in ("date", "preferred_time", "time", "select_slot") and _has_any(text, DOCTOR_WORDS):
         return _finalize(chat_id, session, _doctor_answer(session, chat_id))
+
+    if step == "contraindications" and not _is_no_contra_answer(text) and not _contra_is_clear_no(text) and not _contra_has_hard_stop(text) and not _contra_term_answer(text, session) and not _faq_answer(text, session):
+        if _has_complaint(text) or _has_medical_complaint_text(text):
+            session["contraindications_raw"] = text
+            session["contraindications_ok"] = False
+            session["contraindications_verdict"] = "admin_contact"
+            session["step"] = "contraindications"
+            _safe_log(chat_id, "llm_unknown_contraindication_blocked", {"chat_id": chat_id, "step": "contraindications", "patient_text": text[:180]})
+            return _finalize(chat_id, session, _unknown_contra_safe_answer(session))
 
     brain_answer = await _try_openai_dialog_brain(chat_id, phone, session, text)
     if brain_answer is not None:
@@ -4464,7 +4532,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
         # Если пациент написал симптомы вместо ответа по противопоказаниям — не считаем это противопоказанием.
         if (_has_complaint(text) or _has_medical_complaint_text(text)):
-            return _finalize(chat_id, session, _ask_contra(session))
+            session["contraindications_ok"] = False
+            session["contraindications_verdict"] = "admin_contact"
+            session["step"] = "contraindications"
+            _safe_log(chat_id, "llm_unknown_contraindication_blocked", {"chat_id": chat_id, "step": "contraindications", "patient_text": text[:180]})
+            return _finalize(chat_id, session, _unknown_contra_safe_answer(session))
 
         # Если пациент написал просто "есть/да/бар" без деталей — запись не продолжаем.
         # Просим уточнить, какое именно противопоказание, потому что при наличии противопоказаний приём не проводится.
