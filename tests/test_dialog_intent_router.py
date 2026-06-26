@@ -1272,3 +1272,113 @@ def test_crm_book_http_payload_uses_new_contract(monkeypatch: Any) -> None:
     }
     assert "doctorId" not in captured["json"]
     assert "serviceId" not in captured["json"]
+
+
+def test_contraindications_hemorrhoids_unknown_not_hard_stop(monkeypatch: Any) -> None:
+    calls = setup_crm(monkeypatch)
+    events: list[str] = []
+    monkeypatch.setattr(state, "log_event", lambda chat_id, event, payload: events.append(event))
+    chat_id = "contra_hemorrhoids_unknown"
+    reset(chat_id, {"step": "contraindications", "language": "ru", "language_locked": True})
+
+    result = answer(chat_id, "Геморрой")
+    session = state.get_session(chat_id)
+    low = result.lower()
+
+    assert "геморрой является противопоказанием" not in low
+    assert "процесс записи останавливаю" not in low
+    assert "нет в нашем основном чек-листе" in low
+    assert "передам информацию администратору" in low
+    assert session.get("step") == "contraindications"
+    assert session.get("contraindications_ok") is False
+    assert session.get("contraindications_verdict") == "admin_contact"
+    assert calls["book"] == []
+    assert "llm_unknown_contraindication_blocked" in events
+
+
+def test_contraindications_pressure_unknown_not_hard_stop(monkeypatch: Any) -> None:
+    calls = setup_crm(monkeypatch)
+    chat_id = "contra_pressure_unknown"
+    reset(chat_id, {"step": "contraindications", "language": "ru", "language_locked": True})
+
+    result = answer(chat_id, "давление")
+    session = state.get_session(chat_id)
+
+    assert "является противопоказанием" not in result.lower()
+    assert session.get("step") == "contraindications"
+    assert session.get("contraindications_ok") is False
+    assert calls["book"] == []
+
+
+def test_contraindications_gastritis_unknown_not_hard_stop(monkeypatch: Any) -> None:
+    calls = setup_crm(monkeypatch)
+    chat_id = "contra_gastritis_unknown"
+    reset(chat_id, {"step": "contraindications", "language": "ru", "language_locked": True})
+
+    result = answer(chat_id, "гастрит")
+    session = state.get_session(chat_id)
+
+    assert "является противопоказанием" not in result.lower()
+    assert session.get("step") == "contraindications"
+    assert session.get("contraindications_ok") is False
+    assert calls["book"] == []
+
+
+def test_contraindications_cochlear_implant_hard_stop_allowed(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    chat_id = "contra_cochlear_implant"
+    reset(chat_id, {"step": "contraindications", "language": "ru", "language_locked": True})
+
+    result = answer(chat_id, "у меня есть кохлеарный имплант")
+    session = state.get_session(chat_id)
+
+    assert session.get("step") == "stopped"
+    assert session.get("contraindications_verdict") in {"refuse", "stop"}
+    assert "процесс записи останавливаю" in result.lower()
+
+
+def test_contraindications_thrombosis_hard_stop_allowed(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    chat_id = "contra_thrombosis"
+    reset(chat_id, {"step": "contraindications", "language": "ru", "language_locked": True})
+
+    result = answer(chat_id, "у меня тромбоз")
+    session = state.get_session(chat_id)
+
+    assert session.get("step") == "stopped"
+    assert session.get("contraindications_verdict") in {"refuse", "stop"}
+    assert "процесс записи останавливаю" in result.lower()
+
+
+def test_contraindications_term_question_not_hard_stop(monkeypatch: Any) -> None:
+    calls = setup_crm(monkeypatch)
+    chat_id = "contra_term_question_cochlear"
+    reset(chat_id, {"step": "contraindications", "language": "ru", "language_locked": True})
+
+    result = answer(chat_id, "что такое кохлеарный имплант?")
+    session = state.get_session(chat_id)
+
+    assert "устройство для слуха" in result.lower()
+    assert session.get("step") == "contraindications"
+    assert session.get("contraindications_verdict") != "stop"
+    assert calls["book"] == []
+
+
+def test_openai_decision_validator_blocks_invented_contraindication() -> None:
+    decision = {
+        "action": "stop_contraindication",
+        "next_step": "escalated",
+        "reply": "К сожалению, геморрой является противопоказанием. Процесс записи останавливаю.",
+        "extracted": {"contraindication_confirmed": True, "contraindication_red_flags": []},
+        "safety": {"hard_stop": True, "unsafe_medical_claim": False, "tries_to_book_without_rules": False},
+        "needs_python_tool": "handoff_admin",
+    }
+
+    ok, reason = dialog.validate_openai_dialog_decision(
+        decision,
+        {"step": "contraindications", "ai_lead_started": True},
+        "Геморрой",
+    )
+
+    assert ok is False
+    assert reason == "llm_unknown_contraindication_blocked"
