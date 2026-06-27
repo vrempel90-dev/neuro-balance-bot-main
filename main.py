@@ -46,6 +46,10 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "openai_brain_guard_reason": session.get("openai_brain_guard_reason") or "",
         "openai_brain_skip_reason": session.get("openai_brain_skip_reason") or "",
         "openai_brain_fallback_used": bool(session.get("openai_brain_fallback_used")),
+        "openai_brain_model": session.get("openai_brain_model") or getattr(get_settings(), "ai_brain_model", ""),
+        "openai_brain_temperature": session.get("openai_brain_temperature") if session.get("openai_brain_temperature") is not None else getattr(get_settings(), "ai_brain_temperature", None),
+        "humanize_skipped_because_brain_valid": bool(session.get("humanize_skipped_because_brain_valid")),
+        "humanize_fallback_used": bool(session.get("humanize_fallback_used")),
         "llm_blocked": bool(session.get("llm_blocked")),
         "llm_repaired": bool(session.get("llm_repaired")),
         "repair_reason": session.get("repair_reason") or "",
@@ -109,6 +113,8 @@ def _set_openai_debug(session: dict[str, Any], debug: dict[str, Any], base_answe
     session["openai_model"] = str(debug.get("openai_model") or "")
     session["openai_skip_reason"] = str(debug.get("openai_skip_reason") or "")
     session["openai_guard_failed"] = bool(debug.get("openai_guard_failed"))
+    if "humanize_fallback_used" in debug:
+        session["humanize_fallback_used"] = bool(debug.get("humanize_fallback_used"))
     session["base_answer_preview"] = str(debug.get("base_answer_preview") or _preview(base_answer, 160))
     session["final_answer_preview"] = str(debug.get("final_answer_preview") or _preview(final_answer, 160))
 
@@ -141,16 +147,27 @@ async def _maybe_humanize_answer(chat_id: str, user_text: str, base_answer: str,
     session = _get_session_safe(chat_id)
     session["chat_id"] = chat_id
     if session.get("openai_brain_used") and (base_answer or "").strip():
+        session["humanize_skipped_because_brain_valid"] = True
+        session["humanize_fallback_used"] = False
         debug = {
             "openai_used": True,
-            "openai_model": getattr(get_settings(), "openai_model", ""),
+            "openai_model": session.get("openai_brain_model") or getattr(get_settings(), "ai_brain_model", ""),
             "openai_skip_reason": "",
             "openai_guard_failed": False,
             "base_answer_preview": _preview(base_answer, 160),
             "final_answer_preview": _preview(base_answer, 160),
+            "humanize_fallback_used": False,
         }
         _set_openai_debug(session, debug, base_answer, base_answer)
         state.save_session(chat_id, session)
+        state.log_event(chat_id, "humanize_skipped_because_brain_valid", {
+            "chat_id": chat_id,
+            "openai_brain_model": session.get("openai_brain_model") or getattr(get_settings(), "ai_brain_model", ""),
+            "openai_brain_temperature": session.get("openai_brain_temperature") if session.get("openai_brain_temperature") is not None else getattr(get_settings(), "ai_brain_temperature", None),
+            "openai_brain_used": True,
+            "humanize_skipped_because_brain_valid": True,
+            "humanize_fallback_used": False,
+        })
         return base_answer
     reason = _humanize_skip_reason(session, base_answer, voice_ignored=voice_ignored)
     if reason:
@@ -167,7 +184,11 @@ async def _maybe_humanize_answer(chat_id: str, user_text: str, base_answer: str,
         state.log_event(chat_id, "openai_skipped", {"chat_id": chat_id, "reason": reason, "step": session.get("step") or session.get("current_step") or ""})
         return base_answer
 
+    session["humanize_skipped_because_brain_valid"] = False
+    session["humanize_fallback_used"] = True
+    state.log_event(chat_id, "humanize_fallback_used", {"chat_id": chat_id, "reason": session.get("openai_brain_skip_reason") or session.get("openai_skip_reason") or "rule_based", "humanize_fallback_used": True})
     final_answer, debug = await humanize_reply_with_openai(base_answer=base_answer, user_text=user_text, session=session)
+    debug["humanize_fallback_used"] = True
     _set_openai_debug(session, debug, base_answer, final_answer)
     state.save_session(chat_id, session)
     if not debug.get("openai_used"):

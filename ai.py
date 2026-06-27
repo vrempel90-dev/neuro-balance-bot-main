@@ -512,8 +512,9 @@ async def run_openai_dialog_brain(
     clinic_context: dict | None = None,
 ) -> tuple[dict, dict]:
     settings = get_settings()
-    model = getattr(settings, "openai_model", "")
-    debug = {"openai_brain_used": False, "openai_brain_intent": "", "openai_brain_action": "", "openai_brain_needs_python_tool": "", "openai_brain_extracted": {}, "openai_brain_guard_failed": False, "openai_brain_guard_reason": "", "openai_brain_skip_reason": "", "openai_brain_fallback_used": False, "openai_model": model}
+    model = getattr(settings, "ai_brain_model", "") or getattr(settings, "openai_model", "")
+    temperature = float(getattr(settings, "ai_brain_temperature", 0.2) or 0.2)
+    debug = {"openai_brain_used": False, "openai_brain_intent": "", "openai_brain_action": "", "openai_brain_needs_python_tool": "", "openai_brain_extracted": {}, "openai_brain_guard_failed": False, "openai_brain_guard_reason": "", "openai_brain_skip_reason": "", "openai_brain_fallback_used": False, "openai_brain_model": model, "openai_brain_temperature": temperature, "openai_model": model}
     if not getattr(settings, "ai_enabled", True) or not getattr(settings, "openai_api_key", "") or AsyncOpenAI is None:
         decision, fb = _dialog_brain_fallback("config_missing")
         debug.update(fb)
@@ -530,11 +531,11 @@ async def run_openai_dialog_brain(
             "clinic_context": clinic_context or {},
         }
         if state is not None:
-            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_called", {"chat_id": str(session.get("chat_id") or "system"), "model": model, "step": summary["step"], "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "extracted_preview": {}})
+            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_called", {"chat_id": str(session.get("chat_id") or "system"), "model": model, "openai_brain_model": model, "openai_brain_temperature": temperature, "step": summary["step"], "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "extracted_preview": {}})
         client = _openai_client(settings.openai_api_key)
         response = await client.chat.completions.create(
             model=model,
-            temperature=0.2,
+            temperature=temperature,
             max_tokens=700,
             response_format={"type": "json_object"},
             messages=[
@@ -554,7 +555,7 @@ async def run_openai_dialog_brain(
             decision, fb = _dialog_brain_fallback(reason)
             debug.update(fb)
             return decision, debug
-        debug.update({"openai_brain_used": True, "openai_brain_intent": decision["intent"], "openai_brain_action": decision["action"], "openai_brain_needs_python_tool": decision["needs_python_tool"], "openai_brain_extracted": decision["extracted"]})
+        debug.update({"openai_brain_used": True, "openai_brain_intent": decision["intent"], "openai_brain_action": decision["action"], "openai_brain_needs_python_tool": decision["needs_python_tool"], "openai_brain_extracted": decision["extracted"], "openai_brain_model": model, "openai_brain_temperature": temperature})
         if state is not None:
             state.log_event(str(session.get("chat_id") or "system"), "openai_brain_decision", {"chat_id": str(session.get("chat_id") or "system"), "step": summary["step"], "action": decision["action"], "needs_python_tool": decision["needs_python_tool"], "guard_failed": False, "guard_reason": "", "extracted_preview": {k: v for k, v in decision["extracted"].items() if v not in (None, "", [], {})}})
         return decision, debug
@@ -750,7 +751,7 @@ async def humanize_reply_with_openai(
 ) -> tuple[str, dict[str, Any]]:
     """Safely rephrase a deterministic dialog answer without changing business logic."""
     settings = get_settings()
-    model = settings.openai_model
+    model = getattr(settings, "ai_humanize_model", "") or settings.openai_model
     debug: dict[str, Any] = {
         "openai_used": False,
         "openai_model": model,
