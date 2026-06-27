@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -60,6 +61,22 @@ UNKNOWN_CONTRA_SAFE_ANSWER_RU = (
 )
 
 
+@dataclass
+class RepairResult:
+    answer: str
+    step: str
+    reason: str
+    event: str = "llm_invalid_response_repaired"
+    answer_empty: bool = False
+
+
+def _reset_llm_repair_debug(session: dict[str, Any]) -> None:
+    session["llm_blocked"] = False
+    session["llm_repaired"] = False
+    session["repair_reason"] = ""
+    session["repaired_step"] = ""
+
+
 def _reset_openai_brain_debug(session: dict[str, Any]) -> None:
     session["openai_brain_used"] = False
     session["openai_brain_intent"] = ""
@@ -70,6 +87,7 @@ def _reset_openai_brain_debug(session: dict[str, Any]) -> None:
     session["openai_brain_guard_reason"] = ""
     session["openai_brain_skip_reason"] = ""
     session["openai_brain_fallback_used"] = False
+    _reset_llm_repair_debug(session)
 
 
 def _apply_openai_brain_debug(session: dict[str, Any], debug: dict[str, Any]) -> None:
@@ -80,6 +98,142 @@ def _apply_openai_brain_debug(session: dict[str, Any], debug: dict[str, Any]) ->
     ):
         if key in debug:
             session[key] = debug[key]
+
+
+def _is_active_new_ai_request(session: dict[str, Any]) -> bool:
+    step = str(session.get("step") or session.get("current_step") or "start")
+    if step in {"booked", "confirmed", "done", "appointment_confirmed", "escalated", "stopped"} or session.get("booked"):
+        return False
+    if session.get("manual_takeover") or session.get("manual_admin_intervention") or session.get("ai_muted") or session.get("do_not_reply") or session.get("escalated"):
+        return False
+    if session.get("refund_claim_admin_required") or session.get("gate_reason") == "refund_claim_admin_required":
+        return False
+    if session.get("old_chat_ai_disabled") or session.get("gate_reason") == "old_chat_ai_disabled":
+        return False
+    if session.get("last_ignored_message_type") in {"voice", "audio"} or session.get("voice_ignored") or session.get("last_message_type") in {"voice", "audio"}:
+        return False
+    return session.get("ai_lead_started") is True
+
+
+def _repair_unknown_current_step(session: dict[str, Any]) -> tuple[str, str]:
+    if not session.get("complaint"):
+        session["step"] = "complaint"
+        return "complaint", "Подскажите, пожалуйста, что Вас беспокоит?"
+    if not session.get("age"):
+        session["step"] = "age"
+        return "age", "Сколько Вам лет?"
+    if session.get("contraindications_ok") is not True:
+        session["step"] = "contraindications"
+        session["questionnaire_step"] = "contra"
+        return "contraindications", "Перед записью уточню важный момент по безопасности 🌿 Противопоказаний из списка нет?"
+    if not session.get("preferred_date") and not session.get("last_slots"):
+        session["step"] = "date"
+        session["questionnaire_step"] = "date"
+        return "date", "На какой день Вам удобно прийти?"
+    if str(session.get("step") or "") == "time" and session.get("last_slots"):
+        return "time", "Какое время из вариантов выше Вам удобно?"
+    if str(session.get("step") or "") == "name" and session.get("selected_slot"):
+        return "name", "Подскажите, пожалуйста, Ваше имя для записи."
+    step = str(session.get("step") or "date")
+    return step, _mandatory_step_prompt(session, step)
+
+
+def repair_invalid_llm_response(reason: str, session: dict[str, Any], user_text: str, attempted_reply: str, llm_decision: dict[str, Any]) -> RepairResult:
+    """Block an invalid LLM decision and return a safe controller-owned answer."""
+    normalized = {
+        "slots_without_crm_tool": "slot_hallucination",
+        "select_slot_without_last_slots": "slot_hallucination",
+        "asked_name_too_early": "asked_name_too_early",
+        "ask_name_without_slot": "asked_name_too_early",
+        "extracted_name_before_slot": "asked_name_too_early",
+        "ask_date_before_contra": "date_before_contraindications",
+        "offered_date_before_contra": "date_before_contraindications",
+        "show_slots_multi_entity_guard": "date_before_contraindications",
+        "llm_attempted_booking": "book_without_selected_slot",
+        "book_without_slot_or_name": "book_without_selected_slot",
+        "llm_unknown_contraindication_blocked": "contraindication_false_hard_stop",
+        "contra_term_question_not_hard_stop": "contraindication_false_hard_stop",
+        "contra_question_missing": "contraindication_false_hard_stop",
+    }.get(reason, reason or "unknown_invalid_llm")
+
+    step_before = str(session.get("step") or "start")
+    extracted = llm_decision.get("extracted") if isinstance(llm_decision.get("extracted"), dict) else {}
+    if extracted.get("age") and not session.get("age"):
+        try:
+            session["age"] = int(extracted.get("age"))
+        except Exception:
+            pass
+    if normalized == "slot_hallucination":
+        session["last_slots"] = []
+        session["selected_slot"] = None
+        session["step"] = "date"
+        answer = "На выбранный день свободных окошек не нашла 🌿 Подскажите, пожалуйста, другой удобный день — проверю актуальное расписание."
+        event = "llm_slot_hallucination_repaired"
+    elif normalized == "doctor_hallucination":
+        answer = "Врач зависит от выбранного дня и актуального расписания. Когда подберём свободное окошко, я покажу варианты по расписанию 🌿 Подскажите, пожалуйста, какой день Вам удобен?"
+        event = "llm_doctor_hallucination_repaired"
+    elif normalized == "duration_hallucination":
+        answer = "Длительность зависит от назначенной процедуры и плана врача. На первичном приёме врач объяснит, сколько по времени это займёт именно в Вашем случае 🌿"
+        if step_before == "time":
+            answer += "\n\nКакое время из вариантов выше Вам удобно?"
+        elif step_before == "contraindications":
+            answer += "\n\nПодскажите, пожалуйста, противопоказаний из списка нет?"
+        event = "llm_duration_hallucination_repaired"
+    elif normalized == "contraindication_false_hard_stop":
+        session["step"] = "contraindications"
+        session["hard_stop"] = False
+        session["hard_contraindication_stop"] = False
+        session["contraindication_hard_stop"] = False
+        session["manual_takeover"] = False
+        answer = "Я уточняю это только для безопасности перед записью. Подскажите, пожалуйста, по списку противопоказаний ничего нет?"
+        event = "llm_contraindication_hard_stop_repaired"
+    elif normalized == "asked_name_too_early":
+        if not session.get("complaint"):
+            session["step"] = "complaint"; answer = "Подскажите, пожалуйста, что Вас беспокоит?"
+        elif not session.get("age"):
+            session["step"] = "age"; answer = "Сколько Вам лет?"
+        elif session.get("contraindications_ok") is not True:
+            session["step"] = "contraindications"; session["questionnaire_step"] = "contra"; answer = "Перед записью уточню важный момент по безопасности 🌿 Противопоказаний из списка нет?"
+        else:
+            session["step"] = "date"; session["questionnaire_step"] = "date"; answer = "На какой день Вам удобно прийти?"
+        event = "llm_name_too_early_repaired"
+    elif normalized == "date_before_contraindications":
+        session["step"] = "contraindications"
+        session["questionnaire_step"] = "contra"
+        answer = "Перед тем как подобрать окошко, уточню важный момент по безопасности 🌿 Противопоказаний из списка нет?"
+        event = "llm_date_before_contraindications_repaired"
+    elif normalized == "book_without_selected_slot":
+        session["step"] = "date"
+        session["questionnaire_step"] = "date"
+        answer = "Сначала нужно выбрать удобное окошко из актуального расписания 🌿 На какой день Вам удобно прийти?"
+        event = "llm_book_without_selected_slot_repaired"
+    else:
+        normalized = "unknown_invalid_llm"
+        _, answer = _repair_unknown_current_step(session)
+        event = "llm_invalid_response_repaired"
+
+    session["llm_blocked"] = True
+    session["llm_repaired"] = True
+    session["repair_reason"] = normalized
+    session["repaired_step"] = str(session.get("step") or step_before)
+    return RepairResult(answer=answer, step=session["repaired_step"], reason=normalized, event=event, answer_empty=False)
+
+
+def _log_llm_repair(chat_id: str, result: RepairResult, attempted_reply: str = "") -> None:
+    payload = {
+        "chat_id": chat_id,
+        "llm_response_blocked": True,
+        "llm_response_repaired": True,
+        "repair_reason": result.reason,
+        "repaired_step": result.step,
+        "repaired_answer_preview": result.answer[:180],
+        "attempted_answer_preview": (attempted_reply or "")[:180],
+    }
+    _safe_log(chat_id, "llm_response_blocked", payload)
+    _safe_log(chat_id, "llm_response_repaired", payload)
+    if result.reason == "slot_hallucination":
+        _safe_log(chat_id, "llm_slot_hallucination_blocked", payload)
+    _safe_log(chat_id, result.event, payload)
 
 
 def _openai_brain_skip_reason(session: dict[str, Any], text: str) -> str:
@@ -133,6 +287,8 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
     if extracted.get("contraindication_confirmed") and _looks_like_contra_term_question(_low(user_text)):
         return False, "contra_term_question_not_hard_stop"
     safety = decision.get("safety") if isinstance(decision.get("safety"), dict) else {}
+    if action == "stop_contraindication" and not _contra_has_hard_stop(user_text):
+        return False, "llm_unknown_contraindication_blocked"
     if _llm_claims_contraindication_stop(decision) and not _contra_has_hard_stop(user_text):
         return False, "llm_unknown_contraindication_blocked"
     if safety.get("unsafe_medical_claim") or safety.get("tries_to_book_without_rules"):
@@ -159,9 +315,18 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
     if action == "ask_name" or any(x in low_reply for x in ["как вас зовут", "ваше имя", "имя для записи"]):
         if not session.get("selected_slot"):
             return False, "asked_name_too_early"
+    if (
+        re.search(r"\b\d+\s*(?:минут|час|часа|часов)\b", low_reply)
+        or any(x in low_reply for x in ["около часа", "полчаса", "пол часа", "30 минут", "40 минут", "60 минут"])
+    ) and any(x in low_reply for x in ["длитель", "процедур", "займ", "идет", "идёт"]):
+        return False, "duration_hallucination"
+    if any(x in _low(user_text) for x in ["доктор", "врач", "кто принимает", "какой специалист"]) and any(x in low_reply for x in ["доктор", "врач"]) and not (session.get("last_slots") or []):
+        return False, "doctor_hallucination"
+    if not (session.get("last_slots") or []) and (_TIME_PATTERN.search(reply) or any(p in low_reply for p in _FORBIDDEN_EMPTY_SLOT_PHRASES)):
+        return False, "slot_hallucination"
     if action in {"ask_date", "show_slots"} and session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not (_is_no_contra_answer(user_text) or _contra_is_clear_no(user_text)):
         return False, "offered_date_before_contra"
-    if step == "contraindications" and session.get("contraindications_ok") is not True and action not in {"ask_date", "stop_contraindication", "handoff_admin", "fallback_rule_based", "no_reply"}:
+    if step == "contraindications" and session.get("contraindications_ok") is not True and action not in {"ask_date", "stop_contraindication", "handoff_admin", "fallback_rule_based", "no_reply", "answer_faq_and_continue"}:
         if "противопоказ" not in low_reply and "қарсы" not in low_reply:
             return False, "contra_question_missing"
     return True, ""
@@ -182,6 +347,10 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
     if decision.get("action") == "fallback_rule_based":
         session["openai_brain_fallback_used"] = True
         _safe_log(chat_id, "openai_brain_fallback_rule_based", {"chat_id": chat_id, "step": session.get("step") or "start", "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": False, "guard_reason": "", "fallback_reason": debug.get("openai_brain_skip_reason") or "fallback", "extracted_preview": decision.get("extracted") or {}})
+        if _is_active_new_ai_request(session) and debug.get("openai_brain_skip_reason") in {"invalid_json", "empty_reply", "invalid_next_step", "invalid_action", "invalid_tool", "openai_error"}:
+            repair = repair_invalid_llm_response("unknown_invalid_llm", session, text, str(decision.get("reply") or ""), decision)
+            _log_llm_repair(chat_id, repair, str(decision.get("reply") or ""))
+            return _finalize(chat_id, session, repair.answer)
         return None
     ok, guard_reason = validate_openai_dialog_decision(decision, session, text)
     if not ok:
@@ -190,11 +359,10 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         session["openai_brain_fallback_used"] = True
         event_name = "llm_unknown_contraindication_blocked" if guard_reason == "llm_unknown_contraindication_blocked" else "openai_brain_guard_failed"
         _safe_log(chat_id, event_name, {"chat_id": chat_id, "step": session.get("step") or "start", "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": True, "guard_reason": guard_reason, "fallback_reason": guard_reason, "extracted_preview": {k: v for k, v in (decision.get("extracted") or {}).items() if v not in (None, "", [], {})}})
-        if guard_reason == "llm_unknown_contraindication_blocked":
-            session["contraindications_ok"] = False
-            session["contraindications_verdict"] = "admin_contact"
-            session["step"] = "contraindications"
-            return _finalize(chat_id, session, _unknown_contra_safe_answer(session))
+        if _is_active_new_ai_request(session):
+            repair = repair_invalid_llm_response(guard_reason, session, text, str(decision.get("reply") or ""), decision)
+            _log_llm_repair(chat_id, repair, str(decision.get("reply") or ""))
+            return _finalize(chat_id, session, repair.answer)
         return None
     action = decision.get("action")
     extracted = decision.get("extracted") or {}
