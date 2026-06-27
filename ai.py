@@ -188,7 +188,7 @@ async def generate_complaint_ack(text: str, lang: str = "ru", chat_id: str = "")
 DIALOG_BRAIN_INTENTS = {
     "medical_question", "faq", "complaint", "age_answer", "contraindications_answer",
     "contraindication_term_question", "date_preference", "slot_choice", "ask_human",
-    "booking_name", "unknown",
+    "booking", "booking_name", "name_answer", "objection", "irrelevant", "unclear", "unknown",
 }
 DIALOG_BRAIN_NEXT_STEPS = {
     "complaint", "age", "contraindications", "date", "time", "name", "booked",
@@ -335,7 +335,47 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 Не используй фразу “С такими жалобами к нам обращаются”.
 Не используй фразу “Вижу Ваш запрос” без необходимости.
 
-Верни только JSON строго по схеме:
+Ты НЕ отвечаешь по примерам. Примеры ниже — только стиль и ограничения, а не список фраз.
+Ты читаешь весь dialog_context: session_state, recent_history, last_bot_question, known_facts и current_user_message.
+Твоя задача — понять смысл последнего сообщения в контексте всей переписки: что пациент уже сказал, что бот уже спросил, какой обязательный шаг ожидается, какие данные уже собраны и чего не хватает.
+Пациент может писать любыми словами, с ошибками, не по порядку, несколькими мыслями сразу. Извлекай все сущности из одного сообщения, отвечай на FAQ и возвращай к pending/текущему шагу.
+
+Верни только JSON строго по схеме. Предпочтительная новая схема:
+{
+  "understood_context": {
+    "patient_meaning": "",
+    "is_answer_to_last_question": true,
+    "is_new_question": false,
+    "contains_multiple_entities": false,
+    "should_answer_faq_first": false,
+    "should_return_to_pending_step": false
+  },
+  "intent": "booking | complaint | faq | age_answer | contraindications_answer | date_preference | slot_choice | name_answer | ask_human | objection | irrelevant | unclear",
+  "entities": {
+    "complaint": "",
+    "age": null,
+    "symptom_duration": "",
+    "contraindications_clear": null,
+    "contraindication_confirmed": false,
+    "date_preference": "",
+    "time_preference": "",
+    "slot_choice": null,
+    "patient_name": "",
+    "faq_type": "",
+    "language": "ru"
+  },
+  "next_required_step": "complaint | age | contraindications | date | time | name | booked | escalated | keep_current",
+  "needs_python_tool": "none | check_slots | book_appointment | handoff_admin",
+  "reply": "",
+  "safety": {
+    "hard_stop": false,
+    "unsafe_medical_claim": false,
+    "invented_fact_risk": false,
+    "reason": ""
+  }
+}
+
+Совместимая старая схема тоже принимается:
 {
   "intent": "medical_question | faq | complaint | age_answer | contraindications_answer | contraindication_term_question | date_preference | slot_choice | ask_human | booking_name | unknown",
   "patient_meaning": "что пациент имел в виду",
@@ -440,6 +480,41 @@ def _action_from_structured(intent: str, next_step: str, tool: str, safety: dict
 def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
     if not isinstance(raw, dict):
         return {}, "not_object"
+    if "entities" in raw or "next_required_step" in raw or "understood_context" in raw:
+        entities = raw.get("entities") if isinstance(raw.get("entities"), dict) else {}
+        ctx = raw.get("understood_context") if isinstance(raw.get("understood_context"), dict) else {}
+        safety = raw.get("safety") if isinstance(raw.get("safety"), dict) else {}
+        intent = str(raw.get("intent") or "unknown")
+        intent_map = {"booking": "complaint", "name_answer": "booking_name", "irrelevant": "unknown", "unclear": "unknown", "objection": "faq"}
+        normalized_intent = intent_map.get(intent, intent)
+        raw = {
+            "intent": normalized_intent,
+            "next_step": raw.get("next_required_step") or "keep_current",
+            "patient_meaning": ctx.get("patient_meaning") or raw.get("patient_meaning") or "",
+            "reply": raw.get("reply") or "",
+            "extracted": {
+                "complaint": entities.get("complaint") or "",
+                "age": entities.get("age"),
+                "symptom_duration": entities.get("symptom_duration") or "",
+                "contraindications_clear": entities.get("contraindications_clear"),
+                "contraindication_confirmed": entities.get("contraindication_confirmed") or False,
+                "preferred_date_text": entities.get("date_preference") or entities.get("preferred_date_text") or "",
+                "time_preference": entities.get("time_preference") or "",
+                "slot_choice": entities.get("slot_choice"),
+                "patient_name": entities.get("patient_name") or "",
+                "wants_human": normalized_intent == "ask_human",
+                "faq_type": entities.get("faq_type") or "",
+                "language": entities.get("language") or "ru",
+            },
+            "needs_python_tool": raw.get("needs_python_tool") or "none",
+            "safety": {
+                "hard_stop": safety.get("hard_stop") or False,
+                "reason": safety.get("reason") or "",
+                "unsafe_medical_claim": safety.get("unsafe_medical_claim") or False,
+                "tries_to_book_without_rules": safety.get("invented_fact_risk") or False,
+            },
+            "safety_flags": {},
+        }
     allowed_top = {"intent", "action", "next_step", "patient_meaning", "reply", "extracted", "needs_python_tool", "safety", "safety_flags"}
     if any(k not in allowed_top for k in raw.keys()):
         return {}, "schema_extra_top_level"
@@ -450,7 +525,7 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
     allowed_extracted = {
         "complaint", "age", "contraindications_clear", "contraindication_confirmed",
         "contraindication_term_asked", "contraindication_red_flags", "preferred_date_text",
-        "time_preference", "slot_choice", "patient_name", "wants_human", "faq_type", "language",
+        "time_preference", "slot_choice", "patient_name", "wants_human", "faq_type", "language", "symptom_duration",
     }
     allowed_safety = {"hard_stop", "reason", "unsafe_medical_claim", "tries_to_book_without_rules"}
     if any(k not in allowed_extracted for k in extracted.keys()):
@@ -492,6 +567,7 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
             "contraindication_confirmed": bool(extracted.get("contraindication_confirmed")),
             "contraindication_term_asked": str(extracted.get("contraindication_term_asked") or ""),
             "contraindication_red_flags": extracted.get("contraindication_red_flags") if isinstance(extracted.get("contraindication_red_flags"), list) else [],
+            "symptom_duration": str(extracted.get("symptom_duration") or ""),
             "preferred_date_text": str(extracted.get("preferred_date_text") or ""),
             "time_preference": str(extracted.get("time_preference") or ""),
             "slot_choice": extracted.get("slot_choice"),
@@ -519,6 +595,87 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
     return decision, ""
 
 
+def _infer_last_question_type(text: str) -> str:
+    low = (text or "").lower()
+    if any(x in low for x in ["сколько вам лет", "жасыңыз", "жасыныз"]):
+        return "age"
+    if any(x in low for x in ["противопоказ", "қарсы", "кардиостимулятор"]):
+        return "contraindications"
+    if any(x in low for x in ["какой день", "на какой день", "қай күн", "удобный день"]):
+        return "date"
+    if any(x in low for x in ["какое время", "вариант", "свободное время"]):
+        return "time"
+    if any(x in low for x in ["ваше имя", "имя для оформления", "атыңыз", "атыныз"]):
+        return "name"
+    if any(x in low for x in ["что вас беспокоит", "не мазалай"]):
+        return "complaint"
+    if any(x in low for x in ["стоимость", "цена", "5000", "5 000", "врач", "доктор", "адрес", "мрт"]):
+        return "faq"
+    return "unknown"
+
+
+def _compact_recent_history(history: list | None, limit: int = 20) -> tuple[list[dict[str, Any]], str, dict[str, str]]:
+    items = history or []
+    compact: list[dict[str, Any]] = []
+    last_bot = {"type": "unknown", "text": ""}
+    facts: list[str] = []
+    for item in items[-limit:]:
+        role = str(item.get("role") or item.get("type") or "").strip()
+        text = str(item.get("text") or item.get("content") or "").strip()
+        if not role or not text:
+            continue
+        row = {"role": role, "text": text[:1000]}
+        if item.get("step"):
+            row["step"] = item.get("step")
+        if item.get("timestamp"):
+            row["timestamp"] = item.get("timestamp")
+        compact.append(row)
+        if role in {"assistant", "bot", "admin"}:
+            last_bot = {"type": _infer_last_question_type(text), "text": text[:1000]}
+        if any(k in text.lower() for k in ["бол", "лет", "противопоказ", "понедель", "завтра", "вариант"]):
+            facts.append(f"{role}: {text[:180]}")
+    summary = " | ".join(facts[-8:])
+    return compact[-limit:], summary, last_bot
+
+
+def build_dialog_context(*, user_text: str, session: dict, recent_history: list | None = None, available_slots: list | None = None, clinic_context: dict | None = None) -> dict[str, Any]:
+    history, auto_summary, last_bot_question = _compact_recent_history(recent_history, 20)
+    session_state = {
+        "step": session.get("step") or session.get("current_step") or "start",
+        "complaint": session.get("complaint") or "",
+        "profile_status": session.get("profile_status") or "",
+        "age": session.get("age"),
+        "contraindications_ok": session.get("contraindications_ok"),
+        "preferred_date": session.get("preferred_date") or session.get("preferred_date_text") or "",
+        "last_slots": available_slots if available_slots is not None else session.get("last_slots") or [],
+        "selected_slot": session.get("selected_slot") or None,
+        "patient_name": session.get("patient_name") or "",
+        "manual_takeover": bool(session.get("manual_takeover") or session.get("manual_admin_intervention")),
+        "ai_muted": bool(session.get("ai_muted") or session.get("do_not_reply")),
+        "last_required_question": session.get("last_required_question") or "",
+        "last_required_step": session.get("last_required_step") or "",
+        "pending_step_after_faq": session.get("pending_step_after_faq") or "",
+        "last_user_intent": session.get("last_user_intent") or "",
+        "dialog_summary": session.get("dialog_summary") or auto_summary,
+        "known_user_facts": session.get("known_user_facts") or {},
+        "conversation_turns_count": session.get("conversation_turns_count") or len(history),
+    }
+    if session.get("last_bot_question_type") and last_bot_question.get("type") == "unknown":
+        last_bot_question["type"] = str(session.get("last_bot_question_type"))
+    return {
+        "session_state": session_state,
+        "recent_history": history,
+        "last_bot_question": last_bot_question,
+        "current_user_message": user_text or "",
+        "known_facts": {
+            "clinic_prompt_source": "SYSTEM_PROMPT_rendered.md",
+            "allowed_contraindications": clinic_context.get("allowed_contraindications") if isinstance(clinic_context, dict) else [],
+            "working_hours_rule": "AI only 20:00-08:00 Astana",
+            "booking_order": "complaint -> age -> contraindications -> date -> CRM slots -> time -> name -> booking",
+        },
+    }
+
+
 async def run_openai_dialog_brain(
     *,
     user_text: str,
@@ -536,16 +693,14 @@ async def run_openai_dialog_brain(
         debug.update(fb)
         return decision, debug
     try:
-        summary = {
-            "step": session.get("step") or session.get("current_step") or "start",
-            "complaint": session.get("complaint") or "",
-            "age": session.get("age"),
-            "contraindications_ok": session.get("contraindications_ok"),
-            "last_slots": available_slots if available_slots is not None else session.get("last_slots") or [],
-            "selected_slot": session.get("selected_slot") or {},
-            "language": session.get("language") or "ru",
-            "clinic_context": clinic_context or {},
-        }
+        dialog_context = build_dialog_context(
+            user_text=user_text or "",
+            session=session,
+            recent_history=recent_history or [],
+            available_slots=available_slots,
+            clinic_context=clinic_context or {},
+        )
+        summary = dialog_context["session_state"]
         if state is not None:
             state.log_event(str(session.get("chat_id") or "system"), "openai_brain_called", {"chat_id": str(session.get("chat_id") or "system"), "model": model, "openai_brain_model": model, "openai_brain_temperature": temperature, "step": summary["step"], "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "extracted_preview": {}})
         client = _openai_client(settings.openai_api_key)
@@ -556,7 +711,7 @@ async def run_openai_dialog_brain(
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": _full_dialog_brain_system_prompt()},
-                {"role": "user", "content": json.dumps({"user_text": user_text or "", "session": summary, "recent_history": recent_history or []}, ensure_ascii=False)},
+                {"role": "user", "content": json.dumps({"dialog_context": dialog_context}, ensure_ascii=False)},
             ],
         )
         content = response.choices[0].message.content or ""

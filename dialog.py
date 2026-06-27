@@ -480,7 +480,7 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
             return _finalize(chat_id, session, repair.answer)
         return None
     _safe_log(chat_id, "openai_brain_called", {"chat_id": chat_id, "step": session.get("step") or "start", "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "extracted_preview": {}, **brain_log_fields})
-    decision, debug = await run_openai_dialog_brain(user_text=text, session={**session, "chat_id": chat_id}, recent_history=state.get_history(chat_id)[-6:] if hasattr(state, "get_history") else None, available_slots=session.get("last_slots") or None)
+    decision, debug = await run_openai_dialog_brain(user_text=text, session={**session, "chat_id": chat_id}, recent_history=_recent_history_for_brain(chat_id, session), available_slots=session.get("last_slots") or None)
     _apply_openai_brain_debug(session, debug)
     if decision.get("intent"):
         session["openai_brain_intent"] = decision.get("intent")
@@ -518,6 +518,13 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         return None
     action = decision.get("action")
     extracted = decision.get("extracted") or {}
+    if extracted.get("symptom_duration"):
+        session["symptom_duration"] = str(extracted.get("symptom_duration") or "")
+        facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
+        facts["symptom_duration"] = session["symptom_duration"]
+        session["known_user_facts"] = facts
+    if decision.get("intent"):
+        session["last_user_intent"] = str(decision.get("intent") or "")
     if extracted.get("time_preference"):
         session["time_preference"] = str(extracted.get("time_preference") or "")
     elif "не рано" in _low(text):
@@ -583,7 +590,13 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         session["step"] = "name"
         return _finalize(chat_id, session, reply or _ask_name(session))
     if action == "answer_faq_and_continue":
-        return _finalize(chat_id, session, reply + ("\n\n" + _mandatory_step_prompt(session, session.get("step") or "complaint") if reply else ""))
+        pending = str(session.get("pending_step_after_faq") or session.get("last_required_step") or session.get("step") or "complaint")
+        if pending in {"time", "select_slot"} and session.get("last_slots"):
+            session["step"] = "time"
+        elif pending in {"complaint", "age", "contraindications", "date", "name"}:
+            session["step"] = pending
+        session["pending_step_after_faq"] = pending
+        return _finalize(chat_id, session, reply + ("\n\n" + _mandatory_step_prompt(session, pending) if reply else ""))
     if action == "stop_contraindication":
         if not _contra_has_hard_stop(text):
             _safe_log(chat_id, "llm_unknown_contraindication_blocked", {"chat_id": chat_id, "step": session.get("step") or "start", "answer_preview": reply[:180]})
@@ -2241,9 +2254,55 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
         _safe_log(chat_id, "final_state_after_decision", {"chat_id": chat_id, "state_before_step": before_step, "state_after_step": session.get("step") or "", "answer_empty": not bool(answer), "fallback_reason": session.get("fallback_reason") or "", "state_repaired": bool(session.get("state_repaired")), "state_repair_reason": session.get("state_repair_reason") or ""})
 
     session["last_assistant_answer"] = answer
+    _remember_required_question(session, answer)
     _safe_save(chat_id, session)
     _safe_add_message(chat_id, "assistant", answer)
     return answer
+
+
+def _recent_history_for_brain(chat_id: str, session: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build compact context-first history for the LLM Dialog Brain."""
+    raw = state.get_history(chat_id, limit=24) if hasattr(state, "get_history") else []
+    items: list[dict[str, Any]] = []
+    for item in raw[-20:]:
+        text = str(item.get("text") or item.get("content") or "").strip()
+        role = str(item.get("role") or "").strip()
+        if not text or role not in {"user", "assistant", "bot", "admin", "human", "operator", "manager"}:
+            continue
+        row: dict[str, Any] = {"role": "assistant" if role == "bot" else role, "text": text}
+        if role in {"assistant", "bot", "admin"}:
+            row["step"] = session.get("last_required_step") or session.get("step") or ""
+        items.append(row)
+    return items
+
+
+def _remember_required_question(session: dict[str, Any], answer: str) -> None:
+    qtype = _classify_bot_question(answer)
+    step_by_type = {
+        "complaint": "complaint",
+        "age": "age",
+        "contraindications": "contraindications",
+        "date": "date",
+        "time": "time",
+        "name": "name",
+    }
+    if qtype in step_by_type:
+        session["last_required_question"] = answer
+        session["last_required_step"] = step_by_type[qtype]
+        session["pending_step_after_faq"] = ""
+    session["conversation_turns_count"] = int(session.get("conversation_turns_count") or 0) + 1
+    facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
+    for key in ("complaint", "age", "contraindications_ok", "preferred_date", "selected_slot", "patient_name", "symptom_duration"):
+        val = session.get(key)
+        if val not in (None, "", [], {}):
+            facts[key] = val
+    session["known_user_facts"] = facts
+    important = []
+    for key in ("complaint", "age", "contraindications_ok", "preferred_date", "selected_slot"):
+        if key in facts:
+            important.append(f"{key}={facts[key]}")
+    if important:
+        session["dialog_summary"] = "; ".join(important)[-1200:]
 
 
 def _no_reply(chat_id: str, session: dict[str, Any], reason: str = "") -> str:
