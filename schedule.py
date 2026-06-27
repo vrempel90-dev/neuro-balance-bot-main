@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from config import get_settings
 
 
 def astana_now() -> datetime:
-    return datetime.now(timezone.utc) + timedelta(hours=get_settings().timezone_offset_hours)
+    return datetime.now(ZoneInfo("Asia/Almaty"))
 
 
 def is_bot_work_time(now: datetime | None = None) -> bool:

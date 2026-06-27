@@ -13,7 +13,7 @@ import state
 from config import get_settings
 from dialog import handle_message
 from ai import humanize_reply_with_openai
-from schedule import is_bot_work_time
+from schedule import astana_now, is_bot_work_time
 from voice import transcribe_wazzup_voice, transcribe_bytes, transcribe_upload, voice_text_for_bot
 from wazzup import extract_incoming_messages, is_audio_message_payload, send_text
 
@@ -63,6 +63,7 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "ai_muted": bool(session.get("ai_muted")),
         "manual_takeover": bool(session.get("manual_takeover") or session.get("manual_admin_intervention")),
         "ai_lead_started": bool(session.get("ai_lead_started")),
+        "working_hours_bypassed_by_force": bool(session.get("working_hours_bypassed_by_force")),
     }
 
 
@@ -195,6 +196,34 @@ async def _maybe_humanize_answer(chat_id: str, user_text: str, base_answer: str,
         state.log_event(chat_id, "openai_skipped", {"chat_id": chat_id, "reason": debug.get("openai_skip_reason") or "config_missing", "step": session.get("step") or session.get("current_step") or ""})
     return final_answer
 
+
+
+def _mark_working_hours_disabled(
+    *,
+    chat_id: str,
+    phone: str = "",
+    source: str,
+    force: bool = False,
+    kind: str = "text",
+    text: str = "",
+) -> None:
+    """Persist and log the daytime silence decision before any AI/CRM path runs."""
+    session = _get_session_safe(chat_id)
+    session["no_reply_reason"] = "working_hours_ai_disabled"
+    session["openai_used"] = False
+    session["openai_brain_used"] = False
+    session["openai_brain_skip_reason"] = "working_hours_ai_disabled"
+    session["working_hours_bypassed_by_force"] = False
+    state.save_session(chat_id, session)
+    state.log_event(chat_id, "working_hours_ai_disabled", {
+        "chat_id": chat_id,
+        "phone": phone,
+        "current_time_astana": astana_now().isoformat(),
+        "source": source,
+        "force": force,
+        "kind": kind,
+        "text_preview": _preview(text, 120),
+    })
 
 def _get_session_safe(chat_id: str) -> dict[str, Any]:
     try:
@@ -464,13 +493,14 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
     # В рабочее время (08:00–20:00) Wazzup/webhook полностью молчит:
     # не запускаем Dialog Brain и не вызываем humanize_reply.
     if not is_bot_work_time():
-        session = _get_session_safe(chat_id)
-        session["no_reply_reason"] = "working_hours_ai_disabled"
-        session["openai_used"] = False
-        session["openai_brain_used"] = False
-        session["openai_brain_skip_reason"] = "working_hours_ai_disabled"
-        state.save_session(chat_id, session)
-        state.log_event(chat_id, "working_hours_ai_disabled", {"kind": kind, "source": message.get("source") or "wazzup"})
+        _mark_working_hours_disabled(
+            chat_id=chat_id,
+            phone=phone,
+            source=str(message.get("source") or "wazzup"),
+            force=False,
+            kind=kind,
+            text=str(message.get("text") or ""),
+        )
         return ""
 
     if kind == "voice" or _message_has_voice_url(message):
@@ -761,19 +791,21 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
     force = bool(data.get("force") or False)
 
     if not force and not is_bot_work_time():
-        session = state.get_session(chat_id)
-        session["no_reply_reason"] = "working_hours_ai_disabled"
-        session["openai_used"] = False
-        session["openai_brain_used"] = False
-        session["openai_brain_skip_reason"] = "working_hours_ai_disabled"
-        state.save_session(chat_id, session)
-        state.log_event(chat_id, "working_hours_ai_disabled", {"phone": phone, "text_preview": _preview(text, 120), "force": force, "source": "debug"})
+        _mark_working_hours_disabled(
+            chat_id=chat_id,
+            phone=phone,
+            source="debug",
+            force=force,
+            kind="text",
+            text=text,
+        )
         answer = ""
     else:
         if force:
             session = state.get_session(chat_id)
             for key in ("manual_admin_intervention", "manual_takeover", "ai_muted"):
                 session[key] = False
+            session["working_hours_bypassed_by_force"] = not is_bot_work_time()
             state.save_session(chat_id, session)
         state.log_event(chat_id, "dialog_start", {"phone": phone, "text_preview": _preview(text, 120), "force": force, "source": "debug"})
         raw_answer = await handle_message(chat_id=chat_id, phone=phone, user_text=text)
