@@ -605,3 +605,44 @@ def test_doctor_names_from_last_slots_only() -> None:
     answer = run(handle_message(chat_id, "77011234567", "а врачи кто?"))
     assert "Жумабеков М." in answer and "Садыкова А." in answer
     assert "Иван" not in answer
+
+
+def test_new_lead_first_message_start_allows_brain(monkeypatch: Any) -> None:
+    chat_id = "new_lead_first_start_brain"
+    state.reset_session(chat_id)
+
+    async def fake_brain(**kwargs: Any):
+        assert kwargs["session"].get("gate_reason") == "new_lead"
+        assert kwargs["session"].get("step") in (None, "start")
+        return brain("ask_age", "Поняла, поясница болит. Подскажите, пожалуйста, сколько Вам лет?", {"complaint": "поясница болит"})
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+    answer = run(handle_message(chat_id, "77011234567", "Здравствуйте, хочу записаться. Поясница болит"))
+    session = state.get_session(chat_id)
+    assert session["openai_brain_used"] is True
+    assert session.get("openai_brain_skip_reason") in ("", None)
+    assert session["step"] == "age"
+    assert "лет" in answer.lower()
+
+
+def test_start_and_name_steps_are_allowed_for_active_ai_lead() -> None:
+    assert dialog._openai_brain_skip_reason({"step": "start", "gate_reason": "new_lead"}, "хочу записаться") == ""
+    assert dialog._openai_brain_skip_reason({"step": "name", "ai_lead_started": True}, "Алия") == ""
+
+
+def test_protected_and_working_hours_flows_still_skip_brain() -> None:
+    assert dialog._openai_brain_skip_reason({"step": "date", "ai_lead_started": True, "booked": True}, "завтра") == "booked_or_handoff"
+    assert dialog._openai_brain_skip_reason({"step": "date", "ai_lead_started": True, "manual_takeover": True}, "завтра") == "manual_or_muted"
+    assert dialog._openai_brain_skip_reason({"step": "date", "ai_lead_started": True, "escalated": True}, "завтра") == "manual_or_muted"
+
+
+def test_openai_error_debug_contains_type_and_message(monkeypatch: Any) -> None:
+    monkeypatch.setattr(ai.get_settings(), "openai_api_key", "test-key")
+    monkeypatch.setattr(ai, "AsyncOpenAI", object)
+    err = RuntimeError("boom from openai")
+    monkeypatch.setattr(ai, "_openai_client", lambda key: FakeClient(err))
+    decision, debug = run(ai.run_openai_dialog_brain(user_text="x", session={"chat_id": "err_debug"}))
+    assert decision["action"] == "fallback_rule_based"
+    assert debug["openai_error_type"] == "RuntimeError"
+    assert "boom from openai" in debug["openai_error_message_preview"]
+    assert debug["openai_error_detail"]["model"]

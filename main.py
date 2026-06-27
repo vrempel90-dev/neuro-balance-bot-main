@@ -48,6 +48,8 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "openai_brain_fallback_used": bool(session.get("openai_brain_fallback_used")),
         "openai_brain_model": session.get("openai_brain_model") or getattr(get_settings(), "ai_brain_model", ""),
         "openai_brain_temperature": session.get("openai_brain_temperature") if session.get("openai_brain_temperature") is not None else getattr(get_settings(), "ai_brain_temperature", None),
+        "openai_error_type": session.get("openai_error_type") or "",
+        "openai_error_message_preview": session.get("openai_error_message_preview") or "",
         "humanize_skipped_because_brain_valid": bool(session.get("humanize_skipped_because_brain_valid")),
         "humanize_fallback_used": bool(session.get("humanize_fallback_used")),
         "llm_blocked": bool(session.get("llm_blocked")),
@@ -114,6 +116,9 @@ def _set_openai_debug(session: dict[str, Any], debug: dict[str, Any], base_answe
     session["openai_model"] = str(debug.get("openai_model") or "")
     session["openai_skip_reason"] = str(debug.get("openai_skip_reason") or "")
     session["openai_guard_failed"] = bool(debug.get("openai_guard_failed"))
+    session["openai_error_type"] = str(debug.get("openai_error_type") or "")
+    session["openai_error_message_preview"] = str(debug.get("openai_error_message_preview") or "")
+    session["openai_error_detail"] = debug.get("openai_error_detail") or {}
     if "humanize_fallback_used" in debug:
         session["humanize_fallback_used"] = bool(debug.get("humanize_fallback_used"))
     session["base_answer_preview"] = str(debug.get("base_answer_preview") or _preview(base_answer, 160))
