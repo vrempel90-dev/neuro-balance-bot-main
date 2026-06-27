@@ -36,6 +36,42 @@ def _openai_client(api_key: str):
     return AsyncOpenAI(api_key=api_key, timeout=10.0, max_retries=1)
 
 
+
+def _openai_config_missing_detail(settings: Any, *, chat_id: str = "", step: str = "", brain: bool = False) -> dict[str, Any]:
+    missing_keys: list[str] = []
+    disabled_flags: list[str] = []
+    model = str(getattr(settings, "openai_model", "") or "")
+    brain_model = str(getattr(settings, "ai_brain_model", "") or model)
+    if not getattr(settings, "openai_api_key", ""):
+        missing_keys.append("OPENAI_API_KEY")
+    if not model:
+        missing_keys.append("OPENAI_MODEL")
+    if brain and not (brain_model or model):
+        missing_keys.append("AI_BRAIN_MODEL_or_OPENAI_MODEL")
+    if not getattr(settings, "ai_enabled", True):
+        disabled_flags.append("AI_ENABLED=false")
+    if brain and not getattr(settings, "openai_brain_enabled", True):
+        disabled_flags.append("OPENAI_BRAIN_ENABLED=false")
+    if not brain and not getattr(settings, "openai_humanize_replies", True):
+        disabled_flags.append("OPENAI_HUMANIZE_REPLIES=false")
+    if AsyncOpenAI is None:
+        missing_keys.append("openai_package")
+    return {
+        "chat_id": str(chat_id or ""),
+        "step": str(step or ""),
+        "missing_keys": missing_keys,
+        "disabled_flags": disabled_flags,
+        "model": model,
+        "brain_model": brain_model,
+        "humanize_enabled": bool(getattr(settings, "openai_humanize_replies", True)),
+        "dialog_enabled": bool(getattr(settings, "openai_brain_enabled", True) and getattr(settings, "ai_enabled", True)),
+    }
+
+
+def _log_openai_config_missing_detail(detail: dict[str, Any]) -> None:
+    if state is not None:
+        state.log_event(str(detail.get("chat_id") or "system"), "openai_config_missing_detail", detail)
+
 def _openai_error_detail(exc: Exception, model: str) -> dict[str, Any]:
     message = str(exc)
     status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
@@ -686,11 +722,16 @@ async def run_openai_dialog_brain(
 ) -> tuple[dict, dict]:
     settings = get_settings()
     model = getattr(settings, "ai_brain_model", "") or getattr(settings, "openai_model", "")
-    temperature = float(getattr(settings, "ai_brain_temperature", 0.2) or 0.2)
+    temperature = float(getattr(settings, "ai_brain_temperature", getattr(settings, "openai_dialog_temperature", 0.2)) or 0.2)
     debug = {"openai_brain_used": False, "openai_brain_intent": "", "openai_brain_action": "", "openai_brain_needs_python_tool": "", "openai_brain_extracted": {}, "openai_brain_guard_failed": False, "openai_brain_guard_reason": "", "openai_brain_skip_reason": "", "openai_brain_fallback_used": False, "openai_brain_model": model, "openai_brain_temperature": temperature, "openai_model": model, "openai_error_type": "", "openai_error_message_preview": "", "openai_error_detail": {}}
-    if not getattr(settings, "ai_enabled", True) or not getattr(settings, "openai_api_key", "") or AsyncOpenAI is None:
+    detail = _openai_config_missing_detail(settings, chat_id=str(session.get("chat_id") or ""), step=str(session.get("step") or session.get("current_step") or "start"), brain=True)
+    if detail["missing_keys"] or detail["disabled_flags"]:
         decision, fb = _dialog_brain_fallback("config_missing")
         debug.update(fb)
+        debug["openai_config_missing_detail"] = detail
+        debug["openai_missing_keys"] = detail["missing_keys"]
+        debug["openai_disabled_flags"] = detail["disabled_flags"]
+        _log_openai_config_missing_detail(detail)
         return decision, debug
     try:
         dialog_context = build_dialog_context(
@@ -939,8 +980,13 @@ async def humanize_reply_with_openai(
     if not base_answer:
         debug["openai_skip_reason"] = "empty_answer"
         return "", debug
-    if not settings.ai_enabled or not settings.openai_humanize_replies or not settings.openai_api_key or AsyncOpenAI is None:
+    detail = _openai_config_missing_detail(settings, chat_id=str(session.get("chat_id") or session.get("phone") or ""), step=str(session.get("step") or session.get("current_step") or "start"), brain=False)
+    if detail["missing_keys"] or detail["disabled_flags"]:
         debug["openai_skip_reason"] = "config_missing"
+        debug["openai_config_missing_detail"] = detail
+        debug["openai_missing_keys"] = detail["missing_keys"]
+        debug["openai_disabled_flags"] = detail["disabled_flags"]
+        _log_openai_config_missing_detail(detail)
         return base_answer, debug
 
     step = str(session.get("step") or session.get("current_step") or "start")

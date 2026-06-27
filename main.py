@@ -50,6 +50,9 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "openai_brain_temperature": session.get("openai_brain_temperature") if session.get("openai_brain_temperature") is not None else getattr(get_settings(), "ai_brain_temperature", None),
         "openai_error_type": session.get("openai_error_type") or "",
         "openai_error_message_preview": session.get("openai_error_message_preview") or "",
+        "openai_config_missing_detail": session.get("openai_config_missing_detail") or {},
+        "openai_missing_keys": session.get("openai_missing_keys") or [],
+        "openai_disabled_flags": session.get("openai_disabled_flags") or [],
         "humanize_skipped_because_brain_valid": bool(session.get("humanize_skipped_because_brain_valid")),
         "humanize_fallback_used": bool(session.get("humanize_fallback_used")),
         "llm_blocked": bool(session.get("llm_blocked")),
@@ -126,6 +129,9 @@ def _set_openai_debug(session: dict[str, Any], debug: dict[str, Any], base_answe
     session["openai_error_type"] = str(debug.get("openai_error_type") or "")
     session["openai_error_message_preview"] = str(debug.get("openai_error_message_preview") or "")
     session["openai_error_detail"] = debug.get("openai_error_detail") or {}
+    session["openai_config_missing_detail"] = debug.get("openai_config_missing_detail") or {}
+    session["openai_missing_keys"] = debug.get("openai_missing_keys") or []
+    session["openai_disabled_flags"] = debug.get("openai_disabled_flags") or []
     if "humanize_fallback_used" in debug:
         session["humanize_fallback_used"] = bool(debug.get("humanize_fallback_used"))
     session["base_answer_preview"] = str(debug.get("base_answer_preview") or _preview(base_answer, 160))
@@ -205,7 +211,9 @@ async def _maybe_humanize_answer(chat_id: str, user_text: str, base_answer: str,
     _set_openai_debug(session, debug, base_answer, final_answer)
     state.save_session(chat_id, session)
     if not debug.get("openai_used"):
-        state.log_event(chat_id, "openai_skipped", {"chat_id": chat_id, "reason": debug.get("openai_skip_reason") or "config_missing", "step": session.get("step") or session.get("current_step") or ""})
+        if debug.get("openai_config_missing_detail"):
+            state.log_event(chat_id, "openai_config_missing_detail", debug["openai_config_missing_detail"])
+        state.log_event(chat_id, "openai_skipped", {"chat_id": chat_id, "reason": debug.get("openai_skip_reason") or "config_missing", "step": session.get("step") or session.get("current_step") or "", "missing_keys": debug.get("openai_missing_keys") or [], "disabled_flags": debug.get("openai_disabled_flags") or []})
     return final_answer
 
 
@@ -836,6 +844,9 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
         "no_reply_reason": session.get("no_reply_reason"),
         "current_step": session.get("step"),
         "prior_complaint_text": session.get("prior_complaint_text") or session.get("complaint"),
+        "openai_config_missing_detail": session.get("openai_config_missing_detail") or {},
+        "openai_missing_keys": session.get("openai_missing_keys") or [],
+        "openai_disabled_flags": session.get("openai_disabled_flags") or [],
         "debug": _dialog_debug(session, answer),
     }
 

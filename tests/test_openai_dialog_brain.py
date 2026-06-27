@@ -817,3 +817,68 @@ def test_long_history_context_summary_preserves_key_facts() -> None:
     assert ctx["session_state"]["contraindications_ok"] is True
     assert ctx["session_state"]["preferred_date"] == "понедельник"
     assert ctx["session_state"]["selected_slot"]["time"] == "10:00"
+
+
+def test_humanize_disabled_does_not_disable_dialog_brain(monkeypatch: Any) -> None:
+    payload = {
+        "understood_context": {"patient_meaning": "age", "is_answer_to_last_question": True},
+        "intent": "age_answer",
+        "entities": {"age": 34},
+        "next_required_step": "contraindications",
+        "action": "ask_contraindications",
+        "needs_python_tool": "none",
+        "reply": "Спасибо. Есть ли противопоказания?",
+        "safety": {"hard_stop": False, "unsafe_medical_claim": False, "invented_fact_risk": False, "reason": ""},
+    }
+
+    class Client:
+        def __init__(self):
+            self.chat = type("Chat", (), {"completions": FakeCompletions(json.dumps(payload, ensure_ascii=False))})()
+
+    settings = ai.get_settings()
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(settings, "openai_model", "gpt-4o-mini")
+    monkeypatch.setattr(settings, "ai_brain_model", "gpt-4o-mini")
+    monkeypatch.setattr(settings, "openai_humanize_replies", False)
+    monkeypatch.setattr(settings, "openai_brain_enabled", True, raising=False)
+    monkeypatch.setattr(ai, "AsyncOpenAI", object)
+    monkeypatch.setattr(ai, "_openai_client", lambda key: Client())
+
+    decision, debug = run(ai.run_openai_dialog_brain(user_text="34", session={"chat_id": "brain_humanize_off", "step": "age"}))
+
+    assert decision["action"] == "ask_contraindications"
+    assert debug["openai_brain_used"] is True
+    assert debug["openai_brain_skip_reason"] == ""
+
+
+def test_api_key_and_openai_model_allow_brain(monkeypatch: Any) -> None:
+    settings = ai.get_settings()
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(settings, "openai_model", "gpt-4o-mini")
+    monkeypatch.setattr(settings, "ai_brain_model", "")
+    monkeypatch.setattr(settings, "openai_brain_enabled", True, raising=False)
+    monkeypatch.setattr(ai, "AsyncOpenAI", object)
+
+    detail = ai._openai_config_missing_detail(settings, chat_id="allowed", step="start", brain=True)
+
+    assert detail["missing_keys"] == []
+    assert detail["disabled_flags"] == []
+    assert detail["brain_model"] == "gpt-4o-mini"
+
+
+def test_brain_config_missing_debug_lists_specific_causes(monkeypatch: Any) -> None:
+    settings = ai.get_settings()
+    monkeypatch.setattr(settings, "openai_api_key", "")
+    monkeypatch.setattr(settings, "openai_model", "")
+    monkeypatch.setattr(settings, "ai_brain_model", "")
+    monkeypatch.setattr(settings, "openai_brain_enabled", False, raising=False)
+    monkeypatch.setattr(ai, "AsyncOpenAI", object)
+
+    decision, debug = run(ai.run_openai_dialog_brain(user_text="x", session={"chat_id": "missing_detail", "step": "start"}))
+
+    assert decision["action"] == "fallback_rule_based"
+    assert debug["openai_brain_skip_reason"] == "config_missing"
+    assert "OPENAI_API_KEY" in debug["openai_missing_keys"]
+    assert "OPENAI_MODEL" in debug["openai_missing_keys"]
+    assert "OPENAI_BRAIN_ENABLED=false" in debug["openai_disabled_flags"]
+    assert debug["openai_config_missing_detail"]["chat_id"] == "missing_detail"

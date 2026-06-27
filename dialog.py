@@ -93,6 +93,9 @@ def _reset_openai_brain_debug(session: dict[str, Any]) -> None:
     session["openai_error_type"] = ""
     session["openai_error_message_preview"] = ""
     session["openai_error_detail"] = {}
+    session["openai_config_missing_detail"] = {}
+    session["openai_missing_keys"] = []
+    session["openai_disabled_flags"] = []
     session["humanize_skipped_because_brain_valid"] = False
     session["humanize_fallback_used"] = False
     _reset_llm_repair_debug(session)
@@ -104,6 +107,7 @@ def _apply_openai_brain_debug(session: dict[str, Any], debug: dict[str, Any]) ->
         "openai_brain_intent", "openai_brain_extracted", "openai_brain_guard_failed", "openai_brain_guard_reason",
         "openai_brain_skip_reason", "openai_brain_fallback_used", "openai_brain_model", "openai_brain_temperature",
         "openai_error_type", "openai_error_message_preview", "openai_error_detail",
+        "openai_config_missing_detail", "openai_missing_keys", "openai_disabled_flags",
     ):
         if key in debug:
             session[key] = debug[key]
