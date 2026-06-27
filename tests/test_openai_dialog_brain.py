@@ -731,3 +731,89 @@ def test_debug_chat_working_hours_force_false_still_silent(monkeypatch: Any) -> 
     assert response.status_code == 200
     assert data["answer"] == ""
     assert data["debug"]["no_reply_reason"] == "working_hours_ai_disabled"
+
+
+def test_brain_receives_full_dialog_context(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    payload = {
+        "understood_context": {"patient_meaning": "ответил возрастом", "is_answer_to_last_question": True},
+        "intent": "age_answer",
+        "entities": {"age": 34, "language": "ru"},
+        "next_required_step": "contraindications",
+        "needs_python_tool": "none",
+        "reply": "Спасибо. Есть противопоказания?",
+        "safety": {"hard_stop": False, "unsafe_medical_claim": False, "invented_fact_risk": False, "reason": ""},
+    }
+
+    class CapturingCompletions(FakeCompletions):
+        async def create(self, **kwargs: Any):
+            captured.update(kwargs)
+            return await super().create(**kwargs)
+
+    class CapturingClient:
+        def __init__(self):
+            self.chat = type("Chat", (), {"completions": CapturingCompletions(json.dumps(payload, ensure_ascii=False))})()
+
+    monkeypatch.setattr(ai.get_settings(), "openai_api_key", "test-key")
+    monkeypatch.setattr(ai, "AsyncOpenAI", object)
+    monkeypatch.setattr(ai, "_openai_client", lambda key: CapturingClient())
+    session = {"step": "age", "complaint": "спина", "last_required_step": "age", "last_required_question": "Сколько Вам лет?"}
+    history = [{"role": "assistant", "content": "Сколько Вам лет?"}]
+    decision, _ = run(ai.run_openai_dialog_brain(user_text="34", session=session, recent_history=history))
+    body = json.loads(captured["messages"][1]["content"])
+    ctx = body["dialog_context"]
+    assert ctx["session_state"]["step"] == "age"
+    assert ctx["session_state"]["complaint"] == "спина"
+    assert ctx["recent_history"][0]["text"] == "Сколько Вам лет?"
+    assert ctx["last_bot_question"]["type"] == "age"
+    assert ctx["current_user_message"] == "34"
+    assert decision["action"] == "ask_contraindications"
+    assert decision["extracted"]["age"] == 34
+
+
+def test_new_brain_schema_preserves_multiple_entities_and_symptom_duration() -> None:
+    raw = {
+        "understood_context": {"patient_meaning": "34 года, противопоказаний нет, хочет понедельник не рано", "is_answer_to_last_question": True, "contains_multiple_entities": True},
+        "intent": "date_preference",
+        "entities": {
+            "age": 34,
+            "symptom_duration": "15 лет",
+            "contraindications_clear": True,
+            "date_preference": "в понедельник",
+            "time_preference": "не рано",
+            "language": "ru",
+        },
+        "next_required_step": "time",
+        "needs_python_tool": "check_slots",
+        "reply": "Поняла, посмотрю свободное время.",
+        "safety": {"hard_stop": False, "unsafe_medical_claim": False, "invented_fact_risk": False, "reason": ""},
+    }
+    decision, reason = ai._normalize_dialog_brain_decision(raw)
+    assert reason == ""
+    assert decision["action"] == "show_slots"
+    assert decision["extracted"]["age"] == 34
+    assert decision["extracted"]["contraindications_clear"] is True
+    assert decision["extracted"]["preferred_date_text"] == "в понедельник"
+    assert decision["extracted"]["time_preference"] == "не рано"
+    assert decision["extracted"]["symptom_duration"] == "15 лет"
+
+
+def test_long_history_context_summary_preserves_key_facts() -> None:
+    history = []
+    for i in range(30):
+        history.append({"role": "user", "content": f"мусор {i}"})
+    history.extend([
+        {"role": "user", "content": "болит спина"},
+        {"role": "assistant", "content": "Сколько Вам лет?"},
+        {"role": "user", "content": "34"},
+        {"role": "assistant", "content": "Противопоказаний нет?"},
+        {"role": "user", "content": "нет, можно в понедельник"},
+    ])
+    session = {"step": "time", "complaint": "болит спина", "age": 34, "contraindications_ok": True, "preferred_date": "понедельник", "selected_slot": {"time": "10:00"}}
+    ctx = ai.build_dialog_context(user_text="а врач кто?", session=session, recent_history=history)
+    assert len(ctx["recent_history"]) <= 20
+    assert ctx["session_state"]["complaint"] == "болит спина"
+    assert ctx["session_state"]["age"] == 34
+    assert ctx["session_state"]["contraindications_ok"] is True
+    assert ctx["session_state"]["preferred_date"] == "понедельник"
+    assert ctx["session_state"]["selected_slot"]["time"] == "10:00"
