@@ -421,14 +421,14 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
         return False, "protected_flow"
     if action == "ask_name" and not session.get("selected_slot"):
         return False, "ask_name_without_slot"
-    if action == "ask_date" and session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not (_is_no_contra_answer(user_text) or _contra_is_clear_no(user_text)):
+    if action == "ask_date" and session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not _text_confirms_no_contra(session, user_text):
         return False, "ask_date_before_contra"
     if action == "show_slots" and not extracted.get("preferred_date_text"):
         return False, "show_slots_without_date"
     if action == "show_slots" and (
         step not in OPENAI_BRAIN_MULTI_ENTITY_STEPS
         or session.get("ai_lead_started") is not True
-        or (session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not (_is_no_contra_answer(user_text) or _contra_is_clear_no(user_text)))
+        or (session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not _text_confirms_no_contra(session, user_text))
     ):
         return False, "show_slots_multi_entity_guard"
     if tool == "book_appointment" and not (session.get("selected_slot") and (session.get("patient_name") or extracted.get("patient_name"))):
@@ -448,7 +448,7 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
         return False, "doctor_hallucination"
     if not (session.get("last_slots") or []) and (_TIME_PATTERN.search(reply) or any(p in low_reply for p in _FORBIDDEN_EMPTY_SLOT_PHRASES)):
         return False, "slot_hallucination"
-    if action in {"ask_date", "show_slots"} and session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not (_is_no_contra_answer(user_text) or _contra_is_clear_no(user_text)):
+    if action in {"ask_date", "show_slots"} and session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not _text_confirms_no_contra(session, user_text):
         return False, "offered_date_before_contra"
     if step == "contraindications" and session.get("contraindications_ok") is not True and action not in {"ask_date", "stop_contraindication", "handoff_admin", "fallback_rule_based", "no_reply", "answer_faq_and_continue"}:
         if "противопоказ" not in low_reply and "қарсы" not in low_reply:
@@ -550,7 +550,7 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         session["questionnaire_step"] = "contra"
         return _finalize(chat_id, session, reply or _ask_contra(session))
     if action == "ask_date":
-        if extracted.get("contraindications_clear") is True or _is_no_contra_answer(text) or _contra_is_clear_no(text):
+        if extracted.get("contraindications_clear") is True or _text_confirms_no_contra(session, text):
             _accept_no_contraindications(session, text or "нет")
         session["step"] = "date"
         session["questionnaire_step"] = "date"
@@ -561,13 +561,17 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
                 session["age"] = int(extracted.get("age"))
             except Exception:
                 pass
-        if extracted.get("contraindications_clear") is True or _is_no_contra_answer(text) or _contra_is_clear_no(text):
+        if extracted.get("contraindications_clear") is True or _text_confirms_no_contra(session, text):
             _accept_no_contraindications(session, text or "нет")
+            if extracted.get("contraindications_clear") is True:
+                session["contraindications_raw"] = _extract_no_contra_raw(text)
         if session.get("contraindications_ok") is not True:
             session["step"] = "contraindications"
             session["questionnaire_step"] = "contra"
             return _finalize(chat_id, session, _ask_contra(session))
         date_text = str(extracted.get("preferred_date_text") or text)
+        if date_text.strip():
+            session["preferred_date_text"] = date_text.strip()
         date_iso = _parse_date(date_text) or _parse_date(text)
         if not date_iso:
             session["step"] = "date"
@@ -653,7 +657,7 @@ async def _try_python_multi_entity_fallback(chat_id: str, session: dict[str, Any
     age = _extract_age(text, step="age") or (int(session["age"]) if str(session.get("age") or "").isdigit() else None)
     if not age:
         return None
-    if not (_is_no_contra_answer(text) or _contra_is_clear_no(text)):
+    if not _text_confirms_no_contra(session, text):
         return None
     if _contra_has_hard_stop(text) or not _has_multi_entity_safe_date(text):
         return None
@@ -664,6 +668,7 @@ async def _try_python_multi_entity_fallback(chat_id: str, session: dict[str, Any
 
     session["age"] = age
     _accept_no_contraindications(session, text or "нет")
+    session["contraindications_raw"] = _extract_no_contra_raw(text)
     if "не рано" in _low(text):
         session["time_preference"] = "не рано"
     session["openai_brain_fallback_used"] = True
@@ -984,8 +989,8 @@ LOOKUP_WORDS = [
 ]
 
 NO_CONTRA_WORDS = [
-    "нет", "нету", "не было", "противопоказаний нет", "нет противопоказаний",
-    "ничего нет", "нет такого ничего", "нет такого", "все чисто", "всё чисто", "чисто",
+    "нет", "нету", "не было", "не имеется", "противопоказаний нет", "нет противопоказаний",
+    "ничего нет", "по списку ничего нет", "нет такого ничего", "нет такого", "все чисто", "всё чисто", "чисто",
     "все нормально", "всё нормально", "нормально", "ничего такого нет", "ничего из этого нет",
     "нет ничего из перечисленного", "по всем нет", "все нет", "всё нет",
     "жоқ", "жок", "joq", "jok", "қарсы көрсетілім жоқ", "карсы корсетилим жок",
@@ -3573,6 +3578,34 @@ def _contra_is_clear_no(text: str) -> bool:
     return any(w == low or w in low for w in NO_CONTRA_WORDS)
 
 
+def _contra_clear_allowed_context(session: dict[str, Any], text: str) -> bool:
+    low = _low(text)
+    return (
+        "противопоказ" in low
+        or str(session.get("step") or session.get("current_step") or "") == "contraindications"
+        or str(session.get("last_required_step") or "") == "contraindications"
+        or str(session.get("last_bot_question_type") or "") == "contraindications"
+    )
+
+
+def _text_confirms_no_contra(session: dict[str, Any], text: str) -> bool:
+    if _contra_clear_allowed_context(session, text):
+        return _is_no_contra_answer(text) or _contra_is_clear_no(text)
+    step = str(session.get("step") or session.get("current_step") or "")
+    if step == "age" and _extract_age(text, step="age") and _has_multi_entity_safe_date(text):
+        return _is_no_contra_answer(text) or _contra_is_clear_no(text)
+    return False
+
+
+def _extract_no_contra_raw(text: str) -> str:
+    low = _low(text)
+    for phrase in sorted(NO_CONTRA_WORDS, key=len, reverse=True):
+        if phrase in low:
+            return phrase
+    if "противопоказ" in low and any(x in low for x in ["нет", "нету", "не имеется"]):
+        return "противопоказаний нет"
+    return (text or "нет").strip() or "нет"
+
 
 def _mandatory_step_prompt(session: dict[str, Any], step: str) -> str:
     if step == "age":
@@ -3618,10 +3651,11 @@ def _faq_answer_then_resume(text: str, session: dict[str, Any], step: str) -> st
 
 
 def _accept_no_contraindications(session: dict[str, Any], text: str) -> None:
+    raw = (text or "нет").strip() or "нет"
     session["contraindications_ok"] = True
-    session["contraindications_raw"] = text
+    session["contraindications_raw"] = raw
     session["contraindications_verdict"] = "proceed"
-    bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, text)
+    bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, raw)
 
 
 def _after_booking_admin_answer(text: str, session: dict[str, Any]) -> str:

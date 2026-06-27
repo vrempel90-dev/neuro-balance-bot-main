@@ -193,6 +193,8 @@ def test_age_message_with_clear_contra_and_date_checks_slots(monkeypatch: Any) -
 
     assert session["age"] == 34
     assert session["contraindications_ok"] is True
+    assert session["contraindications_raw"] == "все чисто"
+    assert "понедельник" in session["preferred_date_text"]
     assert session["time_preference"] == "не рано"
     assert calls
     assert session["step"] == "time"
@@ -201,6 +203,48 @@ def test_age_message_with_clear_contra_and_date_checks_slots(monkeypatch: Any) -
     assert session["openai_brain_used"] is True
     assert session["openai_brain_action"] == "show_slots"
     assert session["openai_used"] is True
+    assert session["openai_skip_reason"] == ""
+
+
+def test_age_message_with_no_contra_phrase_date_and_time_keeps_brain_status(monkeypatch: Any) -> None:
+    chat_id = "brain_multi_entity_no_contra_phrase"
+    reset(chat_id, {"step": "age", "complaint": "поясница болит", "ai_lead_started": True})
+    calls: list[str] = []
+
+    async def fake_slots(date: str, doctor_login: str | None = None):
+        calls.append(date)
+        return {"availability": [{"doctorLogin": "d", "doctorName": "Врач", "availableSlots": ["11:00", "15:00"]}]}
+
+    async def fake_brain(**kwargs: Any):
+        return brain(
+            "show_slots",
+            "Спасибо, проверю свободное время на понедельник.",
+            {
+                "age": 34,
+                "contraindications_clear": True,
+                "preferred_date_text": "понедельник",
+                "time_preference": "не рано",
+            },
+            "check_slots",
+        )
+
+    monkeypatch.setattr(crm, "check_slots", fake_slots)
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+
+    raw = run(handle_message(chat_id, "77011234567", "34, противопоказаний нет, можно в понедельник не рано?"))
+    answer = run(main._maybe_humanize_answer(chat_id, "34, противопоказаний нет, можно в понедельник не рано?", raw))
+    session = state.get_session(chat_id)
+
+    assert session["age"] == 34
+    assert session["contraindications_ok"] is True
+    assert session["contraindications_raw"] == "противопоказаний нет"
+    assert "понедельник" in session["preferred_date_text"]
+    assert session["time_preference"] == "не рано"
+    assert session["step"] != "contraindications"
+    assert "противопоказ" not in answer.lower()
+    assert calls
+    assert session["openai_used"] is True
+    assert session["openai_brain_used"] is True
     assert session["openai_skip_reason"] == ""
 
 
