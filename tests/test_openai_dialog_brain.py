@@ -646,3 +646,88 @@ def test_openai_error_debug_contains_type_and_message(monkeypatch: Any) -> None:
     assert debug["openai_error_type"] == "RuntimeError"
     assert "boom from openai" in debug["openai_error_message_preview"]
     assert debug["openai_error_detail"]["model"]
+
+
+def test_debug_chat_force_new_lead_empty_brain_reply_is_repaired(monkeypatch: Any) -> None:
+    from fastapi.testclient import TestClient
+
+    chat_id = "debug_brain_live_1"
+    state.reset_session(chat_id)
+
+    async def empty_brain(**kwargs: Any):
+        return (
+            {"action": "fallback_rule_based", "reply": "", "extracted": {}, "needs_python_tool": "none"},
+            {"openai_brain_used": False, "openai_brain_skip_reason": "empty_reply", "openai_brain_fallback_used": True},
+        )
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", empty_brain)
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: False)
+
+    response = TestClient(main.app).post(
+        "/debug/chat",
+        json={
+            "chat_id": chat_id,
+            "phone": "77000008881",
+            "text": "Здравствуйте, хочу записаться. Поясница болит",
+            "force": True,
+        },
+    )
+    data = response.json()
+    assert response.status_code == 200
+    assert data["answer"] != ""
+    assert data["session"]["step"] == "age"
+    assert data["debug"]["no_reply_reason"] == ""
+    assert data["debug"]["llm_repaired"] is True
+    assert data["debug"]["repair_reason"] == "empty_active_reply"
+    assert data["debug"]["repaired_step"] == "age"
+
+
+def test_active_new_lead_openai_error_gets_safe_fallback(monkeypatch: Any) -> None:
+    chat_id = "active_openai_error_repair"
+    reset(chat_id, {"step": "start", "gate_reason": "new_lead"})
+
+    async def error_brain(**kwargs: Any):
+        return (
+            {"action": "fallback_rule_based", "reply": "", "extracted": {}, "needs_python_tool": "none"},
+            {"openai_brain_used": False, "openai_brain_skip_reason": "openai_error", "openai_brain_fallback_used": True},
+        )
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", error_brain)
+    answer = run(handle_message(chat_id, "77000008881", "Здравствуйте, хочу записаться. Поясница болит"))
+    session = state.get_session(chat_id)
+    assert answer != ""
+    assert "сколько Вам лет" in answer
+    assert session["step"] == "age"
+    assert session["llm_repaired"] is True
+
+
+def test_active_new_lead_brain_skipped_not_allowed_step_no_visible_silence(monkeypatch: Any) -> None:
+    chat_id = "active_not_allowed_repair"
+    reset(chat_id, {"step": "weird_internal_step", "gate_reason": "active_conversation_reply"})
+
+    async def should_not_call_brain(**kwargs: Any):
+        raise AssertionError("Brain must be skipped before OpenAI call")
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", should_not_call_brain)
+    answer = run(handle_message(chat_id, "77000008881", "Здравствуйте, хочу записаться. Поясница болит"))
+    session = state.get_session(chat_id)
+    assert answer != ""
+    assert session["step"] == "age"
+    assert session["repair_reason"] == "empty_active_reply"
+
+
+def test_debug_chat_working_hours_force_false_still_silent(monkeypatch: Any) -> None:
+    from fastapi.testclient import TestClient
+
+    chat_id = "debug_working_hours_silent"
+    state.reset_session(chat_id)
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: False)
+
+    response = TestClient(main.app).post(
+        "/debug/chat",
+        json={"chat_id": chat_id, "phone": "77000008881", "text": "Здравствуйте, хочу записаться. Поясница болит", "force": False},
+    )
+    data = response.json()
+    assert response.status_code == 200
+    assert data["answer"] == ""
+    assert data["debug"]["no_reply_reason"] == "working_hours_ai_disabled"

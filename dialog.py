@@ -117,15 +117,21 @@ def _is_active_new_ai_request(session: dict[str, Any]) -> bool:
         return False
     if session.get("refund_claim_admin_required") or session.get("gate_reason") == "refund_claim_admin_required":
         return False
-    if session.get("old_chat_ai_disabled") or session.get("gate_reason") == "old_chat_ai_disabled":
+    if session.get("old_chat_ai_disabled") or session.get("old_chat") or session.get("gate_reason") == "old_chat_ai_disabled":
         return False
     if session.get("last_ignored_message_type") in {"voice", "audio"} or session.get("voice_ignored") or session.get("last_message_type") in {"voice", "audio"}:
         return False
-    return session.get("ai_lead_started") is True
+    return session.get("ai_lead_started") is True or session.get("gate_reason") in {"new_lead", "active_conversation_reply"}
 
 
-def _repair_unknown_current_step(session: dict[str, Any]) -> tuple[str, str]:
+def _repair_unknown_current_step(session: dict[str, Any], user_text: str = "") -> tuple[str, str]:
     if not session.get("complaint"):
+        if _has_complaint(user_text) or _has_medical_complaint_text(user_text):
+            complaint = (user_text or "").strip()
+            session["complaint"] = complaint
+            _record_complaint_tool(session, complaint, is_in_profile=True)
+            session["step"] = "age"
+            return "age", "Поняла Вас. Поясничная боль — по нашему направлению 🌿 Подскажите, пожалуйста, сколько Вам лет?"
         session["step"] = "complaint"
         return "complaint", "Подскажите, пожалуйста, что Вас беспокоит?"
     if not session.get("age"):
@@ -218,7 +224,7 @@ def repair_invalid_llm_response(reason: str, session: dict[str, Any], user_text:
         event = "llm_book_without_selected_slot_repaired"
     else:
         normalized = "unknown_invalid_llm"
-        _, answer = _repair_unknown_current_step(session)
+        _, answer = _repair_unknown_current_step(session, user_text)
         event = "llm_invalid_response_repaired"
 
     session["llm_blocked"] = True
@@ -226,6 +232,17 @@ def repair_invalid_llm_response(reason: str, session: dict[str, Any], user_text:
     session["repair_reason"] = normalized
     session["repaired_step"] = str(session.get("step") or step_before)
     return RepairResult(answer=answer, step=session["repaired_step"], reason=normalized, event=event, answer_empty=False)
+
+
+def repair_empty_active_reply(session: dict[str, Any], user_text: str, reason: str = "empty_active_reply") -> RepairResult:
+    """Repair forbidden silence for an active new lead using controller-owned prompts."""
+    step, answer = _repair_unknown_current_step(session, user_text)
+    session["llm_blocked"] = True
+    session["llm_repaired"] = True
+    session["repair_reason"] = reason
+    session["repaired_step"] = step
+    session["no_reply_reason"] = ""
+    return RepairResult(answer=answer, step=step, reason=reason, event="empty_active_reply_repaired", answer_empty=False)
 
 
 def _log_llm_repair(chat_id: str, result: RepairResult, attempted_reply: str = "") -> None:
@@ -357,6 +374,10 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
     if reason:
         session["openai_brain_skip_reason"] = reason
         _safe_log(chat_id, "openai_brain_skipped", {"chat_id": chat_id, "reason": reason, "step": session.get("step") or "start", "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "fallback_reason": reason, "extracted_preview": {}, **brain_log_fields})
+        if _is_active_new_ai_request(session) and reason in {"not_allowed_step", "guard_failed", "empty_answer"}:
+            repair = repair_empty_active_reply(session, text)
+            _log_llm_repair(chat_id, repair, "")
+            return _finalize(chat_id, session, repair.answer)
         return None
     _safe_log(chat_id, "openai_brain_called", {"chat_id": chat_id, "step": session.get("step") or "start", "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "extracted_preview": {}, **brain_log_fields})
     decision, debug = await run_openai_dialog_brain(user_text=text, session={**session, "chat_id": chat_id}, recent_history=state.get_history(chat_id)[-6:] if hasattr(state, "get_history") else None, available_slots=session.get("last_slots") or None)
@@ -367,7 +388,11 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
     if decision.get("action") == "fallback_rule_based":
         session["openai_brain_fallback_used"] = True
         _safe_log(chat_id, "openai_brain_fallback_rule_based", {"chat_id": chat_id, "step": session.get("step") or "start", "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": False, "guard_reason": "", "fallback_reason": debug.get("openai_brain_skip_reason") or "fallback", "extracted_preview": decision.get("extracted") or {}})
-        if _is_active_new_ai_request(session) and debug.get("openai_brain_skip_reason") in {"invalid_json", "empty_reply", "invalid_next_step", "invalid_action", "invalid_tool", "openai_error"}:
+        if _is_active_new_ai_request(session) and debug.get("openai_brain_skip_reason") in {"empty_reply", "openai_error"}:
+            repair = repair_empty_active_reply(session, text)
+            _log_llm_repair(chat_id, repair, str(decision.get("reply") or ""))
+            return _finalize(chat_id, session, repair.answer)
+        if _is_active_new_ai_request(session) and debug.get("openai_brain_skip_reason") in {"invalid_json", "invalid_next_step", "invalid_action", "invalid_tool"}:
             repair = repair_invalid_llm_response("unknown_invalid_llm", session, text, str(decision.get("reply") or ""), decision)
             _log_llm_repair(chat_id, repair, str(decision.get("reply") or ""))
             return _finalize(chat_id, session, repair.answer)
