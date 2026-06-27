@@ -39,7 +39,7 @@ except Exception:
     get_settings = None
 
 
-OPENAI_BRAIN_ALLOWED_STEPS = {"complaint", "age", "contraindications", "date", "time", "select_slot", "name"}
+OPENAI_BRAIN_ALLOWED_STEPS = {"start", "complaint", "age", "contraindications", "date", "time", "select_slot", "name"}
 OPENAI_BRAIN_MULTI_ENTITY_STEPS = {"age", "contraindications", "date"}
 OPENAI_BRAIN_ALLOWED_GATES = {"new_lead", "new_lead_like_message", "active_ai_lead", "active_conversation_reply"}
 APPROVED_CONTRA_TERMS = {
@@ -121,36 +121,129 @@ def _is_active_new_ai_request(session: dict[str, Any]) -> bool:
         return False
     if session.get("last_ignored_message_type") in {"voice", "audio"} or session.get("voice_ignored") or session.get("last_message_type") in {"voice", "audio"}:
         return False
-    return session.get("ai_lead_started") is True or session.get("gate_reason") in {"new_lead", "active_conversation_reply"}
+    return session.get("ai_lead_started") is True or session.get("gate_reason") in OPENAI_BRAIN_ALLOWED_GATES
 
 
-def _repair_unknown_current_step(session: dict[str, Any], user_text: str = "") -> tuple[str, str]:
+def build_safe_answer_for_current_state(session: dict[str, Any], user_text: str = "") -> tuple[str, str, dict[str, Any]]:
+    """Central non-LLM fallback for every active state where silence is unsafe."""
+    updates: dict[str, Any] = {}
+    current_step = str(session.get("step") or "start")
+    if session.get("booked"):
+        updates["ai_muted"] = True
+        session["ai_muted"] = True
+        return "", "booked", updates
+
+    if current_step in {"time", "select_slot"} and session.get("last_slots"):
+        session["step"] = "time"
+        updates["step"] = "time"
+        answer = "Какое время из вариантов выше Вам удобно?"
+        _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "time_unselected", "step": "time", "answer_preview": answer[:160]})
+        return answer, "time", updates
+
+    if current_step == "name" and session.get("selected_slot") and session.get("complaint"):
+        session["step"] = "name"
+        updates["step"] = "name"
+        answer = _ask_name(session)
+        _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "name_unknown", "step": "name", "answer_preview": answer[:160]})
+        return answer, "name", updates
+
+    if current_step == "contraindications":
+        session["questionnaire_step"] = "contra"
+        updates["questionnaire_step"] = "contra"
+        answer = _ask_contra(session)
+        _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "contraindications_not_passed", "step": "contraindications", "answer_preview": answer[:160]})
+        return answer, "contraindications", updates
+
     if not session.get("complaint"):
         if _has_complaint(user_text) or _has_medical_complaint_text(user_text):
             complaint = (user_text or "").strip()
             session["complaint"] = complaint
+            updates["complaint"] = complaint
             _record_complaint_tool(session, complaint, is_in_profile=True)
             session["step"] = "age"
-            return "age", "Поняла Вас. Поясничная боль — по нашему направлению 🌿 Подскажите, пожалуйста, сколько Вам лет?"
+            updates["step"] = "age"
+            answer = _profile_confirm_and_ask_age(session, complaint)
+            _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "profile_complaint_detected", "step": "age", "answer_preview": answer[:160]})
+            return answer, "age", updates
         session["step"] = "complaint"
-        return "complaint", "Подскажите, пожалуйста, что Вас беспокоит?"
+        updates["step"] = "complaint"
+        answer = "Подскажите, пожалуйста, что Вас беспокоит?"
+        _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "complaint_unknown", "step": "complaint", "answer_preview": answer[:160]})
+        return answer, "complaint", updates
+
     if not session.get("age"):
         session["step"] = "age"
-        return "age", "Сколько Вам лет?"
+        updates["step"] = "age"
+        answer = _ask_age(session)
+        if _has_complaint(str(session.get("complaint") or user_text)) or _has_medical_complaint_text(str(session.get("complaint") or user_text)):
+            answer = _profile_confirm_and_ask_age(session, str(session.get("complaint") or user_text))
+        _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "age_unknown", "step": "age", "answer_preview": answer[:160]})
+        return answer, "age", updates
+
     if session.get("contraindications_ok") is not True:
         session["step"] = "contraindications"
         session["questionnaire_step"] = "contra"
-        return "contraindications", "Перед записью уточню важный момент по безопасности 🌿 Противопоказаний из списка нет?"
+        updates.update({"step": "contraindications", "questionnaire_step": "contra"})
+        answer = _ask_contra(session)
+        _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "contraindications_not_passed", "step": "contraindications", "answer_preview": answer[:160]})
+        return answer, "contraindications", updates
+
     if not session.get("preferred_date") and not session.get("last_slots"):
         session["step"] = "date"
         session["questionnaire_step"] = "date"
-        return "date", "На какой день Вам удобно прийти?"
-    if str(session.get("step") or "") == "time" and session.get("last_slots"):
-        return "time", "Какое время из вариантов выше Вам удобно?"
-    if str(session.get("step") or "") == "name" and session.get("selected_slot"):
-        return "name", "Подскажите, пожалуйста, Ваше имя для записи."
-    step = str(session.get("step") or "date")
-    return step, _mandatory_step_prompt(session, step)
+        updates.update({"step": "date", "questionnaire_step": "date"})
+        answer = _ask_date(session)
+        _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "date_unknown", "step": "date", "answer_preview": answer[:160]})
+        return answer, "date", updates
+
+    session["step"] = "complaint"
+    updates["step"] = "complaint"
+    answer = "Подскажите, пожалуйста, что Вас беспокоит?"
+    _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "unknown_state", "step": "complaint", "answer_preview": answer[:160]})
+    return answer, "complaint", updates
+
+
+def _repair_state_consistency(session: dict[str, Any], user_text: str = "") -> tuple[bool, str]:
+    before = str(session.get("step") or "start")
+    reason = ""
+    if before in {"escalated", "stopped", "done", "booked"}:
+        if session.get("booked"):
+            session["ai_muted"] = True
+        session["state_repaired"] = False
+        session["state_repair_reason"] = ""
+        return False, ""
+    if session.get("booked"):
+        session["ai_muted"] = True
+        return (before != "booked" or not session.get("ai_muted")), "booked_ai_muted"
+    if session.get("last_slots") and before in {"time", "select_slot"} and not session.get("selected_slot"):
+        session["step"] = "time"; reason = ""  # consistent active slot-picking state
+    elif (session.get("complaint") or _has_complaint(user_text)) and (_profile_status(user_text) == "profile" or session.get("profile_status") == "profile") and before in {"start", "complaint"} and not session.get("age"):
+        if not session.get("complaint") and user_text:
+            session["complaint"] = user_text
+            _record_complaint_tool(session, user_text, is_in_profile=True)
+        session["step"] = "age"; reason = "complaint_profile_without_age"
+    elif before in {"age", "contraindications"} and session.get("age") and session.get("contraindications_ok") is None:
+        session["step"] = "contraindications"; session["questionnaire_step"] = "contra"; reason = "age_without_contraindications"
+    elif before in {"date", "preferred_time"} and session.get("contraindications_ok") is True and not session.get("preferred_date") and not session.get("last_slots"):
+        session["step"] = "date"; session["questionnaire_step"] = "date"; reason = "contraindications_without_date"
+    elif session.get("last_slots") and before not in {"time", "select_slot"} and not session.get("selected_slot"):
+        session["step"] = "time"; reason = "slots_without_selected_slot"
+    elif before == "name" and session.get("selected_slot") and session.get("complaint") and not session.get("patient_name"):
+        session["step"] = "name"; session["questionnaire_step"] = "name"; reason = "slot_without_name"
+    repaired = bool(reason)
+    if repaired:
+        session["state_repaired"] = True
+        session["state_repair_reason"] = reason
+        _safe_log(str(session.get("chat_id") or "system"), "state_inconsistency_repaired", {"from_step": before, "to_step": session.get("step"), "reason": reason})
+    else:
+        session["state_repaired"] = False
+        session["state_repair_reason"] = ""
+    return repaired, reason
+
+
+def _repair_unknown_current_step(session: dict[str, Any], user_text: str = "") -> tuple[str, str]:
+    answer, step, _ = build_safe_answer_for_current_state(session, user_text)
+    return step, answer
 
 
 def repair_invalid_llm_response(reason: str, session: dict[str, Any], user_text: str, attempted_reply: str, llm_decision: dict[str, Any]) -> RepairResult:
@@ -283,7 +376,7 @@ def _openai_brain_skip_reason(session: dict[str, Any], text: str) -> str:
     active_new_lead = session.get("ai_lead_started") is True or session.get("gate_reason") == "new_lead"
     if not active_new_lead:
         return "not_ai_lead"
-    if step not in {"start", "complaint", "age", "contraindications", "date", "time", "name"}:
+    if step not in OPENAI_BRAIN_ALLOWED_STEPS:
         return "not_allowed_step"
     return ""
 
@@ -371,11 +464,18 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
     session["openai_brain_model"] = brain_log_fields["openai_brain_model"]
     session["openai_brain_temperature"] = brain_log_fields["openai_brain_temperature"]
     reason = _openai_brain_skip_reason(session, text)
+    session["brain_allowed"] = not bool(reason)
+    session["brain_skip_reason"] = reason
+    _safe_log(chat_id, "brain_allowed_decision", {"chat_id": chat_id, "step": session.get("step") or "start", "brain_allowed": not bool(reason), "brain_skip_reason": reason})
     if reason:
         session["openai_brain_skip_reason"] = reason
+        _safe_log(chat_id, "brain_skipped", {"chat_id": chat_id, "reason": reason, "step": session.get("step") or "start"})
         _safe_log(chat_id, "openai_brain_skipped", {"chat_id": chat_id, "reason": reason, "step": session.get("step") or "start", "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "fallback_reason": reason, "extracted_preview": {}, **brain_log_fields})
         if _is_active_new_ai_request(session) and reason in {"not_allowed_step", "guard_failed", "empty_answer"}:
-            repair = repair_empty_active_reply(session, text)
+            repair_reason = "not_allowed_step_on_active_lead" if reason == "not_allowed_step" else "brain_skipped_unexpectedly"
+            repair = repair_empty_active_reply(session, text, "empty_active_reply")
+            session["fallback_reason"] = repair_reason
+            _safe_log(chat_id, "fallback_used", {"chat_id": chat_id, "reason": repair_reason, "step": repair.step})
             _log_llm_repair(chat_id, repair, "")
             return _finalize(chat_id, session, repair.answer)
         return None
@@ -389,11 +489,18 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         session["openai_brain_fallback_used"] = True
         _safe_log(chat_id, "openai_brain_fallback_rule_based", {"chat_id": chat_id, "step": session.get("step") or "start", "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": False, "guard_reason": "", "fallback_reason": debug.get("openai_brain_skip_reason") or "fallback", "extracted_preview": decision.get("extracted") or {}})
         if _is_active_new_ai_request(session) and debug.get("openai_brain_skip_reason") in {"empty_reply", "openai_error"}:
-            repair = repair_empty_active_reply(session, text)
+            rr = "openai_error" if debug.get("openai_brain_skip_reason") == "openai_error" else "empty_active_reply"
+            if rr == "openai_error":
+                _safe_log(chat_id, "brain_error", {"chat_id": chat_id, "step": session.get("step") or "start", "error": session.get("openai_error_message_preview") or "openai_error"})
+            repair = repair_empty_active_reply(session, text, rr)
+            session["fallback_reason"] = rr
+            _safe_log(chat_id, "fallback_used", {"chat_id": chat_id, "reason": rr, "step": repair.step})
             _log_llm_repair(chat_id, repair, str(decision.get("reply") or ""))
             return _finalize(chat_id, session, repair.answer)
         if _is_active_new_ai_request(session) and debug.get("openai_brain_skip_reason") in {"invalid_json", "invalid_next_step", "invalid_action", "invalid_tool"}:
             repair = repair_invalid_llm_response("unknown_invalid_llm", session, text, str(decision.get("reply") or ""), decision)
+            session["fallback_reason"] = debug.get("openai_brain_skip_reason") or "invalid_llm_json"
+            _safe_log(chat_id, "fallback_used", {"chat_id": chat_id, "reason": session["fallback_reason"], "step": repair.step})
             _log_llm_repair(chat_id, repair, str(decision.get("reply") or ""))
             return _finalize(chat_id, session, repair.answer)
         return None
@@ -2089,11 +2196,28 @@ def _validate_final_fact_answer(chat_id: str, session: dict[str, Any], answer: s
 
 
 def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
+    session["chat_id"] = chat_id
+    before_step = str(session.get("step") or "start")
     answer = _clean(answer)
+    if str(session.get("step") or "") == "complaint" and ("что Вас беспокоит" in answer or "не мазалайды" in answer):
+        repaired, repair_reason = False, ""
+        session["state_repaired"] = False
+        session["state_repair_reason"] = ""
+    else:
+        repaired, repair_reason = _repair_state_consistency(session, str(session.get("last_user_text") or ""))
+    if repaired and _is_active_new_ai_request(session) and not answer:
+        answer, _, _ = build_safe_answer_for_current_state(session, str(session.get("last_user_text") or ""))
+        session["fallback_reason"] = "state_inconsistency_repaired"
     answer = _validate_final_fact_answer(chat_id, session, answer)
     answer = _remove_name_addressing(answer, session)
     answer = _strict_trim_extra(answer, session)
-    if not answer:
+    if not answer and _is_active_new_ai_request(session):
+        repair = repair_empty_active_reply(session, str(session.get("last_user_text") or ""), "empty_active_reply")
+        session["fallback_reason"] = "empty_active_reply"
+        _safe_log(chat_id, "empty_active_reply_repaired", {"chat_id": chat_id, "from_step": before_step, "to_step": repair.step, "state_repair_reason": repair_reason})
+        _safe_log(chat_id, "fallback_used", {"chat_id": chat_id, "reason": "empty_active_reply", "step": repair.step})
+        answer = repair.answer
+    elif not answer:
         if session.get("complaint") and not session.get("age"):
             answer = _ask_age(session)
         else:
@@ -2110,6 +2234,11 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     if last_answer and _low(last_answer) == _low(answer):
         _safe_save(chat_id, session)
         return ""
+
+    session["state_before_step"] = before_step
+    session["state_after_step"] = session.get("step") or ""
+    if session.get("step") != "escalated":
+        _safe_log(chat_id, "final_state_after_decision", {"chat_id": chat_id, "state_before_step": before_step, "state_after_step": session.get("step") or "", "answer_empty": not bool(answer), "fallback_reason": session.get("fallback_reason") or "", "state_repaired": bool(session.get("state_repaired")), "state_repair_reason": session.get("state_repair_reason") or ""})
 
     session["last_assistant_answer"] = answer
     _safe_save(chat_id, session)
@@ -3856,6 +3985,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session = {}
 
     session["phone"] = phone or session.get("phone") or ""
+    session["chat_id"] = chat_id
+    session["last_user_text"] = text
+    session["state_before_step"] = session.get("step") or "start"
     session["openai_used"] = False
     session["openai_model"] = ""
     session["openai_skip_reason"] = ""
@@ -3864,6 +3996,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session.pop("base_answer_preview", None)
     session.pop("final_answer_preview", None)
     session["language"] = _detect_lang(text, session)
+    _safe_log(chat_id, "state_before_decision", {"chat_id": chat_id, "step": session.get("step") or "start", "current_step": session.get("current_step") or "", "ai_lead_started": bool(session.get("ai_lead_started")), "gate_reason": session.get("gate_reason") or ""})
     if (session.get("step") == "escalated" or session.get("escalated")) and not session.get("booked"):
         session["no_reply_reason"] = "escalated_ai_disabled"
         _reset_openai_brain_debug(session)
