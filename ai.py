@@ -36,6 +36,22 @@ def _openai_client(api_key: str):
     return AsyncOpenAI(api_key=api_key, timeout=10.0, max_retries=1)
 
 
+def _openai_error_detail(exc: Exception, model: str) -> dict[str, Any]:
+    message = str(exc)
+    status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    detail = {
+        "openai_error_type": type(exc).__name__,
+        "openai_error_message_preview": message.replace("\n", " ").strip()[:300],
+        "openai_error_detail": {
+            "type": type(exc).__name__,
+            "message_preview": message.replace("\n", " ").strip()[:300],
+            "model": model or "",
+            "status_code": status_code,
+        },
+    }
+    return detail
+
+
 CLASSIFIER_PROMPT = """
 Ты классификатор для клиники Neuro Balance в Астане.
 Клиника занимается неврологией, позвоночником, суставами, болями в спине/шее/пояснице, грыжами, протрузиями, артрозом, артритом, реабилитацией после травм/операций.
@@ -514,7 +530,7 @@ async def run_openai_dialog_brain(
     settings = get_settings()
     model = getattr(settings, "ai_brain_model", "") or getattr(settings, "openai_model", "")
     temperature = float(getattr(settings, "ai_brain_temperature", 0.2) or 0.2)
-    debug = {"openai_brain_used": False, "openai_brain_intent": "", "openai_brain_action": "", "openai_brain_needs_python_tool": "", "openai_brain_extracted": {}, "openai_brain_guard_failed": False, "openai_brain_guard_reason": "", "openai_brain_skip_reason": "", "openai_brain_fallback_used": False, "openai_brain_model": model, "openai_brain_temperature": temperature, "openai_model": model}
+    debug = {"openai_brain_used": False, "openai_brain_intent": "", "openai_brain_action": "", "openai_brain_needs_python_tool": "", "openai_brain_extracted": {}, "openai_brain_guard_failed": False, "openai_brain_guard_reason": "", "openai_brain_skip_reason": "", "openai_brain_fallback_used": False, "openai_brain_model": model, "openai_brain_temperature": temperature, "openai_model": model, "openai_error_type": "", "openai_error_message_preview": "", "openai_error_detail": {}}
     if not getattr(settings, "ai_enabled", True) or not getattr(settings, "openai_api_key", "") or AsyncOpenAI is None:
         decision, fb = _dialog_brain_fallback("config_missing")
         debug.update(fb)
@@ -562,7 +578,11 @@ async def run_openai_dialog_brain(
     except Exception as exc:
         decision, fb = _dialog_brain_fallback("openai_error")
         debug.update(fb)
-        debug["openai_error_preview"] = str(exc)[:200]
+        detail = _openai_error_detail(exc, model)
+        debug.update(detail)
+        debug["openai_error_preview"] = detail["openai_error_message_preview"][:200]
+        if state is not None:
+            state.log_event(str(session.get("chat_id") or "system"), "openai_error_detail", {"chat_id": str(session.get("chat_id") or "system"), **detail["openai_error_detail"]})
         return decision, debug
 
 
@@ -810,5 +830,9 @@ async def humanize_reply_with_openai(
         return final, debug
     except Exception as exc:
         debug["openai_skip_reason"] = "openai_error"
-        debug["openai_error_preview"] = str(exc)[:300]
+        detail = _openai_error_detail(exc, model)
+        debug.update(detail)
+        debug["openai_error_preview"] = detail["openai_error_message_preview"]
+        if state is not None:
+            state.log_event(chat_id or "system", "openai_error_detail", {"chat_id": chat_id, **detail["openai_error_detail"]})
         return base_answer, debug

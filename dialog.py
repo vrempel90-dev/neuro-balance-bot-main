@@ -90,6 +90,9 @@ def _reset_openai_brain_debug(session: dict[str, Any]) -> None:
     session["openai_brain_fallback_used"] = False
     session["openai_brain_model"] = ""
     session["openai_brain_temperature"] = None
+    session["openai_error_type"] = ""
+    session["openai_error_message_preview"] = ""
+    session["openai_error_detail"] = {}
     session["humanize_skipped_because_brain_valid"] = False
     session["humanize_fallback_used"] = False
     _reset_llm_repair_debug(session)
@@ -100,6 +103,7 @@ def _apply_openai_brain_debug(session: dict[str, Any], debug: dict[str, Any]) ->
         "openai_brain_used", "openai_brain_action", "openai_brain_needs_python_tool",
         "openai_brain_intent", "openai_brain_extracted", "openai_brain_guard_failed", "openai_brain_guard_reason",
         "openai_brain_skip_reason", "openai_brain_fallback_used", "openai_brain_model", "openai_brain_temperature",
+        "openai_error_type", "openai_error_message_preview", "openai_error_detail",
     ):
         if key in debug:
             session[key] = debug[key]
@@ -247,21 +251,22 @@ def _openai_brain_skip_reason(session: dict[str, Any], text: str) -> str:
         return "empty_answer"
     if step in {"booked", "confirmed", "done", "appointment_confirmed", "escalated", "stopped"} or session.get("booked"):
         return "booked_or_handoff"
-    if step == "name" and session.get("selected_slot"):
-        return "python_owned_booking"
     if session.get("manual_takeover") or session.get("manual_admin_intervention") or session.get("ai_muted") or session.get("do_not_reply") or session.get("escalated"):
         return "manual_or_muted"
+    if step == "name" and session.get("selected_slot"):
+        return "python_owned_booking"
     if session.get("refund_claim_admin_required") or session.get("gate_reason") == "refund_claim_admin_required":
         return "refund_or_claim"
-    if session.get("old_chat_ai_disabled") or session.get("gate_reason") == "old_chat_ai_disabled":
+    if session.get("old_chat_ai_disabled") or session.get("old_chat") or session.get("gate_reason") == "old_chat_ai_disabled":
         return "old_chat_ai_disabled"
     if session.get("last_ignored_message_type") in {"voice", "audio"} or session.get("voice_ignored") or session.get("last_message_type") in {"voice", "audio"}:
         return "voice_or_audio"
     if session.get("hard_contraindication_stop") or session.get("contraindication_hard_stop"):
         return "hard_contraindication_stop"
-    if session.get("ai_lead_started") is not True:
+    active_new_lead = session.get("ai_lead_started") is True or session.get("gate_reason") == "new_lead"
+    if not active_new_lead:
         return "not_ai_lead"
-    if step not in {"complaint", "age", "contraindications", "date", "time"}:
+    if step not in {"start", "complaint", "age", "contraindications", "date", "time", "name"}:
         return "not_allowed_step"
     return ""
 
