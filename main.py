@@ -187,6 +187,13 @@ async def _maybe_humanize_answer(chat_id: str, user_text: str, base_answer: str,
             "humanize_skipped_because_brain_valid": True,
             "humanize_fallback_used": False,
         })
+        if not getattr(get_settings(), "openai_humanize_replies", True):
+            state.log_event(chat_id, "humanize_skipped", {
+                "chat_id": chat_id,
+                "reason": "disabled",
+                "step": session.get("step") or session.get("current_step") or "",
+                "disabled_flags": ["OPENAI_HUMANIZE_REPLIES=false"],
+            })
         return base_answer
     reason = _humanize_skip_reason(session, base_answer, voice_ignored=voice_ignored)
     if reason:
@@ -213,7 +220,13 @@ async def _maybe_humanize_answer(chat_id: str, user_text: str, base_answer: str,
     if not debug.get("openai_used"):
         if debug.get("openai_config_missing_detail"):
             state.log_event(chat_id, "openai_config_missing_detail", debug["openai_config_missing_detail"])
-        state.log_event(chat_id, "openai_skipped", {"chat_id": chat_id, "reason": debug.get("openai_skip_reason") or "config_missing", "step": session.get("step") or session.get("current_step") or "", "missing_keys": debug.get("openai_missing_keys") or [], "disabled_flags": debug.get("openai_disabled_flags") or []})
+        disabled_flags = debug.get("openai_disabled_flags") or []
+        missing_keys = debug.get("openai_missing_keys") or []
+        payload = {"chat_id": chat_id, "reason": debug.get("openai_skip_reason") or "config_missing", "step": session.get("step") or session.get("current_step") or "", "missing_keys": missing_keys, "disabled_flags": disabled_flags}
+        if disabled_flags == ["OPENAI_HUMANIZE_REPLIES=false"] and not missing_keys:
+            state.log_event(chat_id, "humanize_skipped", {**payload, "reason": "disabled"})
+        else:
+            state.log_event(chat_id, "openai_skipped", payload)
     return final_answer
 
 

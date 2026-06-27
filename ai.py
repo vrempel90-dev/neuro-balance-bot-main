@@ -41,13 +41,17 @@ def _openai_config_missing_detail(settings: Any, *, chat_id: str = "", step: str
     missing_keys: list[str] = []
     disabled_flags: list[str] = []
     model = str(getattr(settings, "openai_model", "") or "")
-    brain_model = str(getattr(settings, "ai_brain_model", "") or model)
+    configured_brain_model = str(getattr(settings, "ai_brain_model", "") or "")
+    brain_model = configured_brain_model or model
     if not getattr(settings, "openai_api_key", ""):
         missing_keys.append("OPENAI_API_KEY")
-    if not model:
+    if brain:
+        if not brain_model:
+            if not model:
+                missing_keys.append("OPENAI_MODEL")
+            missing_keys.append("AI_BRAIN_MODEL_or_OPENAI_MODEL")
+    elif not model:
         missing_keys.append("OPENAI_MODEL")
-    if brain and not (brain_model or model):
-        missing_keys.append("AI_BRAIN_MODEL_or_OPENAI_MODEL")
     if not getattr(settings, "ai_enabled", True):
         disabled_flags.append("AI_ENABLED=false")
     if brain and not getattr(settings, "openai_brain_enabled", True):
