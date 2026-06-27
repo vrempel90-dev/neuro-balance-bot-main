@@ -21,6 +21,7 @@ _STDOUT_EVENTS = {
     "wazzup_send_result",
     "openai_called",
     "openai_skipped",
+    "humanize_skipped",
 }
 
 

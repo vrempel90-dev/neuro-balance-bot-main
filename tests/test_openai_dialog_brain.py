@@ -851,6 +851,44 @@ def test_humanize_disabled_does_not_disable_dialog_brain(monkeypatch: Any) -> No
     assert debug["openai_brain_skip_reason"] == ""
 
 
+
+def test_humanize_disabled_brain_success_keeps_openai_debug_clean(monkeypatch: Any) -> None:
+    chat_id = "brain_success_humanize_disabled"
+    reset(chat_id, {"step": "age"})
+    payload = {
+        "understood_context": {"patient_meaning": "age", "is_answer_to_last_question": True},
+        "intent": "age_answer",
+        "entities": {"age": 34},
+        "next_required_step": "contraindications",
+        "action": "ask_contraindications",
+        "needs_python_tool": "none",
+        "reply": "Спасибо. Есть ли противопоказания?",
+        "safety": {"hard_stop": False, "unsafe_medical_claim": False, "invented_fact_risk": False, "reason": ""},
+    }
+    events: list[tuple[str, dict[str, Any]]] = []
+    settings = ai.get_settings()
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(settings, "openai_model", "gpt-4o-mini")
+    monkeypatch.setattr(settings, "ai_brain_model", "")
+    monkeypatch.setattr(settings, "openai_humanize_replies", False)
+    monkeypatch.setattr(settings, "openai_brain_enabled", True, raising=False)
+    monkeypatch.setattr(ai, "AsyncOpenAI", object)
+    monkeypatch.setattr(ai, "_openai_client", lambda key: FakeClient(json.dumps(payload, ensure_ascii=False)))
+    monkeypatch.setattr(state, "log_event", lambda chat_id, event, payload: events.append((event, payload)))
+
+    raw = run(dialog._try_openai_dialog_brain(chat_id, "+77000000000", state.get_session(chat_id), "34"))
+    answer = run(main._maybe_humanize_answer(chat_id, "34", raw or ""))
+    session = state.get_session(chat_id)
+
+    assert answer == "Спасибо. Есть ли противопоказания?"
+    assert session["openai_used"] is True
+    assert session["openai_brain_used"] is True
+    assert session["openai_skip_reason"] == ""
+    assert session["openai_disabled_flags"] == []
+    assert any(event == "humanize_skipped_because_brain_valid" for event, _ in events)
+    assert any(event == "humanize_skipped" and payload.get("reason") == "disabled" and payload.get("disabled_flags") == ["OPENAI_HUMANIZE_REPLIES=false"] for event, payload in events)
+    assert not any(event == "openai_skipped" and payload.get("disabled_flags") == ["OPENAI_HUMANIZE_REPLIES=false"] for event, payload in events)
+
 def test_api_key_and_openai_model_allow_brain(monkeypatch: Any) -> None:
     settings = ai.get_settings()
     monkeypatch.setattr(settings, "openai_api_key", "test-key")
