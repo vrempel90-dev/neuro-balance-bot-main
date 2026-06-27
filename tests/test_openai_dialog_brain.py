@@ -493,6 +493,82 @@ def test_llm_hallucinated_slots_blocked_when_crm_empty(monkeypatch: Any) -> None
     assert state.get_session(chat_id)["step"] == "date"
 
 
+def test_active_llm_asked_name_too_early_is_repaired(monkeypatch: Any) -> None:
+    chat_id = "repair_name_too_early"
+    reset(chat_id, {"step": "age", "complaint": "болит спина"})
+
+    async def fake_brain(**kwargs: Any):
+        return brain("ask_name", "Как Вас зовут?", {})
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+    answer = run(handle_message(chat_id, "77011234567", "можно записаться?"))
+    session = state.get_session(chat_id)
+    assert "Сколько Вам лет" in answer
+    assert "имя" not in answer.lower()
+    assert session["step"] == "age"
+    assert session["llm_blocked"] is True
+    assert session["llm_repaired"] is True
+    assert session["repair_reason"] == "asked_name_too_early"
+
+
+def test_active_llm_date_before_contra_is_repaired_without_crm(monkeypatch: Any) -> None:
+    chat_id = "repair_date_before_contra"
+    reset(chat_id, {"step": "age", "complaint": "болит спина"})
+    calls: list[str] = []
+
+    async def fake_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
+        calls.append(date)
+        return {"availability": [{"doctorLogin": "d", "doctorName": "Врач", "availableSlots": ["11:00"]}]}
+
+    async def fake_brain(**kwargs: Any):
+        return brain("show_slots", "Покажу слоты на понедельник", {"age": 34, "preferred_date_text": "понедельник"}, "check_slots")
+
+    monkeypatch.setattr(crm, "check_slots", fake_slots)
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+    answer = run(handle_message(chat_id, "77011234567", "34, в понедельник"))
+    session = state.get_session(chat_id)
+    assert "Противопоказаний из списка нет" in answer
+    assert session["step"] == "contraindications"
+    assert session["age"] == 34
+    assert calls == []
+    assert session["repair_reason"] == "date_before_contraindications"
+
+
+def test_active_llm_false_hard_stop_is_repaired(monkeypatch: Any) -> None:
+    chat_id = "repair_false_hard_stop"
+    reset(chat_id, {"step": "contraindications", "complaint": "спина", "age": 34})
+
+    async def fake_brain(**kwargs: Any):
+        return brain("stop_contraindication", "К сожалению, записать не можем", {})
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+    answer = run(handle_message(chat_id, "77011234567", "нет"))
+    session = state.get_session(chat_id)
+    assert "для безопасности" in answer
+    assert session["step"] == "contraindications"
+    assert session.get("manual_takeover") is not True
+    assert session.get("hard_contraindication_stop") is not True
+    assert session["repair_reason"] == "contraindication_false_hard_stop"
+
+
+def test_active_llm_invalid_json_is_repaired(monkeypatch: Any) -> None:
+    chat_id = "repair_invalid_json"
+    reset(chat_id, {"step": "date", "complaint": "спина", "age": 34, "contraindications_ok": True})
+
+    async def fake_brain(**kwargs: Any):
+        return (
+            {"action": "fallback_rule_based", "reply": "", "extracted": {}, "needs_python_tool": "none"},
+            {"openai_brain_used": False, "openai_brain_skip_reason": "invalid_json", "openai_brain_fallback_used": True},
+        )
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+    answer = run(handle_message(chat_id, "77011234567", "хочу записаться"))
+    session = state.get_session(chat_id)
+    assert "На какой день Вам удобно прийти" in answer
+    assert session["step"] == "date"
+    assert session["repair_reason"] == "unknown_invalid_llm"
+
+
 def test_real_crm_slots_only_are_saved(monkeypatch: Any) -> None:
     chat_id = "reg_real_slots_only"
     reset(chat_id, {"step": "date", "contraindications_ok": True})
