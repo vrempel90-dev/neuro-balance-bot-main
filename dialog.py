@@ -17,6 +17,7 @@ import bot_tools
 import crm
 import state
 from ai import run_openai_dialog_brain
+from config import get_settings
 
 try:
     from phone import sanitize_kz_phone
@@ -87,6 +88,10 @@ def _reset_openai_brain_debug(session: dict[str, Any]) -> None:
     session["openai_brain_guard_reason"] = ""
     session["openai_brain_skip_reason"] = ""
     session["openai_brain_fallback_used"] = False
+    session["openai_brain_model"] = ""
+    session["openai_brain_temperature"] = None
+    session["humanize_skipped_because_brain_valid"] = False
+    session["humanize_fallback_used"] = False
     _reset_llm_repair_debug(session)
 
 
@@ -94,7 +99,7 @@ def _apply_openai_brain_debug(session: dict[str, Any], debug: dict[str, Any]) ->
     for key in (
         "openai_brain_used", "openai_brain_action", "openai_brain_needs_python_tool",
         "openai_brain_intent", "openai_brain_extracted", "openai_brain_guard_failed", "openai_brain_guard_reason",
-        "openai_brain_skip_reason", "openai_brain_fallback_used",
+        "openai_brain_skip_reason", "openai_brain_fallback_used", "openai_brain_model", "openai_brain_temperature",
     ):
         if key in debug:
             session[key] = debug[key]
@@ -333,17 +338,27 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
 
 
 async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, Any], text: str) -> str | None:
+    settings = get_settings()
+    brain_log_fields = {
+        "openai_brain_model": getattr(settings, "ai_brain_model", ""),
+        "openai_brain_temperature": getattr(settings, "ai_brain_temperature", None),
+        "openai_brain_used": False,
+        "humanize_skipped_because_brain_valid": False,
+        "humanize_fallback_used": False,
+    }
+    session["openai_brain_model"] = brain_log_fields["openai_brain_model"]
+    session["openai_brain_temperature"] = brain_log_fields["openai_brain_temperature"]
     reason = _openai_brain_skip_reason(session, text)
     if reason:
         session["openai_brain_skip_reason"] = reason
-        _safe_log(chat_id, "openai_brain_skipped", {"chat_id": chat_id, "reason": reason, "step": session.get("step") or "start", "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "fallback_reason": reason, "extracted_preview": {}})
+        _safe_log(chat_id, "openai_brain_skipped", {"chat_id": chat_id, "reason": reason, "step": session.get("step") or "start", "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "fallback_reason": reason, "extracted_preview": {}, **brain_log_fields})
         return None
-    _safe_log(chat_id, "openai_brain_called", {"chat_id": chat_id, "step": session.get("step") or "start", "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "extracted_preview": {}})
+    _safe_log(chat_id, "openai_brain_called", {"chat_id": chat_id, "step": session.get("step") or "start", "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "extracted_preview": {}, **brain_log_fields})
     decision, debug = await run_openai_dialog_brain(user_text=text, session={**session, "chat_id": chat_id}, recent_history=state.get_history(chat_id)[-6:] if hasattr(state, "get_history") else None, available_slots=session.get("last_slots") or None)
     _apply_openai_brain_debug(session, debug)
     if decision.get("intent"):
         session["openai_brain_intent"] = decision.get("intent")
-    _safe_log(chat_id, "openai_brain_decision", {"chat_id": chat_id, "step": session.get("step") or "start", "intent": decision.get("intent"), "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": False, "guard_reason": "", "extracted_preview": {k: v for k, v in (decision.get("extracted") or {}).items() if v not in (None, "", [], {})}})
+    _safe_log(chat_id, "openai_brain_decision", {"chat_id": chat_id, "step": session.get("step") or "start", "intent": decision.get("intent"), "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": False, "guard_reason": "", "extracted_preview": {k: v for k, v in (decision.get("extracted") or {}).items() if v not in (None, "", [], {})}, "openai_brain_model": session.get("openai_brain_model") or brain_log_fields["openai_brain_model"], "openai_brain_temperature": session.get("openai_brain_temperature"), "openai_brain_used": bool(debug.get("openai_brain_used")), "humanize_skipped_because_brain_valid": False, "humanize_fallback_used": bool(debug.get("openai_brain_fallback_used"))})
     if decision.get("action") == "fallback_rule_based":
         session["openai_brain_fallback_used"] = True
         _safe_log(chat_id, "openai_brain_fallback_rule_based", {"chat_id": chat_id, "step": session.get("step") or "start", "action": decision.get("action"), "needs_python_tool": decision.get("needs_python_tool"), "guard_failed": False, "guard_reason": "", "fallback_reason": debug.get("openai_brain_skip_reason") or "fallback", "extracted_preview": decision.get("extracted") or {}})

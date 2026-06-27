@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     # OpenAI / AI
     openai_api_key: str = Field(default="", validation_alias=AliasChoices("OPENAI_API_KEY", "openai_api_key"))
     openai_model: str = Field(default="gpt-4o-mini", validation_alias=AliasChoices("OPENAI_MODEL", "openai_model"))
+    ai_brain_model: str = Field(default="gpt-5.4-mini", validation_alias=AliasChoices("AI_BRAIN_MODEL", "ai_brain_model"))
+    ai_brain_temperature: float = Field(default=0.2, validation_alias=AliasChoices("AI_BRAIN_TEMPERATURE", "ai_brain_temperature"))
+    ai_humanize_model: str = Field(default="gpt-5.4-mini", validation_alias=AliasChoices("AI_HUMANIZE_MODEL", "ai_humanize_model"))
     openai_voice_model: str = Field(default="whisper-1", validation_alias=AliasChoices("OPENAI_VOICE_MODEL", "openai_voice_model"))
     ai_enabled: bool = Field(default=True, validation_alias=AliasChoices("AI_ENABLED", "ai_enabled"))
     openai_humanize_replies: bool = Field(default=True, validation_alias=AliasChoices("OPENAI_HUMANIZE_REPLIES", "openai_humanize_replies"))

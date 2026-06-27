@@ -49,6 +49,8 @@ def test_rendered_prompt_is_loaded_into_dialog_brain(monkeypatch: Any) -> None:
         chat = type("Chat", (), {"completions": FakeCompletions()})()
 
     monkeypatch.setattr(ai.get_settings(), "openai_api_key", "test-key")
+    monkeypatch.setattr(ai.get_settings(), "ai_brain_model", "gpt-5.4-mini")
+    monkeypatch.setattr(ai.get_settings(), "ai_brain_temperature", 0.2)
     monkeypatch.setattr(ai, "AsyncOpenAI", object)
     monkeypatch.setattr(ai, "_openai_client", lambda key: FakeClient())
     decision, debug = run(ai.run_openai_dialog_brain(user_text="спина", session={"step": "complaint"}))
@@ -56,6 +58,10 @@ def test_rendered_prompt_is_loaded_into_dialog_brain(monkeypatch: Any) -> None:
     assert "SYSTEM_PROMPT" in system_prompt or "PROJECT OVERRIDES" in system_prompt
     assert "20:00–08:00" in system_prompt
     assert decision["action"] == "ask_age"
+    assert captured["model"] == "gpt-5.4-mini"
+    assert captured["temperature"] == 0.2
+    assert debug["openai_brain_model"] == "gpt-5.4-mini"
+    assert debug["openai_brain_temperature"] == 0.2
     assert debug["openai_brain_used"] is True
 
 
