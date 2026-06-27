@@ -66,6 +66,13 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "manual_takeover": bool(session.get("manual_takeover") or session.get("manual_admin_intervention")),
         "ai_lead_started": bool(session.get("ai_lead_started")),
         "working_hours_bypassed_by_force": bool(session.get("working_hours_bypassed_by_force")),
+        "state_before_step": session.get("state_before_step") or "",
+        "state_after_step": session.get("state_after_step") or session.get("step") or "",
+        "brain_allowed": bool(session.get("brain_allowed")),
+        "brain_skip_reason": session.get("brain_skip_reason") or session.get("openai_brain_skip_reason") or "",
+        "fallback_reason": session.get("fallback_reason") or "",
+        "state_repaired": bool(session.get("state_repaired")),
+        "state_repair_reason": session.get("state_repair_reason") or "",
     }
 
 
