@@ -137,6 +137,13 @@ def build_safe_answer_for_current_state(session: dict[str, Any], user_text: str 
         session["ai_muted"] = True
         return "", "booked", updates
 
+    if session.get("selected_time") and not session.get("patient_name"):
+        session["step"] = "name"
+        updates["step"] = "name"
+        answer = _ask_name(session)
+        _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "selected_time_without_name", "step": "name", "answer_preview": answer[:160]})
+        return answer, "name", updates
+
     if current_step in {"time", "select_slot"} and session.get("last_slots"):
         session["step"] = "time"
         updates["step"] = "time"
@@ -207,6 +214,84 @@ def build_safe_answer_for_current_state(session: dict[str, Any], user_text: str 
     return answer, "complaint", updates
 
 
+
+
+def _has_required_data_for_step(session: dict[str, Any], step: str) -> bool:
+    step = str(step or "")
+    if step == "age":
+        try:
+            return int(session.get("age") or 0) > 0
+        except (TypeError, ValueError):
+            return False
+    if step == "contraindications":
+        return session.get("contraindications_ok") is True
+    if step in {"date", "preferred_time"}:
+        return bool(session.get("preferred_date") or session.get("selected_date")) and not (session.get("crm_availability_empty") or session.get("crm_availability_error"))
+    if step in {"time", "select_slot"}:
+        return bool(session.get("selected_time"))
+    if step == "name":
+        return bool(session.get("patient_name"))
+    if step == "complaint":
+        return bool(session.get("complaint"))
+    return False
+
+
+def _next_required_step_after_collected_data(session: dict[str, Any]) -> str:
+    try:
+        age_ok = int(session.get("age") or 0) > 0
+    except (TypeError, ValueError):
+        age_ok = False
+    if not session.get("complaint"):
+        return "complaint"
+    if not age_ok:
+        return "age"
+    if session.get("contraindications_ok") is not True:
+        return "contraindications"
+    if not (session.get("preferred_date") or session.get("selected_date")) or session.get("crm_availability_empty") or session.get("crm_availability_error"):
+        return "date"
+    if not session.get("selected_time"):
+        return "time"
+    if not session.get("patient_name"):
+        return "name"
+    return "book"
+
+
+def _repair_forbidden_required_question(chat_id: str, session: dict[str, Any], answer: str) -> str:
+    qtype = _classify_bot_question(answer)
+    if not qtype:
+        return answer
+    step = "select_slot" if qtype == "time" else qtype
+    if not _has_required_data_for_step(session, step):
+        if session.get("last_required_step") == ("time" if step == "select_slot" else step) and int(session.get("last_required_question_count") or 0) >= 2:
+            session["llm_blocked"] = True
+            session["llm_repaired"] = True
+            session["repair_reason"] = f"repeat_required_step_{step}_limit"
+            session["step"] = "escalated"
+            session["escalated"] = True
+            _safe_log(chat_id, "repeat_required_question_limit_reached", {"blocked_step": step, "answer_preview": answer[:180]})
+            return _tr(
+                session,
+                "Чтобы не повторяться и не запутать Вас, передам диалог администратору — он уточнит данные и поможет с записью 🌿",
+                "Қайталамау және шатастырмау үшін диалогты әкімшіге жіберемін — ол деректерді нақтылап, жазылуға көмектеседі 🌿",
+            )
+        return answer
+    next_step = _next_required_step_after_collected_data(session)
+    session["llm_blocked"] = True
+    session["llm_repaired"] = True
+    session["repair_reason"] = f"repeat_required_step_{step}_blocked"
+    _safe_log(chat_id, "repeat_required_question_blocked", {"blocked_step": step, "next_step": next_step, "answer_preview": answer[:180]})
+    if next_step == "book":
+        return ""
+    if next_step == "time":
+        session["step"] = "time"
+        session["questionnaire_step"] = "time"
+        return _mandatory_step_prompt(session, "time")
+    session["step"] = next_step
+    if next_step in {"date", "name", "contraindications"}:
+        session["questionnaire_step"] = "contra" if next_step == "contraindications" else next_step
+    return _mandatory_step_prompt(session, next_step)
+
+
 def _repair_state_consistency(session: dict[str, Any], user_text: str = "") -> tuple[bool, str]:
     before = str(session.get("step") or "start")
     reason = ""
@@ -226,13 +311,22 @@ def _repair_state_consistency(session: dict[str, Any], user_text: str = "") -> t
             session["complaint"] = user_text
             _record_complaint_tool(session, user_text, is_in_profile=True)
         session["step"] = "age"; reason = "complaint_profile_without_age"
+    elif before == "age" and session.get("age"):
+        next_step = _next_required_step_after_collected_data(session)
+        session["step"] = next_step if next_step != "book" else before; reason = "age_already_collected"
+    elif before == "contraindications" and session.get("contraindications_ok") is True:
+        session["step"] = "date"; session["questionnaire_step"] = "date"; reason = "contraindications_already_ok"
     elif before in {"age", "contraindications"} and session.get("age") and session.get("contraindications_ok") is None:
         session["step"] = "contraindications"; session["questionnaire_step"] = "contra"; reason = "age_without_contraindications"
     elif before in {"date", "preferred_time"} and session.get("contraindications_ok") is True and not session.get("preferred_date") and not session.get("last_slots"):
         session["step"] = "date"; session["questionnaire_step"] = "date"; reason = "contraindications_without_date"
     elif session.get("last_slots") and before not in {"time", "select_slot"} and not session.get("selected_slot"):
         session["step"] = "time"; reason = "slots_without_selected_slot"
-    elif before == "name" and session.get("selected_slot") and session.get("complaint") and not session.get("patient_name"):
+    elif before in {"time", "select_slot"} and session.get("selected_time") and not session.get("patient_name"):
+        session["step"] = "name"; session["questionnaire_step"] = "name"; reason = "selected_time_without_name"
+    elif before == "name" and session.get("patient_name"):
+        reason = "name_already_collected"
+    elif before == "name" and (session.get("selected_slot") or session.get("selected_time")) and session.get("complaint") and not session.get("patient_name"):
         session["step"] = "name"; session["questionnaire_step"] = "name"; reason = "slot_without_name"
     repaired = bool(reason)
     if repaired:
@@ -260,6 +354,7 @@ def _cleanup_contraindications_after_ok(session: dict[str, Any]) -> None:
     if session.get("last_required_step") == "contraindications":
         session["last_required_step"] = ""
         session["last_required_question"] = ""
+        session["last_required_question_count"] = 0
     if session.get("pending_step_after_faq") == "contraindications":
         session["pending_step_after_faq"] = ""
 
@@ -2341,6 +2436,7 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
             answer = repaired_answer
         _safe_log(chat_id, "contraindications_ok_final_guard_repaired", {"chat_id": chat_id, "repaired_step": repaired_step, "answer_preview": answer[:180]})
     _cleanup_contraindications_after_ok(session)
+    answer = _repair_forbidden_required_question(chat_id, session, answer)
     answer = _validate_final_fact_answer(chat_id, session, answer)
     if not (session.get("step") == "booked" and session.get("booking_confirmed") is True):
         answer = _remove_name_addressing(answer, session)
@@ -2410,8 +2506,13 @@ def _remember_required_question(session: dict[str, Any], answer: str) -> None:
     if qtype == "contraindications" and session.get("contraindications_ok") is True:
         _cleanup_contraindications_after_ok(session)
     elif qtype in step_by_type:
+        new_step = step_by_type[qtype]
+        if session.get("last_required_step") == new_step:
+            session["last_required_question_count"] = int(session.get("last_required_question_count") or 0) + 1
+        else:
+            session["last_required_question_count"] = 1
         session["last_required_question"] = answer
-        session["last_required_step"] = step_by_type[qtype]
+        session["last_required_step"] = new_step
         session["pending_step_after_faq"] = ""
     session["conversation_turns_count"] = int(session.get("conversation_turns_count") or 0) + 1
     facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
@@ -3809,6 +3910,12 @@ def _extract_no_contra_raw(text: str) -> str:
 
 
 def _mandatory_step_prompt(session: dict[str, Any], step: str) -> str:
+    if _has_required_data_for_step(session, step):
+        next_step = _next_required_step_after_collected_data(session)
+        if next_step != step and next_step != "book":
+            return _mandatory_step_prompt(session, next_step)
+        if next_step == "book":
+            return ""
     if step == "age":
         return _ask_age(session)
     if step == "contraindications":
@@ -4482,6 +4589,21 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # Intent-router запускается только после обязательных шагов, чтобы не перехватывать
     # возраст/противопоказания/дату/время/имя и не начинать анкету заново.
     step = session.get("step") or "start"
+
+    if step == "contraindications" and session.get("contraindications_ok") is True:
+        session["step"] = "date"
+        session["questionnaire_step"] = "date"
+        step = "date"
+    if step == "age" and session.get("age"):
+        session["step"] = _next_required_step_after_collected_data(session)
+        step = session.get("step") or step
+    if step in ("time", "select_slot") and session.get("selected_time") and not session.get("patient_name"):
+        session["step"] = "name"
+        session["questionnaire_step"] = "name"
+        return _finalize(chat_id, session, _ask_name(session))
+    if step == "name" and session.get("patient_name") and _booking_ready(session, phone):
+        answer = await _book(chat_id, session, phone)
+        return _finalize(chat_id, session, answer)
 
     if step in ("start", "complaint") and session.get("last_bot_question_type") == "city" and text:
         session["city"] = text
@@ -5382,6 +5504,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if not session.get("age"):
         session["step"] = "age"
         return _finalize(chat_id, session, _tr(session, "Подскажите, пожалуйста, сколько Вам лет?", "Жасыңыз нешеде?"))
+
+    if session.get("selected_time") and not session.get("patient_name"):
+        session["step"] = "name"
+        return _finalize(chat_id, session, _ask_name(session))
 
     if session.get("contraindications_ok") is not True:
         session["step"] = "contraindications"

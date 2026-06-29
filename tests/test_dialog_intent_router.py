@@ -1622,3 +1622,78 @@ def test_regression_contra_ok_sticky_after_faq_and_next_message(monkeypatch: Any
     session = state.get_session("reg_sticky")
     assert session["contraindications_ok"] is True
     assert session["contraindications_ok"] is not None
+
+
+def test_required_repeat_guard_no_contra_answer_moves_to_date(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    reset("req_no_contra", {"step": "contraindications", "complaint": "спина", "age": 35, "language": "ru", "language_locked": True})
+
+    result = answer("req_no_contra", "Нет")
+    session = state.get_session("req_no_contra")
+
+    assert session["contraindications_ok"] is True
+    assert session["step"] == "date"
+    assert "На какой день" in result
+
+
+def test_required_repeat_guard_age_already_set_not_asked_again(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    reset("req_age_set", {"step": "age", "complaint": "спина", "age": 35, "language": "ru", "language_locked": True})
+
+    result = answer("req_age_set", "Хочу записаться")
+    session = state.get_session("req_age_set")
+
+    assert session["step"] == "contraindications"
+    assert "сколько Вам лет" not in result
+    assert "противопоказ" in result.lower()
+
+
+def test_required_repeat_guard_selected_time_asks_name_not_time(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    reset("req_time_set", {
+        "step": "time",
+        "complaint": "спина",
+        "age": 35,
+        "contraindications_ok": True,
+        "preferred_date": "2026-07-06",
+        "selected_date": "2026-07-06",
+        "selected_time": "14:00",
+        "selected_doctor_login": "zhuma_md",
+        "language": "ru",
+        "language_locked": True,
+    })
+
+    result = answer("req_time_set", "да")
+    session = state.get_session("req_time_set")
+
+    assert session["step"] == "name"
+    assert "имя" in result.lower()
+    assert "какое время" not in result.lower()
+
+
+def test_required_repeat_guard_patient_name_existing_books_not_reask(monkeypatch: Any) -> None:
+    calls = setup_crm(monkeypatch)
+    reset("req_name_set", {
+        "step": "name",
+        "complaint": "спина",
+        "complaint_gate": bot_tools.COMPLAINT_OK,
+        "age": 35,
+        "contraindications_ok": True,
+        "contraindications_verdict": bot_tools.CONTRA_PROCEED,
+        "selected_date": "2026-07-06",
+        "selected_time": "14:00",
+        "selected_doctor_login": "zhuma_md",
+        "selected_doctor_name": "Жумабек Мади Мухтарович",
+        "patient_name": "Алия",
+        "phone": "77011234567",
+        "language": "ru",
+        "language_locked": True,
+    })
+
+    result = answer("req_name_set", "да")
+    session = state.get_session("req_name_set")
+
+    assert len(calls["book"]) == 1
+    assert calls["book"][0]["patient_name"] == "Алия"
+    assert session["step"] == "booked"
+    assert "имя" not in result.lower()

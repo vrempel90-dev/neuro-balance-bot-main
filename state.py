@@ -62,6 +62,9 @@ DEFAULT_SESSION = {
     "selected_doctor_name": "",
     "selected_date": "",
     "selected_time": "",
+    "last_required_step": "",
+    "last_required_question": "",
+    "last_required_question_count": 0,
     "last_slots": [],
     "escalated": False,
 }
