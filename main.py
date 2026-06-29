@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 import mimetypes
+import re
 from typing import Any
 
 import httpx
@@ -629,36 +630,28 @@ async def _send_answer_parts(
     channel_id: str | None,
     phone: str = "",
 ) -> None:
-    """Отправляет ответ частями через разделитель ---.
-
-    Пустые части не отправляем. Каждую часть дополнительно прогоняем через guard,
-    чтобы даже после split не ушло обращение по имени или лишняя фраза.
-    """
-    parts = [p.strip() for p in (answer or "").split("---") if p.strip()]
-    for part in parts:
-        safe_part = _guard_answer(chat_id, part)
-        if not safe_part:
-            continue
-        state.log_event(chat_id, "wazzup_send_attempt", {"phone": phone, "answer_preview": _preview(safe_part, 160)})
-        try:
-            decision_data = _get_session_safe(chat_id).get("guard_decision")
-            if isinstance(decision_data, dict) and not bool(decision_data.get("should_send_wazzup", True)):
-                state.log_event(chat_id, "wazzup_send_blocked", {"phone": phone, "reason": _get_session_safe(chat_id).get("no_reply_reason") or "send_guard"})
-                return
-            sess = _get_session_safe(chat_id)
-            sess["wazzup_send_called"] = True
-            state.save_session(chat_id, sess)
-            result = await send_text(
-                chat_id=chat_id,
-                text=safe_part,
-                chat_type=chat_type,
-                channel_id=channel_id,
-            )
-            state.log_event(chat_id, "wazzup_send_result", {"phone": phone, "ok": True, "status_code": result.get("status_code")})
-        except Exception as exc:
-            status_code = getattr(getattr(exc, "response", None), "status_code", None)
-            state.log_event(chat_id, "wazzup_send_result", {"phone": phone, "ok": False, "status_code": status_code, "error_preview": _preview(exc, 300)})
-            raise
+    """Отправляет один dialog_result одним сообщением Wazzup."""
+    safe_text = str(answer or "").replace("---", "\n")
+    safe_text = re.sub(r"(?i)Вижу Ваш запрос|Ваш запрос принят", "", safe_text)
+    safe_text = re.sub(r"\n{3,}", "\n\n", safe_text).strip()
+    safe_text = _guard_answer(chat_id, safe_text)
+    if not safe_text:
+        return
+    state.log_event(chat_id, "wazzup_send_attempt", {"phone": phone, "answer_preview": _preview(safe_text, 160)})
+    try:
+        decision_data = _get_session_safe(chat_id).get("guard_decision")
+        if isinstance(decision_data, dict) and not bool(decision_data.get("should_send_wazzup", True)):
+            state.log_event(chat_id, "wazzup_send_blocked", {"phone": phone, "reason": _get_session_safe(chat_id).get("no_reply_reason") or "send_guard"})
+            return
+        sess = _get_session_safe(chat_id)
+        sess["wazzup_send_called"] = True
+        state.save_session(chat_id, sess)
+        result = await send_text(chat_id=chat_id, text=safe_text, chat_type=chat_type, channel_id=channel_id)
+        state.log_event(chat_id, "wazzup_send_result", {"phone": phone, "ok": True, "status_code": result.get("status_code")})
+    except Exception as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        state.log_event(chat_id, "wazzup_send_result", {"phone": phone, "ok": False, "status_code": status_code, "error_preview": _preview(exc, 300)})
+        raise
 
 
 async def _debounced_process_and_send(message: dict[str, Any]) -> None:

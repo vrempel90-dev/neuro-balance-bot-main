@@ -147,7 +147,7 @@ def build_safe_answer_for_current_state(session: dict[str, Any], user_text: str 
     if current_step in {"time", "select_slot"} and session.get("last_slots"):
         session["step"] = "time"
         updates["step"] = "time"
-        answer = "Какое время из вариантов выше Вам удобно?"
+        answer = _slot_times_answer(session)
         _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "time_unselected", "step": "time", "answer_preview": answer[:160]})
         return answer, "time", updates
 
@@ -757,12 +757,20 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         if not date_iso:
             session["step"] = "date"
             return _finalize(chat_id, session, (reply + "\n\n" if reply else "") + _ask_date(session))
+        if any(p in _low(text) for p in TIME_PREFERENCE_WORDS):
+            session["time_preference"] = next((p for p in TIME_PREFERENCE_WORDS if p in _low(text)), "")
         slots_answer = await _show_slots(chat_id, session, date_iso)
         if session.get("step") != "time" or not (session.get("last_slots") or []):
             return _finalize(chat_id, session, slots_answer)
         return _finalize(chat_id, session, (reply + "\n\n" if reply else "") + slots_answer)
     if action == "select_slot":
         slots = session.get("last_slots") or []
+        if not _explicit_slot_selection_text(text, slots):
+            session.pop("slot_choice", None)
+            session.pop("selected_time", None)
+            session.pop("selected_slot", None)
+            session["step"] = "time"
+            return _finalize(chat_id, session, _slot_times_answer(session))
         choice = extracted.get("slot_choice")
         slot = None
         if isinstance(choice, int) and 1 <= choice <= len(slots):
@@ -946,8 +954,9 @@ PRICE_WORDS = [
 ]
 
 ADDRESS_WORDS = [
-    "адрес", "где находитесь", "вы в астане", "2gis", "2 гис",
+    "адрес", "адресс", "где вы", "где находитесь", "вы в астане", "2gis", "2 гис",
     "куда обращаться", "куда прийти", "как пройти", "куда ехать",
+    "куда приехать",
     "мекенжай", "қайда", "кайда", "астанада",
 ]
 
@@ -1179,6 +1188,7 @@ NO_CONTRA_WORDS = [
     "ничего нет", "по списку ничего нет", "нет такого ничего", "нет такого", "все чисто", "всё чисто", "чисто",
     "все нормально", "всё нормально", "нормально", "ничего такого нет", "ничего из этого нет",
     "нет ничего из перечисленного", "ничего из перечисленного нет", "того что перечислено нет",
+    "из перечисленного ничего нет", "из того что вы перечислили ничего нет", "этого нет",
     "того, что перечислено, этого нет", "то что перечислено этого нет", "то что перечислено, этого нет",
     "по всем нет", "все нет", "всё нет",
     "жоқ", "жок", "joq", "jok", "қарсы көрсетілім жоқ", "карсы корсетилим жок",
@@ -1624,10 +1634,12 @@ def _price_answer(text: str, session: dict[str, Any]) -> str:
 
 
 def _address_answer(session: dict[str, Any]) -> str:
-    return _clinic_info_template(session, "address") or _tr(
+    session["last_clinic_info_topic"] = "address"
+    bot_tools.mark_tool(session, "get_clinic_info", topic="address")
+    return _tr(
         session,
-        "Астана, Кабанбай батыра 28, внутренний двор, подъезд 3. Вход со стороны Кунаева, после шлагбаума направо.",
-        "Астана, Қабанбай батыр 28, ішкі аула, 3-подъезд. Қонаев жағынан кіріп, шлагбаумнан кейін оңға бұрыласыз.",
+        "Мы находимся по адресу Кабанбай батыра 28, внутренний двор, подъезд 3. Заезд со стороны Кунаева, после ворот поверните направо 📍\n\n2ГИС: https://2gis.kz/astana/inside/9570784863354265/firm/70000001105992248?m=71.416112%2C51.134091%2F16",
+        "Біздің мекенжай: Қабанбай батыр 28, ішкі аула, 3-кіреберіс. Кунаев жағынан кіріп, қақпадан кейін оңға бұрылыңыз 📍\n\n2ГИС: https://2gis.kz/astana/inside/9570784863354265/firm/70000001105992248?m=71.416112%2C51.134091%2F16",
     )
 
 
@@ -2306,6 +2318,9 @@ def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
         "противопоказан",
         "ваш визит в neuro balance",
         "запись подтверждена",
+        "отлично, запись оформлена",
+        "2гис",
+        "2gis",
         "кардиостимулятор",
         "процесс записи останавливаю",
         "этим направлением",
@@ -2371,6 +2386,14 @@ def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
     return cleaned.strip()
 
 _TIME_PATTERN = re.compile(r"\b(?:[01]?\d|2[0-3])[:.][0-5]\d\b")
+DATE_TIME_NAME_BLOCK_WORDS = (
+    "сегодня", "завтра", "послезавтра", "понедельник", "вторник", "среда",
+    "понеддельник", "понеделник", "пандельник",
+    "среду", "четверг", "пятница", "пятницу", "суббота", "субботу",
+    "воскресенье", "утром", "днём", "днем", "после обеда", "вечером",
+    "не рано", "попозже", "пораньше", "часов",
+)
+TIME_PREFERENCE_WORDS = ("после обеда", "вечером", "не рано", "попозже", "пораньше", "утром", "днем", "днём")
 _FORBIDDEN_EMPTY_SLOT_PHRASES = (
     "есть свободные слоты",
     "есть такие свободные",
@@ -2379,6 +2402,45 @@ _FORBIDDEN_EMPTY_SLOT_PHRASES = (
     "выберите подходящий",
     "выберите удобный",
 )
+
+
+def _contains_date_time_preference(text: str) -> bool:
+    low = _low(text)
+    if _TIME_PATTERN.search(low) or re.search(r"\b(?:[01]?\d|2[0-3])\s*(?:час|ч)\b", low):
+        return True
+    return any(w in low for w in DATE_TIME_NAME_BLOCK_WORDS)
+
+
+def _slot_times_answer(session: dict[str, Any]) -> str:
+    slots = session.get("last_slots") or []
+    times = [_slot_time(slot) for slot in slots if isinstance(slot, dict) and _slot_time(slot)]
+    times = list(dict.fromkeys(times))
+    if not times:
+        return _tr(session, "Какое время Вам удобно?", "Қай уақыт ыңғайлы?")
+    joined = ", ".join(times[:-1]) + (" и " + times[-1] if len(times) > 1 else times[0])
+    pref = str(session.get("time_preference") or "").strip()
+    if pref:
+        return _tr(
+            session,
+            f"{pref.capitalize()} есть {joined} 🌿 Какое время Вам удобно?",
+            f"{joined} уақыттары бар 🌿 Қай уақыт ыңғайлы?",
+        )
+    return _tr(
+        session,
+        f"На выбранный день есть окошки: {joined} 🌿 Какое время Вам удобно?",
+        f"Таңдалған күнге бос уақыттар бар: {joined} 🌿 Қай уақыт ыңғайлы?",
+    )
+
+
+def _cleanup_final_wazzup_text(answer: str) -> str:
+    text = str(answer or "")
+    text = text.replace("---", "\n")
+    for phrase in ("Вижу Ваш запрос", "Ваш запрос принят"):
+        text = re.sub(re.escape(phrase), "", text, flags=re.I)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip(" \n.,")
 
 
 def _validate_final_fact_answer(chat_id: str, session: dict[str, Any], answer: str) -> str:
@@ -2438,9 +2500,14 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     _cleanup_contraindications_after_ok(session)
     answer = _repair_forbidden_required_question(chat_id, session, answer)
     answer = _validate_final_fact_answer(chat_id, session, answer)
+    if session.get("last_slots") and not session.get("selected_time"):
+        session["step"] = "time"
+        if not answer or "на какой день" in _low(answer):
+            answer = _slot_times_answer(session)
     if not (session.get("step") == "booked" and session.get("booking_confirmed") is True):
         answer = _remove_name_addressing(answer, session)
     answer = _strict_trim_extra(answer, session)
+    answer = _cleanup_final_wazzup_text(answer)
     if not answer and _is_active_new_ai_request(session):
         repair = repair_empty_active_reply(session, str(session.get("last_user_text") or ""), "empty_active_reply")
         session["fallback_reason"] = "empty_active_reply"
@@ -3020,6 +3087,16 @@ def _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | Non
     return None
 
 
+def _explicit_slot_selection_text(text: str, slots: list[dict[str, str]]) -> bool:
+    low = _low(text)
+    if _time_from_text(text):
+        return any(_slot_time(slot) == _time_from_text(text) for slot in slots)
+    return bool(
+        re.search(r"\b([1-9])\s*(?:вариант|окно|окошко)\b", low)
+        or any(w in low for w in ("первый", "первая", "первое", "первую", "второй", "вторая", "второе", "вторую", "третий", "третья", "третье", "третью", "пятое окно", "5 вариант"))
+    )
+
+
 def _remember_selected_slot(session: dict[str, Any], slot: dict[str, Any]) -> None:
     """Persist the exact CRM slot payload and denormalized booking fields."""
     last_slots = session.get("last_slots") or []
@@ -3057,6 +3134,8 @@ def _looks_like_name(text: str) -> bool:
 
 def _extract_name(text: str) -> str:
     clean = _clean(text)
+    if _contains_date_time_preference(clean):
+        return ""
 
     patterns = [
         r"\bменя\s+зовут\s+([A-Za-zА-Яа-яӘәҒғҚқҢңӨөҰұҮүҺһІі\-\s]{2,50})",
@@ -3342,8 +3421,11 @@ def _booking_success_answer(session: dict[str, Any], booked: dict[str, Any], slo
     return _tr(
         session,
         (
-            f"{patient_name}, записала Вас на {date_human} в {time_start} к врачу {doctor} 🌿\n\n"
-            "Адрес: Кабанбай батыра 28, внутренний двор, подъезд 3. Ждём Вас!"
+            "Отлично, запись оформлена 🌿\n\n"
+            f"{patient_name}, записала Вас — ждём Вас {date_human} в {time_start} к врачу {doctor}.\n\n"
+            "Адрес: Кабанбай батыра 28, внутренний двор, подъезд 3.\n"
+            "Заезд со стороны Кунаева, после ворот поверните направо.\n\n"
+            "2ГИС: https://2gis.kz/astana/inside/9570784863354265/firm/70000001105992248?m=71.416112%2C51.134091%2F16"
         ),
         (
             f"{patient_name}, Сізді {date_human} күні сағат {time_start} дәрігер {doctor} қабылдауына жаздым 🌿\n\n"
@@ -3431,10 +3513,12 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
     session["crm_availability_empty"] = False
     session["last_slots"] = slots
     session["step"] = "time"
+    if session.get("time_preference"):
+        return _slot_times_answer(session)
     return _tr(
         session,
-        "Есть такие свободные окошки:\n" + _slots_text(slots, lang) + "\n\nКакое Вам удобно? Можно ответить номером варианта.",
-        "Мынадай бос уақыттар бар:\n" + _slots_text(slots, lang) + "\n\nҚайсысы ыңғайлы? Нұсқа нөмірімен жауап беруге болады.",
+        "Есть такие свободные окошки:\n" + _slots_text(slots, lang) + "\n\nКакое время Вам удобно?",
+        "Таңдалған күнге бос уақыттар бар:\n" + _slots_text(slots, lang) + "\n\nҚай уақыт ыңғайлы?",
     )
 
 
@@ -3923,7 +4007,9 @@ def _mandatory_step_prompt(session: dict[str, Any], step: str) -> str:
     if step in ("date", "preferred_time"):
         return _ask_date(session)
     if step in ("time", "select_slot"):
-        return _tr(session, "Какое время из вариантов выше Вам удобно?", "Жоғарыдағы уақыттардың қайсысы ыңғайлы?")
+        if session.get("last_slots"):
+            return _slot_times_answer(session)
+        return _tr(session, "Какое время Вам удобно?", "Қай уақыт ыңғайлы?")
     if step == "name":
         return _ask_name(session)
     return _clarify_intent_answer(session)
@@ -3952,6 +4038,41 @@ def _faq_answer_then_resume(text: str, session: dict[str, Any], step: str) -> st
     if not info:
         return None
     return info + "\n\n" + _mandatory_step_prompt(session, step)
+
+
+def _medical_risk_question(text: str) -> bool:
+    low = _low(text)
+    return any(p in low for p in ("это опасно", "опасно?", "что это может быть", "грыжа шморля"))
+
+
+def _medical_risk_answer_then_resume(session: dict[str, Any], step: str) -> str:
+    return _tr(
+        session,
+        "По переписке точно оценить нельзя. Лучше, чтобы врач посмотрел очно 🌿",
+        "Хат арқылы нақты бағалау мүмкін емес. Дәрігердің көзбе-көз қарағаны дұрыс 🌿",
+    ) + "\n\n" + _mandatory_step_prompt(session, step)
+
+
+def _active_flow_resume_step(session: dict[str, Any]) -> str:
+    step = str(session.get("step") or "start")
+    if step in {"date", "preferred_time", "time", "select_slot", "name"}:
+        return "time" if step == "select_slot" else step
+    if session.get("last_slots") and not session.get("selected_time"):
+        return "time"
+    if session.get("selected_time") and not session.get("patient_name"):
+        return "name"
+    if session.get("contraindications_ok") is True and not (session.get("preferred_date") or session.get("selected_date")):
+        return "date"
+    return step
+
+
+def _address_answer_then_optional_resume(session: dict[str, Any]) -> str:
+    base = _address_answer(session)
+    step = _active_flow_resume_step(session)
+    if step in {"date", "time", "name"}:
+        prompt = _mandatory_step_prompt(session, step)
+        return base + (" " + prompt if prompt else "")
+    return base
 
 
 def _accept_no_contraindications(session: dict[str, Any], text: str) -> None:
@@ -4479,6 +4600,14 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["gate_reason"] = "new_lead_like_message"
         session["ai_lead_started"] = True
         return _finalize(chat_id, session, _instagram_detail_answer(session))
+    if _is_booked_or_confirmed_session(session):
+        session["gate_reason"] = "booked_session_ai_disabled"
+        return _no_reply(chat_id, session, "booked_session_ai_disabled")
+    early_step = str(session.get("step") or "start")
+    if _has_any(text, ADDRESS_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text)) and not (early_step in {"time", "select_slot"} and _select_slot(text, session.get("last_slots") or [])):
+        session.setdefault("gate_reason", "new_lead_like_message")
+        session["ai_lead_started"] = True
+        return _finalize(chat_id, session, _address_answer_then_optional_resume(session))
     if (session.get("step") == "contraindications" or session.get("last_required_step") == "contraindications") and _is_contra_clear_hotfix_phrase(text):
         answer = _accept_no_contra_and_advance(chat_id, session, text)
         faq_info = _faq_answer(text, session)
@@ -4596,6 +4725,36 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         step = "date"
     if step == "age" and session.get("age"):
         session["step"] = _next_required_step_after_collected_data(session)
+        step = session["step"]
+    if session.get("last_slots") and not session.get("selected_time") and step not in {"booked", "done", "escalated", "stopped"}:
+        session["step"] = "time"
+        step = "time"
+    if session.get("selected_time") and not session.get("patient_name") and step not in {"booked", "done", "escalated", "stopped"}:
+        session["step"] = "name"
+        step = "name"
+    if _has_any(text, ADDRESS_WORDS) and step in {"time", "select_slot"}:
+        slot = _select_slot(text, session.get("last_slots") or [])
+        if slot and _explicit_slot_selection_text(text, session.get("last_slots") or []):
+            _remember_selected_slot(session, slot)
+            session["step"] = "name"
+            step = "name"
+            return _finalize(chat_id, session, _address_answer(session) + " " + _ask_name(session))
+    if _has_any(text, ADDRESS_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text)):
+        return _finalize(chat_id, session, _address_answer_then_optional_resume(session))
+    if step in {"date", "preferred_time", "time", "select_slot", "name"} and _medical_risk_question(text):
+        return _finalize(chat_id, session, _medical_risk_answer_then_resume(session, step))
+    if step in {"time", "select_slot"}:
+        slot = _select_slot(text, session.get("last_slots") or [])
+        info = _faq_answer(text, session)
+        if slot and info and _explicit_slot_selection_text(text, session.get("last_slots") or []):
+            _remember_selected_slot(session, slot)
+            session["step"] = "name"
+            step = "name"
+            return _finalize(chat_id, session, info + " " + _ask_name(session))
+    if step in {"date", "preferred_time", "time", "select_slot", "name"}:
+        faq_resume = None if (_has_any(text, ADDRESS_WORDS) and (_parse_date(text) or _contains_date_time_preference(text))) else _faq_answer_then_resume(text, session, step)
+        if faq_resume:
+            return _finalize(chat_id, session, faq_resume)
         step = session.get("step") or step
     if step in ("time", "select_slot") and session.get("selected_time") and not session.get("patient_name"):
         session["step"] = "name"
@@ -4767,15 +4926,17 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
                 return _finalize(chat_id, session, _stop_booking_text(session, "contra"))
             if (_has_complaint(text) or _has_medical_complaint_text(text)):
                 return _finalize(chat_id, session, _ask_contra(session))
-            if any(w in _low(text) for w in YES_WORDS):
+            if any(w in _low(text) for w in YES_WORDS) or _low(text) in {"не знаю", "возможно", "наверное"}:
                 session["contraindications_ok"] = False
                 session["contraindications_verdict"] = "need_details"
-                answer = _tr(
-                    session,
-                    "Поняла Вас. Уточните, пожалуйста, какое именно противопоказание есть: кардиостимулятор, беременность, онкология, металл в зоне лечения, эпилепсия, возраст до 16 или более 75 лет, ограниченная подвижность? Если что-то из этого есть — запись оформить нельзя.",
-                    "Түсіндім. Қай қарсы көрсетілім бар екенін нақтылап жазыңызшы: кардиостимулятор, жүктілік, онкология, емдеу аймағындағы металл, эпилепсия, 16 жасқа дейін немесе 75 жастан жоғары жас, қозғалыстың шектелуі? Егер осының бірі болса — жазба рәсімделмейді.",
-                )
+                session["contraindications_need_details_asked"] = True
+                answer = _tr(session, "Поняла. Подскажите, пожалуйста, какие именно противопоказания есть?", "Түсіндім. Қандай қарсы көрсетілім бар екенін нақтылап жазыңызшы.")
                 return _finalize(chat_id, session, answer)
+            if session.get("contraindications_need_details_asked"):
+                session["escalated"] = True
+                session["manual_takeover"] = True
+                session["step"] = "escalated"
+                return _finalize(chat_id, session, _tr(session, "Чтобы не ошибиться, передам администратору для уточнения 🌿", "Қателеспеу үшін әкімшіге нақтылауға жіберемін 🌿"))
             return _finalize(chat_id, session, _ask_contra(session))
 
         if step in ("date", "preferred_time"):
@@ -4787,6 +4948,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             if _is_new_patient_consultation(session) and _mentions_weekend_day(text) and _is_weekend_date(date_iso):
                 session["step"] = "date"
                 return _finalize(chat_id, session, _weekend_primary_block_answer(session))
+            if any(p in _low(text) for p in TIME_PREFERENCE_WORDS):
+                session["time_preference"] = next((p for p in TIME_PREFERENCE_WORDS if p in _low(text)), "")
+                session["preferred_date_text"] = text
             answer = await _show_slots(chat_id, session, date_iso)
             if _has_video_procedure_question(text):
                 answer = _video_procedure_answer(session) + "\n\n" + answer
@@ -5395,18 +5559,20 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             _safe_log(chat_id, "llm_unknown_contraindication_blocked", {"chat_id": chat_id, "step": "contraindications", "patient_text": text[:180]})
             return _finalize(chat_id, session, _unknown_contra_safe_answer(session))
 
-        # Если пациент написал просто "есть/да/бар" без деталей — запись не продолжаем.
-        # Просим уточнить, какое именно противопоказание, потому что при наличии противопоказаний приём не проводится.
-        if any(w in _low(text) for w in YES_WORDS):
+        # Если пациент написал просто "есть/да/не знаю" без деталей — запись не продолжаем.
+        if any(w in _low(text) for w in YES_WORDS) or _low(text) in {"не знаю", "возможно", "наверное"}:
             session["contraindications_ok"] = False
             session["contraindications_verdict"] = "need_details"
             session["step"] = "contraindications"
-            answer = _tr(
-                session,
-                "Поняла Вас. Уточните, пожалуйста, какое именно противопоказание есть: кардиостимулятор, беременность, онкология, металл в зоне лечения, эпилепсия, возраст до 16 или более 75 лет, ограниченная подвижность? Если что-то из этого есть — запись оформить нельзя.",
-                "Түсіндім. Қай қарсы көрсетілім бар екенін нақтылап жазыңызшы: кардиостимулятор, жүктілік, онкология, емдеу аймағындағы металл, эпилепсия, 16 жасқа дейін немесе 75 жастан жоғары жас, қозғалыстың шектелуі? Егер осының бірі болса — жазба рәсімделмейді.",
-            )
+            session["contraindications_need_details_asked"] = True
+            answer = _tr(session, "Поняла. Подскажите, пожалуйста, какие именно противопоказания есть?", "Түсіндім. Қандай қарсы көрсетілім бар екенін нақтылап жазыңызшы.")
             return _finalize(chat_id, session, answer)
+
+        if session.get("contraindications_need_details_asked"):
+            session["escalated"] = True
+            session["manual_takeover"] = True
+            session["step"] = "escalated"
+            return _finalize(chat_id, session, _tr(session, "Чтобы не ошибиться, передам администратору для уточнения 🌿", "Қателеспеу үшін әкімшіге нақтылауға жіберемін 🌿"))
 
         return _finalize(chat_id, session, _ask_contra(session))
 
@@ -5422,6 +5588,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session["step"] = "date"
             return _finalize(chat_id, session, _weekend_primary_block_answer(session))
 
+        if any(p in _low(text) for p in TIME_PREFERENCE_WORDS):
+            session["time_preference"] = next((p for p in TIME_PREFERENCE_WORDS if p in _low(text)), "")
+            session["preferred_date_text"] = text
         answer = await _show_slots(chat_id, session, date_iso)
         if _has_video_procedure_question(text):
             answer = _video_procedure_answer(session) + "\n\n" + answer
