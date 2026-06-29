@@ -155,7 +155,7 @@ def test_history_age_answer_moves_to_contraindications(monkeypatch: Any) -> None
 
     assert session["step"] == "contraindications"
     assert session["questionnaire_step"] == "contra"
-    assert "Противопоказаний нет" in result
+    assert "Есть ли у Вас какие-нибудь противопоказания?" in result
 
 
 def test_history_contra_clear_answer_moves_to_date(monkeypatch: Any) -> None:
@@ -1382,6 +1382,31 @@ def test_openai_decision_validator_blocks_invented_contraindication() -> None:
     assert ok is False
     assert reason == "llm_unknown_contraindication_blocked"
 
+
+
+def test_short_contraindications_question_after_age() -> None:
+    chat_id = "short_contra_after_age"
+    reset(chat_id, {"step": "age", "complaint": "болит спина", "language": "ru", "language_locked": True})
+
+    result = answer(chat_id, "36 лет")
+    session = state.get_session(chat_id)
+
+    assert "Есть ли у Вас какие-нибудь противопоказания?" in result
+    assert "кардиостимулятора/дефибриллятора" not in result
+    assert "инсулиновой помпы" not in result
+    assert session["step"] == "contraindications"
+
+
+def test_no_contraindications_answer_advances_to_date() -> None:
+    chat_id = "short_contra_no_advances"
+    reset(chat_id, {"step": "contraindications", "complaint": "болит спина", "age": 36, "language": "ru", "language_locked": True})
+
+    result = answer(chat_id, "нет")
+    session = state.get_session(chat_id)
+
+    assert session["contraindications_ok"] is True
+    assert session["step"] == "date"
+    assert result == "Отлично 🌿 На какой день Вам удобно прийти?"
 
 def test_hotfix_contraindications_clear_phrase_advances() -> None:
     chat_id = "hotfix_contra_clear_phrase"

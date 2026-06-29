@@ -3166,20 +3166,35 @@ def _senior_contra_intro(session: dict[str, Any]) -> str:
 
 
 def _ask_contra(session: dict[str, Any]) -> str:
-    sent_count = int(session.get("contraindications_checklist_sent_count") or 0)
-    if sent_count >= 1:
-        session["contraindications_repeated_blocked"] = True
-        _safe_log(str(session.get("chat_id") or "system"), "contraindications_repeated_blocked", {"sent_count": sent_count})
-        return _tr(
-            session,
-            "Подскажите, пожалуйста, противопоказаний из списка нет?",
-            "Айтыңызшы, тізімдегі қарсы көрсетілімдер жоқ па?",
+    return _tr(
+        session,
+        "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?",
+        "Жазбас бұрын қауіпсіздік үшін нақтылайын 🌿 Сізде қандай да бір Қарсы көрсетілімдер бар ма?",
+    )
+
+
+def _contra_details_question(text: str) -> bool:
+    low = _low(text)
+    return any(
+        phrase in low
+        for phrase in (
+            "какие противопоказания",
+            "какие именно",
+            "перечислите",
+            "что входит в противопоказания",
+            "список противопоказаний",
+            "какие есть противопоказания",
         )
+    )
+
+
+def _contra_detailed_list(session: dict[str, Any]) -> str:
+    sent_count = int(session.get("contraindications_checklist_sent_count") or 0)
     session["contraindications_checklist_sent_count"] = sent_count + 1
     return _tr(
         session,
-        'Спасибо 🌿 Перед записью уточню важный момент по безопасности.\n\nНет ли у Вас кардиостимулятора/дефибриллятора, инсулиновой помпы, кохлеарного импланта, беременности, онкологии или подозрения на неё, металла в зоне лечения, эпилепсии/судорог, тромбоза или нарушений свёртываемости, декомпенсированного диабета/тиреотоксикоза, температуры/ОРВИ/острой инфекции, тяжёлых проблем с сердцем, дыханием или психическим состоянием?\n\nТакже приём не проводится пациентам младше 16 или старше 75 лет и при ограниченной подвижности — коляска, костыли.\n\nПротивопоказаний нет?',
-        'Жақсы 🌿 Жазылу алдында қауіпсіздік бойынша маңызды нәрсені нақтылайын.\n\nСізде кардиостимулятор/дефибриллятор, инсулин помпасы, кохлеарлық имплант, жүктілік, онкология немесе оған күдік, емдеу аймағында металл, эпилепсия/судорога, тромбоз немесе қан ұюының бұзылысы, декомпенсацияланған диабет/тиреотоксикоз, қызу/ЖРВИ/жедел инфекция, жүрек, тыныс алу немесе психикалық жағдай бойынша ауыр мәселе жоқ па?\n\nСондай-ақ 16 жасқа дейінгі, 75 жастан асқан және қозғалысы шектеулі пациенттерге — коляска, костыли — қабылдау жүргізілмейді.\n\nҚарсы көрсетілімдер жоқ па?',
+        'Основные противопоказания: кардиостимулятор/дефибриллятор, инсулиновая помпа, кохлеарный имплант, беременность, онкология или подозрение на неё, металл в зоне лечения, эпилепсия/судороги, тромбоз или нарушения свёртываемости, декомпенсированный диабет/тиреотоксикоз, температура/ОРВИ/острая инфекция, тяжёлые проблемы с сердцем, дыханием или психическим состоянием. Также приём не проводится пациентам младше 16 или старше 75 лет и при ограниченной подвижности — коляска, костыли.\n\nЕсть ли у Вас что-то из этого?',
+        'Негізгі қарсы көрсетілімдер: кардиостимулятор/дефибриллятор, инсулин помпасы, кохлеарлық имплант, жүктілік, онкология немесе оған күдік, емдеу аймағында металл, эпилепсия/судорога, тромбоз немесе қан ұюының бұзылысы, декомпенсацияланған диабет/тиреотоксикоз, қызу/ЖРВИ/жедел инфекция, жүрек, тыныс алу немесе психикалық жағдай бойынша ауыр мәселе. Сондай-ақ 16 жасқа дейінгі, 75 жастан асқан және қозғалысы шектеулі пациенттерге — коляска, костыли — қабылдау жүргізілмейді.\n\nСізде осының біреуі бар ма?',
     )
 
 
@@ -3797,11 +3812,7 @@ def _mandatory_step_prompt(session: dict[str, Any], step: str) -> str:
     if step == "age":
         return _ask_age(session)
     if step == "contraindications":
-        return _tr(
-            session,
-            "Перед записью уточню противопоказания для безопасности. Подскажите, пожалуйста, противопоказаний нет?",
-            "Жазылу алдында қауіпсіздік үшін қарсы көрсетілімдерді нақтылаймын. Қарсы көрсетілімдер жоқ па?",
-        )
+        return _ask_contra(session)
     if step in ("date", "preferred_time"):
         return _ask_date(session)
     if step in ("time", "select_slot"):
@@ -3902,7 +3913,7 @@ def _accept_no_contra_and_advance(chat_id: str, session: dict[str, Any], text: s
     _safe_log(chat_id, "contraindications_clear_detected", {"text_preview": (text or "")[:180]})
     if session.get("preferred_date"):
         return ""
-    return _ask_date(session)
+    return _tr(session, "Отлично 🌿 На какой день Вам удобно прийти?", "Жақсы 🌿 Қай күн ыңғайлы?")
 
 def _after_booking_admin_answer(text: str, session: dict[str, Any]) -> str:
     info = _faq_answer(text, session)
@@ -3946,7 +3957,7 @@ async def _continue_after_collected_age(chat_id: str, session: dict[str, Any], t
 
     # Если пациент сразу написал, что противопоказаний нет — не спрашиваем это повторно.
     if _contra_is_clear_no(text):
-        bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, text)
+        _accept_no_contraindications(session, text)
 
         date_iso = _parse_date(text)
         if date_iso:
@@ -4617,6 +4628,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return _finalize(chat_id, session, answer)
 
         if step == "contraindications":
+            if _contra_details_question(text):
+                return _finalize(chat_id, session, _contra_detailed_list(session))
             if _contra_reference_question(text) and int(session.get("contraindications_checklist_sent_count") or 0) >= 1:
                 return _finalize(chat_id, session, _contra_repeated_block_answer(session))
             term_answer = _contra_term_answer(text, session)
