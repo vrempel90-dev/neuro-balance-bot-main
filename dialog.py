@@ -2457,18 +2457,25 @@ def _contains_date_time_preference(text: str) -> bool:
     return any(w in low for w in DATE_TIME_NAME_BLOCK_WORDS)
 
 
+def _join_times(times: list[str]) -> str:
+    unique = list(dict.fromkeys([time for time in times if time]))
+    if not unique:
+        return ""
+    return ", ".join(unique[:-1]) + (" и " + unique[-1] if len(unique) > 1 else unique[0])
+
+
 def _slot_times_answer(session: dict[str, Any]) -> str:
     slots = session.get("last_slots") or []
     times = [_slot_time(slot) for slot in slots if isinstance(slot, dict) and _slot_time(slot)]
-    times = list(dict.fromkeys(times))
-    if not times:
+    joined = _join_times(times)
+    if not joined:
         return _tr(session, "Какое время Вам удобно?", "Қай уақыт ыңғайлы?")
-    joined = ", ".join(times[:-1]) + (" и " + times[-1] if len(times) > 1 else times[0])
     pref = str(session.get("time_preference") or "").strip()
     if pref:
+        prefix = _doctor_date_prefix(session)
         return _tr(
             session,
-            f"{pref.capitalize()} есть {joined} 🌿 Какое время Вам удобно?",
+            f"{prefix}{pref} есть {joined} 🌿 Подойдёт это время?",
             f"{joined} уақыттары бар 🌿 Қай уақыт ыңғайлы?",
         )
     return _tr(
@@ -3097,6 +3104,67 @@ def _filter_slots_by_time_preference(slots: list[dict[str, Any]], pref: str) -> 
         return [s for s in slots if hour(s) >= 17]
     return slots
 
+
+def _time_pref_kind(pref: str) -> str:
+    low = _low(pref)
+    if "до обеда" in low or "утром" in low or "с утра" in low or "пораньше" in low:
+        return "morning"
+    if "после обеда" in low or "днем" in low or "днём" in low:
+        return "afternoon"
+    if "вечер" in low:
+        return "evening"
+    return ""
+
+
+def _slot_hour(slot: dict[str, Any]) -> int:
+    try:
+        return int((_slot_time(slot) or "0:00").split(":", 1)[0])
+    except Exception:
+        return 0
+
+
+def _slots_for_time_pref(slots: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    if kind == "morning":
+        return [slot for slot in slots if _slot_hour(slot) < 12]
+    if kind == "afternoon":
+        return [slot for slot in slots if 12 <= _slot_hour(slot) < 18]
+    if kind == "evening":
+        return [slot for slot in slots if _slot_hour(slot) >= 17]
+    return slots
+
+
+def _doctor_date_prefix(session: dict[str, Any]) -> str:
+    doctor = str(session.get("selected_doctor_name") or "").strip()
+    doctor_phrase = ""
+    if str(session.get("selected_doctor_login") or "") == "zhuma_md" or "Мади Мухтарович" in doctor:
+        doctor_phrase = "К Мади Мухтаровичу "
+    elif doctor and doctor.lower() != "врач клиники":
+        doctor_phrase = f"К врачу {doctor} "
+
+    date_text = str(session.get("preferred_date_text") or "").lower()
+    date_phrase = "завтра " if "завтра" in date_text else ""
+    return doctor_phrase + date_phrase
+
+
+def _time_pref_no_slots_answer(session: dict[str, Any], kind: str, all_slots: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    prefix = _doctor_date_prefix(session)
+    if kind == "morning":
+        other = [slot for slot in all_slots if _slot_hour(slot) >= 12]
+        if other:
+            return f"{prefix}до обеда свободных окошек не вижу. Есть после обеда: {_join_times([_slot_time(slot) for slot in other])} 🌿 Подойдёт что-то из этого?", other
+        return f"{prefix}до обеда свободных окошек не вижу. Могу посмотреть другой день 🌿 Какой день Вам будет удобен?", []
+    if kind == "afternoon":
+        morning = [slot for slot in all_slots if _slot_hour(slot) < 12]
+        if morning:
+            return f"{prefix}после обеда свободных окошек не вижу. Есть утром: {_join_times([_slot_time(slot) for slot in morning])} 🌿 Подойдёт что-то из этого?", morning
+        return f"{prefix}после обеда свободных окошек не вижу. Могу посмотреть другой день 🌿 Какой день Вам будет удобен?", []
+    if kind == "evening":
+        daytime = [slot for slot in all_slots if _slot_hour(slot) < 17]
+        if daytime:
+            return f"{prefix}вечером свободных окошек не вижу. Есть раньше: {_join_times([_slot_time(slot) for slot in daytime])} 🌿 Подойдёт что-то из этого?", daytime
+        return f"{prefix}вечером свободных окошек не вижу. Могу посмотреть другой день 🌿 Какой день Вам будет удобен?", []
+    return _no_slots_text(session), []
+
 def _slots_text(slots: list[dict[str, str]], lang: str) -> str:
     lines = []
     for i, slot in enumerate(slots, 1):
@@ -3606,8 +3674,9 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
                 pass
 
         data = await crm.check_slots(date_iso, doctor_login=(session.get("selected_doctor_login") or None))
-        slots = _format_slots(data, max_count=max_slots)
-        slots = _filter_slots_by_time_preference(slots, str(session.get("time_preference") or "")) or slots
+        all_slots = _format_slots(data, max_count=max_slots)
+        pref_kind = _time_pref_kind(str(session.get("time_preference") or ""))
+        slots = _slots_for_time_pref(all_slots, pref_kind) if pref_kind else all_slots
     except Exception as exc:
         _safe_log(chat_id, "crm_check_slots_error", {"error": str(exc)[:500]})
         session["step"] = "escalated"
@@ -3616,6 +3685,13 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
         return _crm_slots_unavailable_answer(session)
 
     if not slots:
+        pref_kind = _time_pref_kind(str(session.get("time_preference") or ""))
+        if pref_kind and "all_slots" in locals() and all_slots:
+            answer, alternative_slots = _time_pref_no_slots_answer(session, pref_kind, all_slots)
+            session["crm_availability_empty"] = False
+            session["last_slots"] = alternative_slots
+            session["step"] = "time" if alternative_slots else "date"
+            return _tr(session, answer, answer)
         session["last_slots"] = []
         session.pop("selected_slot", None)
         session["step"] = "date"
@@ -3662,8 +3738,9 @@ async def _recover_empty_time_slots(chat_id: str, session: dict[str, Any], text:
             except Exception:
                 pass
         data = await crm.check_slots(preferred_date, doctor_login=(session.get("selected_doctor_login") or None))
-        slots = _format_slots(data, max_count=max_slots)
-        slots = _filter_slots_by_time_preference(slots, str(session.get("time_preference") or "")) or slots
+        all_slots = _format_slots(data, max_count=max_slots)
+        pref_kind = _time_pref_kind(str(session.get("time_preference") or ""))
+        slots = _slots_for_time_pref(all_slots, pref_kind) if pref_kind else all_slots
     except Exception as exc:
         _safe_log(chat_id, "crm_check_slots_error", {"error": str(exc)[:500], "recovery": "empty_time_slots"})
         session["step"] = "escalated"
@@ -3672,6 +3749,12 @@ async def _recover_empty_time_slots(chat_id: str, session: dict[str, Any], text:
         return _crm_slots_unavailable_answer(session)
 
     if not slots:
+        pref_kind = _time_pref_kind(str(session.get("time_preference") or ""))
+        if pref_kind and "all_slots" in locals() and all_slots:
+            answer, alternative_slots = _time_pref_no_slots_answer(session, pref_kind, all_slots)
+            session["last_slots"] = alternative_slots
+            session["step"] = "time" if alternative_slots else "date"
+            return _tr(session, answer, answer)
         _safe_log(chat_id, "crm_slots_empty_time_recovery", {"chat_id": chat_id, "date": preferred_date})
         session["step"] = "escalated"
         session["manual_takeover"] = True
