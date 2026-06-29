@@ -206,6 +206,51 @@ def test_age_message_with_clear_contra_and_date_checks_slots(monkeypatch: Any) -
     assert session["openai_skip_reason"] == ""
 
 
+def test_contraindications_clear_check_slots_without_date_repairs_to_date(monkeypatch: Any) -> None:
+    chat_id = "brain_contra_clear_without_date"
+    user_text = "Из того что вы перечислили, ничего такого у меня нет"
+    reset(chat_id, {
+        "step": "contraindications",
+        "last_required_step": "contraindications",
+        "age": 41,
+        "complaint": "поясница болит",
+        "contraindications_ok": None,
+        "contraindications_checklist_sent_count": 1,
+    })
+
+    async def fake_brain(**kwargs: Any):
+        decision, debug = brain(
+            "show_slots",
+            "",
+            {
+                "contraindications_clear": True,
+                "preferred_date_text": "",
+            },
+            "check_slots",
+        )
+        decision["intent"] = "contraindications_answer"
+        debug["openai_brain_intent"] = "contraindications_answer"
+        return decision, debug
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+
+    answer = run(handle_message(chat_id, "77011234567", user_text))
+    session = state.get_session(chat_id)
+    low_answer = answer.lower()
+
+    assert session["contraindications_ok"] is True
+    assert session["contraindications_raw"] == user_text
+    assert session["step"] == "date"
+    assert session.get("repaired_step") == "date"
+    assert session.get("state_repair_reason") != "age_without_contraindications"
+    assert session.get("repair_reason") == "need_date_after_contraindications_clear"
+    assert "На какой день Вам удобно прийти?" in answer
+    assert "кардиостимулятора" not in low_answer
+    assert "дефибриллятора" not in low_answer
+    assert "противопоказаний нет?" not in low_answer
+    assert "противопоказ" not in low_answer
+
+
 def test_age_message_with_no_contra_phrase_date_and_time_keeps_brain_status(monkeypatch: Any) -> None:
     chat_id = "brain_multi_entity_no_contra_phrase"
     reset(chat_id, {"step": "age", "complaint": "поясница болит", "ai_lead_started": True})
