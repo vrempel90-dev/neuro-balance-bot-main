@@ -177,6 +177,14 @@ def save_session(chat_id: str, data: dict[str, Any]) -> None:
                     cleaned["contraindications_ok"] = True
                     cleaned["contraindications_verdict"] = previous.get("contraindications_verdict") or "proceed"
                     cleaned["contraindications_raw"] = cleaned.get("contraindications_raw") or previous.get("contraindications_raw") or ""
+            previous_slots = previous.get("last_slots") if isinstance(previous.get("last_slots"), list) else []
+            current_slots = cleaned.get("last_slots") if isinstance(cleaned.get("last_slots"), list) else []
+            same_preferred_date = (previous.get("preferred_date") or "") == (cleaned.get("preferred_date") or "")
+            booking_not_selected = not (cleaned.get("selected_time") or cleaned.get("selected_slot") or cleaned.get("booked"))
+            still_choosing_time = str(cleaned.get("step") or previous.get("step") or "") in {"time", "select_slot"}
+            if previous_slots and not current_slots and same_preferred_date and booking_not_selected and still_choosing_time and not cleaned.get("manual_takeover") and not cleaned.get("escalated"):
+                cleaned["last_slots"] = previous_slots
+                cleaned["last_slots_preserved_reason"] = "prevent_lost_slots_between_messages"
         conn.execute(
             """
             INSERT INTO sessions(chat_id, data_json, updated_at) VALUES (?, ?, ?)

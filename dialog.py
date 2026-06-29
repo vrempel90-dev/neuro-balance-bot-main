@@ -2545,6 +2545,15 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
         if answer != safe_contra_answer:
             _safe_log(chat_id, "contraindications_checklist_final_repaired", {"chat_id": chat_id, "answer_preview": answer[:180]})
         answer = safe_contra_answer
+    if not answer and str(session.get("step") or "") == "time" and _is_active_new_ai_request(session):
+        session["repair_reason"] = "empty_answer_time_recovered"
+        session["fallback_reason"] = "empty_answer_time_recovered"
+        _safe_log(chat_id, "empty_answer_time_recovered", {"chat_id": chat_id, "from_step": before_step, "preferred_date": session.get("preferred_date") or "", "slots_count": len(session.get("last_slots") or [])})
+        answer = _slot_times_answer(session) if session.get("last_slots") else _tr(
+            session,
+            "Сейчас уточню свободные окошки и напишу Вам варианты 🌿",
+            "Қазір бос уақыттарды нақтылап, Сізге нұсқаларын жазамын 🌿",
+        )
     if not answer and _is_active_new_ai_request(session):
         repair = repair_empty_active_reply(session, str(session.get("last_user_text") or ""), "empty_active_reply")
         session["fallback_reason"] = "empty_active_reply"
@@ -2965,11 +2974,11 @@ def _parse_date(text: str) -> str | None:
     return None
 
 def _time_from_text(text: str) -> str | None:
-    m = re.search(r"\b([01]?\d|2[0-3])[:.\- ]([0-5]\d)\b", text or "")
+    m = re.search(r"\b([01]?\d|2[0-3])[:./\-\s]+([0-5]\d)\b", text or "")
     if m:
         return f"{int(m.group(1)):02d}:{m.group(2)}"
 
-    m = re.search(r"\b([8-9]|1\d|20)\s*(?:час|ч|:00)?\b", _low(text))
+    m = re.search(r"\b([8-9]|1\d|2[0-3])\s*(?:час|ч|:00)?\b", _low(text))
     if m:
         return f"{int(m.group(1)):02d}:00"
 
@@ -3537,8 +3546,9 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
     except Exception as exc:
         _safe_log(chat_id, "crm_check_slots_error", {"error": str(exc)[:500]})
         session["step"] = "escalated"
+        session["manual_takeover"] = True
         session["escalated"] = True
-        return _crm_fallback_answer(session)
+        return _crm_slots_unavailable_answer(session)
 
     if not slots:
         session["last_slots"] = []
@@ -3558,6 +3568,65 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
         "Есть такие свободные окошки:\n" + _slots_text(slots, lang) + "\n\nКакое время Вам удобно?",
         "Таңдалған күнге бос уақыттар бар:\n" + _slots_text(slots, lang) + "\n\nҚай уақыт ыңғайлы?",
     )
+
+
+def _crm_slots_unavailable_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Сейчас не вижу свободные окошки по системе. Передам администратору, чтобы он помог подобрать время 🌿",
+        "Қазір жүйеден бос уақыттарды көре алмай тұрмын. Уақыт таңдауға көмектесу үшін әкімшіге жіберемін 🌿",
+    )
+
+
+async def _recover_empty_time_slots(chat_id: str, session: dict[str, Any], text: str) -> str | None:
+    """Recover time-step sessions whose CRM slots were lost between messages."""
+    if str(session.get("step") or "") not in {"time", "select_slot"}:
+        return None
+    if session.get("last_slots") or session.get("selected_time"):
+        return None
+    preferred_date = str(session.get("preferred_date") or session.get("selected_date") or "").strip()
+    if not preferred_date:
+        return None
+
+    wanted_time = _time_from_text(text)
+    try:
+        max_slots = 5
+        if get_settings:
+            try:
+                max_slots = int(getattr(get_settings(), "max_slots_to_show", 5) or 5)
+            except Exception:
+                pass
+        data = await crm.check_slots(preferred_date)
+        slots = _format_slots(data, max_count=max_slots)
+    except Exception as exc:
+        _safe_log(chat_id, "crm_check_slots_error", {"error": str(exc)[:500], "recovery": "empty_time_slots"})
+        session["step"] = "escalated"
+        session["manual_takeover"] = True
+        session["escalated"] = True
+        return _crm_slots_unavailable_answer(session)
+
+    if not slots:
+        _safe_log(chat_id, "crm_slots_empty_time_recovery", {"chat_id": chat_id, "date": preferred_date})
+        session["step"] = "escalated"
+        session["manual_takeover"] = True
+        session["escalated"] = True
+        return _crm_slots_unavailable_answer(session)
+
+    session["preferred_date"] = preferred_date
+    session["last_slots"] = slots
+    session["step"] = "time"
+    session["crm_availability_empty"] = False
+
+    if wanted_time:
+        slot = next((slot for slot in slots if _slot_time(slot) == wanted_time), None)
+        if slot:
+            _remember_selected_slot(session, slot)
+            session["step"] = "name"
+            session["questionnaire_step"] = "name"
+            return _ask_name(session)
+        return _slot_times_answer(session)
+
+    return _slot_times_answer(session)
 
 
 
@@ -4799,6 +4868,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["step"] = "name"
         session["questionnaire_step"] = "name"
         return _finalize(chat_id, session, _ask_name(session))
+    recovered_time_answer = await _recover_empty_time_slots(chat_id, session, text)
+    if recovered_time_answer is not None:
+        return _finalize(chat_id, session, recovered_time_answer)
     if step == "name" and session.get("patient_name") and _booking_ready(session, phone):
         answer = await _book(chat_id, session, phone)
         return _finalize(chat_id, session, answer)

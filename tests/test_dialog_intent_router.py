@@ -1710,6 +1710,86 @@ def test_time_empty_answer_final_repair_shows_slots() -> None:
     assert saved["patient_name"] == ""
 
 
+def test_time_lost_slots_rechecks_crm_and_selects_normalized_time(monkeypatch: Any) -> None:
+    chat_id = "hotfix_time_lost_slots_select"
+    calls = setup_crm(monkeypatch)
+
+    async def fake_check_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
+        calls["slots"].append({"date": date, "doctor_login": doctor_login})
+        return {
+            "availability": [
+                {
+                    "doctorLogin": "zhuma_md",
+                    "doctorName": "Жумабек Мади Мухтарович",
+                    "date": date,
+                    "availableSlots": ["11:20", "12:00", "12:40", "13:20", "14:00"],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(crm, "check_slots", fake_check_slots)
+    reset(chat_id, {"step": "time", "preferred_date": "2026-07-02", "last_slots": [], "selected_time": ""})
+
+    result = answer(chat_id, "14/00")
+    session = state.get_session(chat_id)
+
+    assert calls["slots"] == [{"date": "2026-07-02", "doctor_login": None}]
+    assert calls["book"] == []
+    assert session["selected_time"] == "14:00"
+    assert session["selected_date"] == "2026-07-02"
+    assert session["selected_doctor_login"] == "zhuma_md"
+    assert session["step"] == "name"
+    assert result
+    assert "имя" in result.lower()
+
+
+def test_time_lost_slots_rechecks_crm_and_shows_slots_without_time(monkeypatch: Any) -> None:
+    chat_id = "hotfix_time_lost_slots_thanks"
+    calls = setup_crm(monkeypatch)
+
+    async def fake_check_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
+        calls["slots"].append({"date": date, "doctor_login": doctor_login})
+        return {
+            "availability": [
+                {
+                    "doctorLogin": "zhuma_md",
+                    "doctorName": "Жумабек Мади Мухтарович",
+                    "date": date,
+                    "availableSlots": ["11:20", "12:00", "12:40", "13:20", "14:00"],
+                }
+            ]
+        }
+
+    monkeypatch.setattr(crm, "check_slots", fake_check_slots)
+    reset(chat_id, {"step": "time", "preferred_date": "2026-07-02", "last_slots": [], "selected_time": "", "patient_name": ""})
+
+    result = answer(chat_id, "спасибо")
+    session = state.get_session(chat_id)
+
+    assert calls["slots"] == [{"date": "2026-07-02", "doctor_login": None}]
+    assert "11:20" in result
+    assert "14:00" in result
+    assert session["step"] == "time"
+    assert session["patient_name"] == ""
+
+
+def test_last_slots_preserved_between_messages_until_selection_or_date_change() -> None:
+    chat_id = "hotfix_preserve_last_slots"
+    slots = [{"date": "2026-07-02", "time": "14:00"}]
+    reset(chat_id, {"step": "time", "preferred_date": "2026-07-02", "last_slots": slots, "selected_time": ""})
+
+    session = state.get_session(chat_id)
+    session["last_slots"] = []
+    state.save_session(chat_id, session)
+    assert state.get_session(chat_id)["last_slots"] == slots
+
+    session = state.get_session(chat_id)
+    session["preferred_date"] = "2026-07-03"
+    session["last_slots"] = []
+    state.save_session(chat_id, session)
+    assert state.get_session(chat_id)["last_slots"] == []
+
+
 def test_time_thanks_does_not_save_patient_name_and_repeats_slots() -> None:
     chat_id = "hotfix_time_thanks"
     slots = [{"time": t} for t in ["11:20", "12:00", "12:40", "13:20", "14:00"]]
