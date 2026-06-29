@@ -934,7 +934,7 @@ def test_combined_faq_slot_selection_then_name_books_crm(monkeypatch: Any) -> No
     assert calls["book"][0]["doctor_name"] == "Второй врач"
     assert calls["book"][0]["date"] == "2099-01-01"
     assert calls["book"][0]["time_start"] == "10:00"
-    assert "запись подтверждена" in second_result.lower()
+    assert "записала" in second_result.lower()
     assert "передам администратору" not in second_result.lower()
     assert session["status"] == "booked"
 
@@ -1142,7 +1142,7 @@ def test_crm_book_new_contract_success_and_payload(monkeypatch: Any) -> None:
     result = answer(chat_id, "Алия")
     session = state.get_session(chat_id)
 
-    assert "запись подтверждена" in result.lower()
+    assert "записала" in result.lower()
     assert session["step"] == "booked"
     assert session["ai_muted"] is True
     assert session["appointment"]["appointmentId"] == 999
@@ -1186,11 +1186,10 @@ def test_crm_book_409_slot_conflict_refreshes_slots(monkeypatch: Any) -> None:
     result = answer(chat_id, "Алия")
     session = state.get_session(chat_id)
 
-    assert "окошко уже заняли" in result.lower()
-    assert "11:20" in result
-    assert calls["slots"] == [{"date": "2026-06-22", "doctor_login": None}]
-    assert session["step"] == "time"
-    assert "selected_slot" not in session
+    assert "администратору" in result.lower()
+    assert calls["slots"] == []
+    assert session["step"] == "escalated"
+    assert session["selected_slot"]["timeStart"] == "10:40"
 
 
 def test_crm_book_409_doctor_not_scheduled_refreshes_slots(monkeypatch: Any) -> None:
@@ -1208,9 +1207,9 @@ def test_crm_book_409_doctor_not_scheduled_refreshes_slots(monkeypatch: Any) -> 
     result = answer(chat_id, "Алия")
     session = state.get_session(chat_id)
 
-    assert "14:00" in result
-    assert session["step"] == "time"
-    assert "selected_slot" not in session
+    assert "администратору" in result.lower()
+    assert session["step"] == "escalated"
+    assert session["selected_slot"]["timeStart"] == "10:40"
 
 
 def test_crm_book_500_logs_body_and_escalates(monkeypatch: Any) -> None:
@@ -1231,7 +1230,7 @@ def test_crm_book_500_logs_body_and_escalates(monkeypatch: Any) -> None:
     assert session["step"] == "escalated"
     assert session.get("escalated") is True
     assert any(item.get("name") == "escalate_to_human" for item in session.get("tool_history", []))
-    assert events[-1][1] == "crm_book_error"
+    assert events[-1][1] == "crm_booking_failed"
     assert events[-1][2]["status_code"] == 500
     assert "boom" in events[-1][2]["response_text"]
 
@@ -1442,3 +1441,46 @@ def test_hotfix_instagram_detail_request_does_not_start_booking() -> None:
     assert "боль, процедура или запись" in result
     assert session["step"] == "complaint"
     assert "сколько Вам лет" not in result
+
+
+def test_final_name_with_selected_slot_books_crm_without_admin_fallback(monkeypatch: Any) -> None:
+    calls = setup_crm(monkeypatch)
+    chat_id = "final_name_booking_ready"
+    reset(chat_id, {
+        "step": "name",
+        "questionnaire_step": "name",
+        "complaint": "поясница болит",
+        "complaint_gate": bot_tools.COMPLAINT_OK,
+        "age": 34,
+        "contraindications_ok": True,
+        "contraindications_verdict": bot_tools.CONTRA_PROCEED,
+        "selected_date": "2026-07-06",
+        "selected_time": "14:00",
+        "selected_doctor_login": "zhuma_md",
+        "selected_doctor_name": "Жумабек Мади Мухтарович",
+        "phone": "77000008881",
+    })
+
+    result = answer(chat_id, "Виктор")
+    session = state.get_session(chat_id)
+
+    assert session["patient_name"] == "Виктор"
+    assert len(calls["book"]) == 1
+    assert calls["book"][0]["patient_name"] == "Виктор"
+    assert calls["book"][0]["date"] == "2026-07-06"
+    assert calls["book"][0]["time_start"] == "14:00"
+    assert calls["book"][0]["doctor_login"] == "zhuma_md"
+    assert session["step"] == "booked"
+    assert session["ai_muted"] is True
+    assert session["booking_confirmed"] is True
+    assert session.get("escalated") is not True
+    assert "Виктор" in result
+    assert "записала" in result
+    assert "6 июля" in result
+    assert "14:00" in result
+    assert "Жумабек Мади Мухтарович" in result
+    assert "Кабанбай батыра 28" in result
+    low = result.lower()
+    assert "передам администратору" not in low
+    assert "уточню" not in low
+    assert "назовите имя" not in low
