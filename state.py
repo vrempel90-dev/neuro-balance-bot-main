@@ -300,3 +300,28 @@ def get_history(chat_id: str, limit: int = 24) -> list[dict[str, str]]:
             (chat_id, limit),
         ).fetchall()
     return [{"role": str(r["role"]), "content": str(r["content"])} for r in reversed(rows)]
+
+
+def determine_next_step(session: dict[str, Any]) -> str:
+    """Production booking state-machine: Python is the source of truth."""
+    if session.get("booking_confirmed") is True or session.get("booked") is True:
+        return "booked"
+    if session.get("manual_takeover") is True or session.get("escalated") is True:
+        return "escalated"
+    try:
+        age_ok = int(session.get("age") or 0) > 0
+    except (TypeError, ValueError):
+        age_ok = False
+    if not session.get("complaint"):
+        return "complaint"
+    if not age_ok:
+        return "age"
+    if session.get("contraindications_ok") is not True:
+        return "contraindications"
+    if not (session.get("selected_date") or session.get("preferred_date")):
+        return "date"
+    if not session.get("selected_time"):
+        return "time"
+    if not session.get("patient_name"):
+        return "name"
+    return "booking"

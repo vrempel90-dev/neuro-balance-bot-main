@@ -86,6 +86,20 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "fallback_reason": session.get("fallback_reason") or "",
         "state_repaired": bool(session.get("state_repaired")),
         "state_repair_reason": session.get("state_repair_reason") or "",
+        "state_before": session.get("state_before_step") or "",
+        "state_after": session.get("state_after_step") or session.get("step") or "",
+        "next_step_reason": session.get("state_repair_reason") or session.get("fallback_reason") or session.get("gate_reason") or "",
+        "entity_extraction": session.get("openai_brain_extracted") or {},
+        "faq_type": session.get("last_answered_faq_type") or "",
+        "crm_result": session.get("crm_result") or session.get("appointment_status") or "",
+        "booking_ready": bool(session.get("booking_ready")),
+        "booking_confirmed": bool(session.get("booking_confirmed")),
+        "final_repair_reason": session.get("repair_reason") or session.get("fallback_reason") or "",
+        "answer_source": session.get("answer_source") or ("openai" if session.get("openai_used") else "python"),
+        "last_slots_count": len(session.get("last_slots") or []),
+        "selected_slot": session.get("selected_slot") or {},
+        "selected_doctor_login": session.get("selected_doctor_login") or "",
+        "selected_doctor_name": session.get("selected_doctor_name") or "",
     }
 
 
