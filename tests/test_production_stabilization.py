@@ -110,3 +110,62 @@ def test_kazakh_complaint_answer_stays_kazakh_and_no_russian_checklist():
     assert "Жасыңыз" in answer or "Жасыныз" in answer
     assert "Перед записью" not in answer
     assert "кардиостимулятор" not in answer.lower()
+
+
+def test_booking_age_asks_short_contraindications_question_without_checklist():
+    chat_id = "prod_short_contra_after_age"
+
+    first = asyncio.run(handle_message(chat_id, "77010000000", "Здравствуйте, хочу записаться. Спина болит"))
+    answer = asyncio.run(handle_message(chat_id, "77010000000", "35"))
+
+    assert "сколько Вам лет" in first
+    assert answer == "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?"
+    forbidden = [
+        "кардиостим",
+        "беремен",
+        "онколог",
+        "металл",
+        "анамнез",
+        "у нашего метода есть противопоказания",
+    ]
+    assert all(fragment not in answer.lower() for fragment in forbidden)
+
+
+def test_contraindications_list_allowed_only_on_explicit_question():
+    chat_id = "prod_explicit_contra_list"
+    session = state.get_session(chat_id)
+    session.update({
+        "step": "contraindications",
+        "last_required_step": "contraindications",
+        "complaint": "спина болит",
+        "age": 35,
+        "ai_lead_started": True,
+        "language": "ru",
+        "language_locked": True,
+    })
+    state.save_session(chat_id, session)
+
+    answer = asyncio.run(handle_message(chat_id, "77010000000", "Какие противопоказания?"))
+
+    assert "Основные противопоказания" in answer or answer == "Лучше уточню это через администратора, чтобы не ошибиться 🌿"
+
+
+def test_no_on_contraindications_advances_to_date_exact_answer():
+    chat_id = "prod_no_contra_to_date"
+    session = state.get_session(chat_id)
+    session.update({
+        "step": "contraindications",
+        "last_required_step": "contraindications",
+        "complaint": "спина болит",
+        "age": 35,
+        "ai_lead_started": True,
+    })
+    state.save_session(chat_id, session)
+
+    answer = asyncio.run(handle_message(chat_id, "77010000000", "Нет"))
+    saved = state.get_session(chat_id)
+
+    assert saved["contraindications_ok"] is True
+    assert saved["step"] == "date"
+    assert answer == "Отлично 🌿 На какой день Вам удобно прийти?"
+    assert "противопоказ" not in answer.lower()
