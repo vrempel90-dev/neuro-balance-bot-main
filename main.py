@@ -12,6 +12,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File
 import state
 from config import get_settings
 from dialog import handle_message
+from guards import GuardDecision, should_auto_reply
 from ai import humanize_reply_with_openai
 from schedule import astana_now, is_bot_work_time
 from voice import transcribe_wazzup_voice, transcribe_bytes, transcribe_upload, voice_text_for_bot
@@ -32,6 +33,7 @@ def _preview(value: Any, limit: int = 120) -> str:
 
 
 def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
+    decision = session.get("guard_decision") if isinstance(session.get("guard_decision"), dict) else {}
     return {
         "source": session.get("source") or "",
         "local_time": session.get("local_time") or astana_now().isoformat(),
@@ -67,6 +69,9 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "final_answer_preview": session.get("final_answer_preview") or _preview(answer, 160),
         "gate_reason": session.get("gate_reason") or "",
         "no_reply_reason": session.get("no_reply_reason") or "",
+        "crm_called": bool(session.get("crm_called")),
+        "wazzup_send_called": bool(session.get("wazzup_send_called")),
+        "should_send_wazzup": bool(decision.get("should_send_wazzup", False)),
         "answer_empty": not bool(answer),
         "step": session.get("step") or session.get("current_step") or "",
         "ai_muted": bool(session.get("ai_muted")),
@@ -280,6 +285,38 @@ def _mark_bot_auto_reply_disabled(*, chat_id: str, phone: str = "", source: str,
         "chat_id": chat_id, "phone": phone, "source": source, "force": force, "kind": kind,
         "text_preview": _preview(text, 120), "current_time_astana": astana_now().isoformat(),
     })
+
+
+
+def _apply_guard_block(
+    decision: GuardDecision,
+    *,
+    chat_id: str,
+    phone: str = "",
+    source: str,
+    force: bool = False,
+    kind: str = "text",
+    text: str = "",
+) -> None:
+    session = _get_session_safe(chat_id)
+    session["source"] = source
+    session["local_time"] = astana_now().isoformat()
+    session["working_hours_allowed"] = is_bot_work_time() or bool(force)
+    session["no_reply_reason"] = decision.no_reply_reason
+    session["openai_used"] = False
+    session["openai_brain_used"] = False
+    session["openai_brain_skip_reason"] = decision.no_reply_reason
+    session["crm_called"] = False
+    session["wazzup_send_called"] = False
+    session["guard_decision"] = decision.to_dict()
+    state.save_session(chat_id, session)
+    event = "working_hours_blocked" if decision.no_reply_reason == "working_hours_ai_disabled" else decision.no_reply_reason
+    state.log_event(chat_id, event or "auto_reply_blocked", {
+        "chat_id": chat_id, "phone": phone, "source": source, "force": force, "kind": kind,
+        "text_preview": _preview(text, 120), "current_time_astana": astana_now().isoformat(),
+        "openai_used": False, "openai_brain_used": False, "crm_called": False, "wazzup_send_called": False,
+    })
+
 
 def _get_session_safe(chat_id: str) -> dict[str, Any]:
     try:
@@ -547,23 +584,14 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
 
     state.log_event(chat_id, "incoming_message_received", {"phone": phone, "kind": kind, "source": str(message.get("source") or "wazzup"), "text_preview": _preview(message.get("text"), 120)})
 
-    settings = get_settings()
-    if not getattr(settings, "bot_auto_reply_enabled", True):
-        _mark_bot_auto_reply_disabled(chat_id=chat_id, phone=phone, source=str(message.get("source") or "wazzup"), force=False, kind=kind, text=str(message.get("text") or ""))
-        return ""
-
-    # AI-админ работает только в night-only окне (20:00–08:00 Astana).
-    # В рабочее время (08:00–20:00) Wazzup/webhook полностью молчит:
-    # не запускаем Dialog Brain и не вызываем humanize_reply.
-    if not is_bot_work_time():
-        _mark_working_hours_disabled(
-            chat_id=chat_id,
-            phone=phone,
-            source=str(message.get("source") or "wazzup"),
-            force=False,
-            kind=kind,
-            text=str(message.get("text") or ""),
-        )
+    source = str(message.get("source") or "wazzup")
+    pre_session = _get_session_safe(chat_id)
+    decision = should_auto_reply(message, pre_session, source=source, force=False, now=astana_now())
+    # Tests and deployments patch main.is_bot_work_time as the public work-hours seam.
+    if not decision.allowed and decision.no_reply_reason == "working_hours_ai_disabled" and is_bot_work_time():
+        decision = GuardDecision(True, "", True, True, source in {"wazzup", "crm"})
+    if not decision.allowed:
+        _apply_guard_block(decision, chat_id=chat_id, phone=phone, source=source, force=False, kind=kind, text=str(message.get("text") or ""))
         return ""
 
     if kind == "voice" or _message_has_voice_url(message):
@@ -578,9 +606,12 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
         user_text = str(message.get("text") or "")
 
     session = _get_session_safe(chat_id)
-    session["source"] = str(message.get("source") or "wazzup")
+    session["source"] = source
     session["local_time"] = astana_now().isoformat()
     session["working_hours_allowed"] = True
+    session["guard_decision"] = decision.to_dict()
+    session["crm_called"] = False
+    session["wazzup_send_called"] = False
     state.save_session(chat_id, session)
     state.log_event(chat_id, "dialog_start", {"phone": phone, "text_preview": _preview(user_text, 120), "force": False, "source": message.get("source") or "wazzup"})
     base_answer = await handle_message(chat_id=chat_id, phone=phone, user_text=user_text)
@@ -610,6 +641,13 @@ async def _send_answer_parts(
             continue
         state.log_event(chat_id, "wazzup_send_attempt", {"phone": phone, "answer_preview": _preview(safe_part, 160)})
         try:
+            decision_data = _get_session_safe(chat_id).get("guard_decision")
+            if isinstance(decision_data, dict) and not bool(decision_data.get("should_send_wazzup", True)):
+                state.log_event(chat_id, "wazzup_send_blocked", {"phone": phone, "reason": _get_session_safe(chat_id).get("no_reply_reason") or "send_guard"})
+                return
+            sess = _get_session_safe(chat_id)
+            sess["wazzup_send_called"] = True
+            state.save_session(chat_id, sess)
             result = await send_text(
                 chat_id=chat_id,
                 text=safe_part,
@@ -654,8 +692,10 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
             message["text"] = combined_text
 
         answer = await _build_answer_for_message(message)
-        if not answer:
-            state.log_event(chat_id, "wazzup_send_blocked", {"phone": str(message.get("phone") or ""), "reason": _get_session_safe(chat_id).get("no_reply_reason") or "empty_answer"})
+        session_after = _get_session_safe(chat_id)
+        guard_decision = session_after.get("guard_decision") if isinstance(session_after.get("guard_decision"), dict) else {}
+        if not answer or not bool(guard_decision.get("should_send_wazzup", True)):
+            state.log_event(chat_id, "wazzup_send_blocked", {"phone": str(message.get("phone") or ""), "reason": session_after.get("no_reply_reason") or "empty_answer"})
             return
 
         await _send_answer_parts(
@@ -857,18 +897,12 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
 
     state.log_event(chat_id, "incoming_message_received", {"phone": phone, "kind": "text", "source": "debug", "text_preview": _preview(text, 120), "force": force})
 
-    if not force and not getattr(get_settings(), "bot_auto_reply_enabled", True):
-        _mark_bot_auto_reply_disabled(chat_id=chat_id, phone=phone, source="debug", force=force, kind="text", text=text)
-        answer = ""
-    elif not force and not is_bot_work_time():
-        _mark_working_hours_disabled(
-            chat_id=chat_id,
-            phone=phone,
-            source="debug",
-            force=force,
-            kind="text",
-            text=text,
-        )
+    pre_session = state.get_session(chat_id)
+    decision = should_auto_reply(text, pre_session, source="debug", force=force, now=astana_now())
+    if not decision.allowed and decision.no_reply_reason == "working_hours_ai_disabled" and is_bot_work_time():
+        decision = GuardDecision(True, "", True, True, False)
+    if not decision.allowed:
+        _apply_guard_block(decision, chat_id=chat_id, phone=phone, source="debug", force=force, kind="text", text=text)
         answer = ""
     else:
         if force:
@@ -881,6 +915,7 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
         session["source"] = "debug"
         session["local_time"] = astana_now().isoformat()
         session["working_hours_allowed"] = True
+        session["guard_decision"] = decision.to_dict()
         state.save_session(chat_id, session)
         state.log_event(chat_id, "dialog_start", {"phone": phone, "text_preview": _preview(text, 120), "force": force, "source": "debug"})
         raw_answer = await handle_message(chat_id=chat_id, phone=phone, user_text=text)
