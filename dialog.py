@@ -303,6 +303,24 @@ def _repair_after_contraindications_ok(session: dict[str, Any]) -> tuple[str, st
     return str(session.get("step") or "date"), answer
 
 
+def _apply_brain_contraindications_clear(
+    session: dict[str, Any],
+    user_text: str,
+    decision: dict[str, Any],
+) -> None:
+    """Persist Brain-confirmed contraindication clearance before guards/repairs."""
+    extracted = decision.get("extracted") if isinstance(decision.get("extracted"), dict) else {}
+    if extracted.get("contraindications_clear") is not True:
+        return
+    _accept_no_contraindications(session, user_text or "нет")
+    session["last_required_step"] = ""
+    session["last_required_question"] = ""
+    session["pending_step_after_faq"] = ""
+    session["questionnaire_step"] = ""
+    if str(session.get("step") or "") == "contraindications":
+        session["step"] = "date"
+
+
 def repair_invalid_llm_response(reason: str, session: dict[str, Any], user_text: str, attempted_reply: str, llm_decision: dict[str, Any]) -> RepairResult:
     """Block an invalid LLM decision and return a safe controller-owned answer."""
     normalized = {
@@ -331,6 +349,12 @@ def repair_invalid_llm_response(reason: str, session: dict[str, Any], user_text:
     if normalized == "contraindications_already_ok":
         repaired_step, answer = _repair_after_contraindications_ok(session)
         event = "llm_contraindications_already_ok_repaired"
+    elif normalized == "need_date_after_contraindications_clear":
+        _cleanup_contraindications_after_ok(session)
+        session["step"] = "date"
+        session["questionnaire_step"] = "date"
+        answer = "Отлично 🌿 На какой день Вам удобно прийти?"
+        event = "llm_need_date_after_contraindications_clear_repaired"
     elif normalized == "slot_hallucination":
         session["last_slots"] = []
         session["selected_slot"] = None
@@ -483,6 +507,8 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
     if action == "ask_date" and session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not _text_confirms_no_contra(session, user_text):
         return False, "ask_date_before_contra"
     if action == "show_slots" and not extracted.get("preferred_date_text"):
+        if session.get("contraindications_ok") is True or extracted.get("contraindications_clear") is True:
+            return False, "need_date_after_contraindications_clear"
         return False, "show_slots_without_date"
     if action == "show_slots" and (
         step not in OPENAI_BRAIN_MULTI_ENTITY_STEPS
@@ -567,6 +593,7 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
             _log_llm_repair(chat_id, repair, str(decision.get("reply") or ""))
             return _finalize(chat_id, session, repair.answer)
         return None
+    _apply_brain_contraindications_clear(session, text, decision)
     ok, guard_reason = validate_openai_dialog_decision(decision, session, text)
     if not ok:
         session["openai_brain_guard_failed"] = True
