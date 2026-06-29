@@ -992,8 +992,16 @@ NO_CONTRA_WORDS = [
     "нет", "нету", "не было", "не имеется", "противопоказаний нет", "нет противопоказаний",
     "ничего нет", "по списку ничего нет", "нет такого ничего", "нет такого", "все чисто", "всё чисто", "чисто",
     "все нормально", "всё нормально", "нормально", "ничего такого нет", "ничего из этого нет",
-    "нет ничего из перечисленного", "по всем нет", "все нет", "всё нет",
+    "нет ничего из перечисленного", "ничего из перечисленного нет", "того что перечислено нет",
+    "того, что перечислено, этого нет", "то что перечислено этого нет", "то что перечислено, этого нет",
+    "по всем нет", "все нет", "всё нет",
     "жоқ", "жок", "joq", "jok", "қарсы көрсетілім жоқ", "карсы корсетилим жок",
+]
+
+REFUSAL_OR_IRRITATION_WORDS = [
+    "я уже от вас ничего не хочу", "не хочу", "отстаньте", "хватит писать",
+    "вы надоели", "устал", "устала", "одно и тоже пишите", "спокойной ночи",
+    "не надо", "не интересно",
 ]
 
 YES_WORDS = [
@@ -3020,6 +3028,16 @@ def _senior_contra_intro(session: dict[str, Any]) -> str:
 
 
 def _ask_contra(session: dict[str, Any]) -> str:
+    sent_count = int(session.get("contraindications_checklist_sent_count") or 0)
+    if sent_count >= 1:
+        session["contraindications_repeated_blocked"] = True
+        _safe_log(str(session.get("chat_id") or "system"), "contraindications_repeated_blocked", {"sent_count": sent_count})
+        return _tr(
+            session,
+            "Подскажите, пожалуйста, противопоказаний из списка нет?",
+            "Айтыңызшы, тізімдегі қарсы көрсетілімдер жоқ па?",
+        )
+    session["contraindications_checklist_sent_count"] = sent_count + 1
     return _tr(
         session,
         'Спасибо 🌿 Перед записью уточню важный момент по безопасности.\n\nНет ли у Вас кардиостимулятора/дефибриллятора, инсулиновой помпы, кохлеарного импланта, беременности, онкологии или подозрения на неё, металла в зоне лечения, эпилепсии/судорог, тромбоза или нарушений свёртываемости, декомпенсированного диабета/тиреотоксикоза, температуры/ОРВИ/острой инфекции, тяжёлых проблем с сердцем, дыханием или психическим состоянием?\n\nТакже приём не проводится пациентам младше 16 или старше 75 лет и при ограниченной подвижности — коляска, костыли.\n\nПротивопоказаний нет?',
@@ -3658,6 +3676,63 @@ def _accept_no_contraindications(session: dict[str, Any], text: str) -> None:
     bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, raw)
 
 
+
+
+def _is_contra_clear_hotfix_phrase(text: str) -> bool:
+    low = _low(text)
+    compact = re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", low)
+    phrases = [
+        "противопоказаний нет", "нет противопоказаний", "по списку ничего нет",
+        "ничего из перечисленного нет", "того что перечислено нет",
+        "то что перечислено этого нет", "этого нет", "ничего нет", "всё чисто",
+        "все чисто", "нету", "не имеется",
+    ]
+    return any(compact == re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", phrase) for phrase in phrases)
+
+def _is_refusal_or_irritation(text: str) -> bool:
+    low = _low(text)
+    return bool(low and any(phrase in low for phrase in REFUSAL_OR_IRRITATION_WORDS))
+
+
+def _is_instagram_detail_request(text: str) -> bool:
+    low = _low(text)
+    has_link = "instagram.com" in low or "instagr.am" in low or "instagram" in low or "инстаграм" in low
+    asks_detail = any(x in low for x in ["можно узнать", "подробнее", "что это", "интересует", "об этом", "про это"])
+    return has_link and asks_detail
+
+
+def _instagram_detail_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Да, конечно 🌿 Подскажите, пожалуйста, что именно заинтересовало в посте — боль, процедура или запись на консультацию?",
+        "Иә, әрине 🌿 Постта нақты не қызықтырды — ауырсыну, процедура ма, әлде консультацияға жазылу ма?",
+    )
+
+
+def _contra_reference_question(text: str) -> bool:
+    low = _low(text)
+    return "противопоказ" in low and any(x in low for x in ["где", "написано", "писали", "было", "выше", "список"])
+
+
+def _contra_repeated_block_answer(session: dict[str, Any]) -> str:
+    session["contraindications_repeated_blocked"] = True
+    _safe_log(str(session.get("chat_id") or "system"), "contraindications_repeated_blocked", {"sent_count": int(session.get("contraindications_checklist_sent_count") or 0)})
+    return _tr(
+        session,
+        "Я выше перечислил основные противопоказания. Если ничего из этого нет, напишите, пожалуйста: противопоказаний нет.",
+        "Жоғарыда негізгі қарсы көрсетілімдерді жаздым. Егер ешқайсысы болмаса: қарсы көрсетілімдер жоқ деп жазыңызшы.",
+    )
+
+
+def _accept_no_contra_and_advance(chat_id: str, session: dict[str, Any], text: str) -> str:
+    _accept_no_contraindications(session, text or "нет")
+    session["step"] = "date"
+    session["questionnaire_step"] = "date"
+    _safe_log(chat_id, "contraindications_clear_detected", {"text_preview": (text or "")[:180]})
+    if session.get("preferred_date"):
+        return ""
+    return _ask_date(session)
+
 def _after_booking_admin_answer(text: str, session: dict[str, Any]) -> str:
     info = _faq_answer(text, session)
     if info:
@@ -4094,6 +4169,33 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session.pop("final_answer_preview", None)
     session["language"] = _detect_lang(text, session)
     _safe_log(chat_id, "state_before_decision", {"chat_id": chat_id, "step": session.get("step") or "start", "current_step": session.get("current_step") or "", "ai_lead_started": bool(session.get("ai_lead_started")), "gate_reason": session.get("gate_reason") or ""})
+    if (session.get("ai_muted") or session.get("manual_takeover") or session.get("manual_admin_intervention")) and not (session.get("old_chat") or session.get("imported") or session.get("existing_chat")):
+        session["ai_muted"] = True
+        session["manual_takeover"] = True
+        session["openai_brain_skip_reason"] = "manual_takeover"
+        _safe_log(chat_id, "ai_muted_no_reply", {"chat_id": chat_id, "reason": "manual_takeover"})
+        return _no_reply(chat_id, session, "manual_takeover")
+    if _is_refusal_or_irritation(text):
+        session["ai_muted"] = True
+        session["manual_takeover"] = True
+        session["escalated"] = True
+        session["step"] = "escalated"
+        session["no_reply_reason"] = "user_refused_or_irritated"
+        session["openai_brain_skip_reason"] = "user_refused_or_irritated"
+        _safe_log(chat_id, "user_refused_or_irritated", {"chat_id": chat_id, "text_preview": text[:180]})
+        return _finalize(chat_id, session, "Понимаю, извините за повторные сообщения. Передаю диалог администратору, больше не буду беспокоить.")
+    if _is_instagram_detail_request(text):
+        session["step"] = "complaint"
+        session["instagram_detail_request"] = True
+        session["gate_reason"] = "new_lead_like_message"
+        session["ai_lead_started"] = True
+        return _finalize(chat_id, session, _instagram_detail_answer(session))
+    if (session.get("step") == "contraindications" or session.get("last_required_step") == "contraindications") and _is_contra_clear_hotfix_phrase(text):
+        answer = _accept_no_contra_and_advance(chat_id, session, text)
+        faq_info = _faq_answer(text, session)
+        if faq_info and answer:
+            answer = faq_info + "\n\n" + answer
+        return _finalize(chat_id, session, answer)
     if (session.get("step") == "escalated" or session.get("escalated")) and not session.get("booked"):
         session["no_reply_reason"] = "escalated_ai_disabled"
         _reset_openai_brain_debug(session)
@@ -4335,16 +4437,15 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return _finalize(chat_id, session, answer)
 
         if step == "contraindications":
+            if _contra_reference_question(text) and int(session.get("contraindications_checklist_sent_count") or 0) >= 1:
+                return _finalize(chat_id, session, _contra_repeated_block_answer(session))
             term_answer = _contra_term_answer(text, session)
             if term_answer:
                 session["step"] = "contraindications"
                 session["questionnaire_step"] = "contra"
                 return _finalize(chat_id, session, term_answer)
             if _is_no_contra_answer(text) or _contra_is_clear_no(text):
-                _accept_no_contraindications(session, text or "нет")
-                session["step"] = "date"
-                session["questionnaire_step"] = "date"
-                return _finalize(chat_id, session, _ask_date(session))
+                return _finalize(chat_id, session, _accept_no_contra_and_advance(chat_id, session, text or "нет"))
             if _contra_has_hard_stop(text):
                 bot_tools.verify_contraindications(session, bot_tools.CONTRA_REFUSE, text)
                 session["step"] = "stopped"
@@ -4953,11 +5054,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         # "Нет" / "Жоқ!" на вопрос о противопоказаниях = противопоказаний нет,
         # дальше спрашиваем дату, а не возвращаемся к жалобе.
         if _is_no_contra_answer(text):
-            _accept_no_contraindications(session, text or "нет")
-            session["step"] = "date"
-            session["questionnaire_step"] = "date"
+            answer = _accept_no_contra_and_advance(chat_id, session, text or "нет")
             faq_info = _faq_answer(text, session)
-            answer = faq_info + "\n\n" + _ask_date(session) if faq_info else _ask_date(session)
+            answer = faq_info + "\n\n" + answer if faq_info and answer else answer
             return _finalize(chat_id, session, answer)
 
         session["contraindications_raw"] = text

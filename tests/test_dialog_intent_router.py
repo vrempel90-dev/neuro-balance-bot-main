@@ -1382,3 +1382,63 @@ def test_openai_decision_validator_blocks_invented_contraindication() -> None:
 
     assert ok is False
     assert reason == "llm_unknown_contraindication_blocked"
+
+
+def test_hotfix_contraindications_clear_phrase_advances() -> None:
+    chat_id = "hotfix_contra_clear_phrase"
+    reset(chat_id, {"step": "contraindications", "complaint": "болит спина", "age": 36, "language": "ru", "language_locked": True})
+
+    result = answer(chat_id, "То что перечислено, этого нет")
+    session = state.get_session(chat_id)
+
+    assert session["contraindications_ok"] is True
+    assert session["contraindications_raw"] == "То что перечислено, этого нет"
+    assert session["step"] != "contraindications"
+    assert "Противопоказаний нет?" not in result
+
+
+def test_hotfix_repeated_contraindications_checklist_is_short() -> None:
+    chat_id = "hotfix_contra_repeated"
+    reset(chat_id, {
+        "step": "contraindications",
+        "complaint": "болит спина",
+        "age": 36,
+        "language": "ru",
+        "language_locked": True,
+        "contraindications_checklist_sent_count": 1,
+    })
+
+    result = answer(chat_id, "где написано о противопоказаниях?")
+
+    assert "Я выше перечислил" in result
+    assert "кардиостимулятора/дефибриллятора" not in result
+    assert "инсулиновой помпы" not in result
+
+
+def test_hotfix_user_irritated_mutes_followups() -> None:
+    chat_id = "hotfix_irritated"
+    reset(chat_id, {"step": "date", "complaint": "болит спина", "age": 36, "contraindications_ok": True, "language": "ru", "language_locked": True})
+
+    first = answer(chat_id, "Я уже от вас ничего не хочу")
+    session = state.get_session(chat_id)
+    second = answer(chat_id, "вы тут?")
+
+    assert "больше не буду беспокоить" in first
+    assert session["ai_muted"] is True
+    assert session["manual_takeover"] is True
+    assert session["escalated"] is True
+    assert second == ""
+    assert state.get_session(chat_id)["no_reply_reason"] == "manual_takeover"
+
+
+def test_hotfix_instagram_detail_request_does_not_start_booking() -> None:
+    chat_id = "hotfix_instagram_detail"
+    reset(chat_id)
+
+    result = answer(chat_id, "Привет! Можно узнать об этом подробнее? https://instagram.com/p/test")
+    session = state.get_session(chat_id)
+
+    assert "что именно заинтересовало" in result
+    assert "боль, процедура или запись" in result
+    assert session["step"] == "complaint"
+    assert "сколько Вам лет" not in result

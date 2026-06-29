@@ -116,3 +116,51 @@ def test_wazzup_after_hours_can_reply_to_new_lead(monkeypatch):
 
     assert answer
     assert state.get_session("wh_wazzup_night").get("no_reply_reason", "") == ""
+
+
+def test_real_wazzup_daytime_debounced_does_not_send(monkeypatch):
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: False)
+
+    async def should_not_send(*args, **kwargs):
+        raise AssertionError("Wazzup send must not be called during daytime guard")
+
+    async def should_not_handle(*args, **kwargs):
+        raise AssertionError("dialog must not run during daytime guard")
+
+    monkeypatch.setattr(main, "send_text", should_not_send)
+    monkeypatch.setattr(main, "handle_message", should_not_handle)
+
+    asyncio.run(main._debounced_process_and_send({
+        "chat_id": "wh_real_day_send_guard",
+        "phone": "77010000002",
+        "text": "Здравствуйте, хочу записаться",
+        "kind": "text",
+        "source": "wazzup",
+    }))
+
+    session = state.get_session("wh_real_day_send_guard")
+    assert session["no_reply_reason"] == "working_hours_ai_disabled"
+    assert session["openai_used"] is False
+
+
+def test_bot_auto_reply_disabled_blocks_wazzup(monkeypatch):
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: True)
+    monkeypatch.setattr(main.get_settings(), "bot_auto_reply_enabled", False, raising=False)
+
+    async def should_not_handle(*args, **kwargs):
+        raise AssertionError("dialog/OpenAI path must not be called when auto-reply is disabled")
+
+    monkeypatch.setattr(main, "handle_message", should_not_handle)
+
+    answer = asyncio.run(main._build_answer_for_message({
+        "chat_id": "wh_auto_disabled",
+        "phone": "77010000003",
+        "text": "Здравствуйте, хочу записаться",
+        "kind": "text",
+        "source": "wazzup",
+    }))
+
+    session = state.get_session("wh_auto_disabled")
+    assert answer == ""
+    assert session["no_reply_reason"] == "bot_auto_reply_disabled"
+    assert session["openai_used"] is False
