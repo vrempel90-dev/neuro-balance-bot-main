@@ -983,9 +983,9 @@ PRICE_WORDS = [
 ]
 
 ADDRESS_WORDS = [
-    "адрес", "адресс", "где вы", "где находитесь", "вы в астане", "2gis", "2 гис",
+    "адрес", "адресс", "где вы", "где находитесь", "вы в астане", "2gis", "2 гис", "2гис",
     "куда обращаться", "куда прийти", "как пройти", "куда ехать",
-    "куда приехать", "в каком городе",
+    "куда приехать", "в каком городе", "локация", "геолокация",
     "мекенжай", "қайда", "кайда", "астанада",
 ]
 
@@ -2575,9 +2575,15 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
             answer = _ask_date(session)
     elif str(session.get("step") or "") == "contraindications" and not _contra_details_question(str(session.get("last_user_text") or "")):
         safe_contra_answer = _ask_contra(session)
-        if answer != safe_contra_answer:
+        if _has_any(str(session.get("last_user_text") or ""), ADDRESS_WORDS):
+            address_answer = _address_answer(session)
+            expected = address_answer + "\n\n" + safe_contra_answer
+            if answer != expected:
+                _safe_log(chat_id, "contraindications_address_faq_final_repaired", {"chat_id": chat_id, "answer_preview": answer[:180]})
+            answer = expected
+        elif answer != safe_contra_answer:
             _safe_log(chat_id, "contraindications_checklist_final_repaired", {"chat_id": chat_id, "answer_preview": answer[:180]})
-        answer = safe_contra_answer
+            answer = safe_contra_answer
     if not answer and str(session.get("step") or "") == "age" and _is_active_new_ai_request(session):
         extracted_age = _extract_age(str(session.get("last_user_text") or ""), step="age")
         if extracted_age:
@@ -2622,11 +2628,22 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     # чтобы Wazzup не получал одинаковые сообщения подряд.
     last_answer = _clean(str(session.get("last_assistant_answer") or session.get("last_bot_answer") or ""))
     if last_answer and _low(last_answer) == _low(answer):
-        if str(session.get("step") or "") == "age" and _is_active_new_ai_request(session):
+        if _has_any(str(session.get("last_user_text") or ""), ADDRESS_WORDS) and str(session.get("step") or "") in {"complaint", "age", "contraindications", "date", "time", "select_slot", "name"}:
+            answer = _address_answer_then_optional_resume(session)
+        elif str(session.get("step") or "") == "age" and _is_active_new_ai_request(session):
             answer = _ask_age(session)
         else:
             _safe_save(chat_id, session)
             return ""
+
+    # final_no_empty_guard: this must be the last answer mutation before saving/returning.
+    if not str(answer or "").strip():
+        if _has_any(str(session.get("last_user_text") or ""), ADDRESS_WORDS):
+            answer = _address_answer_then_optional_resume(session)
+            session["fallback_reason"] = "final_no_empty_address_faq"
+        else:
+            answer, _, _ = build_safe_answer_for_current_state(session, str(session.get("last_user_text") or ""))
+            session["fallback_reason"] = "final_no_empty_step_fallback"
 
     session["state_before_step"] = before_step
     session["state_after_step"] = session.get("step") or ""
@@ -4342,9 +4359,9 @@ def _active_flow_resume_step(session: dict[str, Any]) -> str:
 def _address_answer_then_optional_resume(session: dict[str, Any]) -> str:
     base = _address_answer(session)
     step = _active_flow_resume_step(session)
-    if step in {"date", "time", "name"}:
+    if step in {"complaint", "age", "contraindications", "date", "time", "name"}:
         prompt = _mandatory_step_prompt(session, step)
-        return base + (" " + prompt if prompt else "")
+        return base + ("\n\n" + prompt if prompt else "")
     return base
 
 
