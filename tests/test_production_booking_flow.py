@@ -62,6 +62,34 @@ def test_doctor_lock_and_before_noon_filter(monkeypatch: Any) -> None:
     assert calls["slots"][-1]["doctor_login"] == "zhuma_md"
     assert "09:20" in r and all(t not in r for t in ["14:40", "15:20", "16:40", "17:20"])
 
+def test_before_noon_request_with_only_afternoon_slots_does_not_label_them_morning(monkeypatch: Any) -> None:
+    patch_crm(monkeypatch, ["14:40", "15:20", "16:40", "17:20"])
+    reset(
+        "prod_before_noon_only_afternoon",
+        {
+            "step": "date",
+            "complaint": "спина",
+            "age": 32,
+            "contraindications_ok": True,
+            "selected_doctor_login": "zhuma_md",
+            "selected_doctor_name": "Жумабек Мади Мухтарович",
+            "preferred_date": "2026-06-30",
+        },
+    )
+    r = answer("prod_before_noon_only_afternoon", "Когда есть время к Мади Мухтаровичу завтра до обеда?")
+    assert "до обеда свободных окошек не вижу" in r
+    assert "Есть после обеда" in r
+    assert "14:40" in r
+    assert "До обеда есть 14:40" not in r
+
+def test_before_noon_request_shows_only_morning_slots(monkeypatch: Any) -> None:
+    patch_crm(monkeypatch, ["09:20", "14:40", "15:20"])
+    reset("prod_before_noon_mixed", {"step": "date", "complaint": "спина", "age": 32, "contraindications_ok": True})
+    r = answer("prod_before_noon_mixed", "Могу завтра до обеда")
+    assert "09:20" in r
+    assert "14:40" not in r
+    assert "15:20" not in r
+
 def test_slot_status_name_booking_success(monkeypatch: Any) -> None:
     calls = patch_crm(monkeypatch)
     reset("prod_book", {"step": "time", "complaint": "спина", "age": 32, "contraindications_ok": True, "preferred_date": "2026-07-02", "last_slots": [{"doctorLogin":"zhuma_md","doctorName":"Жумабек Мади Мухтарович","date":"2026-07-02","timeStart":"09:20","doctor_login":"zhuma_md","doctor_name":"Жумабек Мади Мухтарович","time":"09:20"}]})
