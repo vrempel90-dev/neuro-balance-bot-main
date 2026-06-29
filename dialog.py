@@ -295,6 +295,8 @@ def _repair_forbidden_required_question(chat_id: str, session: dict[str, Any], a
 def _repair_state_consistency(session: dict[str, Any], user_text: str = "") -> tuple[bool, str]:
     before = str(session.get("step") or "start")
     reason = ""
+    if _repair_bad_patient_name(session):
+        reason = "bad_patient_name_cleared"
     if before in {"escalated", "stopped", "done", "booked"}:
         if session.get("booked"):
             session["ai_muted"] = True
@@ -304,7 +306,9 @@ def _repair_state_consistency(session: dict[str, Any], user_text: str = "") -> t
     if session.get("booked"):
         session["ai_muted"] = True
         return (before != "booked" or not session.get("ai_muted")), "booked_ai_muted"
-    if session.get("last_slots") and before in {"time", "select_slot"} and not session.get("selected_slot"):
+    if reason:
+        pass
+    elif session.get("last_slots") and before in {"time", "select_slot"} and not session.get("selected_slot"):
         session["step"] = "time"; reason = ""  # consistent active slot-picking state
     elif (session.get("complaint") or _has_complaint(user_text)) and (_profile_status(user_text) == "profile" or session.get("profile_status") == "profile") and before in {"start", "complaint"} and not session.get("age"):
         if not session.get("complaint") and user_text:
@@ -1221,8 +1225,24 @@ HARD_CONTRA_WORDS = [
 ]
 
 NAME_BANNED_WORDS = set(
-    "да нет ок окей хорошо приду буду завтра сегодня ертең бугин бүгін жок жоқ хочу записаться консультация болит боль".split()
+    "да нет ок окей хорошо приду буду завтра сегодня ертең бугин бүгін жок жоқ хочу записаться консультация болит боль спасибо спс благодарю понял поняла".split()
 )
+
+SERVICE_POLITE_NAME_PHRASES = {"спасибо", "спс", "благодарю", "ок", "окей", "хорошо", "поняла", "понял"}
+BAD_PATIENT_NAME_VALUES = {"спасибо", "ок", "окей", "хорошо", "понял", "поняла"}
+
+
+def _is_service_polite_phrase(text: str) -> bool:
+    cleaned = re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", _low(text or ""))
+    return cleaned in {re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", phrase) for phrase in SERVICE_POLITE_NAME_PHRASES}
+
+
+def _repair_bad_patient_name(session: dict[str, Any]) -> bool:
+    name = str(session.get("patient_name") or "")
+    if _low(name) in BAD_PATIENT_NAME_VALUES:
+        session["patient_name"] = ""
+        return True
+    return False
 
 
 def _clean(text: str) -> str:
@@ -2427,7 +2447,7 @@ def _slot_times_answer(session: dict[str, Any]) -> str:
         )
     return _tr(
         session,
-        f"На выбранный день есть окошки: {joined} 🌿 Какое время Вам удобно?",
+        f"Есть такие свободные окошки: {joined} 🌿 Какое время Вам удобно?",
         f"Таңдалған күнге бос уақыттар бар: {joined} 🌿 Қай уақыт ыңғайлы?",
     )
 
@@ -2502,8 +2522,10 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     answer = _validate_final_fact_answer(chat_id, session, answer)
     if session.get("last_slots") and not session.get("selected_time"):
         session["step"] = "time"
-        if not answer or "на какой день" in _low(answer):
+        if not answer or "на какой день" in _low(answer) or "сейчас посмотр" in _low(answer):
             answer = _slot_times_answer(session)
+    if str(session.get("step") or "") == "time" and session.get("last_slots") and not session.get("selected_time") and not str(answer or "").strip():
+        answer = _slot_times_answer(session)
     if not (session.get("step") == "booked" and session.get("booking_confirmed") is True):
         answer = _remove_name_addressing(answer, session)
     answer = _strict_trim_extra(answer, session)
@@ -4594,6 +4616,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session.pop("base_answer_preview", None)
     session.pop("final_answer_preview", None)
     session["language"] = _detect_lang(text, session)
+    _repair_bad_patient_name(session)
     _safe_log(chat_id, "state_before_decision", {"chat_id": chat_id, "step": session.get("step") or "start", "current_step": session.get("current_step") or "", "ai_lead_started": bool(session.get("ai_lead_started")), "gate_reason": session.get("gate_reason") or ""})
     if (session.get("ai_muted") or session.get("manual_takeover") or session.get("manual_admin_intervention")) and not (session.get("old_chat") or session.get("imported") or session.get("existing_chat")):
         session["ai_muted"] = True
@@ -4821,7 +4844,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # was already selected and all required booking fields are present, CRM
     # booking must be attempted before any AI/admin fallback can answer.
     name_from_text = _extract_name(text)
-    if name_from_text and not session.get("patient_name"):
+    if step == "name" and _is_service_polite_phrase(text):
+        session["patient_name"] = ""
+        return _finalize(chat_id, session, "Подскажите, пожалуйста, Ваше имя для записи.")
+
+    if step == "name" and name_from_text and not session.get("patient_name"):
         session["patient_name"] = name_from_text
         if _booking_ready(session, phone):
             return _finalize(chat_id, session, await _book(chat_id, session, phone))
@@ -4860,8 +4887,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _finalize(chat_id, session, _after_booking_admin_answer(text, session))
 
     if step in ("age", "contraindications", "date", "preferred_time", "time", "select_slot", "name"):
-        if _is_thanks_or_ok(text) and step in ("date", "preferred_time", "time", "select_slot"):
+        if _is_thanks_or_ok(text) and step in ("date", "preferred_time"):
             return _no_reply(chat_id, session)
+        if _is_thanks_or_ok(text) and step in ("time", "select_slot"):
+            session["patient_name"] = "" if _is_service_polite_phrase(text) else session.get("patient_name", "")
+            return _finalize(chat_id, session, _slot_times_answer(session))
         faq_info = _doctor_answer(session, chat_id) if _has_any(text, DOCTOR_WORDS) else _faq_answer(text, session)
 
         if step in ("time", "select_slot") and faq_info:
@@ -4994,6 +5024,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return _finalize(chat_id, session, answer)
 
         if step == "name":
+            if _is_service_polite_phrase(text):
+                session["patient_name"] = ""
+                return _finalize(chat_id, session, "Подскажите, пожалуйста, Ваше имя для записи.")
             name = _extract_name(text)
             if not name:
                 return _finalize(chat_id, session, _ask_name(session))
@@ -5274,6 +5307,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session.clear()
         session["phone"] = phone or ""
         session["language"] = _detect_lang(text, session)
+        _repair_bad_patient_name(session)
         session["language_locked"] = True
         _record_complaint_tool(session, text, is_in_profile=True)
         session["step"] = "age"

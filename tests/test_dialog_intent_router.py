@@ -1693,3 +1693,43 @@ def test_required_repeat_guard_patient_name_existing_books_not_reask(monkeypatch
     assert calls["book"][0]["patient_name"] == "Алия"
     assert session["step"] == "booked"
     assert "имя" not in result.lower()
+
+
+def test_time_empty_answer_final_repair_shows_slots() -> None:
+    chat_id = "hotfix_time_empty_answer"
+    slots = [{"time": t} for t in ["11:20", "12:00", "12:40", "13:20", "14:00"]]
+    reset(chat_id, {"step": "time", "last_slots": slots, "selected_time": "", "patient_name": "Спасибо"})
+    session = state.get_session(chat_id)
+
+    result = dialog._finalize(chat_id, session, "")
+    saved = state.get_session(chat_id)
+
+    assert result
+    assert "11:20" in result
+    assert "Какое время Вам удобно?" in result
+    assert saved["patient_name"] == ""
+
+
+def test_time_thanks_does_not_save_patient_name_and_repeats_slots() -> None:
+    chat_id = "hotfix_time_thanks"
+    slots = [{"time": t} for t in ["11:20", "12:00", "12:40", "13:20", "14:00"]]
+    reset(chat_id, {"step": "time", "last_slots": slots, "selected_time": "", "patient_name": "Спасибо"})
+
+    result = answer(chat_id, "спасибо")
+    session = state.get_session(chat_id)
+
+    assert session["patient_name"] == ""
+    assert session["step"] == "time"
+    assert "11:20" in result
+    assert "Какое время Вам удобно?" in result
+
+
+def test_name_thanks_does_not_save_patient_name_and_asks_name_again() -> None:
+    chat_id = "hotfix_name_thanks"
+    reset(chat_id, {"step": "name", "selected_slot": {"time": "11:20"}, "selected_time": "11:20", "complaint": "спина", "age": 35, "contraindications_ok": True})
+
+    result = answer(chat_id, "спасибо")
+    session = state.get_session(chat_id)
+
+    assert session["patient_name"] == ""
+    assert "Подскажите, пожалуйста, Ваше имя для записи" in result
