@@ -2239,7 +2239,8 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
         answer, _, _ = build_safe_answer_for_current_state(session, str(session.get("last_user_text") or ""))
         session["fallback_reason"] = "state_inconsistency_repaired"
     answer = _validate_final_fact_answer(chat_id, session, answer)
-    answer = _remove_name_addressing(answer, session)
+    if not (session.get("step") == "booked" and session.get("booking_confirmed") is True):
+        answer = _remove_name_addressing(answer, session)
     answer = _strict_trim_extra(answer, session)
     if not answer and _is_active_new_ai_request(session):
         repair = repair_empty_active_reply(session, str(session.get("last_user_text") or ""), "empty_active_reply")
@@ -2742,6 +2743,38 @@ def _slot_time(slot: dict[str, Any]) -> str:
     return str(slot.get("time") or slot.get("timeStart") or slot.get("time_start") or "")
 
 
+def _selected_slot_from_session(session: dict[str, Any]) -> dict[str, Any]:
+    """Build a CRM booking slot from denormalized selected_* fields."""
+    return {
+        "doctorLogin": session.get("selected_doctor_login") or "",
+        "doctorName": session.get("selected_doctor_name") or "",
+        "date": session.get("selected_date") or session.get("preferred_date") or "",
+        "timeStart": session.get("selected_time") or "",
+        "doctor_login": session.get("selected_doctor_login") or "",
+        "doctor_name": session.get("selected_doctor_name") or "",
+        "time": session.get("selected_time") or "",
+    }
+
+
+def _booking_ready(session: dict[str, Any], phone: str = "") -> bool:
+    """Return True when all required final booking fields are present."""
+    try:
+        age_ok = int(session.get("age") or 0) > 0
+    except (TypeError, ValueError):
+        age_ok = False
+    normalized_phone = sanitize_kz_phone(phone or session.get("phone") or "")
+    return bool(
+        session.get("patient_name")
+        and normalized_phone
+        and session.get("complaint")
+        and age_ok
+        and session.get("contraindications_ok") is True
+        and session.get("selected_date")
+        and session.get("selected_time")
+        and (session.get("selected_doctor_login") or session.get("selected_doctor_name"))
+    )
+
+
 def _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | None:
     low = _low(text)
 
@@ -3061,6 +3094,52 @@ def _ask_name(session: dict[str, Any]) -> str:
     )
 
 
+def _format_booking_date_human(date_iso: str, lang: str = "ru") -> str:
+    try:
+        dt = datetime.fromisoformat(str(date_iso)).date()
+    except Exception:
+        return str(date_iso or "")
+    if lang == "kk":
+        months = [
+            "қаңтар", "ақпан", "наурыз", "сәуір", "мамыр", "маусым",
+            "шілде", "тамыз", "қыркүйек", "қазан", "қараша", "желтоқсан",
+        ]
+        return f"{dt.day} {months[dt.month - 1]}"
+    months = [
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря",
+    ]
+    return f"{dt.day} {months[dt.month - 1]}"
+
+
+def _booking_success_answer(session: dict[str, Any], booked: dict[str, Any], slot: dict[str, Any]) -> str:
+    patient_name = str(session.get("patient_name") or "Пациент").strip()
+    date = booked.get("date") or _slot_date(slot) or session.get("selected_date") or session.get("preferred_date") or ""
+    time_start = booked.get("timeStart") or booked.get("time_start") or _slot_time(slot) or session.get("selected_time") or ""
+    doctor = booked.get("doctorName") or booked.get("doctor_name") or _slot_doctor_name(slot) or session.get("selected_doctor_name") or "врачу клиники"
+    date_human = _format_booking_date_human(date, session.get("language") or "ru")
+    return _tr(
+        session,
+        (
+            f"{patient_name}, записала Вас на {date_human} в {time_start} к врачу {doctor} 🌿\n\n"
+            "Адрес: Кабанбай батыра 28, внутренний двор, подъезд 3. Ждём Вас!"
+        ),
+        (
+            f"{patient_name}, Сізді {date_human} күні сағат {time_start} дәрігер {doctor} қабылдауына жаздым 🌿\n\n"
+            "Мекенжай: Қабанбай батыр 28, ішкі аула, 3-подъезд. Күтеміз!"
+        ),
+    )
+
+
+def _booking_failed_answer(session: dict[str, Any]) -> str:
+    patient_name = str(session.get("patient_name") or "Пациент").strip()
+    return _tr(
+        session,
+        f"{patient_name}, данные для записи собрала 🌿 Сейчас передам администратору, чтобы он подтвердил запись.",
+        f"{patient_name}, жазылуға қажет деректерді жинадым 🌿 Қазір әкімшіге жіберемін, ол жазбаны растайды.",
+    )
+
+
 def _no_slots_text(session: dict[str, Any]) -> str:
     return _tr(
         session,
@@ -3161,6 +3240,13 @@ async def _refresh_slots_after_book_conflict(chat_id: str, session: dict[str, An
 async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
     normalized_phone = sanitize_kz_phone(phone or session.get("phone") or "")
     slot = session.get("selected_slot") or {}
+    if not slot and (
+        session.get("selected_date")
+        and session.get("selected_time")
+        and (session.get("selected_doctor_login") or session.get("selected_doctor_name"))
+    ):
+        slot = _selected_slot_from_session(session)
+        session["selected_slot"] = slot
 
     if not normalized_phone:
         session["step"] = "phone"
@@ -3226,38 +3312,14 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         session["step"] = "booked"
         session["appointment_status"] = "booked"
         session["ai_muted"] = True
-        session["manual_takeover"] = True
-        session["no_reply_reason"] = "booked_session_ai_disabled"
+        session["manual_takeover"] = False
+        session["booking_confirmed"] = True
+        session["no_reply_reason"] = ""
         session["status"] = "booked"
         session["crm_status"] = "Записан"
+        _safe_log(chat_id, "crm_booking_success", {"appointment": booked, "doctor_login": _slot_doctor_login(slot), "date": _slot_date(slot), "time_start": _slot_time(slot)})
 
-        date = booked.get("date") or _slot_date(slot) or session.get("preferred_date") or ""
-        time_start = booked.get("timeStart") or booked.get("time_start") or _slot_time(slot)
-        doctor = booked.get("doctorName") or _slot_doctor_name(slot) or ""
-
-        return _tr(
-            session,
-            (
-                "Спасибо, запись подтверждена ✅\n\n"
-                "Ваш визит в Neuro Balance:\n"
-                f"📅 Дата: {date}\n"
-                f"⏰ Время: {time_start}\n"
-                "📍 Адрес: Кабанбай батыра 28, внутренний двор, подъезд 3.\n"
-                "👉 Местоположение: https://go.2gis.com/NcqGj\n\n"
-                "Просим взять с собой все имеющиеся снимки, заключения или анализы. "
-                "Если их нет — ничего страшного, врач при необходимости подскажет, что нужно."
-            ),
-            (
-                "Рақмет, жазба расталды ✅\n\n"
-                "Neuro Balance қабылдауы:\n"
-                f"📅 Күні: {date}\n"
-                f"⏰ Уақыты: {time_start}\n"
-                "📍 Мекенжай: Қабанбай батыр 28, ішкі аула, 3-подъезд.\n"
-                "👉 Орналасуы: https://go.2gis.com/NcqGj\n\n"
-                "Өзіңізде бар снимок, қорытынды немесе анализ болса, ала келіңіз. "
-                "Егер жоқ болса — ештеңе етпейді, дәрігер қажет болса өзі айтады."
-            ),
-        )
+        return _booking_success_answer(session, booked, slot)
     except crm.CRMResponseError as exc:
         log_payload = {
             "error": str(exc)[:500],
@@ -3271,22 +3333,20 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
             "time_start": _slot_time(slot),
             "selected_slot": slot,
         }
-        _safe_log(chat_id, "crm_book_error", log_payload)
-
-        if exc.status_code == 409 and exc.code in {"slot_conflict", "doctor_not_scheduled"}:
-            return await _refresh_slots_after_book_conflict(
-                chat_id, session, _slot_date(slot) or session.get("preferred_date") or ""
-            )
+        _safe_log(chat_id, "crm_booking_failed", log_payload)
 
         session["step"] = "escalated"
         session["escalated"] = True
+        session["manual_takeover"] = True
+        session["ai_muted"] = True
         session["handoff_reason"] = f"crm_book_{exc.status_code}"
         bot_tools.escalate_to_human(session, session["handoff_reason"])
-        return _crm_fallback_answer(session)
+        session["step"] = "escalated"
+        return _booking_failed_answer(session)
     except Exception as exc:
         _safe_log(
             chat_id,
-            "crm_book_error",
+            "crm_booking_failed",
             {
                 "error": str(exc)[:500],
                 "gate": bot_tools.booking_gate_status(session),
@@ -3298,8 +3358,11 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         )
         session["step"] = "escalated"
         session["escalated"] = True
+        session["manual_takeover"] = True
+        session["ai_muted"] = True
         bot_tools.escalate_to_human(session, "crm_book_exception")
-        return _crm_fallback_answer(session)
+        session["step"] = "escalated"
+        return _booking_failed_answer(session)
 
 
 async def _handle_existing_lookup(chat_id: str, phone: str, session: dict[str, Any], text: str = "") -> str:
@@ -4337,6 +4400,15 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session["step"] = "contraindications"
             _safe_log(chat_id, "llm_unknown_contraindication_blocked", {"chat_id": chat_id, "step": "contraindications", "patient_text": text[:180]})
             return _finalize(chat_id, session, _unknown_contra_safe_answer(session))
+
+    # Final booking step guard: if a patient provides their name after a slot
+    # was already selected and all required booking fields are present, CRM
+    # booking must be attempted before any AI/admin fallback can answer.
+    name_from_text = _extract_name(text)
+    if name_from_text and not session.get("patient_name"):
+        session["patient_name"] = name_from_text
+        if _booking_ready(session, phone):
+            return _finalize(chat_id, session, await _book(chat_id, session, phone))
 
     brain_answer = await _try_openai_dialog_brain(chat_id, phone, session, text)
     if brain_answer is not None:
