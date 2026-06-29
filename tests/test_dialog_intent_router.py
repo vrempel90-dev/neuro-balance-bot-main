@@ -1863,3 +1863,50 @@ def test_active_age_empty_answer_repair_is_non_empty() -> None:
     repaired = dialog.repair_empty_active_reply(session, session["last_user_text"])
     assert repaired.answer.strip()
     assert repaired.answer == "Жасыңызды жаза аласыз ба?"
+
+
+def test_address_faq_during_contraindications_keeps_step_and_required_question() -> None:
+    chat_id = "hotfix_address_faq_contra"
+    reset(chat_id, {
+        "step": "contraindications",
+        "complaint": "Беспокоит колено, кажется артроз...",
+        "age": 48,
+        "contraindications_ok": None,
+        "language": "ru",
+        "language_locked": True,
+    })
+
+    result = answer(chat_id, "А где вы находитесь? В каком городе?")
+    session = state.get_session(chat_id)
+
+    assert result.strip()
+    assert "Кабанбай батыра 28" in result
+    assert "2ГИС" in result
+    assert "Есть ли у Вас какие-нибудь противопоказания?" in result
+    assert session["step"] == "contraindications"
+    assert session.get("manual_takeover") is not True
+    assert session.get("escalated") is not True
+
+
+def test_faq_types_at_every_active_step_never_return_empty() -> None:
+    faq_cases = {
+        "price": "Сколько стоит первичный прием?",
+        "address": "А где вы находитесь? В каком городе? 2гис",
+        "medical": "Это опасно? Можно лечить?",
+        "mri": "Нужно ли МРТ или снимок?",
+    }
+    active_steps = {
+        "complaint": {"step": "complaint", "language": "ru", "language_locked": True},
+        "age": {"step": "age", "complaint": "болит спина", "language": "ru", "language_locked": True},
+        "contraindications": {"step": "contraindications", "complaint": "болит спина", "age": 48, "contraindications_ok": None, "language": "ru", "language_locked": True},
+        "date": {"step": "date", "complaint": "болит спина", "age": 48, "contraindications_ok": True, "language": "ru", "language_locked": True},
+        "time": {"step": "time", "complaint": "болит спина", "age": 48, "contraindications_ok": True, "preferred_date": "2026-07-02", "last_slots": [{"time": "11:20"}, {"time": "12:00"}], "language": "ru", "language_locked": True},
+        "name": {"step": "name", "complaint": "болит спина", "age": 48, "contraindications_ok": True, "selected_slot": {"time": "11:20"}, "selected_time": "11:20", "language": "ru", "language_locked": True},
+    }
+
+    for step, preset in active_steps.items():
+        for faq_type, text in faq_cases.items():
+            chat_id = f"hotfix_faq_nonempty_{step}_{faq_type}"
+            reset(chat_id, dict(preset))
+            result = answer(chat_id, text)
+            assert result.strip(), f"{faq_type} FAQ returned empty answer at step={step}"
