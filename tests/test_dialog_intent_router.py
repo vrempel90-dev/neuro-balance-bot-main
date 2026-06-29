@@ -1813,3 +1813,53 @@ def test_name_thanks_does_not_save_patient_name_and_asks_name_again() -> None:
 
     assert session["patient_name"] == ""
     assert "Подскажите, пожалуйста, Ваше имя для записи" in result
+
+
+def test_kazakh_age_25te_moves_to_contraindications() -> None:
+    chat_id = "hotfix_kz_age_25te"
+    reset(chat_id, {"step": "age", "complaint": "белім ауырады", "language": "kk", "language_locked": True})
+    result = answer(chat_id, "25те")
+    session = state.get_session(chat_id)
+    assert session["age"] == 25
+    assert session["step"] == "contraindications"
+    assert "Қарсы көрсетілімдеріңіз бар ма?" in result
+    assert result.strip()
+
+
+def test_kazakh_age_25_zhasta_and_zhasym_25_parse() -> None:
+    for chat_id, text in [("hotfix_kz_age_zhasta", "25 жаста"), ("hotfix_kz_age_zhasym", "жасым 25")]:
+        reset(chat_id, {"step": "age", "complaint": "белім ауырады", "language": "kk", "language_locked": True})
+        answer(chat_id, text)
+        session = state.get_session(chat_id)
+        assert session["age"] == 25
+        assert session["step"] == "contraindications"
+
+
+def test_kazakh_complaint_answer_is_human_not_dry_age_only() -> None:
+    chat_id = "hotfix_kz_complaint_bel_san"
+    reset(chat_id, {"step": "start", "language": "kk", "language_locked": True})
+    result = answer(chat_id, "Мені мазалайтыны белім ауырады, сосын саным ауырады")
+    assert "беліңіз" in result
+    assert "санға" in result
+    assert "жасыңыз нешеде" in result.lower()
+    assert result.strip() != "Жасыңыз нешеде?"
+
+
+def test_kazakh_no_contra_moves_to_date() -> None:
+    chat_id = "hotfix_kz_no_contra"
+    reset(chat_id, {"step": "contraindications", "complaint": "белім ауырады", "age": 25, "language": "kk", "language_locked": True})
+    result = answer(chat_id, "жоқ")
+    session = state.get_session(chat_id)
+    assert session["contraindications_ok"] is True
+    assert session["step"] == "date"
+    assert "Қай күнге" in result
+
+
+def test_active_age_empty_answer_repair_is_non_empty() -> None:
+    chat_id = "hotfix_active_age_empty_repair"
+    reset(chat_id, {"step": "age", "complaint": "белім ауырады", "language": "kk", "language_locked": True, "gate_reason": "active_conversation_reply"})
+    session = state.get_session(chat_id)
+    session["last_user_text"] = "түсінікті"
+    repaired = dialog.repair_empty_active_reply(session, session["last_user_text"])
+    assert repaired.answer.strip()
+    assert repaired.answer == "Жасыңызды жаза аласыз ба?"
