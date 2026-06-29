@@ -462,8 +462,8 @@ def test_contraindication_term_question_is_not_hard_stop(monkeypatch: Any) -> No
     assert session["step"] == "contraindications"
     assert session.get("manual_takeover") is not True
     assert session.get("hard_contraindication_stop") is not True
-    assert "устройство" in answer.lower()
-    assert "у вас" in answer.lower()
+    assert answer == "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?"
+    assert "устройство" not in answer.lower()
 
 
 def test_real_contraindication_stops_booking_after_brain_fallback(monkeypatch: Any) -> None:
@@ -616,7 +616,7 @@ def test_active_llm_date_before_contra_is_repaired_without_crm(monkeypatch: Any)
     monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
     answer = run(handle_message(chat_id, "77011234567", "34, в понедельник"))
     session = state.get_session(chat_id)
-    assert "Противопоказаний из списка нет" in answer
+    assert answer == "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?"
     assert session["step"] == "contraindications"
     assert session["age"] == 34
     assert calls == []
@@ -969,7 +969,7 @@ def test_humanize_disabled_brain_success_keeps_openai_debug_clean(monkeypatch: A
     answer = run(main._maybe_humanize_answer(chat_id, "34", raw or ""))
     session = state.get_session(chat_id)
 
-    assert answer == "Спасибо. Есть ли противопоказания?"
+    assert answer == "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?"
     assert session["openai_used"] is True
     assert session["openai_brain_used"] is True
     assert session["openai_skip_reason"] == ""

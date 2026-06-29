@@ -2508,6 +2508,21 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
         answer = _remove_name_addressing(answer, session)
     answer = _strict_trim_extra(answer, session)
     answer = _cleanup_final_wazzup_text(answer)
+    # final_contraindications_repair:
+    # Последний барьер перед сохранением/возвратом ответа. Он должен перебивать
+    # OpenAI/Brain/fallback/старые шаблоны и запрещать длинный чек-лист в обычном
+    # booking flow, если пациент явно не попросил список противопоказаний.
+    if session.get("contraindications_ok") is True:
+        if str(session.get("step") or "") == "contraindications" or "противопоказ" in _low(answer):
+            _safe_log(chat_id, "contraindications_ok_final_answer_repaired", {"chat_id": chat_id, "step": session.get("step") or "", "answer_preview": answer[:180]})
+            session["step"] = "date"
+            session["questionnaire_step"] = "date"
+            answer = _ask_date(session)
+    elif str(session.get("step") or "") == "contraindications" and not _contra_details_question(str(session.get("last_user_text") or "")):
+        safe_contra_answer = _ask_contra(session)
+        if answer != safe_contra_answer:
+            _safe_log(chat_id, "contraindications_checklist_final_repaired", {"chat_id": chat_id, "answer_preview": answer[:180]})
+        answer = safe_contra_answer
     if not answer and _is_active_new_ai_request(session):
         repair = repair_empty_active_reply(session, str(session.get("last_user_text") or ""), "empty_active_reply")
         session["fallback_reason"] = "empty_active_reply"
@@ -3361,6 +3376,7 @@ def _contra_details_question(text: str) -> bool:
             "какие противопоказания",
             "какие именно",
             "перечислите",
+            "что входит",
             "что входит в противопоказания",
             "список противопоказаний",
             "какие есть противопоказания",

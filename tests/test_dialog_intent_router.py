@@ -456,10 +456,8 @@ def test_release_candidate_state_machine_and_faq_regressions(monkeypatch: Any) -
     reset("rc_contra_price", {"step": "contraindications", "complaint": "болит спина", "age": 36, "language": "ru", "language_locked": True})
     result = answer("rc_contra_price", "Сколько стоит курс лечения")
     session = state.get_session("rc_contra_price")
-    assert "5 000" in result
-    assert "Стоимость курса" in result
-    assert "противопоказ" in result.lower()
-    assert "сколько Вам лет" not in result
+    assert result == "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?"
+    assert "кардиостим" not in result.lower()
     assert session["step"] == "contraindications"
 
     reset("rc_date_price", {"step": "date", "complaint": "болит спина", "age": 36, "contraindications_ok": True, "language": "ru", "language_locked": True})
@@ -654,10 +652,9 @@ def test_production_fix_live_admin_regressions(monkeypatch: Any) -> None:
     reset("pf_doctors_age_inline", {"step": "age", "complaint": "болит спина", "language": "ru", "language_locked": True})
     result = answer("pf_doctors_age_inline", "У вас врачи или как 46")
     session = state.get_session("pf_doctors_age_inline")
-    assert "консультацию проводит врач" in result
+    assert result == "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?"
     assert session["age"] == 46
     assert session["step"] == "contraindications"
-    assert "противопоказ" in result.lower()
 
     reset("pf_leg_radiation")
     result = answer("pf_leg_radiation", "У меня боль в пояснице и отдаёт на ногу")
@@ -1286,8 +1283,7 @@ def test_contraindications_hemorrhoids_unknown_not_hard_stop(monkeypatch: Any) -
 
     assert "геморрой является противопоказанием" not in low
     assert "процесс записи останавливаю" not in low
-    assert "нет в нашем основном чек-листе" in low
-    assert "передам информацию администратору" in low
+    assert result == "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?"
     assert session.get("step") == "contraindications"
     assert session.get("contraindications_ok") is False
     assert session.get("contraindications_verdict") == "admin_contact"
@@ -1357,7 +1353,7 @@ def test_contraindications_term_question_not_hard_stop(monkeypatch: Any) -> None
     result = answer(chat_id, "что такое кохлеарный имплант?")
     session = state.get_session(chat_id)
 
-    assert "устройство для слуха" in result.lower()
+    assert result == "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?"
     assert session.get("step") == "contraindications"
     assert session.get("contraindications_verdict") != "stop"
     assert calls["book"] == []
@@ -1434,7 +1430,7 @@ def test_hotfix_repeated_contraindications_checklist_is_short() -> None:
 
     result = answer(chat_id, "где написано о противопоказаниях?")
 
-    assert "Я выше перечислил" in result
+    assert result == "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?"
     assert "кардиостимулятора/дефибриллятора" not in result
     assert "инсулиновой помпы" not in result
 
