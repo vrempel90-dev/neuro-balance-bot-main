@@ -586,6 +586,9 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
     state.log_event(chat_id, "incoming_message_received", {"phone": phone, "kind": kind, "source": str(message.get("source") or "wazzup"), "text_preview": _preview(message.get("text"), 120)})
 
     source = str(message.get("source") or "wazzup")
+    if not is_bot_work_time():
+        _mark_working_hours_disabled(chat_id=chat_id, phone=phone, source=source, force=False, kind=kind, text=str(message.get("text") or ""))
+        return ""
     pre_session = _get_session_safe(chat_id)
     decision = should_auto_reply(message, pre_session, source=source, force=False, now=astana_now())
     # Tests and deployments patch main.is_bot_work_time as the public work-hours seam.
@@ -891,6 +894,18 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
     state.log_event(chat_id, "incoming_message_received", {"phone": phone, "kind": "text", "source": "debug", "text_preview": _preview(text, 120), "force": force})
 
     pre_session = state.get_session(chat_id)
+    if not force and not is_bot_work_time():
+        _mark_working_hours_disabled(chat_id=chat_id, phone=phone, source="debug", force=force, kind="text", text=text)
+        answer = ""
+        session = state.get_session(chat_id)
+        return {
+            "answer": answer,
+            "session": session,
+            "bot_work_time_now": is_bot_work_time(),
+            "last_bot_question_type": session.get("last_bot_question_type"),
+            "inferred_context_action": session.get("inferred_context_action"),
+            "debug": _dialog_debug(session, answer),
+        }
     decision = should_auto_reply(text, pre_session, source="debug", force=force, now=astana_now())
     if not decision.allowed and decision.no_reply_reason == "working_hours_ai_disabled" and is_bot_work_time():
         decision = GuardDecision(True, "", True, True, False)

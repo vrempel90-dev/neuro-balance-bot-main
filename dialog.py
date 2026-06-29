@@ -158,6 +158,22 @@ def build_safe_answer_for_current_state(session: dict[str, Any], user_text: str 
         _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "name_unknown", "step": "name", "answer_preview": answer[:160]})
         return answer, "name", updates
 
+    if current_step == "age" and not session.get("age"):
+        extracted_age = _extract_age(user_text, step="age")
+        if extracted_age:
+            session["age"] = extracted_age
+            session["step"] = "contraindications"
+            session["questionnaire_step"] = "contra"
+            updates.update({"age": extracted_age, "step": "contraindications", "questionnaire_step": "contra"})
+            answer = _ask_contra(session)
+            _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "age_extracted_at_age_step", "step": "contraindications", "age": extracted_age, "answer_preview": answer[:160]})
+            return answer, "contraindications", updates
+        session["step"] = "age"
+        updates["step"] = "age"
+        answer = _ask_age(session)
+        _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "age_step_prompt_recovered", "step": "age", "answer_preview": answer[:160]})
+        return answer, "age", updates
+
     if current_step == "contraindications":
         session["questionnaire_step"] = "contra"
         updates["questionnaire_step"] = "contra"
@@ -183,6 +199,15 @@ def build_safe_answer_for_current_state(session: dict[str, Any], user_text: str 
         return answer, "complaint", updates
 
     if not session.get("age"):
+        extracted_age = _extract_age(user_text, step="age")
+        if extracted_age:
+            session["age"] = extracted_age
+            session["step"] = "contraindications"
+            session["questionnaire_step"] = "contra"
+            updates.update({"age": extracted_age, "step": "contraindications", "questionnaire_step": "contra"})
+            answer = _ask_contra(session)
+            _safe_log(str(session.get("chat_id") or "system"), "safe_answer_built", {"reason": "age_extracted_from_empty_repair", "step": "contraindications", "age": extracted_age, "answer_preview": answer[:160]})
+            return answer, "contraindications", updates
         session["step"] = "age"
         updates["step"] = "age"
         answer = _ask_age(session)
@@ -1195,7 +1220,8 @@ NO_CONTRA_WORDS = [
     "из перечисленного ничего нет", "из того что вы перечислили ничего нет", "этого нет",
     "того, что перечислено, этого нет", "то что перечислено этого нет", "то что перечислено, этого нет",
     "по всем нет", "все нет", "всё нет",
-    "жоқ", "жок", "joq", "jok", "қарсы көрсетілім жоқ", "карсы корсетилим жок",
+    "жоқ", "жок", "joq", "jok", "жоқ жоқ", "жок жок", "қарсы көрсетілім жоқ", "карсы корсетилим жок",
+    "ештеңе жоқ", "ештене жоқ",
 ]
 
 REFUSAL_OR_IRRITATION_WORDS = [
@@ -2545,6 +2571,20 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
         if answer != safe_contra_answer:
             _safe_log(chat_id, "contraindications_checklist_final_repaired", {"chat_id": chat_id, "answer_preview": answer[:180]})
         answer = safe_contra_answer
+    if not answer and str(session.get("step") or "") == "age" and _is_active_new_ai_request(session):
+        extracted_age = _extract_age(str(session.get("last_user_text") or ""), step="age")
+        if extracted_age:
+            session["age"] = extracted_age
+            session["step"] = "contraindications"
+            session["questionnaire_step"] = "contra"
+            answer = _ask_contra(session)
+            session["repair_reason"] = "empty_answer_age_extracted"
+            session["fallback_reason"] = "empty_answer_age_extracted"
+        else:
+            answer = _ask_age(session)
+            session["repair_reason"] = "empty_answer_age_prompt"
+            session["fallback_reason"] = "empty_answer_age_prompt"
+        _safe_log(chat_id, "empty_answer_age_recovered", {"chat_id": chat_id, "from_step": before_step, "age": extracted_age or 0, "answer_preview": answer[:180]})
     if not answer and str(session.get("step") or "") == "time" and _is_active_new_ai_request(session):
         session["repair_reason"] = "empty_answer_time_recovered"
         session["fallback_reason"] = "empty_answer_time_recovered"
@@ -2575,8 +2615,11 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     # чтобы Wazzup не получал одинаковые сообщения подряд.
     last_answer = _clean(str(session.get("last_assistant_answer") or session.get("last_bot_answer") or ""))
     if last_answer and _low(last_answer) == _low(answer):
-        _safe_save(chat_id, session)
-        return ""
+        if str(session.get("step") or "") == "age" and _is_active_new_ai_request(session):
+            answer = _ask_age(session)
+        else:
+            _safe_save(chat_id, session)
+            return ""
 
     session["state_before_step"] = before_step
     session["state_after_step"] = session.get("step") or ""
@@ -2852,29 +2895,32 @@ def _extract_age(text: str, step: str = "") -> int | None:
     if re.search(r"\b\d{1,2}[:.]\d{2}\b", low):
         return None
 
-    # Прямые формы возраста RU/KZ.
+    # Не путать длительность боли с возрастом: "3 день болит" не возраст.
+    if re.search(r"\b\d{1,3}\s*(день|дня|дней|недел|неделя|месяц|месяцев|сутки)\b", low):
+        return None
+
+    # Прямые формы возраста RU/KZ, включая казахские слитные/дефисные окончания:
+    # "25те", "25 те", "25-де", "25 жаста", "жасым 25", "мен 25-темін".
     patterns = [
-        r"\bмне\s*(\d{1,2})\s*(?:лет|года|год)?\b",
-        r"\bмен\s*(\d{1,2})\s*(?:жастамын|жаста|жас)?\b",
-        r"\b(\d{1,2})\s*(?:лет|года|год|жас|жастамын|жаста)\b",
+        r"\bмне\s*(\d{1,3})\s*(?:лет|года|год)?\b",
+        r"\bжасым\s*(\d{1,3})\b",
+        r"\bмен\s*(\d{1,3})(?:\s*[-–—]?\s*(?:темін|темин|демін|демин|жастамын|жаста|жас))?\b",
+        r"\b(\d{1,3})(?:\s*[-–—]?\s*(?:те|де|темін|темин|демін|демин)|\s*(?:лет|года|год|жас|жастамын|жаста))\b",
     ]
     for pat in patterns:
         m = re.search(pat, low)
         if m:
             age = int(m.group(1))
-            if 1 <= age <= 99:
+            if 1 <= age <= 120:
                 return age
 
-    # Не путать длительность боли с возрастом: "3 день болит" не возраст.
-    if re.search(r"\b\d{1,2}\s*(день|дня|дней|недел|неделя|месяц|месяцев|сутки)\b", low):
-        return None
-
-    # Если мы явно ждём возраст — можно принять просто число.
-    nums = re.findall(r"\b(\d{1,2})\b", low)
-    if nums and step == "age":
-        age = int(nums[0])
-        if 1 <= age <= 99:
-            return age
+    # Если мы явно ждём возраст — можно принять первое число 1-120 даже если сразу после него идут буквы.
+    if step == "age":
+        m = re.search(r"(?<!\d)(\d{1,3})(?!\d)", low)
+        if m:
+            age = int(m.group(1))
+            if 1 <= age <= 120:
+                return age
 
     return None
 
@@ -3316,14 +3362,14 @@ def _ask_age(session: dict[str, Any]) -> str:
     return _tr(
         session,
         "Подскажите, пожалуйста, сколько Вам лет?",
-        "Жасыңыз нешеде?",
+        "Жасыңызды жаза аласыз ба?",
     )
 def _human_profile_age_answer(session: dict[str, Any], text: str) -> str:
     low = _low(text)
 
     if any(w in low for w in ["поясниц", "пояснич", "бел"]):
         ru = "Поняла Вас. Поясничная боль — по нашему направлению 🌿\nПодскажите, пожалуйста, сколько Вам лет?"
-        kk = "Түсіндім. Бел ауыруы біздің бағытқа жатады 🌿\nЖасыңыз нешеде?"
+        kk = "Түсіндім, беліңіз ауырып, ауырсыну санға беріліп тұр екен. Бұл біздің профиль 🌿 Жазылу үшін жасыңызды нақтылап алайын: Жасыңыз нешеде?"
     elif any(w in low for w in ["спина", "спине", "спину", "арқа", "арка"]):
         ru = "Поняла, спина беспокоит. Это наш профиль 🌿\nПодскажите, пожалуйста, сколько Вам лет?"
         kk = "Түсіндім, арқаңыз мазалап тұр екен. Бұл біздің бағыт 🌿\nЖасыңыз нешеде?"
@@ -3341,7 +3387,7 @@ def _human_profile_age_answer(session: dict[str, Any], text: str) -> str:
         kk = "Түсіндім. Буын бойынша да қабылдаймыз 🌿\nЖасыңыз нешеде?"
     else:
         ru = "Поняла Вас. Это относится к нашему профилю 🌿\nПодскажите, пожалуйста, сколько Вам лет?"
-        kk = "Түсіндім. Бұл біздің клиниканың бағытына жатады 🌿\nЖасыңыз нешеде?"
+        kk = "Түсіндім. Бұл біздің профиль 🌿 Жазылу үшін жасыңызды нақтылап алайын: Жасыңыз нешеде?"
 
     return _tr(session, ru, kk)
 
@@ -3395,7 +3441,7 @@ def _ask_contra(session: dict[str, Any]) -> str:
     return _tr(
         session,
         "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?",
-        "Жазбас бұрын қауіпсіздік үшін нақтылайын 🌿 Сізде қандай да бір Қарсы көрсетілімдер бар ма?",
+        "Жазылу алдында қауіпсіздік үшін нақтылап алайын 🌿 Қарсы көрсетілімдеріңіз бар ма?",
     )
 
 
@@ -4248,7 +4294,7 @@ def _accept_no_contra_and_advance(chat_id: str, session: dict[str, Any], text: s
     _safe_log(chat_id, "contraindications_clear_detected", {"text_preview": (text or "")[:180]})
     if session.get("preferred_date"):
         return ""
-    return _tr(session, "Отлично 🌿 На какой день Вам удобно прийти?", "Жақсы 🌿 Қай күн ыңғайлы?")
+    return _tr(session, "Отлично 🌿 На какой день Вам удобно прийти?", "Жақсы 🌿 Қай күнге жазылған ыңғайлы?")
 
 def _after_booking_admin_answer(text: str, session: dict[str, Any]) -> str:
     info = _faq_answer(text, session)
