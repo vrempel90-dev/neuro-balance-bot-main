@@ -1484,3 +1484,116 @@ def test_final_name_with_selected_slot_books_crm_without_admin_fallback(monkeypa
     assert "передам администратору" not in low
     assert "уточню" not in low
     assert "назовите имя" not in low
+
+
+def test_regression_contra_clear_long_phrase_never_reasks(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    reset("reg_contra_phrase", {"step": "contraindications", "age": 34, "language": "ru", "language_locked": True})
+
+    result = answer("reg_contra_phrase", "Из того что вы перечислили, ничего такого нет")
+    session = state.get_session("reg_contra_phrase")
+
+    assert session["contraindications_ok"] is True
+    assert session["step"] != "contraindications"
+    assert "противопоказ" not in result.lower()
+
+
+def test_regression_contra_ok_price_faq_resumes_date(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    reset("reg_contra_ok_price", {
+        "step": "date",
+        "complaint": "болит спина",
+        "age": 36,
+        "contraindications_ok": True,
+        "contraindications_verdict": "proceed",
+        "last_required_step": "contraindications",
+        "pending_step_after_faq": "contraindications",
+        "language": "ru",
+        "language_locked": True,
+    })
+
+    result = answer("reg_contra_ok_price", "А сколько стоит?")
+    session = state.get_session("reg_contra_ok_price")
+
+    assert "5 000" in result or "5000" in result
+    assert "противопоказ" not in result.lower()
+    assert session["step"] == "date"
+    assert session.get("last_required_step") != "contraindications"
+    assert session.get("pending_step_after_faq") != "contraindications"
+
+
+def test_regression_contra_ok_blocks_brain_next_contra(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+
+    async def fake_brain(**kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        return {
+            "intent": "faq",
+            "reply": "Подскажите, противопоказаний нет?",
+            "action": "ask_contraindications",
+            "next_step": "contraindications",
+            "extracted": {},
+            "needs_python_tool": "none",
+        }, {"openai_brain_used": True}
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+    reset("reg_brain_contra", {
+        "step": "date",
+        "complaint": "спина",
+        "age": 34,
+        "contraindications_ok": True,
+        "contraindications_verdict": "proceed",
+        "language": "ru",
+        "language_locked": True,
+    })
+
+    result = answer("reg_brain_contra", "хочу записаться")
+    session = state.get_session("reg_brain_contra")
+
+    assert session["repair_reason"] == "contraindications_already_ok"
+    assert session["step"] == "date"
+    assert "На какой день" in result
+    assert "противопоказ" not in result.lower()
+
+
+def test_regression_contra_ok_checklist_count_no_long_repeat(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    reset("reg_count", {
+        "step": "date",
+        "complaint": "спина",
+        "age": 34,
+        "contraindications_ok": True,
+        "contraindications_verdict": "proceed",
+        "contraindications_checklist_sent_count": 1,
+        "language": "ru",
+        "language_locked": True,
+    })
+
+    result = answer("reg_count", "повторите список противопоказаний")
+    session = state.get_session("reg_count")
+
+    assert session["contraindications_ok"] is True
+    assert "кардиостимулятор" not in result.lower()
+    assert "противопоказ" not in result.lower()
+
+
+def test_regression_contra_ok_sticky_after_faq_and_next_message(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    reset("reg_sticky", {
+        "step": "date",
+        "complaint": "спина",
+        "age": 34,
+        "contraindications_ok": True,
+        "contraindications_verdict": "proceed",
+        "language": "ru",
+        "language_locked": True,
+    })
+
+    first = answer("reg_sticky", "Где вы находитесь?")
+    session = state.get_session("reg_sticky")
+    assert session["contraindications_ok"] is True
+    assert "противопоказ" not in first.lower()
+
+    second = answer("reg_sticky", "спасибо")
+    session = state.get_session("reg_sticky")
+    assert session["contraindications_ok"] is True
+    assert session["contraindications_ok"] is not None

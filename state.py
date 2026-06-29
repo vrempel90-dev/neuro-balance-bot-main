@@ -161,6 +161,19 @@ def save_session(chat_id: str, data: dict[str, Any]) -> None:
     cleaned = dict(DEFAULT_SESSION)
     cleaned.update(data)
     with _connect() as conn:
+        row = conn.execute("SELECT data_json FROM sessions WHERE chat_id=?", (chat_id,)).fetchone()
+        if row:
+            try:
+                previous = json.loads(row["data_json"])
+            except Exception:
+                previous = {}
+            if previous.get("contraindications_ok") is True and cleaned.get("contraindications_ok") is not True:
+                verdict = str(cleaned.get("contraindications_verdict") or "")
+                # contraindications_ok=True is sticky unless the patient explicitly reports a real contraindication.
+                if verdict not in {"stop", "refuse", "admin_contact", "need_details"}:
+                    cleaned["contraindications_ok"] = True
+                    cleaned["contraindications_verdict"] = previous.get("contraindications_verdict") or "proceed"
+                    cleaned["contraindications_raw"] = cleaned.get("contraindications_raw") or previous.get("contraindications_raw") or ""
         conn.execute(
             """
             INSERT INTO sessions(chat_id, data_json, updated_at) VALUES (?, ?, ?)

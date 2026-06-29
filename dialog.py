@@ -250,6 +250,59 @@ def _repair_unknown_current_step(session: dict[str, Any], user_text: str = "") -
     return step, answer
 
 
+def _cleanup_contraindications_after_ok(session: dict[str, Any]) -> None:
+    """Once contraindications are cleared, never let state point back to that gate."""
+    if session.get("contraindications_ok") is not True:
+        return
+    if session.get("step") == "contraindications":
+        session["step"] = "date"
+        session["questionnaire_step"] = "date"
+    if session.get("last_required_step") == "contraindications":
+        session["last_required_step"] = ""
+        session["last_required_question"] = ""
+    if session.get("pending_step_after_faq") == "contraindications":
+        session["pending_step_after_faq"] = ""
+
+
+def _answer_contains_contraindications_question(answer: str) -> bool:
+    low = _low(answer)
+    if not low:
+        return False
+    contra = "противопоказ" in low or "қарсы көрсет" in low or "карсы корсет" in low
+    checklist_terms = [
+        "кардиостимулятор", "дефибриллятор", "инсулинов", "кохлеар", "беремен",
+        "онколог", "эпилеп", "судорог", "тромбоз", "свёртываем", "свертываем",
+        "тиреотоксикоз", "ограниченной подвиж", "коляска", "костыли",
+    ]
+    asks = "?" in low or any(x in low for x in ["нет", "уточ", "подскаж", "жоқ", "жок"])
+    return (contra and asks) or sum(1 for term in checklist_terms if term in low) >= 2
+
+
+def _repair_after_contraindications_ok(session: dict[str, Any]) -> tuple[str, str]:
+    """Controller-owned continuation when Brain tries to reopen contraindications."""
+    session["llm_blocked"] = True
+    session["llm_repaired"] = True
+    session["repair_reason"] = "contraindications_already_ok"
+    if session.get("last_slots") and not session.get("selected_slot"):
+        session["step"] = "time"
+        session["questionnaire_step"] = "time"
+        answer = "Какое окошко Вам удобно?"
+    elif session.get("selected_slot") and not session.get("patient_name"):
+        session["step"] = "name"
+        session["questionnaire_step"] = "name"
+        answer = "Подскажите, пожалуйста, Ваше имя для записи."
+    elif not session.get("preferred_date"):
+        session["step"] = "date"
+        session["questionnaire_step"] = "date"
+        answer = "Отлично 🌿 На какой день Вам удобно прийти?"
+    else:
+        session["step"] = "date"
+        session["questionnaire_step"] = "date"
+        answer = "На какой день Вам удобно прийти?"
+    _cleanup_contraindications_after_ok(session)
+    return str(session.get("step") or "date"), answer
+
+
 def repair_invalid_llm_response(reason: str, session: dict[str, Any], user_text: str, attempted_reply: str, llm_decision: dict[str, Any]) -> RepairResult:
     """Block an invalid LLM decision and return a safe controller-owned answer."""
     normalized = {
@@ -275,7 +328,10 @@ def repair_invalid_llm_response(reason: str, session: dict[str, Any], user_text:
             session["age"] = int(extracted.get("age"))
         except Exception:
             pass
-    if normalized == "slot_hallucination":
+    if normalized == "contraindications_already_ok":
+        repaired_step, answer = _repair_after_contraindications_ok(session)
+        event = "llm_contraindications_already_ok_repaired"
+    elif normalized == "slot_hallucination":
         session["last_slots"] = []
         session["selected_slot"] = None
         session["step"] = "date"
@@ -392,6 +448,9 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
     reply = str(decision.get("reply") or "")
     step = str(session.get("step") or "start")
     next_step = str(decision.get("next_step") or "")
+    if session.get("contraindications_ok") is True:
+        if next_step == "contraindications" or action == "ask_contraindications" or _answer_contains_contraindications_question(reply):
+            return False, "contraindications_already_ok"
     if action == "show_slots" and tool != "check_slots":
         return False, "slots_without_crm_tool"
     if tool == "check_slots" and action != "show_slots":
@@ -599,6 +658,11 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         return _finalize(chat_id, session, reply or _ask_name(session))
     if action == "answer_faq_and_continue":
         pending = str(session.get("pending_step_after_faq") or session.get("last_required_step") or session.get("step") or "complaint")
+        if session.get("contraindications_ok") is True and pending == "contraindications":
+            _, prompt = _repair_after_contraindications_ok(session)
+            pending = str(session.get("step") or "date")
+            session["pending_step_after_faq"] = ""
+            return _finalize(chat_id, session, reply + ("\n\n" + prompt if reply else prompt))
         if pending in {"time", "select_slot"} and session.get("last_slots"):
             session["step"] = "time"
         elif pending in {"complaint", "age", "contraindications", "date", "name"}:
@@ -1666,6 +1730,10 @@ def _is_no_contra_answer(text: str) -> bool:
         "нет противопоказаний", "ограничений нет", "не противопоказаний",
         "все чисто", "всё чисто", "чисто", "все нормально", "всё нормально", "нормально",
         "ничего такого нет", "ничего из этого нет", "нет ничего из перечисленного",
+        "ничего из перечисленного нет", "из того что вы перечислили ничего нет",
+        "из того что вы перечислили ничего такого нет", "того что перечислено нет",
+        "то что перечислено этого нет", "то что перечислено, этого нет",
+        "этого нет", "по списку ничего нет", "нет, ничего такого нет",
         "по всем нет", "все нет", "всё нет",
         "жоқ", "жок", "қарсы көрсетілім жоқ", "карсы корсетилим жок",
         "қарсы көрсетілімдер жоқ", "карсы корсетилимдер жок",
@@ -2238,6 +2306,14 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     if repaired and _is_active_new_ai_request(session) and not answer:
         answer, _, _ = build_safe_answer_for_current_state(session, str(session.get("last_user_text") or ""))
         session["fallback_reason"] = "state_inconsistency_repaired"
+    if session.get("contraindications_ok") is True and (str(session.get("step") or "") == "contraindications" or _answer_contains_contraindications_question(answer)):
+        repaired_step, repaired_answer = _repair_after_contraindications_ok(session)
+        if not _answer_contains_contraindications_question(answer):
+            answer = answer
+        else:
+            answer = repaired_answer
+        _safe_log(chat_id, "contraindications_ok_final_guard_repaired", {"chat_id": chat_id, "repaired_step": repaired_step, "answer_preview": answer[:180]})
+    _cleanup_contraindications_after_ok(session)
     answer = _validate_final_fact_answer(chat_id, session, answer)
     if not (session.get("step") == "booked" and session.get("booking_confirmed") is True):
         answer = _remove_name_addressing(answer, session)
@@ -2304,7 +2380,9 @@ def _remember_required_question(session: dict[str, Any], answer: str) -> None:
         "time": "time",
         "name": "name",
     }
-    if qtype in step_by_type:
+    if qtype == "contraindications" and session.get("contraindications_ok") is True:
+        _cleanup_contraindications_after_ok(session)
+    elif qtype in step_by_type:
         session["last_required_question"] = answer
         session["last_required_step"] = step_by_type[qtype]
         session["pending_step_after_faq"] = ""
@@ -3737,6 +3815,7 @@ def _accept_no_contraindications(session: dict[str, Any], text: str) -> None:
     session["contraindications_raw"] = raw
     session["contraindications_verdict"] = "proceed"
     bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, raw)
+    _cleanup_contraindications_after_ok(session)
 
 
 
@@ -3747,8 +3826,10 @@ def _is_contra_clear_hotfix_phrase(text: str) -> bool:
     phrases = [
         "противопоказаний нет", "нет противопоказаний", "по списку ничего нет",
         "ничего из перечисленного нет", "того что перечислено нет",
-        "то что перечислено этого нет", "этого нет", "ничего нет", "всё чисто",
-        "все чисто", "нету", "не имеется",
+        "то что перечислено этого нет", "то что перечислено, этого нет",
+        "из того что вы перечислили ничего нет", "из того что вы перечислили ничего такого нет",
+        "нет, ничего такого нет", "этого нет", "ничего нет", "ничего такого нет",
+        "всё чисто", "все чисто", "нету", "не имеется",
     ]
     return any(compact == re.sub(r"[\s.!?,🙏🌿❤️❤]+", "", phrase) for phrase in phrases)
 
