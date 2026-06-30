@@ -556,9 +556,28 @@ def repair_invalid_llm_response(reason: str, session: dict[str, Any], user_text:
         answer = "Перед тем как подобрать окошко, уточню важный момент по безопасности 🌿 Противопоказаний из списка нет?"
         event = "llm_date_before_contraindications_repaired"
     elif normalized == "book_without_selected_slot":
-        session["step"] = "date"
-        session["questionnaire_step"] = "date"
-        answer = "Сначала нужно выбрать удобное окошко из актуального расписания 🌿 На какой день Вам удобно прийти?"
+        slot = _select_slot(user_text, session.get("last_slots") or [])
+        if slot:
+            _remember_selected_slot(session, slot)
+            if session.get("selected_slot"):
+                session["step"] = "name"
+                session["questionnaire_step"] = "name"
+                answer = _ask_name(session)
+            else:
+                session["step"] = "time"
+                answer = _slot_times_answer(session)
+        elif session.get("selected_time") and session.get("selected_slot"):
+            session["step"] = "name"
+            session["questionnaire_step"] = "name"
+            answer = _ask_name(session)
+        elif session.get("last_slots"):
+            session["step"] = "time"
+            session["questionnaire_step"] = "time"
+            answer = _slot_times_answer(session)
+        else:
+            session["step"] = "date"
+            session["questionnaire_step"] = "date"
+            answer = "Сначала нужно выбрать удобное окошко из актуального расписания 🌿 На какой день Вам удобно прийти?"
         event = "llm_book_without_selected_slot_repaired"
     else:
         normalized = "unknown_invalid_llm"
@@ -2640,6 +2659,16 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
             session["fallback_reason"] = "empty_answer_age_prompt"
         _safe_log(chat_id, "empty_answer_age_recovered", {"chat_id": chat_id, "from_step": before_step, "age": extracted_age or 0, "answer_preview": answer[:180]})
     if not answer and str(session.get("step") or "") == "time" and _is_active_new_ai_request(session):
+        slot = _select_slot(str(session.get("last_user_text") or ""), session.get("last_slots") or [])
+        if session.get("llm_blocked") and slot:
+            _remember_selected_slot(session, slot)
+            if session.get("selected_slot"):
+                session["step"] = "name"
+                session["questionnaire_step"] = "name"
+                answer = _ask_name(session)
+                session["repair_reason"] = "blocked_llm_time_selection_recovered"
+                session["fallback_reason"] = "blocked_llm_time_selection_recovered"
+                _safe_log(chat_id, "blocked_llm_time_selection_recovered", {"chat_id": chat_id, "from_step": before_step, "selected_time": session.get("selected_time") or ""})
         session["repair_reason"] = "empty_answer_time_recovered"
         session["fallback_reason"] = "empty_answer_time_recovered"
         _safe_log(chat_id, "empty_answer_time_recovered", {"chat_id": chat_id, "from_step": before_step, "preferred_date": session.get("preferred_date") or "", "slots_count": len(session.get("last_slots") or [])})
@@ -2648,6 +2677,8 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
             "Сейчас уточню свободные окошки и напишу Вам варианты 🌿",
             "Қазір бос уақыттарды нақтылап, Сізге нұсқаларын жазамын 🌿",
         )
+    if session.get("llm_blocked") and not answer and str(session.get("step") or "") == "name" and session.get("selected_time"):
+        answer = f"Пока ещё нет 🌿 Я выбрала время {session.get('selected_time')}, осталось только Ваше имя для записи."
     if not answer and _is_active_new_ai_request(session):
         repair = repair_empty_active_reply(session, str(session.get("last_user_text") or ""), "empty_active_reply")
         session["fallback_reason"] = "empty_active_reply"
@@ -3104,7 +3135,7 @@ def _format_slots(slots_data: dict[str, Any], max_count: int = 5) -> list[dict[s
     for item in slots_data.get("availability", []) or []:
         doctor_login = item.get("doctorLogin") or item.get("doctor_login") or ""
         doctor_name = item.get("doctorName") or item.get("doctor_name") or "Врач клиники"
-        date = item.get("date") or ""
+        date = item.get("date") or slots_data.get("date") or ""
         for time_start in item.get("availableSlots", []) or item.get("slots", []) or []:
             if isinstance(time_start, dict):
                 time_start = time_start.get("timeStart") or time_start.get("time") or ""
@@ -3119,8 +3150,6 @@ def _format_slots(slots_data: dict[str, Any], max_count: int = 5) -> list[dict[s
                 "doctor_name": str(doctor_name),
                 "time": str(time_start),
             })
-            if len(result) >= max_count:
-                return result
 
     # Fallback format: {"slots":[...]}
     for item in slots_data.get("slots", []) or []:
@@ -3139,10 +3168,8 @@ def _format_slots(slots_data: dict[str, Any], max_count: int = 5) -> list[dict[s
                 "doctor_name": doctor_name,
                 "time": time_start,
             })
-        if len(result) >= max_count:
-            return result
 
-    return result
+    return sanitize_slots(result)[:max_count]
 
 
 def _filter_slots_by_time_preference(slots: list[dict[str, Any]], pref: str) -> list[dict[str, Any]]:
@@ -3252,6 +3279,34 @@ def _slot_time(slot: dict[str, Any]) -> str:
     return str(slot.get("time") or slot.get("timeStart") or slot.get("time_start") or "")
 
 
+RESERVE_LOGINS = {"", "reserve", "rezerv", "reserved", "fallback"}
+
+
+def _is_reserve_slot(slot: dict[str, Any]) -> bool:
+    login = _slot_doctor_login(slot).strip().lower()
+    name = _slot_doctor_name(slot).strip().lower()
+    return (
+        login in RESERVE_LOGINS
+        or not name
+        or "резерв" in name
+        or name in {"reserve", "rezerv", "reserved", "fallback"}
+    )
+
+
+def sanitize_slots(slots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only real CRM slots with a concrete doctor; never expose reserve slots."""
+    clean: list[dict[str, Any]] = []
+    for slot in slots or []:
+        if not isinstance(slot, dict):
+            continue
+        if not (_slot_date(slot) and _slot_time(slot) and _slot_doctor_login(slot) and _slot_doctor_name(slot)):
+            continue
+        if _is_reserve_slot(slot):
+            continue
+        clean.append(slot)
+    return clean
+
+
 def _selected_slot_from_session(session: dict[str, Any]) -> dict[str, Any]:
     """Build a CRM booking slot from denormalized selected_* fields."""
     return {
@@ -3272,6 +3327,14 @@ def _booking_ready(session: dict[str, Any], phone: str = "") -> bool:
     except (TypeError, ValueError):
         age_ok = False
     normalized_phone = sanitize_kz_phone(phone or session.get("phone") or "")
+    slot = session.get("selected_slot") if isinstance(session.get("selected_slot"), dict) else {}
+    if not slot and session.get("selected_date") and session.get("selected_time") and session.get("selected_doctor_login") and session.get("selected_doctor_name"):
+        slot = _selected_slot_from_session(session)
+    login = str(session.get("selected_doctor_login") or _slot_doctor_login(slot) or "").strip().lower()
+    name = str(session.get("selected_doctor_name") or _slot_doctor_name(slot) or "").strip()
+    if login in RESERVE_LOGINS or "резерв" in name.lower() or not name:
+        session["booking_ready"] = False
+        return False
     return bool(
         session.get("patient_name")
         and normalized_phone
@@ -3280,7 +3343,8 @@ def _booking_ready(session: dict[str, Any], phone: str = "") -> bool:
         and session.get("contraindications_ok") is True
         and session.get("selected_date")
         and session.get("selected_time")
-        and (session.get("selected_doctor_login") or session.get("selected_doctor_name"))
+        and session.get("selected_doctor_login")
+        and session.get("selected_doctor_name")
     )
 
 
@@ -3317,7 +3381,7 @@ def _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | Non
     t = _time_from_text(text)
     if t:
         for slot in slots:
-            if _slot_time(slot) == t:
+            if _slot_time(slot) == t and not _is_reserve_slot(slot):
                 return slot
 
     return None
@@ -3335,6 +3399,13 @@ def _explicit_slot_selection_text(text: str, slots: list[dict[str, str]]) -> boo
 
 def _remember_selected_slot(session: dict[str, Any], slot: dict[str, Any]) -> None:
     """Persist the exact CRM slot payload and denormalized booking fields."""
+    if _is_reserve_slot(slot) or not (_slot_date(slot) and _slot_time(slot) and _slot_doctor_login(slot) and _slot_doctor_name(slot)):
+        session.pop("selected_slot", None)
+        session["slot_selection_rejected_reason"] = "reserve_or_invalid_slot"
+        session["selected_time"] = ""
+        session["selected_doctor_login"] = ""
+        session["selected_doctor_name"] = ""
+        return
     last_slots = session.get("last_slots") or []
     if last_slots and not any(existing == slot for existing in last_slots if isinstance(existing, dict)):
         session.pop("selected_slot", None)
@@ -3584,8 +3655,8 @@ def _senior_contra_intro(session: dict[str, Any]) -> str:
 def _ask_contra(session: dict[str, Any]) -> str:
     return _tr(
         session,
-        CONTRAINDICATIONS_MESSAGE_RU + "\n\nПодскажите, пожалуйста, у Вас ничего из этого нет?",
-        CONTRAINDICATIONS_MESSAGE_RU + "\n\nПодскажите, пожалуйста, у Вас ничего из этого нет?",
+        "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?",
+        "Қарсы көрсетілімдеріңіз бар ма?",
     )
 
 
@@ -3608,7 +3679,7 @@ def _contra_details_question(text: str) -> bool:
 def _contra_detailed_list(session: dict[str, Any]) -> str:
     sent_count = int(session.get("contraindications_checklist_sent_count") or 0)
     session["contraindications_checklist_sent_count"] = sent_count + 1
-    return _ask_contra(session)
+    return "Основные противопоказания:\n" + CONTRAINDICATIONS_MESSAGE_RU + "\n\nПодскажите, пожалуйста, у Вас ничего из этого нет?"
 
 
 def _ask_date(session: dict[str, Any]) -> str:
@@ -3620,6 +3691,12 @@ def _ask_date(session: dict[str, Any]) -> str:
 
 
 def _ask_name(session: dict[str, Any]) -> str:
+    if session.get("selected_time") and session.get("selected_doctor_name"):
+        return _tr(
+            session,
+            f"Хорошо, предварительно выбрала {session['selected_time']} к врачу {session['selected_doctor_name']} 🌿 Подскажите, пожалуйста, Ваше имя для записи.",
+            f"Жақсы, {session['selected_time']} уақытына {session['selected_doctor_name']} дәрігеріне алдын ала таңдадым 🌿 Жазылу үшін атыңызды жазыңызшы.",
+        )
     return _tr(
         session,
         "Хорошо, это окошко можем закрепить за Вами 🌿 Подскажите, пожалуйста, Ваше имя для оформления записи.",
@@ -3718,6 +3795,10 @@ def _video_procedure_answer(session: dict[str, Any]) -> str:
 async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> str:
     session["preferred_date"] = date_iso
     lang = session.get("language") or "ru"
+    if not session.get("time_preference"):
+        user_text = str(session.get("last_user_text") or "")
+        if any(p in _low(user_text) for p in TIME_PREFERENCE_WORDS):
+            session["time_preference"] = next((p for p in TIME_PREFERENCE_WORDS if p in _low(user_text)), "")
 
     try:
         max_slots = 5
@@ -3728,6 +3809,8 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
                 pass
 
         data = await crm.check_slots(date_iso, doctor_login=(session.get("selected_doctor_login") or None))
+        if isinstance(data, dict):
+            data.setdefault("date", date_iso)
         all_slots = _format_slots(data, max_count=max_slots)
         pref_kind = _time_pref_kind(str(session.get("time_preference") or ""))
         slots = _slots_for_time_pref(all_slots, pref_kind) if pref_kind else all_slots
@@ -3746,12 +3829,29 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
             session["last_slots"] = alternative_slots
             session["step"] = "time" if alternative_slots else "date"
             return _tr(session, answer, answer)
+        try:
+            nearest = await crm.find_nearest_available_slots(date_iso, days_ahead=14, doctor_login=(session.get("selected_doctor_login") or None), time_preference=(session.get("time_preference") or None))
+            nearest_slots = sanitize_slots(_format_slots(nearest, max_count=max_slots))
+        except Exception:
+            nearest_slots = []
+        if nearest_slots:
+            session["last_slots"] = nearest_slots
+            session["preferred_date"] = _slot_date(nearest_slots[0]) or date_iso
+            session["step"] = "time"
+            session["crm_availability_empty"] = False
+            return _tr(
+                session,
+                "Нашла ближайшие свободные окошки:\n" + _slots_text(nearest_slots, lang) + "\n\nКакое время Вам удобно?",
+                "Жақын бос уақыттарды таптым:\n" + _slots_text(nearest_slots, lang) + "\n\nҚай уақыт ыңғайлы?",
+            )
         session["last_slots"] = []
         session.pop("selected_slot", None)
-        session["step"] = "date"
+        session["step"] = "escalated"
+        session["manual_takeover"] = True
+        session["escalated"] = True
         session["crm_availability_empty"] = True
         _safe_log(chat_id, "crm_slots_empty", {"chat_id": chat_id, "date": date_iso, "step": session.get("step") or "date", "slots_count": 0})
-        return _no_slots_text(session)
+        return "Сейчас свободные окошки нужно уточнить у администратора 🌿 Передам Вас, чтобы подобрали удобное время или другой подходящий день."
 
     session["crm_availability_empty"] = False
     session["last_slots"] = slots
@@ -3792,6 +3892,8 @@ async def _recover_empty_time_slots(chat_id: str, session: dict[str, Any], text:
             except Exception:
                 pass
         data = await crm.check_slots(preferred_date, doctor_login=(session.get("selected_doctor_login") or None))
+        if isinstance(data, dict):
+            data.setdefault("date", preferred_date)
         all_slots = _format_slots(data, max_count=max_slots)
         pref_kind = _time_pref_kind(str(session.get("time_preference") or ""))
         slots = _slots_for_time_pref(all_slots, pref_kind) if pref_kind else all_slots
@@ -3874,6 +3976,16 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
     if not slot:
         session["step"] = "date"
         return _ask_date(session)
+    if _is_reserve_slot(slot) or not (_slot_date(slot) and _slot_time(slot) and _slot_doctor_login(slot) and _slot_doctor_name(slot)):
+        session["booking_ready"] = False
+        session["crm_called"] = False
+        session["manual_takeover"] = False
+        session.pop("selected_slot", None)
+        session["selected_doctor_login"] = ""
+        session["selected_doctor_name"] = ""
+        session["step"] = "time" if session.get("last_slots") else "date"
+        _safe_log(chat_id, "booking_payload_blocked_reserve_or_invalid_slot", {"chat_id": chat_id, "step": session.get("step") or "", "doctor_login": _slot_doctor_login(slot), "doctor_name": _slot_doctor_name(slot)})
+        return "Сейчас уточню свободное время у администратора, чтобы записать Вас корректно 🌿"
     last_slots = session.get("last_slots") or []
     if last_slots and not any(existing == slot for existing in last_slots if isinstance(existing, dict)):
         session.pop("selected_slot", None)

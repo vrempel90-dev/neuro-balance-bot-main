@@ -1910,3 +1910,117 @@ def test_faq_types_at_every_active_step_never_return_empty() -> None:
             reset(chat_id, dict(preset))
             result = answer(chat_id, text)
             assert result.strip(), f"{faq_type} FAQ returned empty answer at step={step}"
+
+
+def test_production_slash_time_selects_real_slot_without_booking(monkeypatch: Any) -> None:
+    chat_id = "prod_slash_1120"
+    calls = setup_crm(monkeypatch)
+    slots = [{"doctorLogin":"kaisar_k","doctorName":"Куанышулы Кайсар Куанышулы","date":"2026-07-03","timeStart":"11:20","doctor_login":"kaisar_k","doctor_name":"Куанышулы Кайсар Куанышулы","time":"11:20"}]
+    reset(chat_id, {"step":"time", "last_slots": slots, "selected_time":"", "patient_name":"", "complaint":"спина", "age": 35, "contraindications_ok": True})
+
+    result = answer(chat_id, "11/20")
+    session = state.get_session(chat_id)
+
+    assert result
+    assert session["selected_time"] == "11:20"
+    assert session["selected_date"] == "2026-07-03"
+    assert session["selected_doctor_login"] == "kaisar_k"
+    assert session["selected_doctor_name"] == "Куанышулы Кайсар Куанышулы"
+    assert session["step"] == "name"
+    assert "Подскажите, пожалуйста, Ваше имя" in result
+    assert calls["book"] == []
+    assert dialog._booking_ready(session, "77011234567") is False
+
+
+def test_production_slash_time_0920_normalized(monkeypatch: Any) -> None:
+    chat_id = "prod_slash_0920"
+    setup_crm(monkeypatch)
+    slots = [{"doctorLogin":"kaisar_k","doctorName":"Куанышулы Кайсар Куанышулы","date":"2026-07-03","timeStart":"09:20","doctor_login":"kaisar_k","doctor_name":"Куанышулы Кайсар Куанышулы","time":"09:20"}]
+    reset(chat_id, {"step":"time", "last_slots": slots, "selected_time":"", "patient_name":""})
+
+    answer(chat_id, "9/20")
+    session = state.get_session(chat_id)
+
+    assert session["selected_time"] == "09:20"
+    assert session["step"] == "name"
+
+
+def test_production_reserve_slots_filtered_when_showing(monkeypatch: Any) -> None:
+    chat_id = "prod_reserve_filtered"
+    calls = setup_crm(monkeypatch)
+
+    async def fake_check_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
+        calls["slots"].append({"date": date, "doctor_login": doctor_login})
+        return {"availability": [
+            {"doctorLogin":"reserve", "doctorName":"Резерв", "date": date, "availableSlots":["10:00"]},
+            {"doctorLogin":"kaisar_k", "doctorName":"Куанышулы Кайсар Куанышулы", "date": date, "availableSlots":["11:20"]},
+        ]}
+
+    monkeypatch.setattr(crm, "check_slots", fake_check_slots)
+    reset(chat_id, {"step":"date", "complaint":"спина", "age": 35, "contraindications_ok": True})
+    session = state.get_session(chat_id)
+
+    result = run(dialog._show_slots(chat_id, session, "2026-07-03"))
+    state.save_session(chat_id, session)
+    session = state.get_session(chat_id)
+
+    assert len(session["last_slots"]) == 1
+    assert session["last_slots"][0]["doctorLogin"] == "kaisar_k"
+    assert "Резерв" not in result
+    assert "10:00" not in result
+    assert "11:20" in result
+
+
+def test_production_only_reserve_slots_escalates_after_range_empty(monkeypatch: Any) -> None:
+    chat_id = "prod_only_reserve"
+    calls = setup_crm(monkeypatch)
+
+    async def fake_check_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
+        calls["slots"].append({"date": date, "doctor_login": doctor_login})
+        return {"availability": [{"doctorLogin":"reserve", "doctorName":"Резерв", "date": date, "availableSlots":["10:00"]}]}
+
+    async def fake_nearest(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"slots": [{"doctorLogin":"reserve", "doctorName":"Резерв", "date":"2026-07-04", "timeStart":"10:00"}]}
+
+    monkeypatch.setattr(crm, "check_slots", fake_check_slots)
+    monkeypatch.setattr(crm, "find_nearest_available_slots", fake_nearest)
+    reset(chat_id, {"step":"date", "complaint":"спина", "age": 35, "contraindications_ok": True})
+    session = state.get_session(chat_id)
+
+    result = run(dialog._show_slots(chat_id, session, "2026-07-03"))
+    state.save_session(chat_id, session)
+    session = state.get_session(chat_id)
+
+    assert session.get("last_slots") == []
+    assert session.get("manual_takeover") is True
+    assert session.get("escalated") is True
+    assert calls["book"] == []
+    assert "администратор" in result.lower() or "администратора" in result.lower()
+
+
+def test_production_booking_ready_blocks_reserve_and_empty_login(monkeypatch: Any) -> None:
+    setup_crm(monkeypatch)
+    base = {"patient_name":"Алия", "phone":"77011234567", "complaint":"спина", "age":35, "contraindications_ok": True, "selected_date":"2026-07-03", "selected_time":"11:20", "selected_doctor_name":"Резерв", "selected_slot":{"doctorLogin":"reserve", "doctorName":"Резерв", "date":"2026-07-03", "timeStart":"11:20"}}
+    assert dialog._booking_ready({**base, "selected_doctor_login":"reserve"}, "77011234567") is False
+    assert dialog._booking_ready({**base, "selected_doctor_login":"", "selected_doctor_name":"Куанышулы Кайсар Куанышулы", "selected_slot":{"doctorLogin":"", "doctorName":"Куанышулы Кайсар Куанышулы", "date":"2026-07-03", "timeStart":"11:20"}}, "77011234567") is False
+
+
+def test_production_llm_book_before_name_repaired_to_ask_name(monkeypatch: Any) -> None:
+    chat_id = "prod_llm_book_before_name"
+    calls = setup_crm(monkeypatch)
+
+    async def fake_brain(**kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+        return ({"action":"ask_name", "next_step":"booked", "reply":"", "extracted":{}, "needs_python_tool":"book_appointment"}, {"openai_brain_used": True})
+
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+    slots = [{"doctorLogin":"kaisar_k","doctorName":"Куанышулы Кайсар Куанышулы","date":"2026-07-03","timeStart":"11:20","doctor_login":"kaisar_k","doctor_name":"Куанышулы Кайсар Куанышулы","time":"11:20"}]
+    reset(chat_id, {"step":"time", "last_slots": slots, "selected_time":"", "patient_name":"", "complaint":"спина", "age": 35, "contraindications_ok": True})
+
+    result = answer(chat_id, "11/20")
+    session = state.get_session(chat_id)
+
+    assert session.get("llm_blocked") is True
+    assert result
+    assert session["step"] == "name"
+    assert session["selected_time"] == "11:20"
+    assert calls["book"] == []
