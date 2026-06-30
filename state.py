@@ -66,6 +66,11 @@ DEFAULT_SESSION = {
     "last_required_question": "",
     "last_required_question_count": 0,
     "last_slots": [],
+    "first_touch_info_sent": False,
+    "conversation_turns_count": 0,
+    "booking_confirmed": False,
+    "manual_takeover": False,
+    "ai_muted": False,
     "escalated": False,
 }
 
@@ -308,6 +313,8 @@ def determine_next_step(session: dict[str, Any]) -> str:
         return "booked"
     if session.get("manual_takeover") is True or session.get("escalated") is True:
         return "escalated"
+    if session.get("first_touch_info_sent") is not True and int(session.get("conversation_turns_count") or 0) == 0:
+        return "first_touch"
     try:
         age_ok = int(session.get("age") or 0) > 0
     except (TypeError, ValueError):

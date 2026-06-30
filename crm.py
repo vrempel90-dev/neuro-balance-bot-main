@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Any
+from datetime import date as date_cls, datetime, timedelta
 import logging
 import time
 import re
@@ -229,6 +230,62 @@ async def check_slots(date: str, doctor_login: str | None = None) -> dict[str, A
 
     _SLOTS_CACHE[cache_key] = (now, normalized)
     return normalized
+
+
+def _iso_date(value: str | date_cls) -> str:
+    if isinstance(value, date_cls):
+        return value.isoformat()
+    return str(value)[:10]
+
+def _time_hour(slot: dict[str, Any]) -> int:
+    t = str(slot.get("time") or slot.get("timeStart") or slot.get("time_start") or "0:00")
+    try:
+        return int(t.split(":", 1)[0])
+    except Exception:
+        return 0
+
+def _filter_time_preference(slots: list[dict[str, Any]], time_preference: str | None) -> list[dict[str, Any]]:
+    low = str(time_preference or "").lower()
+    if not low:
+        return slots
+    if any(x in low for x in ("до обеда", "утром", "с утра", "morning")):
+        return [s for s in slots if _time_hour(s) < 12]
+    if any(x in low for x in ("после обеда", "днем", "днём", "afternoon")):
+        return [s for s in slots if 12 <= _time_hour(s) < 18]
+    if any(x in low for x in ("вечер", "evening")):
+        return [s for s in slots if _time_hour(s) >= 17]
+    return slots
+
+async def check_slots_for_date(date: str | date_cls, doctor_login: str | None = None) -> dict[str, Any]:
+    return await check_slots(_iso_date(date), doctor_login=doctor_login)
+
+async def check_slots_range(date_from: str | date_cls, date_to: str | date_cls, doctor_login: str | None = None) -> dict[str, Any]:
+    start = datetime.fromisoformat(_iso_date(date_from)).date()
+    end = datetime.fromisoformat(_iso_date(date_to)).date()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    slots: list[dict[str, Any]] = []
+    current = start
+    while current <= end:
+        data = await check_slots_for_date(current, doctor_login=doctor_login)
+        day_slots = list(data.get("slots") or [])
+        if day_slots:
+            grouped[current.isoformat()] = day_slots
+            slots.extend(day_slots)
+        current += timedelta(days=1)
+    return {"ok": True, "date_from": start.isoformat(), "date_to": end.isoformat(), "grouped": grouped, "slots": slots}
+
+async def find_nearest_available_slots(start_date: str | date_cls, days_ahead: int = 14, doctor_login: str | None = None, time_preference: str | None = None) -> dict[str, Any]:
+    start = datetime.fromisoformat(_iso_date(start_date)).date()
+    end = start + timedelta(days=max(0, int(days_ahead or 14)) - 1)
+    data = await check_slots_range(start, end, doctor_login=doctor_login)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    all_slots: list[dict[str, Any]] = []
+    for day, day_slots in (data.get("grouped") or {}).items():
+        filtered = _filter_time_preference(list(day_slots or []), time_preference)
+        if filtered:
+            grouped[day] = filtered
+            all_slots.extend(filtered)
+    return {**data, "grouped": grouped, "slots": all_slots, "all_slots_unfiltered": data.get("slots") or [], "ok": True}
 
 
 async def book_appointment(
