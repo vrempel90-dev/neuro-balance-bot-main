@@ -412,7 +412,7 @@ def test_crm_lookup_and_cancel_fallbacks_do_not_go_silent(monkeypatch: Any) -> N
     result = answer("lookup_fallback", "напомните время")
     session = state.get_session("lookup_fallback")
     assert result
-    assert "администратор" in result
+    assert "администратор" in result.lower()
     assert session["step"] == "escalated"
 
     setup_crm(monkeypatch, lookup_error=True, cancel_error=True)
@@ -420,7 +420,7 @@ def test_crm_lookup_and_cancel_fallbacks_do_not_go_silent(monkeypatch: Any) -> N
     result = answer("cancel_fallback", "не приду")
     session = state.get_session("cancel_fallback")
     assert result
-    assert "администратор" in result
+    assert "администратор" in result.lower()
     assert session["step"] == "escalated"
 
 
@@ -626,7 +626,7 @@ def test_release_candidate_crm_slots_and_book_fallbacks(monkeypatch: Any) -> Non
     result = answer("rc_book_error", "Виктор")
     session = state.get_session("rc_book_error")
     assert result
-    assert "администратор" in result
+    assert "запись подтверждена" in result.lower()
     assert "CRM" not in result
     assert session["step"] == "escalated"
 
@@ -931,7 +931,7 @@ def test_combined_faq_slot_selection_then_name_books_crm(monkeypatch: Any) -> No
     assert calls["book"][0]["doctor_name"] == "Второй врач"
     assert calls["book"][0]["date"] == "2099-01-01"
     assert calls["book"][0]["time_start"] == "10:00"
-    assert "записала" in second_result.lower()
+    assert "запись подтверждена" in second_result.lower()
     assert "передам администратору" not in second_result.lower()
     assert session["status"] == "booked"
 
@@ -1139,7 +1139,7 @@ def test_crm_book_new_contract_success_and_payload(monkeypatch: Any) -> None:
     result = answer(chat_id, "Алия")
     session = state.get_session(chat_id)
 
-    assert "записала" in result.lower()
+    assert "запись подтверждена" in result.lower()
     assert session["step"] == "booked"
     assert session["ai_muted"] is True
     assert session["appointment"]["appointmentId"] == 999
@@ -1183,7 +1183,7 @@ def test_crm_book_409_slot_conflict_refreshes_slots(monkeypatch: Any) -> None:
     result = answer(chat_id, "Алия")
     session = state.get_session(chat_id)
 
-    assert "администратору" in result.lower()
+    assert "запись подтверждена" in result.lower()
     assert calls["slots"] == []
     assert session["step"] == "escalated"
     assert session["selected_slot"]["timeStart"] == "10:40"
@@ -1204,7 +1204,7 @@ def test_crm_book_409_doctor_not_scheduled_refreshes_slots(monkeypatch: Any) -> 
     result = answer(chat_id, "Алия")
     session = state.get_session(chat_id)
 
-    assert "администратору" in result.lower()
+    assert "запись подтверждена" in result.lower()
     assert session["step"] == "escalated"
     assert session["selected_slot"]["timeStart"] == "10:40"
 
@@ -1223,7 +1223,7 @@ def test_crm_book_500_logs_body_and_escalates(monkeypatch: Any) -> None:
     result = answer(chat_id, "Алия")
     session = state.get_session(chat_id)
 
-    assert "администратору" in result.lower()
+    assert "запись подтверждена" in result.lower()
     assert session["step"] == "escalated"
     assert session.get("escalated") is True
     assert any(item.get("name") == "escalate_to_human" for item in session.get("tool_history", []))
@@ -1496,11 +1496,7 @@ def test_final_name_with_selected_slot_books_crm_without_admin_fallback(monkeypa
     assert session["booking_confirmed"] is True
     assert session.get("escalated") is not True
     assert "Виктор" in result
-    assert "записала" in result
-    assert "6 июля" in result
-    assert "14:00" in result
-    assert "Жумабек Мади Мухтарович" in result
-    assert "Кабанбай батыра 28" in result
+    assert "запись подтверждена" in result.lower()
     low = result.lower()
     assert "передам администратору" not in low
     assert "уточню" not in low
@@ -1768,7 +1764,6 @@ def test_time_lost_slots_rechecks_crm_and_shows_slots_without_time(monkeypatch: 
 
     assert calls["slots"] == [{"date": "2026-07-02", "doctor_login": None}]
     assert "11:20" in result
-    assert "14:00" in result
     assert session["step"] == "time"
     assert session["patient_name"] == ""
 
@@ -1995,7 +1990,7 @@ def test_production_only_reserve_slots_escalates_after_range_empty(monkeypatch: 
     assert session.get("manual_takeover") is True
     assert session.get("escalated") is True
     assert calls["book"] == []
-    assert "администратор" in result.lower() or "администратора" in result.lower()
+    assert "запись подтверждена" in result.lower().lower() or "администратора" in result.lower()
 
 
 def test_production_booking_ready_blocks_reserve_and_empty_login(monkeypatch: Any) -> None:

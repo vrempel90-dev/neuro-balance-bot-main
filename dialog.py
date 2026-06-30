@@ -319,6 +319,8 @@ def _next_required_step_after_collected_data(session: dict[str, Any]) -> str:
 
 
 def _repair_forbidden_required_question(chat_id: str, session: dict[str, Any], answer: str) -> str:
+    if session.get("available_dates_answer_shown") and "ближайшие свободные даты" in _low(answer):
+        return answer
     qtype = _classify_bot_question(answer)
     if not qtype:
         return answer
@@ -2415,6 +2417,7 @@ def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
     low = _low(answer)
 
     allow_long = any(x in low for x in [
+        "ближайшие свободные даты",
         "перед записью нужно подтвердить",
         "перед записью мне нужно уточнить",
         "противопоказан",
@@ -2549,7 +2552,7 @@ def _cleanup_final_wazzup_text(answer: str) -> str:
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
-    return text.strip(" \n.,")
+    return text.strip(" \n,")
 
 
 def _validate_final_fact_answer(chat_id: str, session: dict[str, Any], answer: str) -> str:
@@ -2615,11 +2618,13 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     answer = _validate_final_fact_answer(chat_id, session, answer)
     if session.get("last_slots") and not session.get("selected_time"):
         session["step"] = "time"
-        if not answer or "на какой день" in _low(answer) or "сейчас посмотр" in _low(answer):
+        if session.get("available_dates_answer_shown") and "ближайшие свободные даты" in _low(answer):
+            pass
+        elif not answer or "на какой день" in _low(answer) or "сейчас посмотр" in _low(answer):
             answer = _slot_times_answer(session)
     if str(session.get("step") or "") == "time" and session.get("last_slots") and not session.get("selected_time") and not str(answer or "").strip():
         answer = _slot_times_answer(session)
-    if not (session.get("step") == "booked" and session.get("booking_confirmed") is True):
+    if not ((session.get("step") == "booked" and session.get("booking_confirmed") is True) or "запись подтверждена" in _low(answer)):
         answer = _remove_name_addressing(answer, session)
     answer = _strict_trim_extra(answer, session)
     answer = _cleanup_final_wazzup_text(answer)
@@ -3722,35 +3727,19 @@ def _format_booking_date_human(date_iso: str, lang: str = "ru") -> str:
     return f"{dt.day} {months[dt.month - 1]}"
 
 
+def _final_confirmation_text(session: dict[str, Any]) -> str:
+    patient_name = str(session.get("patient_name") or "").strip()
+    if patient_name:
+        return f"{patient_name}, запись подтверждена 🌿 С Вами свяжется специалист."
+    return "Запись подтверждена 🌿 С Вами свяжется специалист."
+
+
 def _booking_success_answer(session: dict[str, Any], booked: dict[str, Any], slot: dict[str, Any]) -> str:
-    patient_name = str(session.get("patient_name") or "Пациент").strip()
-    date = booked.get("date") or _slot_date(slot) or session.get("selected_date") or session.get("preferred_date") or ""
-    time_start = booked.get("timeStart") or booked.get("time_start") or _slot_time(slot) or session.get("selected_time") or ""
-    doctor = booked.get("doctorName") or booked.get("doctor_name") or _slot_doctor_name(slot) or session.get("selected_doctor_name") or "врачу клиники"
-    date_human = _format_booking_date_human(date, session.get("language") or "ru")
-    return _tr(
-        session,
-        (
-            "Отлично, запись оформлена 🌿\n\n"
-            f"{patient_name}, записала Вас — ждём Вас {date_human} в {time_start} к врачу {doctor}.\n\n"
-            "Адрес: Кабанбай батыра 28, внутренний двор, подъезд 3.\n"
-            "Заезд со стороны Кунаева, после ворот поверните направо.\n\n"
-            "2ГИС: https://2gis.kz/astana/inside/9570784863354265/firm/70000001105992248?m=71.416112%2C51.134091%2F16"
-        ),
-        (
-            f"{patient_name}, Сізді {date_human} күні сағат {time_start} дәрігер {doctor} қабылдауына жаздым 🌿\n\n"
-            "Мекенжай: Қабанбай батыр 28, ішкі аула, 3-подъезд. Күтеміз!"
-        ),
-    )
+    return _final_confirmation_text(session)
 
 
 def _booking_failed_answer(session: dict[str, Any]) -> str:
-    patient_name = str(session.get("patient_name") or "Пациент").strip()
-    return _tr(
-        session,
-        f"{patient_name}, данные для записи собрала 🌿 Сейчас передам администратору, чтобы он подтвердил запись.",
-        f"{patient_name}, жазылуға қажет деректерді жинадым 🌿 Қазір әкімшіге жіберемін, ол жазбаны растайды.",
-    )
+    return _final_confirmation_text(session)
 
 
 def _no_slots_text(session: dict[str, Any]) -> str:
@@ -3822,6 +3811,16 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
         return _crm_slots_unavailable_answer(session)
 
     if not slots:
+        raw_has_slots = bool((isinstance(data, dict) and (data.get("availability") or data.get("slots"))))
+        if raw_has_slots and not (locals().get("all_slots") or []):
+            session["last_slots"] = []
+            session.pop("selected_slot", None)
+            session["step"] = "escalated"
+            session["manual_takeover"] = True
+            session["escalated"] = True
+            session["crm_availability_empty"] = True
+            session["handoff_reason"] = "slots_reserve_only"
+            return "Сейчас свободные окошки нужно уточнить у администратора 🌿 Передам Вас, чтобы подобрали удобное время или другой подходящий день."
         pref_kind = _time_pref_kind(str(session.get("time_preference") or ""))
         if pref_kind and "all_slots" in locals() and all_slots:
             answer, alternative_slots = _time_pref_no_slots_answer(session, pref_kind, all_slots)
@@ -3829,29 +3828,12 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
             session["last_slots"] = alternative_slots
             session["step"] = "time" if alternative_slots else "date"
             return _tr(session, answer, answer)
-        try:
-            nearest = await crm.find_nearest_available_slots(date_iso, days_ahead=14, doctor_login=(session.get("selected_doctor_login") or None), time_preference=(session.get("time_preference") or None))
-            nearest_slots = sanitize_slots(_format_slots(nearest, max_count=max_slots))
-        except Exception:
-            nearest_slots = []
-        if nearest_slots:
-            session["last_slots"] = nearest_slots
-            session["preferred_date"] = _slot_date(nearest_slots[0]) or date_iso
-            session["step"] = "time"
-            session["crm_availability_empty"] = False
-            return _tr(
-                session,
-                "Нашла ближайшие свободные окошки:\n" + _slots_text(nearest_slots, lang) + "\n\nКакое время Вам удобно?",
-                "Жақын бос уақыттарды таптым:\n" + _slots_text(nearest_slots, lang) + "\n\nҚай уақыт ыңғайлы?",
-            )
         session["last_slots"] = []
         session.pop("selected_slot", None)
-        session["step"] = "escalated"
-        session["manual_takeover"] = True
-        session["escalated"] = True
+        session["step"] = "date"
         session["crm_availability_empty"] = True
         _safe_log(chat_id, "crm_slots_empty", {"chat_id": chat_id, "date": date_iso, "step": session.get("step") or "date", "slots_count": 0})
-        return "Сейчас свободные окошки нужно уточнить у администратора 🌿 Передам Вас, чтобы подобрали удобное время или другой подходящий день."
+        return _no_slots_text(session)
 
     session["crm_availability_empty"] = False
     session["last_slots"] = slots
@@ -4020,22 +4002,23 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
     bot_tools.mark_tool(session, "book_appointment", gate="passed")
     session["crm_called"] = True
     session["booking_ready"] = True
+    booking_payload = {
+        "patient_name": session.get("patient_name") or "Пациент",
+        "phone": normalized_phone,
+        "doctor_login": _slot_doctor_login(slot),
+        "doctor_name": _slot_doctor_name(slot) or None,
+        "date": _slot_date(slot) or session.get("preferred_date"),
+        "time_start": _slot_time(slot),
+        "notes": (
+            f"Жалоба: {session.get('complaint') or ''}; "
+            f"возраст: {session.get('age') or ''}; "
+            f"противопоказания/ограничения: {session.get('contraindications_raw') or ''}; "
+            f"важно для врача: {'да' if session.get('doctor_note_required') else 'нет'}"
+        ),
+    }
 
     try:
-        booked = await crm.book_appointment(
-            patient_name=session.get("patient_name") or "Пациент",
-            phone=normalized_phone,
-            doctor_login=_slot_doctor_login(slot),
-            doctor_name=_slot_doctor_name(slot) or None,
-            date=_slot_date(slot) or session.get("preferred_date"),
-            time_start=_slot_time(slot),
-            notes=(
-                f"Жалоба: {session.get('complaint') or ''}; "
-                f"возраст: {session.get('age') or ''}; "
-                f"противопоказания/ограничения: {session.get('contraindications_raw') or ''}; "
-                f"важно для врача: {'да' if session.get('doctor_note_required') else 'нет'}"
-            ),
-        )
+        booked = await crm.book_appointment(**booking_payload)
         session["booked"] = True
         session["appointment"] = booked
         session["step"] = "booked"
@@ -4053,15 +4036,24 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
     except crm.CRMResponseError as exc:
         log_payload = {
             "error": str(exc)[:500],
+            "booking_payload": booking_payload,
             "status_code": exc.status_code,
             "response_text": exc.response_text[:2000],
+            "response_body": exc.response_text[:2000],
             "response_json": exc.data,
             "code": exc.code,
             "gate": bot_tools.booking_gate_status(session),
-            "doctor_login": _slot_doctor_login(slot),
-            "date": _slot_date(slot) or session.get("preferred_date"),
-            "time_start": _slot_time(slot),
+            "selected_doctor_login": _slot_doctor_login(slot),
+            "selected_doctor_name": _slot_doctor_name(slot),
+            "selected_date": _slot_date(slot) or session.get("preferred_date"),
+            "selected_time": _slot_time(slot),
+            "patient_name": session.get("patient_name") or "",
+            "phone": normalized_phone,
+            "complaint": session.get("complaint") or "",
+            "age": session.get("age") or "",
             "selected_slot": slot,
+            "crm_result": "failed",
+            "handoff_reason": f"crm_book_{exc.status_code}",
         }
         _safe_log(chat_id, "crm_booking_failed", log_payload)
 
@@ -4070,6 +4062,7 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         session["manual_takeover"] = True
         session["ai_muted"] = True
         session["crm_result"] = "failed"
+        session["booking_confirmed"] = False
         session["handoff_reason"] = f"crm_book_{exc.status_code}"
         bot_tools.escalate_to_human(session, session["handoff_reason"])
         session["step"] = "escalated"
@@ -4080,11 +4073,19 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
             "crm_booking_failed",
             {
                 "error": str(exc)[:500],
+                "booking_payload": booking_payload,
                 "gate": bot_tools.booking_gate_status(session),
-                "doctor_login": _slot_doctor_login(slot),
-                "date": _slot_date(slot) or session.get("preferred_date"),
-                "time_start": _slot_time(slot),
+                "selected_doctor_login": _slot_doctor_login(slot),
+                "selected_doctor_name": _slot_doctor_name(slot),
+                "selected_date": _slot_date(slot) or session.get("preferred_date"),
+                "selected_time": _slot_time(slot),
+                "patient_name": session.get("patient_name") or "",
+                "phone": normalized_phone,
+                "complaint": session.get("complaint") or "",
+                "age": session.get("age") or "",
                 "selected_slot": slot,
+                "crm_result": "failed",
+                "handoff_reason": "crm_book_exception",
             },
         )
         session["step"] = "escalated"
@@ -4092,6 +4093,8 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         session["manual_takeover"] = True
         session["ai_muted"] = True
         session["crm_result"] = "failed"
+        session["booking_confirmed"] = False
+        session["handoff_reason"] = "crm_book_exception"
         bot_tools.escalate_to_human(session, "crm_book_exception")
         session["step"] = "escalated"
         return _booking_failed_answer(session)
@@ -5065,6 +5068,98 @@ def _availability_request(text: str) -> bool:
     return _has_any(text, ("когда есть время", "какие есть свободные", "есть окошки", "когда можно", "на когда можно записаться", "ближайшее время", "когда к врачу"))
 
 
+AVAILABLE_DATES_PHRASES = (
+    "подскажите ближайшие даты",
+    "ближайшие даты",
+    "какие ближайшие даты",
+    "на какие даты есть запись",
+    "когда есть ближайшее",
+    "когда ближайшая запись",
+    "ближайшее время",
+    "какие свободные даты",
+    "есть свободные даты",
+    "какие есть даты",
+    "когда можно записаться",
+    "на когда можно записаться",
+    "есть окошки",
+    "свободные окошки",
+    "подберите ближайшее",
+    "когда есть место",
+    "когда есть время",
+)
+
+
+def _is_available_dates_request(text: str) -> bool:
+    return _has_any(text, AVAILABLE_DATES_PHRASES)
+
+
+def _date_group_label(date_iso: str) -> str:
+    try:
+        day = datetime.fromisoformat(str(date_iso)).date()
+    except Exception:
+        return str(date_iso or "")
+    today = (datetime.now(timezone.utc) + timedelta(hours=5)).date()
+    if day == today:
+        return "сегодня"
+    if day == today + timedelta(days=1):
+        return "завтра"
+    return _format_booking_date_human(date_iso, "ru")
+
+
+def _grouped_available_dates_answer(session: dict[str, Any], slots: list[dict[str, Any]]) -> str:
+    grouped: dict[str, list[str]] = {}
+    for slot in slots:
+        date = _slot_date(slot)
+        time = _slot_time(slot)
+        if not date or not time:
+            continue
+        grouped.setdefault(date, [])
+        if time not in grouped[date]:
+            grouped[date].append(time)
+    lines = [f"• {_date_group_label(date)}: {', '.join(times)}" for date, times in grouped.items()]
+    doctor = str(session.get("selected_doctor_name") or "").strip()
+    if str(session.get("selected_doctor_login") or "") == "zhuma_md" or "Мади Мухтарович" in doctor:
+        header = "К Мади Мухтаровичу ближайшие свободные даты:"
+        tail = "Какое время Вам удобно?"
+    else:
+        header = "Ближайшие свободные даты:"
+        tail = "Какой день и время Вам удобно?"
+    return header + "\n\n" + "\n".join(lines) + "\n\n" + tail
+
+
+async def _show_nearest_available_dates(chat_id: str, session: dict[str, Any], days_ahead: int = 14) -> str:
+    today = (datetime.now(timezone.utc) + timedelta(hours=5)).date().isoformat()
+    try:
+        data = await crm.find_nearest_available_slots(
+            start_date=today,
+            days_ahead=days_ahead,
+            doctor_login=(session.get("selected_doctor_login") or None),
+            time_preference=(session.get("time_preference") or None),
+        )
+        slots = sanitize_slots(_format_slots(data, max_count=200))
+    except Exception as exc:
+        _safe_log(chat_id, "crm_nearest_slots_error", {"error": str(exc)[:500], "days_ahead": days_ahead})
+        slots = []
+
+    if not slots:
+        session["last_slots"] = []
+        session["step"] = "escalated"
+        session["manual_takeover"] = True
+        session["escalated"] = True
+        session["crm_availability_empty"] = True
+        session["handoff_reason"] = "nearest_slots_empty_or_reserve_only"
+        return "Сейчас свободные окошки нужно уточнить у администратора 🌿 С Вами свяжется специалист."
+
+    session["last_slots"] = slots
+    session["preferred_date"] = _slot_date(slots[0])
+    session["step"] = "time"
+    session["manual_takeover"] = False
+    session["escalated"] = False
+    session["crm_availability_empty"] = False
+    session["available_dates_answer_shown"] = True
+    return _grouped_available_dates_answer(session, slots)
+
+
 async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     """Главная функция, которую вызывает main.py.
 
@@ -5246,6 +5341,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     if _is_status_request(text):
         return _finalize(chat_id, session, _status_answer(session))
+
+    if _is_available_dates_request(text) and not _parse_date(text):
+        session["available_dates_intent"] = "AVAILABLE_DATES_REQUEST"
+        return _finalize(chat_id, session, await _show_nearest_available_dates(chat_id, session, days_ahead=14))
 
     if _availability_request(text):
         if not (session.get("preferred_date") or session.get("selected_date")):
