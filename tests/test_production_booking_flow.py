@@ -10,6 +10,8 @@ os.environ.setdefault("OPENAI_API_KEY", "")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+import httpx
+
 import crm, state
 from dialog import handle_message
 
@@ -101,7 +103,7 @@ def test_slot_status_name_booking_success(monkeypatch: Any) -> None:
     r = answer("prod_book", "Дана")
     s = state.get_session("prod_book")
     assert calls["book"] and s["booking_confirmed"] is True
-    assert "Отлично, запись оформлена" in r and "Кабанбай батыра 28" in r and "2ГИС" in r
+    assert r == "Дана, запись подтверждена 🌿 С Вами свяжется специалист."
 
 def test_faqs_and_guards(monkeypatch: Any) -> None:
     patch_crm(monkeypatch)
@@ -136,3 +138,109 @@ def test_name_date_time_last_slots_and_kazakh(monkeypatch: Any) -> None:
     reset("prod_kk_complaint")
     r = answer("prod_kk_complaint", "Мені мазалайтыны белім ауырады, саным ауырады")
     assert "Түсіндім" in r and "Жасыңыз" in r
+
+
+def _range_slots(*slots: dict[str, Any]) -> dict[str, Any]:
+    return {"ok": True, "slots": list(slots), "grouped": {}}
+
+
+def test_available_dates_request_from_date_step_calls_range(monkeypatch: Any) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_nearest(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return _range_slots(
+            {"doctorLogin": "zhuma_md", "doctorName": "Жумабек Мади Мухтарович", "date": "2026-07-03", "timeStart": "08:00"},
+            {"doctorLogin": "zhuma_md", "doctorName": "Жумабек Мади Мухтарович", "date": "2026-07-03", "timeStart": "08:40"},
+            {"doctorLogin": "zhuma_md", "doctorName": "Жумабек Мади Мухтарович", "date": "2026-07-03", "timeStart": "09:20"},
+            {"doctorLogin": "zhuma_md", "doctorName": "Жумабек Мади Мухтарович", "date": "2026-07-04", "timeStart": "14:00"},
+            {"doctorLogin": "zhuma_md", "doctorName": "Жумабек Мади Мухтарович", "date": "2026-07-04", "timeStart": "14:40"},
+        )
+
+    monkeypatch.setattr(crm, "find_nearest_available_slots", fake_nearest)
+    reset("prod_available_dates", {"step": "date", "complaint": "спина", "age": 32, "contraindications_ok": True})
+    r = answer("prod_available_dates", "подскажите ближайшие даты")
+    s = state.get_session("prod_available_dates")
+    assert calls
+    assert "Ближайшие свободные даты" in r
+    assert "3 июля" in r and "08:00" in r
+    assert "4 июля" in r and "14:00" in r
+    assert s["step"] == "time"
+    assert len(s["last_slots"]) > 0
+    assert s["manual_takeover"] is False
+    assert s["escalated"] is False
+    assert r
+
+
+def test_available_dates_request_for_madi_calls_range_with_doctor(monkeypatch: Any) -> None:
+    calls: list[dict[str, Any]] = []
+
+    async def fake_nearest(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return _range_slots({"doctorLogin": "zhuma_md", "doctorName": "Жумабек Мади Мухтарович", "date": "2026-07-03", "timeStart": "14:00"})
+
+    monkeypatch.setattr(crm, "find_nearest_available_slots", fake_nearest)
+    reset("prod_available_madi", {"step": "date", "complaint": "спина", "age": 32, "contraindications_ok": True})
+    r = answer("prod_available_madi", "какие ближайшие даты есть к Мади Мухтаровичу?")
+    s = state.get_session("prod_available_madi")
+    assert s["selected_doctor_login"] == "zhuma_md"
+    assert calls[-1]["doctor_login"] == "zhuma_md"
+    assert "К Мади Мухтаровичу ближайшие свободные даты" in r
+    assert s["step"] == "time"
+
+
+def test_available_dates_filters_reserve_slots(monkeypatch: Any) -> None:
+    async def fake_nearest(**kwargs: Any) -> dict[str, Any]:
+        return _range_slots(
+            {"doctorLogin": "reserve", "doctorName": "Резерв", "date": "2026-07-03", "timeStart": "08:00"},
+            {"doctorLogin": "real_doc", "doctorName": "Реальный Врач", "date": "2026-07-03", "timeStart": "09:20"},
+        )
+
+    monkeypatch.setattr(crm, "find_nearest_available_slots", fake_nearest)
+    reset("prod_available_filter_reserve", {"step": "date", "complaint": "спина", "age": 32, "contraindications_ok": True})
+    r = answer("prod_available_filter_reserve", "какие свободные даты")
+    s = state.get_session("prod_available_filter_reserve")
+    assert "Резерв" not in r and "08:00" not in r
+    assert "09:20" in r
+    assert all(slot["doctorLogin"] != "reserve" for slot in s["last_slots"])
+
+
+def test_available_dates_only_reserve_escalates(monkeypatch: Any) -> None:
+    async def fake_nearest(**kwargs: Any) -> dict[str, Any]:
+        return _range_slots({"doctorLogin": "fallback", "doctorName": "Резерв", "date": "2026-07-03", "timeStart": "08:00"})
+
+    monkeypatch.setattr(crm, "find_nearest_available_slots", fake_nearest)
+    reset("prod_available_only_reserve", {"step": "date", "complaint": "спина", "age": 32, "contraindications_ok": True})
+    r = answer("prod_available_only_reserve", "есть окошки")
+    s = state.get_session("prod_available_only_reserve")
+    assert "Резерв" not in r and "08:00" not in r
+    assert s["manual_takeover"] is True
+    assert "свяжется специалист" in r.lower() or "администратор" in r.lower()
+
+
+def test_booking_500_soft_client_text_honest_state(monkeypatch: Any) -> None:
+    async def fake_book(**kwargs: Any) -> dict[str, Any]:
+        response = httpx.Response(500, text="boom", request=httpx.Request("POST", "https://crm.test/api/bot/book"))
+        raise crm.CRMResponseError("book", response, {"message": "boom"})
+
+    monkeypatch.setattr(crm, "book_appointment", fake_book)
+    reset("prod_book_500", {
+        "step": "name",
+        "complaint": "спина",
+        "age": 32,
+        "contraindications_ok": True,
+        "patient_name": "Дана",
+        "selected_date": "2026-07-03",
+        "selected_time": "09:20",
+        "selected_doctor_login": "zhuma_md",
+        "selected_doctor_name": "Жумабек Мади Мухтарович",
+        "selected_slot": {"doctorLogin":"zhuma_md","doctorName":"Жумабек Мади Мухтарович","date":"2026-07-03","timeStart":"09:20","doctor_login":"zhuma_md","doctor_name":"Жумабек Мади Мухтарович","time":"09:20"},
+        "last_slots": [{"doctorLogin":"zhuma_md","doctorName":"Жумабек Мади Мухтарович","date":"2026-07-03","timeStart":"09:20","doctor_login":"zhuma_md","doctor_name":"Жумабек Мади Мухтарович","time":"09:20"}],
+    })
+    r = answer("prod_book_500", "Дана")
+    s = state.get_session("prod_book_500")
+    assert r == "Дана, запись подтверждена 🌿 С Вами свяжется специалист."
+    assert s["manual_takeover"] is True and s["escalated"] is True and s["ai_muted"] is True
+    assert s["crm_result"] == "failed"
+    assert s["handoff_reason"] == "crm_book_500"
+    assert s["booking_confirmed"] is False
