@@ -42,6 +42,43 @@ except Exception:
 OPENAI_BRAIN_ALLOWED_STEPS = {"start", "complaint", "age", "contraindications", "date", "time", "select_slot", "name"}
 OPENAI_BRAIN_MULTI_ENTITY_STEPS = {"age", "contraindications", "date"}
 OPENAI_BRAIN_ALLOWED_GATES = {"new_lead", "new_lead_like_message", "active_ai_lead", "active_conversation_reply"}
+
+FIRST_TOUCH_CLINIC_INFO_RU = """Здравствуйте ☺️
+
+Хорошо, расскажу подробнее о нашей клинике и о том, как мы лечим.
+
+Клиника Neuro Balance помогает людям избавиться от боли в спине и суставах без операций и долгого восстановления.
+
+🧑‍⚕️ У нас работают опытные врачи,
+🏥 используется современное оборудование,
+📋 а лечение подбирается индивидуально для каждого пациента.
+
+Мы специализируемся на:
+• протрузиях и грыжах
+• защемлении нервов
+• болях в спине и шее
+• заболеваниях суставов
+
+Мы используем современные методы: магнитотерапию и лазерную терапию для снятия воспаления и улучшения кровообращения, ударно-волновую терапию — при хронических болях и спазмах, плазмотерапию (PRP) — для восстановления тканей сустава, иглотерапию — для расслабления мышц и обезболивания, а также лечебную физкультуру для укрепления мышц и стабилизации сустава 🏃
+
+Все процедуры направлены на устранение причины боли, а не только симптомов.
+
+📍 Астана
+2ГИС: https://2gis.kz/astana/geo/70000001105992248
+
+📲 Instagram: https://www.instagram.com/neuro_balance_ast
+TikTok:
+https://www.tiktok.com/@neuro_balance_ast
+
+Подскажите, пожалуйста, что именно Вас беспокоит?"""
+
+CONTRAINDICATIONS_MESSAGE_RU = """Перед записью нужно подтвердить: нет ли у Вас противопоказаний — кардиостимулятор, беременность, онкология, металл в зоне лечения, эпилепсия, возраст до 16 или более 75 лет?
+
+Также обращаем Ваше внимание:
+для обеспечения безопасности и эффективности лечения приём не проводится:
+• пациентам с ограниченной подвижностью (коляски, костыли)
+• лицам младше 16 лет
+• лицам от 16 до 18 лет — только в сопровождении родителей"""
 APPROVED_CONTRA_TERMS = {
     "кардиостимулятор", "дефибриллятор", "инсулиновая помпа", "помпа",
     "кохлеар", "кохлеарный имплант", "тромбофлебит", "тромбоз",
@@ -2534,7 +2571,11 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     session["chat_id"] = chat_id
     before_step = str(session.get("step") or "start")
     answer = _clean(answer)
-    if str(session.get("step") or "") == "complaint" and ("что Вас беспокоит" in answer or "не мазалайды" in answer):
+    if session.pop("first_touch_answer_in_progress", False):
+        repaired, repair_reason = False, ""
+        session["state_repaired"] = False
+        session["state_repair_reason"] = ""
+    elif str(session.get("step") or "") == "complaint" and ("что Вас беспокоит" in answer or "не мазалайды" in answer):
         repaired, repair_reason = False, ""
         session["state_repaired"] = False
         session["state_repair_reason"] = ""
@@ -2647,6 +2688,7 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
 
     session["state_before_step"] = before_step
     session["state_after_step"] = session.get("step") or ""
+    session["conversation_turns_count"] = int(session.get("conversation_turns_count") or 0) + 1
     if session.get("step") != "escalated":
         _safe_log(chat_id, "final_state_after_decision", {"chat_id": chat_id, "state_before_step": before_step, "state_after_step": session.get("step") or "", "answer_empty": not bool(answer), "fallback_reason": session.get("fallback_reason") or "", "state_repaired": bool(session.get("state_repaired")), "state_repair_reason": session.get("state_repair_reason") or ""})
 
@@ -2694,7 +2736,6 @@ def _remember_required_question(session: dict[str, Any], answer: str) -> None:
         session["last_required_question"] = answer
         session["last_required_step"] = new_step
         session["pending_step_after_faq"] = ""
-    session["conversation_turns_count"] = int(session.get("conversation_turns_count") or 0) + 1
     facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
     for key in ("complaint", "age", "contraindications_ok", "preferred_date", "selected_slot", "patient_name", "symptom_duration"):
         val = session.get(key)
@@ -3543,8 +3584,8 @@ def _senior_contra_intro(session: dict[str, Any]) -> str:
 def _ask_contra(session: dict[str, Any]) -> str:
     return _tr(
         session,
-        "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?",
-        "Жазылу алдында қауіпсіздік үшін нақтылап алайын 🌿 Қарсы көрсетілімдеріңіз бар ма?",
+        CONTRAINDICATIONS_MESSAGE_RU + "\n\nПодскажите, пожалуйста, у Вас ничего из этого нет?",
+        CONTRAINDICATIONS_MESSAGE_RU + "\n\nПодскажите, пожалуйста, у Вас ничего из этого нет?",
     )
 
 
@@ -3567,11 +3608,7 @@ def _contra_details_question(text: str) -> bool:
 def _contra_detailed_list(session: dict[str, Any]) -> str:
     sent_count = int(session.get("contraindications_checklist_sent_count") or 0)
     session["contraindications_checklist_sent_count"] = sent_count + 1
-    return _tr(
-        session,
-        'Основные противопоказания: кардиостимулятор/дефибриллятор, инсулиновая помпа, кохлеарный имплант, беременность, онкология или подозрение на неё, металл в зоне лечения, эпилепсия/судороги, тромбоз или нарушения свёртываемости, декомпенсированный диабет/тиреотоксикоз, температура/ОРВИ/острая инфекция, тяжёлые проблемы с сердцем, дыханием или психическим состоянием. Также приём не проводится пациентам младше 16 или старше 75 лет и при ограниченной подвижности — коляска, костыли.\n\nЕсть ли у Вас что-то из этого?',
-        'Негізгі қарсы көрсетілімдер: кардиостимулятор/дефибриллятор, инсулин помпасы, кохлеарлық имплант, жүктілік, онкология немесе оған күдік, емдеу аймағында металл, эпилепсия/судорога, тромбоз немесе қан ұюының бұзылысы, декомпенсацияланған диабет/тиреотоксикоз, қызу/ЖРВИ/жедел инфекция, жүрек, тыныс алу немесе психикалық жағдай бойынша ауыр мәселе. Сондай-ақ 16 жасқа дейінгі, 75 жастан асқан және қозғалысы шектеулі пациенттерге — коляска, костыли — қабылдау жүргізілмейді.\n\nСізде осының біреуі бар ма?',
-    )
+    return _ask_contra(session)
 
 
 def _ask_date(session: dict[str, Any]) -> str:
@@ -4879,6 +4916,43 @@ def _weekend_primary_block_answer(session: dict[str, Any]) -> str:
     )
 
 
+def _is_first_touch_due(session: dict[str, Any]) -> bool:
+    return session.get("first_touch_info_sent") is not True and int(session.get("conversation_turns_count") or 0) == 0 and not session.get("ai_lead_started")
+
+
+def _first_touch_answer(session: dict[str, Any], text: str) -> str:
+    session["first_touch_info_sent"] = True
+    session["first_touch_answer_in_progress"] = True
+    session["ai_lead_started"] = True
+    if _has_any(text, PRICE_WORDS):
+        session["step"] = "complaint"
+        return FIRST_TOUCH_CLINIC_INFO_RU + "\n\nПервичный приём стоит 5 000 тг 🌿 Подскажите, пожалуйста, что именно Вас беспокоит?"
+    if _has_any(text, ADDRESS_WORDS):
+        session["step"] = "complaint"
+        return FIRST_TOUCH_CLINIC_INFO_RU
+    if _has_complaint(text) or _has_medical_complaint_text(text):
+        session["complaint"] = text.strip()
+        session["step"] = "age"
+        _record_complaint_tool(session, text.strip(), is_in_profile=True)
+        return FIRST_TOUCH_CLINIC_INFO_RU + "\n\nПоняла Вас, это как раз наш профиль 🌿 Подскажите, пожалуйста, сколько Вам лет?"
+    session["step"] = "complaint"
+    return FIRST_TOUCH_CLINIC_INFO_RU
+
+
+def _is_clinic_info_repeat_request(text: str) -> bool:
+    return _has_any(text, ("подробнее", "расскажите", "консультация", "акция", "что за клиника"))
+
+
+def _short_clinic_info_answer(session: dict[str, Any]) -> str:
+    if not session.get("complaint"):
+        session["step"] = "complaint"
+    return "Мы занимаемся болями в спине, шее и суставах, а лечение врач подбирает индивидуально после осмотра 🌿 Подскажите, что именно Вас беспокоит?"
+
+
+def _availability_request(text: str) -> bool:
+    return _has_any(text, ("когда есть время", "какие есть свободные", "есть окошки", "когда можно", "на когда можно записаться", "ближайшее время", "когда к врачу"))
+
+
 async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     """Главная функция, которую вызывает main.py.
 
@@ -4935,6 +5009,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if _is_booked_or_confirmed_session(session):
         session["gate_reason"] = "booked_session_ai_disabled"
         return _no_reply(chat_id, session, "booked_session_ai_disabled")
+    if _is_first_touch_due(session):
+        session["gate_reason"] = "new_lead"
+        session["lead_source"] = "new_lead"
+        session["ai_started_at"] = datetime.now(timezone.utc).isoformat()
+        return _finalize(chat_id, session, _first_touch_answer(session, text))
     early_step = str(session.get("step") or "start")
     if _has_any(text, ADDRESS_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text)) and not (early_step in {"time", "select_slot"} and _select_slot(text, session.get("last_slots") or [])):
         session.setdefault("gate_reason", "new_lead_like_message")
@@ -4984,6 +5063,14 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             _safe_add_message(chat_id, "assistant", answer)
             return answer
         return ""
+
+    if _is_first_touch_due(session):
+        session["lead_source"] = reason
+        session["ai_started_at"] = datetime.now(timezone.utc).isoformat()
+        return _finalize(chat_id, session, _first_touch_answer(session, text))
+
+    if session.get("first_touch_info_sent") is True and _is_clinic_info_repeat_request(text) and not session.get("complaint"):
+        return _finalize(chat_id, session, _short_clinic_info_answer(session))
 
     if reason in {"new_lead", "new_lead_like_message", "active_conversation_reply", "active_ai_lead"}:
         session.pop("no_reply_reason", None)
@@ -5047,6 +5134,15 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     if _is_status_request(text):
         return _finalize(chat_id, session, _status_answer(session))
+
+    if _availability_request(text):
+        if not (session.get("preferred_date") or session.get("selected_date")):
+            session["preferred_date"] = datetime.now(timezone.utc).date().isoformat()
+        return _finalize(
+            chat_id,
+            session,
+            await _show_slots(chat_id, session, session.get("preferred_date") or datetime.now(timezone.utc).date().isoformat()),
+        )
 
     # state_machine_first_guard:
     # После языкового режима сначала уважаем текущее состояние диалога.

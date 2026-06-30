@@ -600,6 +600,9 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
     state.log_event(chat_id, "incoming_message_received", {"phone": phone, "kind": kind, "source": str(message.get("source") or "wazzup"), "text_preview": _preview(message.get("text"), 120)})
 
     source = str(message.get("source") or "wazzup")
+    if not bool(getattr(get_settings(), "bot_auto_reply_enabled", True)):
+        _mark_bot_auto_reply_disabled(chat_id=chat_id, phone=phone, source=source, force=False, kind=kind, text=str(message.get("text") or ""))
+        return ""
     if not is_bot_work_time():
         _mark_working_hours_disabled(chat_id=chat_id, phone=phone, source=source, force=False, kind=kind, text=str(message.get("text") or ""))
         return ""
