@@ -78,7 +78,38 @@ CONTRAINDICATIONS_MESSAGE_RU = """Перед записью нужно подт�
 для обеспечения безопасности и эффективности лечения приём не проводится:
 • пациентам с ограниченной подвижностью (коляски, костыли)
 • лицам младше 16 лет
-• лицам от 16 до 18 лет — только в сопровождении родителей"""
+• лицам от 16 до 18 лет — только в сопровождении родителей
+
+Подскажите, пожалуйста, у Вас ничего из этого нет?"""
+
+FIRST_TOUCH_REQUIRED_FRAGMENTS = (
+    "Клиника Neuro Balance помогает",
+    "Мы специализируемся на:",
+    "магнитотерапию",
+    "ударно-волновую терапию",
+    "плазмотерапию",
+    "иглотерапию",
+    "лечебную физкультуру",
+    "2ГИС",
+    "Instagram",
+    "TikTok",
+    "Подскажите, пожалуйста, что именно Вас беспокоит?",
+)
+
+LOCKED_TEMPLATES = {
+    "first_touch": FIRST_TOUCH_CLINIC_INFO_RU,
+    "contraindications": CONTRAINDICATIONS_MESSAGE_RU,
+}
+
+BANNED_FINAL_PHRASES = (
+    "Не беспокоит?",
+    "не беспокоит?",
+    "Сәлеметсіз бе! 🥰 Не беспокоит?",
+    "чем можем помочь: хотите записаться",
+    "чем можем помочь",
+    "хотите записаться или уточняете",
+    "по уже имеющейся записи",
+)
 APPROVED_CONTRA_TERMS = {
     "кардиостимулятор", "онколог", "онкология", "рак",
     "эпилеп", "беремен", "беременность", "металл",
@@ -90,6 +121,37 @@ UNKNOWN_CONTRA_SAFE_ANSWER_RU = (
     "но чтобы не ошибиться по медицинской части, передам информацию администратору "
     "для уточнения 🌿\n\nПодскажите, пожалуйста, других противопоказаний из списка нет?"
 )
+
+
+def _contraindications_locked_message(session: dict[str, Any]) -> str:
+    prep = _patient_pronoun_prep(session)
+    if prep == "у Вас":
+        return CONTRAINDICATIONS_MESSAGE_RU
+    return CONTRAINDICATIONS_MESSAGE_RU.replace("у Вас противопоказаний", f"{prep} противопоказаний").replace(
+        "Подскажите, пожалуйста, у Вас ничего из этого нет?",
+        f"Подскажите, пожалуйста, {prep} ничего из этого нет?",
+    )
+
+
+def _contra_details_locked_answer(session: dict[str, Any]) -> str:
+    prep = _patient_pronoun_prep(session)
+    return (
+        "Уточняю по противопоказаниям из списка выше: кардиостимулятор, беременность, "
+        "онкология, металл в зоне лечения, эпилепсия, возраст до 16 или более 75 лет, "
+        "ограниченная подвижность — коляски или костыли. "
+        f"Подскажите, пожалуйста, {prep} ничего из этого нет?"
+    )
+
+
+def _has_banned_final_phrase(answer: str) -> bool:
+    low = _low(answer)
+    return any(_low(phrase) in low for phrase in BANNED_FINAL_PHRASES)
+
+
+def _repair_locked_first_touch(answer: str) -> str:
+    if not all(fragment in (answer or "") for fragment in FIRST_TOUCH_REQUIRED_FRAGMENTS):
+        return FIRST_TOUCH_CLINIC_INFO_RU
+    return answer
 
 
 @dataclass
@@ -2712,6 +2774,17 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
                 "Сізді не мазалайды? 🌿",
             )
 
+    if str(session.get("answer_source") or "").startswith("locked_template:first_touch"):
+        answer = _repair_locked_first_touch(answer)
+    if _has_banned_final_phrase(answer):
+        session["banned_phrase_repaired"] = True
+        if str(session.get("step") or "") == "complaint":
+            answer = "Расскажите, пожалуйста, что именно Вас беспокоит?"
+        elif str(session.get("step") or "") == "contraindications":
+            answer = _ask_contra(session)
+        else:
+            answer, _, _ = build_safe_answer_for_current_state(session, str(session.get("last_user_text") or ""))
+
     # duplicate_answer_guard: на одно входящее сообщение — один ответ.
     # Если новый текст полностью совпадает с последним ответом бота, молчим,
     # чтобы Wazzup не получал одинаковые сообщения подряд.
@@ -3811,26 +3884,9 @@ def _senior_contra_intro(session: dict[str, Any]) -> str:
 
 
 def _ask_contra(session: dict[str, Any]) -> str:
-    if not session.get("patient_relation"):
-        return _tr(
-            session,
-            "Перед записью уточню для безопасности 🌿 Есть ли у Вас какие-нибудь противопоказания?",
-            "Қарсы көрсетілімдеріңіз бар ма?",
-        )
-    prep = _patient_pronoun_prep(session)
-    return _tr(
-        session,
-        f"""Перед записью нужно подтвердить: нет ли {prep} противопоказаний — кардиостимулятор, беременность, онкология, металл в зоне лечения, эпилепсия, возраст до 16 или более 75 лет?
-
-Также обращаем Ваше внимание:
-для обеспечения безопасности и эффективности лечения приём не проводится:
-• пациентам с ограниченной подвижностью (коляски, костыли)
-• лицам младше 16 лет
-• лицам от 16 до 18 лет — только в сопровождении родителей
-
-Подскажите, пожалуйста, {prep} ничего из этого нет?""",
-        "Қарсы көрсетілімдеріңіз бар ма?",
-    )
+    session["answer_source"] = "locked_template:contraindications"
+    session["skip_humanize"] = True
+    return _contraindications_locked_message(session)
 
 
 def _contra_details_question(text: str) -> bool:
@@ -3843,6 +3899,11 @@ def _contra_details_question(text: str) -> bool:
             "перечислите",
             "что входит",
             "что входит в противопоказания",
+            "на что",
+            "что именно",
+            "какие",
+            "не понял",
+            "не поняла",
             "список противопоказаний",
             "какие есть противопоказания",
         )
@@ -5209,11 +5270,13 @@ def _first_touch_answer(session: dict[str, Any], text: str) -> str:
     session["first_touch_info_sent"] = True
     session["first_touch_answer_in_progress"] = True
     session["ai_lead_started"] = True
-    if (_has_complaint(text) or _has_medical_complaint_text(text)) and not _low(text).strip() in {"хочу записаться", "запишите"}:
+    session["answer_source"] = "locked_template:first_touch"
+    session["skip_openai"] = True
+    session["skip_humanize"] = True
+    session["skip_fallback_question"] = True
+    if (_has_complaint(text) or _has_medical_complaint_text(text)) and _low(text).strip() not in {"хочу записаться", "запишите"}:
         session["complaint"] = text.strip()
-        session["step"] = "age"
         _record_complaint_tool(session, text.strip(), is_in_profile=True)
-        return FIRST_TOUCH_CLINIC_INFO_RU + "\n\nПоняла Вас, это как раз наш профиль 🌿 Подскажите, пожалуйста, сколько Вам лет?"
     session["step"] = "complaint"
     return FIRST_TOUCH_CLINIC_INFO_RU
 
@@ -5341,6 +5404,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     session["phone"] = phone or session.get("phone") or ""
     session["chat_id"] = chat_id
+    session["answer_source"] = ""
+    session["skip_openai"] = False
+    session["skip_humanize"] = False
+    session["skip_fallback_question"] = False
     session["last_user_text"] = text
     session["state_before_step"] = session.get("step") or "start"
     session["openai_used"] = False
@@ -5390,6 +5457,13 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session.setdefault("gate_reason", "new_lead_like_message")
         session["ai_lead_started"] = True
         return _finalize(chat_id, session, _address_answer_then_optional_resume(session))
+    if (session.get("step") == "contraindications" or session.get("last_required_step") == "contraindications") and _contra_details_question(text):
+        session["step"] = "contraindications"
+        session["questionnaire_step"] = "contra"
+        session["manual_takeover"] = False
+        session["escalated"] = False
+        session["answer_source"] = "locked_template:contraindications_details"
+        return _finalize(chat_id, session, _contra_details_locked_answer(session))
     if (session.get("step") == "contraindications" or session.get("last_required_step") == "contraindications") and _is_contra_clear_hotfix_phrase(text):
         answer = _accept_no_contra_and_advance(chat_id, session, text)
         faq_info = _faq_answer(text, session)
