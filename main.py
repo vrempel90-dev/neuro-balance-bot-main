@@ -12,7 +12,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File
 
 import state
 from config import get_settings
-from dialog import handle_message
+from dialog import FIRST_TOUCH_CLINIC_INFO_RU, handle_message
 from guards import GuardDecision, should_auto_reply
 from ai import humanize_reply_with_openai
 from schedule import astana_now, is_bot_work_time
@@ -189,6 +189,22 @@ def _humanize_skip_reason(session: dict[str, Any], answer: str, *, voice_ignored
 async def _maybe_humanize_answer(chat_id: str, user_text: str, base_answer: str, *, voice_ignored: bool = False) -> str:
     session = _get_session_safe(chat_id)
     session["chat_id"] = chat_id
+    if session.get("skip_humanize") or str(session.get("answer_source") or "").startswith("locked_template"):
+        debug = {
+            "openai_used": False,
+            "openai_model": getattr(get_settings(), "openai_model", ""),
+            "openai_skip_reason": "locked_template",
+            "openai_guard_failed": False,
+            "base_answer_preview": _preview(base_answer, 160),
+            "final_answer_preview": _preview(base_answer, 160),
+            "humanize_fallback_used": False,
+        }
+        session["humanize_skipped_because_locked_template"] = True
+        session["humanize_fallback_used"] = False
+        _set_openai_debug(session, debug, base_answer, base_answer)
+        state.save_session(chat_id, session)
+        state.log_event(chat_id, "humanize_skipped", {"chat_id": chat_id, "reason": "locked_template", "step": session.get("step") or session.get("current_step") or ""})
+        return base_answer
     if session.get("openai_brain_used") and (base_answer or "").strip():
         session["humanize_skipped_because_brain_valid"] = True
         session["humanize_fallback_used"] = False
@@ -350,6 +366,8 @@ def _guard_answer(chat_id: str, answer: str) -> str:
     - ограничивает длинные ответы вне разрешённых шаблонов.
     """
     session = _get_session_safe(chat_id)
+    if str(session.get("answer_source") or "").startswith("locked_template") or (answer or "").strip() == FIRST_TOUCH_CLINIC_INFO_RU:
+        return (answer or "").strip()
     return enforce_prompt_only(answer or "", session)
 
 
@@ -657,6 +675,14 @@ async def _send_answer_parts(
     safe_text = _guard_answer(chat_id, safe_text)
     if not safe_text:
         return
+    sess = _get_session_safe(chat_id)
+    last_sent = str(sess.get("last_sent_answer") or "")
+    if last_sent and (last_sent.strip() == safe_text or (FIRST_TOUCH_CLINIC_INFO_RU in last_sent and safe_text == FIRST_TOUCH_CLINIC_INFO_RU)):
+        sess["wazzup_send_called"] = False
+        sess["outgoing_duplicate_guard_blocked"] = True
+        state.save_session(chat_id, sess)
+        state.log_event(chat_id, "wazzup_send_blocked", {"phone": phone, "reason": "duplicate_answer"})
+        return
     state.log_event(chat_id, "wazzup_send_attempt", {"phone": phone, "answer_preview": _preview(safe_text, 160)})
     try:
         decision_data = _get_session_safe(chat_id).get("guard_decision")
@@ -665,6 +691,7 @@ async def _send_answer_parts(
             return
         sess = _get_session_safe(chat_id)
         sess["wazzup_send_called"] = True
+        sess["last_sent_answer"] = safe_text
         state.save_session(chat_id, sess)
         result = await send_text(chat_id=chat_id, text=safe_text, chat_type=chat_type, channel_id=channel_id)
         state.log_event(chat_id, "wazzup_send_result", {"phone": phone, "ok": True, "status_code": result.get("status_code")})
