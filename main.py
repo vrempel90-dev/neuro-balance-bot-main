@@ -5,6 +5,7 @@ import uuid
 import mimetypes
 import re
 from typing import Any
+from datetime import datetime, timezone
 
 import httpx
 
@@ -270,6 +271,61 @@ async def _maybe_humanize_answer(chat_id: str, user_text: str, base_answer: str,
     return final_answer
 
 
+
+
+
+def _parse_message_datetime(value: Any):
+    if value in (None, ""):
+        return None
+    try:
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            ts = float(value)
+            if ts > 10_000_000_000:
+                ts = ts / 1000
+            return datetime.fromtimestamp(ts, timezone.utc)
+        text = str(value).strip().replace("Z", "+00:00")
+        return datetime.fromisoformat(text)
+    except Exception:
+        return None
+
+def _bot_activated_at():
+    raw = getattr(get_settings(), "bot_activated_at", "") or "2026-07-02T00:00:00+05:00"
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        return datetime.now(timezone.utc)
+
+def _mark_no_reply(chat_id: str, reason: str, message: dict[str, Any], *, duplicate: bool = False, old: bool = False) -> None:
+    session = _get_session_safe(chat_id)
+    session["no_reply_reason"] = reason
+    session["message_id"] = str(message.get("message_id") or message.get("message_key") or "")
+    session["message_timestamp"] = str(message.get("timestamp") or "")
+    session["bot_activated_at"] = _bot_activated_at().isoformat()
+    session["is_old_message"] = old
+    session["is_duplicate_message"] = duplicate
+    session["openai_used"] = False
+    session["openai_brain_used"] = False
+    session["wazzup_send_called"] = False
+    session["guard_decision"] = GuardDecision(False, reason, False, False, False).to_dict()
+    state.save_session(chat_id, session)
+    state.log_event(chat_id, "bot_no_reply", {"no_reply_reason": reason, "message_id": session["message_id"], "message_timestamp": session["message_timestamp"], "bot_activated_at": session["bot_activated_at"]})
+
+def _hard_inbound_block_reason(message: dict[str, Any], session: dict[str, Any] | None = None) -> tuple[str, bool, bool]:
+    direction = str(message.get("direction") or "incoming").lower()
+    from_me = str(message.get("is_from_me") or "").lower() == "true" or bool(message.get("from_me") or message.get("is_operator") or message.get("is_admin"))
+    if direction != "incoming" or from_me:
+        return "not_client_incoming_message", False, False
+    ts = _parse_message_datetime(message.get("timestamp") or message.get("message_timestamp"))
+    activated = _bot_activated_at()
+    if ts and ts < activated:
+        return "old_message_before_bot_activation", False, True
+    key = str(message.get("message_key") or message.get("message_id") or "")
+    if key and state.is_processed_message(key):
+        return "duplicate_message_already_processed", True, False
+    s = session or {}
+    if any(bool(s.get(k)) for k in ("manual_admin_intervention", "operator_replied_after_client")) or str(s.get("chat_status") or "") == "answered_by_admin" or s.get("wazzup_reply_needed") is False:
+        return "admin_or_wazzup_marked_no_reply", False, False
+    return "", False, False
 
 def _mark_working_hours_disabled(
     *,
@@ -617,6 +673,12 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
 
     state.log_event(chat_id, "incoming_message_received", {"phone": phone, "kind": kind, "source": str(message.get("source") or "wazzup"), "text_preview": _preview(message.get("text"), 120)})
 
+    pre_hard_session = _get_session_safe(chat_id)
+    hard_reason, is_dup, is_old = _hard_inbound_block_reason(message, pre_hard_session)
+    if hard_reason:
+        _mark_no_reply(chat_id, hard_reason, message, duplicate=is_dup, old=is_old)
+        return ""
+
     source = str(message.get("source") or "wazzup")
     if not bool(getattr(get_settings(), "bot_auto_reply_enabled", True)):
         _mark_bot_auto_reply_disabled(chat_id=chat_id, phone=phone, source=source, force=False, kind=kind, text=str(message.get("text") or ""))
@@ -657,6 +719,9 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
     answer = await _maybe_humanize_answer(chat_id, user_text, base_answer)
     answer = _guard_answer(chat_id, answer)
     _log_dialog_result(chat_id, phone, answer)
+    message_key = str(message.get("message_key") or message.get("message_id") or "")
+    if message_key:
+        state.mark_processed_message(message_key, chat_id)
     return answer
 
 
@@ -908,19 +973,18 @@ async def wazzup_webhook(request: Request, authorization: str | None = Header(de
         })
         message_key = str(message.get("message_key") or "")
 
-        if message_key and (message_key in ignored_raw_message_keys or state.is_processed_message(message_key)):
+        hard_reason, is_dup, is_old = _hard_inbound_block_reason(message, _get_session_safe(chat_id))
+        if message_key in ignored_raw_message_keys or hard_reason:
+            _mark_no_reply(chat_id, hard_reason or "duplicate_message_already_processed", message, duplicate=is_dup or bool(message_key in ignored_raw_message_keys), old=is_old)
             skipped += 1
             continue
 
         if is_audio_message_payload(message):
+            _ignore_voice_message(chat_id, message_key, "extracted_message")
             if message_key:
                 state.mark_processed_message(message_key, chat_id)
-            _ignore_voice_message(chat_id, message_key, "extracted_message")
             accepted += 1
             continue
-
-        if message_key:
-            state.mark_processed_message(message_key, chat_id)
 
         asyncio.create_task(_debounced_process_and_send(message))
         accepted += 1

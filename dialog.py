@@ -109,6 +109,9 @@ BANNED_FINAL_PHRASES = (
     "чем можем помочь",
     "хотите записаться или уточняете",
     "по уже имеющейся записи",
+    "хотите записаться на консультацию или уточняете по уже имеющейся записи",
+    "Чтобы не повторяться и не запутать Вас, передам диалог администратору",
+    "Есть ли у Вас какие-нибудь противопоказания?",
 )
 APPROVED_CONTRA_TERMS = {
     "кардиостимулятор", "онколог", "онкология", "рак",
@@ -142,6 +145,81 @@ def _contra_details_locked_answer(session: dict[str, Any]) -> str:
         f"Подскажите, пожалуйста, {prep} ничего из этого нет?"
     )
 
+
+
+POST_BOOKING_OK_WORDS = ("да", "ок", "окей", "хорошо", "поняла", "понял", "спасибо", "здравствуйте ок")
+POST_BOOKING_TIME_WORDS = ("во сколько", "на какое время", "напомните время", "когда я записан", "когда приём", "на когда запись", "я записан")
+POST_BOOKING_RESCHEDULE_WORDS = ("перенесите", "хочу перенести", "можно перенести", "поменять время", "поменять дату", "не могу в это время", "давайте на другое время")
+
+def _post_booking_ok_answer(session: dict[str, Any]) -> str:
+    date = str(session.get("appointment_date") or session.get("booked_date") or "")
+    time = str(session.get("appointment_time") or session.get("booked_time") or "")
+    if date and time:
+        return f"Хорошо 🌿 Ждём Вас {_format_booking_date_human(date, 'ru')} в {time}. Если возникнут вопросы по записи, можете написать сюда."
+    return "Хорошо 🌿 Если возникнут вопросы по записи, можете написать сюда."
+
+def _store_appointment_fields(session: dict[str, Any], appt: dict[str, Any]) -> None:
+    session["booking_visible_in_crm"] = True
+    session["booking_confirmed"] = True
+    session["post_booking_support_active"] = True
+    session["step"] = "booked"
+    session["appointment_id"] = appt.get("id") or appt.get("appointmentId") or session.get("appointment_id") or ""
+    session["crm_booking_id"] = appt.get("crm_booking_id") or appt.get("bookingId") or session.get("crm_booking_id") or ""
+    session["appointment_date"] = appt.get("date") or appt.get("appointmentDate") or session.get("appointment_date") or ""
+    session["appointment_time"] = appt.get("timeStart") or appt.get("time_start") or appt.get("time") or session.get("appointment_time") or ""
+    session["appointment_doctor_name"] = appt.get("doctorName") or appt.get("doctor_name") or session.get("appointment_doctor_name") or ""
+    session["appointment_doctor_login"] = appt.get("doctorLogin") or appt.get("doctor_login") or session.get("appointment_doctor_login") or ""
+
+async def _lookup_active_appointment(chat_id: str, phone: str, session: dict[str, Any]) -> dict[str, Any] | None:
+    if session.get("appointment_id") or (session.get("appointment_date") and session.get("appointment_time")):
+        return {"id": session.get("appointment_id"), "date": session.get("appointment_date"), "timeStart": session.get("appointment_time"), "doctorName": session.get("appointment_doctor_name")}
+    normalized = sanitize_kz_phone(phone or session.get("phone") or "") or (phone or session.get("phone") or "")
+    if not normalized:
+        return None
+    session["appointment_lookup_called"] = True
+    try:
+        lookup = await crm.patient_lookup(normalized)
+        session["appointment_lookup_result"] = lookup
+        if isinstance(lookup, dict) and lookup.get("hasActiveAppointment"):
+            appt = lookup.get("lastAppointment") or lookup.get("appointment") or {}
+            if isinstance(appt, dict):
+                _store_appointment_fields(session, appt)
+                return appt
+    except Exception as exc:
+        session["appointment_lookup_result"] = {"error": str(exc)[:300]}
+    return None
+
+async def _post_booking_support_answer(chat_id: str, phone: str, session: dict[str, Any], text: str) -> str:
+    low = _low(text)
+    session["is_booked_client"] = True
+    session["post_booking_support_active"] = True
+    session["first_touch_blocked_reason"] = session.get("first_touch_blocked_reason") or "active_appointment"
+    if _has_any(low, ADDRESS_WORDS):
+        return "Адрес: Кабанбай батыра 28, внутренний двор, подъезд 3.\nЗаезд со стороны Кунаева, после ворот поверните направо 📍\n\n2ГИС: https://2gis.kz/astana/inside/9570784863354265/firm/70000001105992248?m=71.416112%2C51.134091%2F16"
+    if _is_cancel(text):
+        ans = await _handle_cancel_appointment(chat_id, phone, session, text)
+        return "Запись отменена 🌿 Хорошо, что предупредили. Запись отменили." if session.get("cancelled") else ans
+    if _has_any(low, POST_BOOKING_RESCHEDULE_WORDS):
+        appt = await _lookup_active_appointment(chat_id, phone, session)
+        if appt:
+            session["reschedule_mode"] = True
+            session["original_appointment"] = appt
+            return "Хорошо, перенесём 🌿 На какой день и время Вам было бы удобно?"
+        session["manual_takeover"] = True
+        return "Сейчас передам администратору, чтобы он помог перенести запись 🌿"
+    if _has_any(low, POST_BOOKING_TIME_WORDS) or _wants_existing_lookup(text):
+        appt = await _lookup_active_appointment(chat_id, phone, session)
+        if appt:
+            date = session.get("appointment_date") or appt.get("date") or appt.get("appointmentDate") or ""
+            time = session.get("appointment_time") or appt.get("timeStart") or appt.get("time") or ""
+            doctor = session.get("appointment_doctor_name") or appt.get("doctorName") or "врачу"
+            if date and time:
+                return f"Вы уже записаны на {_format_booking_date_human(date, 'ru')} в {time} к врачу {doctor} 🌿"
+        session["manual_takeover"] = True
+        return "Сейчас передам администратору, чтобы проверили запись вручную 🌿"
+    if low.strip() in POST_BOOKING_OK_WORDS or any(x == low.strip() for x in POST_BOOKING_OK_WORDS):
+        return _post_booking_ok_answer(session)
+    return _post_booking_ok_answer(session)
 
 def _has_banned_final_phrase(answer: str) -> bool:
     low = _low(answer)
@@ -4255,6 +4333,16 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         session["ai_muted"] = True
         session["manual_takeover"] = False
         session["booking_confirmed"] = True
+        session["booking_confirmed_at"] = datetime.now(timezone.utc).isoformat()
+        session["post_booking_support_until"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        session["post_booking_support_active"] = True
+        session["appointment_id"] = booked.get("id") or booked.get("appointmentId") or booked.get("bookingId") or "" if isinstance(booked, dict) else ""
+        session["crm_booking_id"] = session.get("appointment_id")
+        session["appointment_date"] = _slot_date(slot)
+        session["appointment_time"] = _slot_time(slot)
+        session["appointment_doctor_name"] = _slot_doctor_name(slot)
+        session["appointment_doctor_login"] = _slot_doctor_login(slot)
+        session["booking_visible_in_crm"] = True
         session["no_reply_reason"] = ""
         session["status"] = "booked"
         session["crm_status"] = "Записан"
@@ -4395,7 +4483,7 @@ def _wants_existing_lookup(text: str) -> bool:
     has_existing = any(w in low for w in ["уже", "моя", "мою", "у меня", "менің", "меним"])
     has_record = any(w in low for w in ["запис", "запись", "жазыл", "жазба"])
     has_time = any(w in low for w in ["когда", "время", "дат", "во сколько", "напом", "қашан", "уақыт"])
-    return has_existing and has_record and has_time
+    return (has_existing and has_record) or (has_record and has_time)
 
 
 def _is_cancel(text: str) -> bool:
@@ -4472,6 +4560,10 @@ async def _handle_cancel_appointment(chat_id: str, phone: str, session: dict[str
         session["step"] = "done"
         session["status"] = "cancelled"
         session["cancelled"] = True
+        session["appointment_status"] = "cancelled"
+        session["booking_confirmed"] = False
+        session["cancellation_confirmed"] = True
+        session["post_booking_support_active"] = False
         session["escalated"] = False
 
         if isinstance(result, dict) and result.get("alreadyCancelled"):
@@ -4483,7 +4575,7 @@ async def _handle_cancel_appointment(chat_id: str, phone: str, session: dict[str
 
         return _tr(
             session,
-            "Запись отменили. Хорошо, будем рады Вам в другой раз🌿",
+            "Запись отменена 🌿 Хорошо, что предупредили. Запись отменили.",
             "Жазба тоқтатылды. Жақсы, Сізді басқа уақытта күтеміз🌿",
         )
     except Exception as exc:
@@ -5444,9 +5536,20 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _finalize(chat_id, session, _instagram_detail_answer(session))
     if _is_status_request(text) and (session.get("booking_confirmed") is True or not _is_booked_or_confirmed_session(session)):
         return _finalize(chat_id, session, _status_answer(session))
-    if _is_booked_or_confirmed_session(session):
-        session["gate_reason"] = "booked_session_ai_disabled"
-        return _no_reply(chat_id, session, "booked_session_ai_disabled")
+    appt = None
+    should_lookup_active = (
+        session.get("old_chat") is True
+        or session.get("existing_chat") is True
+        or session.get("imported") is True
+        or _wants_existing_lookup(text)
+    )
+    if not _is_booked_or_confirmed_session(session) and should_lookup_active:
+        appt = await _lookup_active_appointment(chat_id, phone, session)
+        if appt:
+            session["first_touch_blocked_reason"] = "active_appointment"
+    if _is_booked_or_confirmed_session(session) or appt:
+        session["gate_reason"] = "post_booking_support"
+        return _finalize(chat_id, session, await _post_booking_support_answer(chat_id, phone, session, text))
     if _is_first_touch_due(session):
         session["gate_reason"] = "new_lead"
         session["lead_source"] = "new_lead"
