@@ -300,8 +300,6 @@ def extract_incoming_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
     for msg in raw_messages:
         if not isinstance(msg, dict):
             continue
-        if msg.get("isEcho") is True or msg.get("fromMe") is True:
-            continue
 
         chat_id = str(msg.get("chatId") or msg.get("chat_id") or msg.get("from") or "").strip()
         if not chat_id:
@@ -325,12 +323,15 @@ def extract_incoming_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
 
         text = _message_text(msg)
         media = _message_media(msg)
+        direction = str(_dig(msg, "direction") or _dig(msg, "message.direction") or ("outgoing" if (msg.get("isEcho") is True or msg.get("fromMe") is True) else "incoming")).lower()
+        is_from_me = bool(msg.get("isEcho") is True or msg.get("fromMe") is True or msg.get("isFromMe") is True)
+        timestamp = str(_message_ts(msg) or "")
         message_key = _message_id(msg, payload, chat_id, text or (media.get("file_id") if media else ""))
 
         if text:
-            result.append({"chat_id": chat_id, "text": text, "phone": phone, "chat_type": chat_type, "kind": "text", "channel_id": channel_id, "message_key": message_key})
+            result.append({"chat_id": chat_id, "text": text, "phone": phone, "chat_type": chat_type, "kind": "text", "channel_id": channel_id, "message_key": message_key, "message_id": message_key, "timestamp": timestamp, "direction": direction, "is_from_me": str(is_from_me).lower()})
         elif media:
-            item = {"chat_id": chat_id, "phone": phone, "chat_type": chat_type, "kind": "voice", "channel_id": channel_id, "message_key": message_key}
+            item = {"chat_id": chat_id, "phone": phone, "chat_type": chat_type, "kind": "voice", "channel_id": channel_id, "message_key": message_key, "message_id": message_key, "timestamp": timestamp, "direction": direction, "is_from_me": str(is_from_me).lower()}
             item.update(media)
             result.append(item)
 
