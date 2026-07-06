@@ -98,11 +98,31 @@ _SERVICES_CACHE: tuple[float, dict[str, Any]] | None = None
 _META_CACHE_TTL = 300.0
 
 
-def _normalize_phone(phone: str | None) -> str:
+def normalize_phone(phone: str | None) -> str:
     digits = re.sub(r"\D+", "", phone or "")
-    if digits.startswith("8") and len(digits) == 11:
+    if len(digits) == 10 and digits.startswith("7"):
+        digits = "7" + digits
+    elif digits.startswith("8") and len(digits) == 11:
         digits = "7" + digits[1:]
     return digits
+
+
+def phone_lookup_variants(phone: str | None) -> list[str]:
+    normalized = normalize_phone(phone)
+    variants: list[str] = []
+    if normalized:
+        variants.extend([normalized, f"+{normalized}"])
+        if normalized.startswith("7") and len(normalized) == 11:
+            variants.extend(["8" + normalized[1:], normalized[1:]])
+    raw_digits = re.sub(r"\D+", "", phone or "")
+    if raw_digits:
+        variants.append(raw_digits)
+    seen: set[str] = set()
+    return [v for v in variants if not (v in seen or seen.add(v))]
+
+
+def _normalize_phone(phone: str | None) -> str:
+    return normalize_phone(phone)
 
 
 async def patient_lookup(phone: str) -> dict[str, Any]:
@@ -420,6 +440,104 @@ async def reschedule_appointment(
 
     return data
 
+
+
+def _appointment_datetime(appt: dict[str, Any]) -> datetime | None:
+    date_value = appt.get("date") or appt.get("appointmentDate") or appt.get("appointment_date")
+    time_value = appt.get("timeStart") or appt.get("time_start") or appt.get("time") or "00:00"
+    if not date_value:
+        return None
+    try:
+        return datetime.fromisoformat(f"{str(date_value)[:10]}T{str(time_value)[:5]}")
+    except Exception:
+        return None
+
+
+def _appointment_id(appt: dict[str, Any]) -> Any:
+    return appt.get("id") or appt.get("appointmentId") or appt.get("record_id") or appt.get("recordId") or appt.get("bookingId")
+
+
+def _extract_appointments(data: dict[str, Any]) -> list[dict[str, Any]]:
+    # Production lookup should consume CRM list contracts. Legacy tests/fallbacks
+    # often expose only lastAppointment for the old on-demand lookup flow; do not
+    # let that singleton make every new lead look booked before first-touch.
+    candidates = data.get("appointments") or data.get("records") or data.get("items") or []
+    if not isinstance(candidates, list):
+        candidates = []
+    return [a for a in candidates if isinstance(a, dict)]
+
+
+def _is_active_future_appointment(appt: dict[str, Any]) -> bool:
+    status = str(appt.get("status") or appt.get("appointmentStatus") or "").lower()
+    if status in {"cancelled", "canceled", "completed", "deleted", "no_show", "no-show", "done"}:
+        return False
+    if not _appointment_id(appt):
+        return False
+    dt = _appointment_datetime(appt)
+    if dt is None:
+        return bool(appt)
+    return dt >= datetime.now().replace(tzinfo=None)
+
+
+class CRMClient:
+    async def lookup_active_appointments_by_phone(self, phone: str) -> dict[str, Any]:
+        variants = phone_lookup_variants(phone)
+        errors: list[str] = []
+        last_status: int | None = None
+        for variant in variants or [phone]:
+            try:
+                data = await patient_lookup(variant)
+                last_status = 200
+            except CRMResponseError as exc:
+                last_status = exc.status_code
+                errors.append(str(exc))
+                continue
+            except Exception as exc:
+                errors.append(str(exc))
+                continue
+            appointments = _extract_appointments(data)
+            active = [a for a in appointments if _is_active_future_appointment(a)]
+            active.sort(key=lambda a: _appointment_datetime(a) or datetime.max)
+            return {
+                "ok": True,
+                "status_code": last_status or 200,
+                "phone_raw": phone,
+                "phone_normalized": normalize_phone(phone),
+                "phone_variants": variants,
+                "appointments": active,
+                "appointment": active[0] if active else None,
+                "appointments_cache": active[1:],
+                "active_count": len(active),
+                "raw": data,
+            }
+        raise CRMError("CRM lookup failed: " + "; ".join(errors[-3:]))
+
+    async def lookup_appointment_by_id(self, appointment_id: str | int) -> dict[str, Any]:
+        response = await _client().get(_url("/api/bot/appointment"), params={"appointmentId": appointment_id}, headers=_headers())
+        _raise_for_crm(response, "appointment")
+        data = response.json(); data.setdefault("ok", True); return data
+
+    async def check_slots_for_date(self, date: str | date_cls, doctor_login: str | None = None) -> dict[str, Any]:
+        return await check_slots_for_date(date, doctor_login)
+
+    async def check_slots_range(self, date_from: str | date_cls, date_to: str | date_cls, doctor_login: str | None = None) -> dict[str, Any]:
+        return await check_slots_range(date_from, date_to, doctor_login)
+
+    async def find_nearest_available_slots(self, start_date: str | date_cls, days_ahead: int = 14, doctor_login: str | None = None, time_preference: str | None = None) -> dict[str, Any]:
+        return await find_nearest_available_slots(start_date, days_ahead, doctor_login, time_preference)
+
+    async def book_appointment(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await book_appointment(**payload)
+
+    async def cancel_appointment(self, appointment_id: str | int, reason: str | None = None) -> dict[str, Any]:
+        return await cancel_appointment(phone="0", appointment_id=appointment_id, reason=reason or "отмена через бота")
+
+    async def reschedule_appointment(self, appointment_id: str | int, new_slot: dict[str, Any]) -> dict[str, Any]:
+        return await reschedule_appointment(phone=str(new_slot.get("phone") or "0"), appointment_id=appointment_id, new_date=str(new_slot.get("date") or new_slot.get("newDate") or ""), new_time_start=str(new_slot.get("timeStart") or new_slot.get("time") or new_slot.get("newTimeStart") or ""))
+
+
+async def lookup_active_appointments_by_phone(phone: str) -> dict[str, Any]:
+    return await CRMClient().lookup_active_appointments_by_phone(phone)
 
 async def escalate_to_operator(
     *,
