@@ -135,9 +135,7 @@ def _patient_lookup_url() -> str:
 
 
 def _normalize_patient_lookup_response(data: dict[str, Any]) -> dict[str, Any]:
-    if data.get("lastAppointment") and not data.get("appointment"):
-        data["appointment"] = data.get("lastAppointment")
-    data.setdefault("hasActiveAppointment", bool(data.get("lastAppointment") or data.get("appointment")))
+    data.setdefault("hasActiveAppointment", bool(data.get("appointment")))
     data.setdefault("ok", True)
     return data
 

@@ -174,6 +174,87 @@ def _store_appointment_fields(session: dict[str, Any], appt: dict[str, Any]) -> 
     session["appointment_doctor_login"] = appt.get("doctorLogin") or appt.get("doctor_login") or session.get("appointment_doctor_login") or ""
     session["appointment_status"] = appt.get("status") or appt.get("appointmentStatus") or session.get("appointment_status") or "booked"
 
+CRM_ACTIVE_STATUSES = {"active", "scheduled", "confirmed", "booked", "активна", "активный", "запланирован", "подтвержден", "подтверждён", "записан"}
+
+
+def _crm_raw(lookup: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(lookup, dict):
+        return {}
+    raw = lookup.get("raw")
+    return raw if isinstance(raw, dict) else lookup
+
+
+def _crm_appt_is_active(appt: dict[str, Any] | None) -> bool:
+    if not isinstance(appt, dict) or not appt:
+        return False
+    status = _low(str(appt.get("status") or appt.get("appointmentStatus") or ""))
+    if status and not any(s in status for s in CRM_ACTIVE_STATUSES):
+        return False
+    date_s = str(appt.get("date") or appt.get("appointmentDate") or "")[:10]
+    if date_s:
+        try:
+            return datetime.fromisoformat(date_s).date() >= (datetime.now(timezone.utc) + timedelta(hours=5)).date()
+        except Exception:
+            pass
+    return any(s in status for s in CRM_ACTIVE_STATUSES)
+
+
+def _set_crm_patient_debug(session: dict[str, Any], lookup: dict[str, Any] | None, appt: dict[str, Any] | None) -> None:
+    raw = _crm_raw(lookup)
+    patient = raw.get("patient") if isinstance(raw.get("patient"), dict) else {}
+    lead = raw.get("lead") if isinstance(raw.get("lead"), dict) else {}
+    last = raw.get("lastAppointment") if isinstance(raw.get("lastAppointment"), dict) else {}
+    session["crm_patient_found"] = bool(raw.get("found")) if "found" in raw else bool(patient or lead or last)
+    session["crm_patient_is_new"] = bool(raw.get("isNew")) if "isNew" in raw else not bool(patient or lead or last or appt)
+    session["crm_patient_name"] = patient.get("name") or raw.get("patientName") or ""
+    session["crm_lead_id"] = lead.get("id") or ""
+    session["crm_lead_status"] = lead.get("status") or ""
+    session["crm_lead_complaint"] = lead.get("complaint") or ""
+    session["crm_lead_request"] = lead.get("request") or ""
+    session["crm_last_appointment_id"] = last.get("id") or ""
+    session["crm_last_appointment_date"] = last.get("date") or last.get("appointmentDate") or ""
+    session["crm_last_appointment_time"] = last.get("timeStart") or last.get("time") or ""
+    session["crm_last_appointment_status"] = last.get("status") or last.get("appointmentStatus") or ""
+    if appt:
+        session["crm_patient_state"] = "ACTIVE_BOOKING"
+    elif bool(patient or lead or last or raw.get("found") is True or raw.get("isNew") is False):
+        session["crm_patient_state"] = "RETURNING_PATIENT_NO_ACTIVE_BOOKING"
+    else:
+        session["crm_patient_state"] = "NEW_PATIENT"
+
+
+def _returning_patient_greeting(session: dict[str, Any]) -> str:
+    topic = (session.get("crm_lead_request") or session.get("crm_lead_complaint") or "").strip()
+    if topic:
+        return f"Здравствуйте 🌿 Вижу, что Вы уже обращались к нам по вопросу: {topic.lower()}. Активной записи сейчас не вижу. Хотите, я подберу ближайшее свободное время?"
+    return "Здравствуйте 🌿 Вижу, что Вы уже обращались к нам. Активной записи сейчас не вижу. Хотите, я подберу для Вас ближайшее свободное время?"
+
+
+def _returning_wants_booking(text: str) -> bool:
+    low = _low(text).strip()
+    return low in {"да", "хочу", "хочу записаться", "подберите", "когда можно", "ближайшее время", "запишите"} or _has_any(low, ("хочу запис", "подберите", "когда можно", "ближайшее время", "запишите"))
+
+
+def _returning_patient_answer(session: dict[str, Any], text: str) -> str:
+    session["first_touch_allowed"] = False
+    session["first_touch_blocked_reason"] = "returning_patient_in_crm"
+    session["ai_lead_started"] = True
+    if _has_any(text, ADDRESS_WORDS):
+        return "Адрес: Кабанбай батыра 28, внутренний двор, подъезд 3.\nЗаезд со стороны Кунаева, после ворот поверните направо 📍\n\n2ГИС: https://2gis.kz/astana/inside/9570784863354265/firm/70000001105992248?m=71.416112%2C51.134091%2F16"
+    if _has_any(_low(text), POST_BOOKING_TIME_WORDS) or _wants_existing_lookup(text):
+        return "Активной записи сейчас не вижу 🌿 Могу подобрать для Вас ближайшее свободное время."
+    if _returning_wants_booking(text):
+        complaint = (session.get("crm_lead_request") or session.get("crm_lead_complaint") or "").strip()
+        if complaint:
+            session["complaint"] = complaint
+            _record_complaint_tool(session, complaint, is_in_profile=True)
+        if not session.get("age"):
+            session["step"] = "age"
+            return _ask_age(session)
+        session["step"] = "contraindications"
+        return _ask_contra(session)
+    return _returning_patient_greeting(session)
+
 async def _lookup_active_appointment(chat_id: str, phone: str, session: dict[str, Any]) -> dict[str, Any] | None:
     normalized = crm.normalize_phone(phone or session.get("phone") or "") or sanitize_kz_phone(phone or session.get("phone") or "")
     variants = crm.phone_lookup_variants(phone or session.get("phone") or "") if hasattr(crm, "phone_lookup_variants") else [normalized]
@@ -203,14 +284,16 @@ async def _lookup_active_appointment(chat_id: str, phone: str, session: dict[str
         session["crm_endpoint_url"] = lookup.get("endpoint_url") if isinstance(lookup, dict) else ""
         session["crm_lookup_scope"] = "active_appointments_by_phone"
         session["appointments_raw_count"] = int((lookup or {}).get("appointments_raw_count") or len((lookup or {}).get("appointments") or [])) if isinstance(lookup, dict) else 0
-        active = list((lookup or {}).get("appointments") or []) if isinstance(lookup, dict) else []
-        appt = (lookup or {}).get("appointment") if isinstance(lookup, dict) else None
+        active = [a for a in list((lookup or {}).get("appointments") or []) if _crm_appt_is_active(a)] if isinstance(lookup, dict) else []
+        appt = (lookup or {}).get("appointment") if isinstance(lookup, dict) and _crm_appt_is_active((lookup or {}).get("appointment")) else None
+        raw = _crm_raw(lookup)
+        if not appt and isinstance(lookup, dict) and lookup.get("hasActiveAppointment") is True:
+            cand = raw.get("appointment") or lookup.get("appointment") or raw.get("lastAppointment")
+            appt = cand if isinstance(cand, dict) else None
         session["nearest_active_appointment"] = appt
-        if not appt and isinstance(lookup, dict) and (session.get("old_chat") or session.get("existing_chat") or session.get("imported") or _wants_existing_lookup(str(session.get("last_user_text") or "")) or _is_cancel(str(session.get("last_user_text") or ""))):
-            raw = lookup.get("raw") if isinstance(lookup.get("raw"), dict) else {}
-            appt = raw.get("appointment") or raw.get("lastAppointment")
         session["active_appointment_found"] = bool(appt)
         session["active_appointment_count"] = len(active) if active else (1 if appt else 0)
+        _set_crm_patient_debug(session, lookup, appt)
         session["appointments_cache"] = (lookup or {}).get("appointments_cache") or active[1:]
         if isinstance(appt, dict):
             _store_appointment_fields(session, appt)
@@ -229,6 +312,7 @@ async def _lookup_active_appointment(chat_id: str, phone: str, session: dict[str
         if os.environ.get("PYTEST_CURRENT_TEST") and getattr(crm.lookup_active_appointments_by_phone, "__module__", "crm") == "crm":
             session["crm_lookup_error"] = ""
             session["crm_lookup_result"] = {"ok": True, "appointments": [], "appointment": None, "test_default_no_active": True}
+            _set_crm_patient_debug(session, session["crm_lookup_result"], None)
             return None
         raise
     return None
@@ -2660,6 +2744,7 @@ def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
         "подбирается индивидуально",
         "снимок заранее делать не обязательно",
         "график приёма",
+        "активной записи сейчас не вижу",
     ])
 
     if allow_long:
@@ -2914,6 +2999,9 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     if last_answer and (_low(last_answer) == _low(answer) or _similar_text(last_answer, answer)):
         if _has_any(str(session.get("last_user_text") or ""), ADDRESS_WORDS) and str(session.get("step") or "") in {"complaint", "age", "contraindications", "date", "time", "select_slot", "name"}:
             answer = _address_answer_then_optional_resume(session)
+        elif session.get("crm_patient_state") == "RETURNING_PATIENT_NO_ACTIVE_BOOKING":
+            session["outbound_duplicate_guard_blocked"] = True
+            answer = _returning_patient_answer(session, str(session.get("last_user_text") or ""))
         else:
             session["outbound_duplicate_guard_blocked"] = True
             _safe_save(chat_id, session)
@@ -2921,7 +3009,10 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
 
     # final_no_empty_guard: this must be the last answer mutation before saving/returning.
     if not str(answer or "").strip():
-        if _has_any(str(session.get("last_user_text") or ""), ADDRESS_WORDS):
+        if session.get("crm_patient_state") == "RETURNING_PATIENT_NO_ACTIVE_BOOKING":
+            answer = _returning_patient_answer(session, str(session.get("last_user_text") or ""))
+            session["fallback_reason"] = "final_no_empty_returning_patient"
+        elif _has_any(str(session.get("last_user_text") or ""), ADDRESS_WORDS):
             answer = _address_answer_then_optional_resume(session)
             session["fallback_reason"] = "final_no_empty_address_faq"
         else:
@@ -5434,6 +5525,10 @@ def _first_touch_answer(session: dict[str, Any], text: str) -> str:
         session["first_touch_allowed"] = False
         session["first_touch_blocked_reason"] = "crm_lookup_not_done"
         return "Сейчас уточню Вашу запись у администратора 🌿"
+    if session.get("crm_patient_state") != "NEW_PATIENT":
+        session["first_touch_allowed"] = False
+        session["first_touch_blocked_reason"] = "active_appointment" if session.get("crm_patient_state") == "ACTIVE_BOOKING" else "returning_patient_in_crm"
+        return _returning_patient_answer(session, text)
     session["first_touch_allowed"] = True
     session["first_touch_info_sent"] = True
     session["first_touch_answer_in_progress"] = True
@@ -5583,7 +5678,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session["openai_skip_reason"] = ""
     session["openai_guard_failed"] = False
     _reset_openai_brain_debug(session)
-    for _k in ("crm_lookup_called","crm_lookup_status_code","crm_lookup_result","crm_lookup_error","crm_lookup_phone_variants","active_appointment_found","active_appointment_count","first_touch_allowed","first_touch_blocked_reason","post_booking_support_active"):
+    for _k in ("crm_lookup_called","crm_lookup_status_code","crm_lookup_result","crm_lookup_error","crm_lookup_phone_variants","active_appointment_found","active_appointment_count","first_touch_allowed","first_touch_blocked_reason","post_booking_support_active","crm_patient_found","crm_patient_is_new","crm_patient_state","crm_patient_name","crm_lead_id","crm_lead_status","crm_lead_complaint","crm_lead_request","crm_last_appointment_id","crm_last_appointment_date","crm_last_appointment_time","crm_last_appointment_status"):
         if _k not in {"post_booking_support_active"}:
             session.pop(_k, None)
     session.pop("base_answer_preview", None)
@@ -5614,7 +5709,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         else:
             booked_answer = await _post_booking_support_answer(chat_id, phone, session, text)
         return _finalize(chat_id, session, booked_answer)
-    session["first_touch_allowed"] = True
+    if session.get("crm_patient_state") == "RETURNING_PATIENT_NO_ACTIVE_BOOKING":
+        session["gate_reason"] = "returning_patient_no_active_booking"
+        return _finalize(chat_id, session, _returning_patient_answer(session, text))
+    session["first_touch_allowed"] = session.get("crm_patient_state") == "NEW_PATIENT"
     if (session.get("ai_muted") or session.get("manual_takeover") or session.get("manual_admin_intervention")) and not (session.get("old_chat") or session.get("imported") or session.get("existing_chat")):
         session["ai_muted"] = True
         session["manual_takeover"] = True
