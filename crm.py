@@ -35,6 +35,11 @@ def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=3.0))
 
 
+def _redacted_headers() -> dict[str, str]:
+    headers = _headers()
+    return {k: ("***" if "secret" in k.lower() or "token" in k.lower() else v) for k, v in headers.items()}
+
+
 def _headers() -> dict[str, str]:
     settings = get_settings()
     secret = (
@@ -125,21 +130,31 @@ def _normalize_phone(phone: str | None) -> str:
     return normalize_phone(phone)
 
 
-async def patient_lookup(phone: str) -> dict[str, Any]:
-    response = await _client().get(
-        _url("/api/bot/patient-lookup"),
-        params={"phone": _normalize_phone(phone)},
-        headers=_headers(),
-    )
-    _raise_for_crm(response, "patient-lookup")
-    data = response.json()
+def _patient_lookup_url() -> str:
+    return _url("/api/bot/patient-lookup")
 
+
+def _normalize_patient_lookup_response(data: dict[str, Any]) -> dict[str, Any]:
     if data.get("lastAppointment") and not data.get("appointment"):
         data["appointment"] = data.get("lastAppointment")
-
     data.setdefault("hasActiveAppointment", bool(data.get("lastAppointment") or data.get("appointment")))
     data.setdefault("ok", True)
     return data
+
+
+async def patient_lookup_raw(phone_param: str) -> dict[str, Any]:
+    endpoint = _patient_lookup_url()
+    params = {"phone": phone_param}
+    logger.info("CRM patient-lookup request endpoint=%s params=%s headers=%s", endpoint, params, _redacted_headers())
+    response = await _client().get(endpoint, params=params, headers=_headers())
+    logger.info("CRM patient-lookup status_code=%s endpoint=%s params=%s", response.status_code, endpoint, params)
+    _raise_for_crm(response, "patient-lookup")
+    data = response.json()
+    return _normalize_patient_lookup_response(data)
+
+
+async def patient_lookup(phone: str) -> dict[str, Any]:
+    return await patient_lookup_raw(_normalize_phone(phone))
 
 
 async def get_doctors(force: bool = False) -> dict[str, Any]:
@@ -484,16 +499,24 @@ class CRMClient:
         variants = phone_lookup_variants(phone)
         errors: list[str] = []
         last_status: int | None = None
+        endpoint = _patient_lookup_url()
+        last_params: dict[str, Any] = {}
         for variant in variants or [phone]:
+            last_params = {"phone": variant}
             try:
-                data = await patient_lookup(variant)
+                if getattr(patient_lookup, "__module__", "crm") != __name__:
+                    data = await patient_lookup(variant)
+                else:
+                    data = await patient_lookup_raw(variant)
                 last_status = 200
             except CRMResponseError as exc:
                 last_status = exc.status_code
                 errors.append(str(exc))
+                logger.exception("CRM active appointment lookup response error endpoint=%s params=%s status_code=%s", endpoint, last_params, exc.status_code)
                 continue
             except Exception as exc:
                 errors.append(str(exc))
+                logger.exception("CRM active appointment lookup failed endpoint=%s params=%s", endpoint, last_params)
                 continue
             appointments = _extract_appointments(data)
             active = [a for a in appointments if _is_active_future_appointment(a)]
@@ -504,13 +527,20 @@ class CRMClient:
                 "phone_raw": phone,
                 "phone_normalized": normalize_phone(phone),
                 "phone_variants": variants,
+                "endpoint_url": endpoint,
+                "query_params": last_params,
+                "appointments_raw_count": len(appointments),
                 "appointments": active,
                 "appointment": active[0] if active else None,
                 "appointments_cache": active[1:],
                 "active_count": len(active),
                 "raw": data,
             }
-        raise CRMError("CRM lookup failed: " + "; ".join(errors[-3:]))
+        err = CRMError("CRM lookup failed: " + "; ".join(errors[-3:]))
+        setattr(err, "status_code", last_status)
+        setattr(err, "endpoint_url", endpoint)
+        setattr(err, "query_params", last_params)
+        raise err
 
     async def lookup_appointment_by_id(self, appointment_id: str | int) -> dict[str, Any]:
         response = await _client().get(_url("/api/bot/appointment"), params={"appointmentId": appointment_id}, headers=_headers())
