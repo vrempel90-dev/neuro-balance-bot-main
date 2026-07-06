@@ -200,8 +200,12 @@ async def _lookup_active_appointment(chat_id: str, phone: str, session: dict[str
         lookup = await crm.lookup_active_appointments_by_phone(normalized or phone or session.get("phone") or "")
         session["crm_lookup_result"] = lookup
         session["crm_lookup_status_code"] = lookup.get("status_code") if isinstance(lookup, dict) else 200
+        session["crm_endpoint_url"] = lookup.get("endpoint_url") if isinstance(lookup, dict) else ""
+        session["crm_lookup_scope"] = "active_appointments_by_phone"
+        session["appointments_raw_count"] = int((lookup or {}).get("appointments_raw_count") or len((lookup or {}).get("appointments") or [])) if isinstance(lookup, dict) else 0
         active = list((lookup or {}).get("appointments") or []) if isinstance(lookup, dict) else []
         appt = (lookup or {}).get("appointment") if isinstance(lookup, dict) else None
+        session["nearest_active_appointment"] = appt
         if not appt and isinstance(lookup, dict) and (session.get("old_chat") or session.get("existing_chat") or session.get("imported") or _wants_existing_lookup(str(session.get("last_user_text") or "")) or _is_cancel(str(session.get("last_user_text") or ""))):
             raw = lookup.get("raw") if isinstance(lookup.get("raw"), dict) else {}
             appt = raw.get("appointment") or raw.get("lastAppointment")
@@ -213,6 +217,9 @@ async def _lookup_active_appointment(chat_id: str, phone: str, session: dict[str
             return appt
     except Exception as exc:
         session["crm_lookup_error"] = str(exc)[:500]
+        session["crm_lookup_status_code"] = getattr(exc, "status_code", None)
+        session["crm_endpoint_url"] = getattr(exc, "endpoint_url", session.get("crm_endpoint_url") or "")
+        session["crm_lookup_scope"] = "active_appointments_by_phone"
         session["crm_lookup_result"] = {"error": str(exc)[:300]}
         session["active_appointment_found"] = False
         session["active_appointment_count"] = 0
@@ -5597,7 +5604,16 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["gate_reason"] = "post_booking_support"
         session["first_touch_allowed"] = False
         session["first_touch_blocked_reason"] = "active_appointment"
-        return _finalize(chat_id, session, await _post_booking_support_answer(chat_id, phone, session, text))
+        date = session.get("appointment_date") or appt.get("date") or appt.get("appointmentDate") or ""
+        time = session.get("appointment_time") or appt.get("timeStart") or appt.get("time") or ""
+        doctor = session.get("appointment_doctor_name") or appt.get("doctorName") or "врачу"
+        if _is_cancel(text) or _has_any(_low(text), POST_BOOKING_RESCHEDULE_WORDS) or _has_any(_low(text), POST_BOOKING_TIME_WORDS) or _wants_existing_lookup(text) or _has_any(_low(text), ADDRESS_WORDS) or _low(text).strip() in POST_BOOKING_OK_WORDS:
+            booked_answer = await _post_booking_support_answer(chat_id, phone, session, text)
+        elif date and time:
+            booked_answer = f"Здравствуйте 🌿 Вы уже записаны на {_format_booking_date_human(date, 'ru')} в {time} к врачу {doctor}. Если возникнут вопросы по записи, можете написать сюда."
+        else:
+            booked_answer = await _post_booking_support_answer(chat_id, phone, session, text)
+        return _finalize(chat_id, session, booked_answer)
     session["first_touch_allowed"] = True
     if (session.get("ai_muted") or session.get("manual_takeover") or session.get("manual_admin_intervention")) and not (session.get("old_chat") or session.get("imported") or session.get("existing_chat")):
         session["ai_muted"] = True

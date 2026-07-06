@@ -9,9 +9,10 @@ from datetime import datetime, timezone
 
 import httpx
 
-from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File, Query
 
 import state
+import crm
 from config import get_settings
 from dialog import FIRST_TOUCH_CLINIC_INFO_RU, handle_message
 from guards import GuardDecision, should_auto_reply
@@ -32,6 +33,43 @@ app = FastAPI(title="Neuro Balance Hybrid WhatsApp Booking Bot")
 
 def _preview(value: Any, limit: int = 120) -> str:
     return str(value or "").replace("\n", " ").strip()[:limit]
+
+
+def _crm_debug_payload(phone: str, lookup: dict[str, Any] | None = None, error: Exception | None = None) -> dict[str, Any]:
+    lookup = lookup or {}
+    appt = lookup.get("appointment") if isinstance(lookup, dict) else None
+    appointments = lookup.get("appointments") if isinstance(lookup.get("appointments"), list) else []
+    status_code = lookup.get("status_code") if isinstance(lookup, dict) else getattr(error, "status_code", None)
+    endpoint_url = lookup.get("endpoint_url") if isinstance(lookup, dict) else getattr(error, "endpoint_url", "")
+    return {
+        "phone_raw": phone,
+        "phone_normalized": crm.normalize_phone(phone),
+        "phone_lookup_variants": crm.phone_lookup_variants(phone),
+        "crm_lookup_called": True,
+        "crm_endpoint_url": endpoint_url or "",
+        "crm_status_code": status_code,
+        "crm_lookup_error": str(error)[:500] if error else "",
+        "crm_raw_response": (lookup.get("raw") if isinstance(lookup, dict) else {}) or {},
+        "active_appointment_found": bool(appt),
+        "active_appointment_count": int((lookup.get("active_count") if isinstance(lookup, dict) else 0) or len(appointments) or (1 if appt else 0)),
+        "appointments": appointments,
+        "nearest_active_appointment": appt,
+        "appointments_raw_count": int((lookup.get("appointments_raw_count") if isinstance(lookup, dict) else 0) or len(appointments)),
+        "crm_query_params": (lookup.get("query_params") if isinstance(lookup, dict) else getattr(error, "query_params", {})) or {},
+    }
+
+
+async def _run_debug_crm_lookup(phone: str) -> dict[str, Any]:
+    phone = str(phone or "").strip()
+    try:
+        lookup = await crm.lookup_active_appointments_by_phone(phone)
+        payload = _crm_debug_payload(phone, lookup=lookup)
+        state.log_event("debug_crm_lookup", "crm_lookup_success", {k: v for k, v in payload.items() if k != "crm_raw_response"})
+        return payload
+    except Exception as exc:
+        payload = _crm_debug_payload(phone, error=exc)
+        state.log_event("debug_crm_lookup", "crm_lookup_failed", payload)
+        return payload
 
 
 def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
@@ -103,11 +141,18 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "selected_doctor_name": session.get("selected_doctor_name") or "",
         "crm_lookup_called": bool(session.get("crm_lookup_called")),
         "crm_lookup_status_code": session.get("crm_lookup_status_code"),
+        "crm_lookup_scope": session.get("crm_lookup_scope") or "",
+        "crm_endpoint_url": session.get("crm_endpoint_url") or "",
         "crm_lookup_result": session.get("crm_lookup_result") or {},
         "crm_lookup_error": session.get("crm_lookup_error") or "",
         "crm_lookup_phone_variants": session.get("crm_lookup_phone_variants") or session.get("phone_lookup_variants") or [],
+        "phone_raw": session.get("phone_raw") or "",
+        "phone_normalized": session.get("phone_normalized") or "",
+        "phone_lookup_variants": session.get("phone_lookup_variants") or [],
         "active_appointment_found": bool(session.get("active_appointment_found")),
         "active_appointment_count": int(session.get("active_appointment_count") or 0),
+        "appointments_raw_count": int(session.get("appointments_raw_count") or 0),
+        "nearest_active_appointment": session.get("nearest_active_appointment"),
         "appointment_id": session.get("appointment_id") or "",
         "crm_booking_id": session.get("crm_booking_id") or "",
         "appointment_date": session.get("appointment_date") or "",
@@ -1011,6 +1056,15 @@ async def wazzup_webhook(request: Request, authorization: str | None = Header(de
     return {"ok": True, "accepted": accepted, "skipped": skipped}
 
 
+@app.get("/debug/crm/lookup")
+async def debug_crm_lookup_get(phone: str = Query(...)) -> dict[str, Any]:
+    return await _run_debug_crm_lookup(phone)
+
+
+@app.post("/debug/crm/lookup")
+async def debug_crm_lookup_post(data: dict[str, Any]) -> dict[str, Any]:
+    return await _run_debug_crm_lookup(str(data.get("phone") or ""))
+
 @app.post("/debug/chat")
 async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
     chat_id = str(data.get("chat_id") or "test")
@@ -1073,6 +1127,20 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
         "openai_missing_keys": session.get("openai_missing_keys") or [],
         "openai_disabled_flags": session.get("openai_disabled_flags") or [],
         "debug": _dialog_debug(session, answer),
+        "crm_lookup_called": bool(session.get("crm_lookup_called")),
+        "crm_lookup_scope": session.get("crm_lookup_scope") or "",
+        "crm_endpoint_url": session.get("crm_endpoint_url") or "",
+        "crm_lookup_status_code": session.get("crm_lookup_status_code"),
+        "crm_lookup_error": session.get("crm_lookup_error") or "",
+        "phone_raw": session.get("phone_raw") or phone,
+        "phone_normalized": session.get("phone_normalized") or crm.normalize_phone(phone),
+        "phone_lookup_variants": session.get("phone_lookup_variants") or crm.phone_lookup_variants(phone),
+        "active_appointment_found": bool(session.get("active_appointment_found")),
+        "active_appointment_count": int(session.get("active_appointment_count") or 0),
+        "appointments_raw_count": int(session.get("appointments_raw_count") or 0),
+        "nearest_active_appointment": session.get("nearest_active_appointment"),
+        "first_touch_allowed": bool(session.get("first_touch_allowed")),
+        "first_touch_blocked_reason": session.get("first_touch_blocked_reason") or "",
     }
 
 
