@@ -215,7 +215,7 @@ def _set_crm_patient_debug(session: dict[str, Any], lookup: dict[str, Any] | Non
     session["crm_last_appointment_date"] = last.get("date") or last.get("appointmentDate") or ""
     session["crm_last_appointment_time"] = last.get("timeStart") or last.get("time") or ""
     session["crm_last_appointment_status"] = last.get("status") or last.get("appointmentStatus") or ""
-    if appt:
+    if appt or raw.get("hasActiveAppointment") is True or raw.get("appointment") or raw.get("activeAppointment"):
         session["crm_patient_state"] = "ACTIVE_BOOKING"
     elif bool(patient or lead or last or raw.get("found") is True or raw.get("isNew") is False):
         session["crm_patient_state"] = "RETURNING_PATIENT_NO_ACTIVE_BOOKING"
@@ -325,7 +325,9 @@ async def _post_booking_support_answer(chat_id: str, phone: str, session: dict[s
     if _has_any(low, ADDRESS_WORDS):
         return "Адрес: Кабанбай батыра 28, внутренний двор, подъезд 3.\nЗаезд со стороны Кунаева, после ворот поверните направо 📍\n\n2ГИС: https://2gis.kz/astana/inside/9570784863354265/firm/70000001105992248?m=71.416112%2C51.134091%2F16"
     if _has_any(low, POST_BOOKING_RESCHEDULE_WORDS):
-        appt = await _lookup_active_appointment(chat_id, phone, session)
+        appt = session.get("nearest_active_appointment") if isinstance(session.get("nearest_active_appointment"), dict) else None
+        if not appt:
+            appt = await _lookup_active_appointment(chat_id, phone, session)
         if appt:
             session["reschedule_mode"] = True
             session["original_appointment"] = appt
@@ -336,7 +338,9 @@ async def _post_booking_support_answer(chat_id: str, phone: str, session: dict[s
         ans = await _handle_cancel_appointment(chat_id, phone, session, text)
         return "Запись отменена 🌿 Хорошо, что предупредили. Запись отменили." if session.get("cancelled") else ans
     if _has_any(low, POST_BOOKING_TIME_WORDS) or _wants_existing_lookup(text):
-        appt = await _lookup_active_appointment(chat_id, phone, session)
+        appt = session.get("nearest_active_appointment") if isinstance(session.get("nearest_active_appointment"), dict) else None
+        if not appt:
+            appt = await _lookup_active_appointment(chat_id, phone, session)
         if appt:
             date = session.get("appointment_date") or appt.get("date") or appt.get("appointmentDate") or ""
             time = session.get("appointment_time") or appt.get("timeStart") or appt.get("time") or ""
@@ -348,6 +352,48 @@ async def _post_booking_support_answer(chat_id: str, phone: str, session: dict[s
     if low.strip() in POST_BOOKING_OK_WORDS or any(x == low.strip() for x in POST_BOOKING_OK_WORDS):
         return _post_booking_ok_answer(session)
     return _post_booking_ok_answer(session)
+
+
+def _is_new_leads_only_enabled() -> bool:
+    try:
+        return bool(getattr(get_settings(), "new_leads_only", True))
+    except Exception:
+        return True
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _post_booking_support_is_active(session: dict[str, Any], chat_id: str) -> bool:
+    until = _parse_iso_datetime(session.get("post_booking_support_until"))
+    active = bool(
+        session.get("created_by_ai") is True
+        and session.get("booking_confirmed") is True
+        and str(session.get("chat_id") or chat_id) == str(chat_id)
+        and until is not None
+        and datetime.now(timezone.utc) < until
+    )
+    session["post_booking_support_active"] = active
+    return active
+
+
+def _mute_old_lead(chat_id: str, session: dict[str, Any], reason: str, blocked_reason: str | None = None) -> str:
+    session["NEW_LEADS_ONLY"] = _is_new_leads_only_enabled()
+    session["silent_old_lead"] = True
+    session["old_lead_reason"] = reason
+    session["ai_muted"] = True
+    session["manual_takeover"] = True
+    session["no_reply_reason"] = reason
+    session["first_touch_allowed"] = False
+    session["first_touch_blocked_reason"] = blocked_reason or reason
+    session["guard_decision"] = {"allowed": False, "no_reply_reason": reason, "should_call_openai": False, "should_call_crm": False, "should_send_wazzup": False}
+    return _no_reply(chat_id, session, reason)
 
 def _has_banned_final_phrase(answer: str) -> bool:
     low = _low(answer)
@@ -4470,6 +4516,7 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         session["booking_confirmed"] = True
         session["booking_confirmed_at"] = datetime.now(timezone.utc).isoformat()
         session["post_booking_support_until"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        session["created_by_ai"] = True
         session["post_booking_support_active"] = True
         session["appointment_id"] = booked.get("id") or booked.get("appointmentId") or booked.get("bookingId") or "" if isinstance(booked, dict) else ""
         session["crm_booking_id"] = session.get("appointment_id")
@@ -5666,6 +5713,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session = {}
 
     session["phone"] = phone or session.get("phone") or ""
+    session["NEW_LEADS_ONLY"] = _is_new_leads_only_enabled()
+    session.setdefault("created_by_ai", False)
+    session.setdefault("silent_old_lead", False)
+    session.setdefault("old_lead_reason", "")
     session["chat_id"] = chat_id
     session["answer_source"] = ""
     session["skip_openai"] = False
@@ -5694,7 +5745,16 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["no_reply_reason"] = "crm_lookup_failed"
         session["first_touch_allowed"] = False
         session["first_touch_blocked_reason"] = "crm_lookup_failed"
+        if _is_new_leads_only_enabled():
+            session["guard_decision"] = {"allowed": False, "no_reply_reason": "crm_lookup_failed", "should_call_openai": False, "should_call_crm": False, "should_send_wazzup": False}
+            return _no_reply(chat_id, session, "crm_lookup_failed")
         return _finalize(chat_id, session, "Сейчас уточню Вашу запись у администратора 🌿")
+    if _is_new_leads_only_enabled() and session.get("crm_patient_state") != "NEW_PATIENT" and not _post_booking_support_is_active(session, chat_id):
+        state_reason = "active_booking_old_lead" if session.get("crm_patient_state") == "ACTIVE_BOOKING" or appt else ("returning_patient_old_lead" if session.get("crm_patient_state") == "RETURNING_PATIENT_NO_ACTIVE_BOOKING" else "old_lead_from_crm")
+        # Public no_reply_reason remains the requested old-lead value for generic returning patients.
+        public_reason = "active_booking_old_lead" if state_reason == "active_booking_old_lead" else "old_lead_from_crm"
+        blocked_reason = "returning_patient_old_lead" if state_reason == "returning_patient_old_lead" else public_reason
+        return _mute_old_lead(chat_id, session, public_reason, blocked_reason)
     if appt:
         session["gate_reason"] = "post_booking_support"
         session["first_touch_allowed"] = False

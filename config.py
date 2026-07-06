@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     ai_enabled: bool = Field(default=True, validation_alias=AliasChoices("AI_ENABLED", "ai_enabled"))
     bot_auto_reply_enabled: bool = Field(default=True, validation_alias=AliasChoices("BOT_AUTO_REPLY_ENABLED", "bot_auto_reply_enabled"))
     bot_activated_at: str = Field(default="2026-07-02T00:00:00+05:00", validation_alias=AliasChoices("BOT_ACTIVATED_AT", "bot_activated_at"))
+    new_leads_only: bool = Field(default=True, validation_alias=AliasChoices("NEW_LEADS_ONLY", "new_leads_only"))
     openai_humanize_replies: bool = Field(default=True, validation_alias=AliasChoices("OPENAI_HUMANIZE_REPLIES", "openai_humanize_replies"))
     openai_brain_enabled: bool = Field(default=True, validation_alias=AliasChoices("OPENAI_BRAIN_ENABLED", "openai_brain_enabled"))
     openai_dialog_temperature: float = Field(default=0.2, validation_alias=AliasChoices("OPENAI_DIALOG_TEMPERATURE", "openai_dialog_temperature"))

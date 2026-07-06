@@ -76,6 +76,7 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
     decision = session.get("guard_decision") if isinstance(session.get("guard_decision"), dict) else {}
     return {
         "source": session.get("source") or "",
+        "NEW_LEADS_ONLY": bool(getattr(get_settings(), "new_leads_only", True)),
         "local_time": session.get("local_time") or astana_now().isoformat(),
         "bot_work_time_now": is_bot_work_time(),
         "working_hours_allowed": bool(session.get("working_hours_allowed", is_bot_work_time())),
@@ -109,6 +110,8 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "final_answer_preview": session.get("final_answer_preview") or _preview(answer, 160),
         "gate_reason": session.get("gate_reason") or "",
         "no_reply_reason": session.get("no_reply_reason") or "",
+        "silent_old_lead": bool(session.get("silent_old_lead")),
+        "old_lead_reason": session.get("old_lead_reason") or "",
         "crm_called": bool(session.get("crm_called")),
         "wazzup_send_called": bool(session.get("wazzup_send_called")),
         "should_send_wazzup": bool(decision.get("should_send_wazzup", False)),
@@ -177,6 +180,9 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "first_touch_blocked_reason": session.get("first_touch_blocked_reason") or "",
         "is_booked_client": bool(session.get("is_booked_client")),
         "post_booking_support_active": bool(session.get("post_booking_support_active")),
+        "created_by_ai": bool(session.get("created_by_ai")),
+        "message_timestamp": session.get("message_timestamp") or "",
+        "bot_activated_at": session.get("bot_activated_at") or getattr(get_settings(), "bot_activated_at", ""),
     }
 
 
@@ -374,8 +380,8 @@ def _bot_activated_at():
 def _mark_no_reply(chat_id: str, reason: str, message: dict[str, Any], *, duplicate: bool = False, old: bool = False) -> None:
     session = _get_session_safe(chat_id)
     session["no_reply_reason"] = reason
-    session["message_id"] = str(message.get("message_id") or message.get("message_key") or "")
-    session["message_timestamp"] = str(message.get("timestamp") or "")
+    session["message_id"] = session.get("message_id") or ""
+    session["message_timestamp"] = session.get("message_timestamp") or ""
     session["bot_activated_at"] = _bot_activated_at().isoformat()
     session["is_old_message"] = old
     session["is_duplicate_message"] = duplicate
@@ -472,6 +478,9 @@ def _apply_guard_block(
     session["crm_called"] = False
     session["wazzup_send_called"] = False
     session["guard_decision"] = decision.to_dict()
+    session["message_id"] = session.get("message_id") or ""
+    session["message_timestamp"] = session.get("message_timestamp") or ""
+    session["bot_activated_at"] = _bot_activated_at().isoformat()
     state.save_session(chat_id, session)
     event = "working_hours_blocked" if decision.no_reply_reason == "working_hours_ai_disabled" else decision.no_reply_reason
     state.log_event(chat_id, event or "auto_reply_blocked", {
@@ -787,6 +796,9 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
     session["local_time"] = astana_now().isoformat()
     session["working_hours_allowed"] = True
     session["guard_decision"] = decision.to_dict()
+    session["message_id"] = str(message.get("message_id") or message.get("message_key") or "")
+    session["message_timestamp"] = str(message.get("timestamp") or "")
+    session["bot_activated_at"] = _bot_activated_at().isoformat()
     session["crm_called"] = False
     session["wazzup_send_called"] = False
     state.save_session(chat_id, session)
@@ -1117,6 +1129,9 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
         session["local_time"] = astana_now().isoformat()
         session["working_hours_allowed"] = True
         session["guard_decision"] = decision.to_dict()
+        session["message_id"] = str(data.get("message_id") or "")
+        session["message_timestamp"] = str(data.get("timestamp") or "")
+        session["bot_activated_at"] = _bot_activated_at().isoformat()
         state.save_session(chat_id, session)
         state.log_event(chat_id, "dialog_start", {"phone": phone, "text_preview": _preview(text, 120), "force": force, "source": "debug"})
         raw_answer = await handle_message(chat_id=chat_id, phone=phone, user_text=text)

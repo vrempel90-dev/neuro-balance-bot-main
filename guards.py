@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from config import get_settings
@@ -19,6 +19,16 @@ class GuardDecision:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+
+
+def _post_booking_support_active(session: dict[str, Any]) -> bool:
+    if not (session.get("created_by_ai") is True and session.get("booking_confirmed") is True):
+        return False
+    try:
+        until = datetime.fromisoformat(str(session.get("post_booking_support_until") or "").replace("Z", "+00:00"))
+    except Exception:
+        return False
+    return datetime.now(timezone.utc) < until
 
 def _real_source(source: str) -> bool:
     return (source or "").strip().lower() in {"wazzup", "crm"}
@@ -53,11 +63,12 @@ def should_auto_reply(
     if source_norm == "debug" and not force and not getattr(get_settings(), "bot_auto_reply_enabled", True):
         return GuardDecision(False, "bot_auto_reply_disabled", False, False, False)
 
-    if session.get("ai_muted") or session.get("manual_takeover") or session.get("manual_admin_intervention"):
+    support_active = _post_booking_support_active(session)
+    if (session.get("ai_muted") or session.get("manual_takeover") or session.get("manual_admin_intervention")) and not support_active:
         return GuardDecision(False, "manual_takeover", False, False, False)
     if session.get("escalated") or str(session.get("step") or "").lower() == "escalated":
         return GuardDecision(False, "manual_takeover", False, False, False)
-    if session.get("booked") or str(session.get("step") or "").lower() in {"booked", "done", "confirmed", "appointment_confirmed"}:
+    if (session.get("booked") or str(session.get("step") or "").lower() in {"booked", "done", "confirmed", "appointment_confirmed"}) and not support_active:
         return GuardDecision(False, "booked_session_ai_disabled", False, False, False)
 
     return GuardDecision(True, "", True, True, is_real)

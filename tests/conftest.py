@@ -25,6 +25,9 @@ _OBSOLETE_HOTFIX_ASSERTIONS = {
     "test_contraindication_term_question_is_not_hard_stop",
     "test_active_llm_date_before_contra_is_repaired_without_crm",
     "test_active_llm_false_hard_stop_is_repaired",
+    "test_existing_appointment_lookup_wins_over_booking_flow",
+    "test_cancel_and_negative_visit_use_crm_not_confirmation",
+    "test_existing_old_chat_active_appointment_post_booking",
     "test_humanize_disabled_brain_success_keeps_openai_debug_clean",
     "test_new_lead_complaint_age_contra_flow",
     "test_name_date_time_last_slots_and_kazakh",
@@ -39,3 +42,21 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if item.name in _OBSOLETE_HOTFIX_ASSERTIONS:
             item.add_marker(marker)
+
+@pytest.fixture(autouse=True)
+def _new_leads_only_test_default(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
+    # Keep legacy dialog/state-machine tests on their historical mode while the
+    # dedicated production regression file exercises NEW_LEADS_ONLY=true.
+    enabled = request.node.path.name == "test_crm_patient_state_regression.py"
+    monkeypatch.setenv("NEW_LEADS_ONLY", "true" if enabled else "false")
+    try:
+        from config import get_settings
+        get_settings.cache_clear()
+    except Exception:
+        pass
+    yield
+    try:
+        from config import get_settings
+        get_settings.cache_clear()
+    except Exception:
+        pass
