@@ -47,6 +47,33 @@ async def _fake_sender(**kwargs):
     return {"ok": True, "status_code": 200, "echo": kwargs}
 
 
+
+def test_post_webhook_wazzup_logs_bot_decision_after_received(monkeypatch):
+    async def handler(message):
+        return {"answer": "Здравствуйте!", "should_send_wazzup": False}
+
+    monkeypatch.setattr(main, "handle_incoming_message", handler)
+    monkeypatch.setattr(main, "send_wazzup_message", _fake_sender)
+    client = TestClient(main.app)
+
+    response = client.post("/webhook/wazzup", json=_payload(
+        phone="77712841932",
+        chatId="77712841932",
+        text="Здравствуйте",
+        messageId="msg-decision-after-received",
+        isEcho=False,
+        status="inbound",
+        type="text",
+        channelId="7e4fc1db-0061-481c-9e67-309455af8aeb",
+    ))
+
+    assert response.status_code == 200
+    events = state.recent_events_for_phone("77712841932", limit=20)
+    names = [event["event"] for event in events]
+    assert "wazzup_webhook_received" in names
+    assert "bot_decision" in names
+    assert names.index("wazzup_webhook_received") < names.index("bot_decision")
+
 def test_post_wazzup_webhook_incoming_new_lead_calls_handler_and_sends(monkeypatch):
     calls = {"handler": [], "sender": []}
 
@@ -109,7 +136,7 @@ def test_outgoing_from_me_payload_is_silent(monkeypatch):
     body = response.json()
     assert body["answer"] == ""
     assert body["should_send_wazzup"] is False
-    assert body["no_reply_reason"] == "non_incoming_message"
+    assert body["no_reply_reason"] == "echo_or_outgoing_message"
     assert handler_calls == []
     assert sender_calls == []
 
@@ -286,7 +313,7 @@ def test_wazzup_outbound_echo_is_ignored_without_handler_or_crm(monkeypatch):
     body = response.json()
     assert body["processed_count"] == 0
     assert body["ignored_count"] == 1
-    assert body["results"][0]["no_reply_reason"] == "non_incoming_message"
+    assert body["results"][0]["no_reply_reason"] == "echo_or_outgoing_message"
     assert handler_calls == []
 
 
@@ -299,5 +326,5 @@ def test_wazzup_from_me_true_is_ignored_without_handler(monkeypatch):
     body = response.json()
     assert body["processed_count"] == 0
     assert body["ignored_count"] == 1
-    assert body["results"][0]["no_reply_reason"] == "non_incoming_message"
+    assert body["results"][0]["no_reply_reason"] == "echo_or_outgoing_message"
     assert handler_calls == []
