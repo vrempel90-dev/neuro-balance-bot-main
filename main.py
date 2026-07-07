@@ -461,7 +461,7 @@ def _mark_no_reply(chat_id: str, reason: str, message: dict[str, Any], *, duplic
 def _hard_inbound_block_reason(message: dict[str, Any], session: dict[str, Any] | None = None) -> tuple[str, bool, bool]:
     direction = str(message.get("direction") or "incoming").lower()
     from_me = str(message.get("is_from_me") or "").lower() == "true" or bool(message.get("from_me") or message.get("is_operator") or message.get("is_admin"))
-    if direction != "incoming" or from_me:
+    if direction in WAZZUP_OUTGOING_DIRECTIONS or from_me:
         return "not_client_incoming_message", False, False
     ts = _parse_message_datetime(message.get("timestamp") or message.get("message_timestamp"))
     activated = _bot_activated_at()
@@ -1103,26 +1103,46 @@ def _primary_payload_message(payload: dict[str, Any]) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else payload
 
 
-def _normalize_wazzup_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    msg = _primary_payload_message(payload)
+WAZZUP_INCOMING_STATUSES = {"inbound", "incoming", "received"}
+WAZZUP_OUTGOING_DIRECTIONS = {"out", "outbound", "outgoing", "sent"}
+
+
+def _wazzup_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return bool(value)
+
+
+def _is_wazzup_incoming(*, is_echo: Any, from_me: Any, status: str, direction: str) -> bool:
+    if _wazzup_bool(is_echo) or _wazzup_bool(from_me):
+        return False
+    status_norm = (status or "").strip().lower()
+    direction_norm = (direction or "").strip().lower()
+    if status_norm in WAZZUP_OUTGOING_DIRECTIONS or direction_norm in WAZZUP_OUTGOING_DIRECTIONS:
+        return False
+    if status_norm in WAZZUP_INCOMING_STATUSES or direction_norm in WAZZUP_INCOMING_STATUSES:
+        return True
+    return ((is_echo is not None and not _wazzup_bool(is_echo)) or (from_me is not None and not _wazzup_bool(from_me)))
+
+
+def _normalize_wazzup_message(payload: dict[str, Any], msg: dict[str, Any]) -> dict[str, Any]:
     merged = {**payload, **msg}
     chat_id = _first_deep_value(merged, ["chatId", "chat_id", "dialogId", "dialog_id", "conversationId", "conversation_id", "chat.id", "contact.id"])
-    phone = _first_deep_value(merged, ["phone", "contactPhone", "clientPhone", "userPhone", "contact.phone", "contactData.phone", "authorPhone"])
+    phone = _first_deep_value(merged, ["contact.phone", "phone", "contactPhone", "clientPhone", "userPhone", "contactData.phone", "authorPhone"])
     text = _first_deep_value(merged, ["text", "message", "body", "content", "message.text", "message.body"])
     if isinstance(text, dict):
         text = _first_deep_value(text, ["text", "body", "content"]) or ""
     message_id = _first_deep_value(merged, ["messageId", "message_id", "id", "message.id"])
     message_timestamp = _first_deep_value(merged, ["timestamp", "message_timestamp", "dateTime", "createdAt", "created_at", "message.createdAt"])
-    direction = str(_first_deep_value(merged, ["direction", "type"]) or "").lower()
-    from_me = bool(_first_deep_value(merged, ["fromMe"]))
-    is_echo = bool(_first_deep_value(merged, ["isEcho"]))
-    is_incoming = _first_deep_value(merged, ["isIncoming"])
-    if from_me or is_echo or direction == "outgoing":
-        direction = "outgoing"
-    elif is_incoming is False:
-        direction = direction or "outgoing"
-    else:
-        direction = direction or "incoming"
+    message_type = str(_first_deep_value(merged, ["type", "message.type"]) or "").lower()
+    explicit_direction = str(_first_deep_value(merged, ["direction", "message.direction"]) or "").lower()
+    status = str(_first_deep_value(merged, ["status", "message.status"]) or "").lower()
+    is_echo = _first_deep_value(merged, ["isEcho", "message.isEcho"])
+    from_me = _first_deep_value(merged, ["fromMe", "isFromMe", "message.fromMe", "message.isFromMe"])
+    is_incoming = _is_wazzup_incoming(is_echo=is_echo, from_me=from_me, status=status, direction=explicit_direction)
+    direction = explicit_direction or status or ("incoming" if is_incoming else "outgoing")
     channel_id = str(_first_deep_value(merged, ["channelId", "channel_id", "channel.id", "message.channelId", "message.channel_id"]) or "").strip()
     chat_id = str(chat_id or phone or "").strip()
     phone = str(phone or chat_id).strip()
@@ -1136,11 +1156,19 @@ def _normalize_wazzup_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "timestamp": str(message_timestamp or "").strip(),
         "channel_id": channel_id,
         "chat_type": str(_first_deep_value(merged, ["chatType", "chat_type"]) or "whatsapp"),
+        "message_type": message_type,
         "direction": direction,
-        "from_me": from_me,
-        "is_from_me": str(from_me or is_echo or direction == "outgoing").lower(),
+        "status": status,
+        "is_echo": _wazzup_bool(is_echo),
+        "from_me": _wazzup_bool(from_me),
+        "is_incoming": is_incoming,
+        "is_from_me": str(_wazzup_bool(from_me) or _wazzup_bool(is_echo)).lower(),
         "force": False,
     }
+
+
+def _normalize_wazzup_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return _normalize_wazzup_message(payload, _primary_payload_message(payload))
 
 
 def _result_answer(result: Any) -> str:
@@ -1220,15 +1248,10 @@ def wazzup_webhook_health_response(request: Request) -> dict[str, Any]:
     }
 
 
-async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) -> dict[str, Any]:
-    payload, parse_meta = await _safe_read_webhook_payload(request)
-    if not parse_meta.get("ok"):
-        _log_ignored_wazzup_webhook(request, parse_meta)
-        return {"ok": True, "ignored": True, "reason": parse_meta.get("reason") or "invalid_json"}
-
-    message = _normalize_wazzup_payload(payload)
+async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw_msg: dict[str, Any], parse_meta: dict[str, Any], *, send_enabled: bool = True) -> dict[str, Any]:
+    message = _normalize_wazzup_message(payload, raw_msg)
     chat_id = message["chat_id"] or "wazzup"
-    state.log_event(chat_id, "wazzup_webhook_received", {
+    received_log = {
         "source": "wazzup",
         "path": request.url.path,
         "method": request.method,
@@ -1242,21 +1265,35 @@ async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) 
         "text_preview": _preview(message["text"], 160),
         "message_id": message["message_id"],
         "message_timestamp": message["message_timestamp"],
+        "message_type": message["message_type"],
         "direction": message["direction"],
+        "status": message["status"],
+        "is_echo": message["is_echo"],
+        "from_me": message["from_me"],
+        "is_incoming": message["is_incoming"],
         "channel_id": message["channel_id"],
-    })
+    }
+    state.log_event(chat_id, "wazzup_webhook_received", received_log)
 
-    if is_audio_message_payload(_primary_payload_message(payload)):
+    if is_audio_message_payload(raw_msg):
         _ignore_voice_message(chat_id, message["message_id"], "webhook_payload")
-        return {"ok": True, "answer": "", "should_send_wazzup": False, "no_reply_reason": "voice_message_ignored"}
+        state.log_event(chat_id, "wazzup_message_ignored", {**received_log, "reason": "voice_message_ignored"})
+        return {"ok": True, "ignored": True, "answer": "", "should_send_wazzup": False, "no_reply_reason": "voice_message_ignored"}
 
-    if message["direction"] == "outgoing" or message["from_me"] or str(message["is_from_me"]).lower() == "true":
+    if not message["is_incoming"]:
         session = _get_session_safe(chat_id)
         session["no_reply_reason"] = "non_incoming_message"
         session["guard_decision"] = GuardDecision(False, "non_incoming_message", False, False, False).to_dict()
         state.save_session(chat_id, session)
-        return {"ok": True, "answer": "", "should_send_wazzup": False, "no_reply_reason": "non_incoming_message"}
+        state.log_event(chat_id, "wazzup_message_ignored", {**received_log, "reason": "non_incoming_message"})
+        return {"ok": True, "ignored": True, "answer": "", "should_send_wazzup": False, "no_reply_reason": "non_incoming_message"}
 
+    state.log_event(chat_id, "wazzup_message_processing", {
+        "chat_id": chat_id,
+        "phone": message["phone"],
+        "message_id": message["message_id"],
+        "text_preview": _preview(message["text"], 160),
+    })
     result = await handle_incoming_message(message)
     answer = _result_answer(result)
     should_send = _result_should_send(result, chat_id)
@@ -1277,7 +1314,32 @@ async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) 
         else:
             state.log_event(chat_id, "wazzup_send_skipped", {"reason": "debug_incoming_test", "phone": message["phone"], "channel_id": message["channel_id"]})
 
-    return {"ok": True, "answer": answer, "should_send_wazzup": bool(answer and should_send), "no_reply_reason": no_reply_reason}
+    return {"ok": True, "ignored": False, "answer": answer, "should_send_wazzup": bool(answer and should_send), "no_reply_reason": no_reply_reason}
+
+
+async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) -> dict[str, Any]:
+    payload, parse_meta = await _safe_read_webhook_payload(request)
+    if not parse_meta.get("ok"):
+        _log_ignored_wazzup_webhook(request, parse_meta)
+        return {"ok": True, "ignored": True, "reason": parse_meta.get("reason") or "invalid_json"}
+
+    raw_messages = _raw_wazzup_messages(payload) or [_primary_payload_message(payload)]
+    results = []
+    processed_count = 0
+    ignored_count = 0
+    for raw_msg in raw_messages:
+        result = await _process_wazzup_message(request, payload, raw_msg, parse_meta, send_enabled=send_enabled)
+        results.append(result)
+        if result.get("ignored"):
+            ignored_count += 1
+        else:
+            processed_count += 1
+
+    if len(results) == 1 and "messages" not in payload:
+        result = dict(results[0])
+        result.pop("ignored", None)
+        return result
+    return {"ok": True, "processed_count": processed_count, "ignored_count": ignored_count, "results": results}
 
 
 @app.post("/wazzup/webhook")
