@@ -76,6 +76,7 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
     decision = session.get("guard_decision") if isinstance(session.get("guard_decision"), dict) else {}
     return {
         "source": session.get("source") or "",
+        "message_id": session.get("message_id") or "",
         "NEW_LEADS_ONLY": bool(getattr(get_settings(), "new_leads_only", True)),
         "timezone": getattr(get_settings(), "bot_timezone", "Asia/Almaty"),
         "utc_time": datetime.now(timezone.utc).isoformat(),
@@ -429,8 +430,8 @@ def _bot_activated_at():
 def _mark_no_reply(chat_id: str, reason: str, message: dict[str, Any], *, duplicate: bool = False, old: bool = False) -> None:
     session = _get_session_safe(chat_id)
     session["no_reply_reason"] = reason
-    session["message_id"] = session.get("message_id") or ""
-    session["message_timestamp"] = session.get("message_timestamp") or ""
+    session["message_id"] = str(message.get("message_id") or message.get("message_key") or session.get("message_id") or "")
+    session["message_timestamp"] = str(message.get("timestamp") or message.get("message_timestamp") or session.get("message_timestamp") or "")
     session["bot_activated_at"] = _bot_activated_at().isoformat()
     session["is_old_message"] = old
     session["is_duplicate_message"] = duplicate
@@ -860,6 +861,19 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
     if message_key:
         state.mark_processed_message(message_key, chat_id)
     return answer
+
+
+async def handle_incoming_message(message: dict[str, Any]) -> str:
+    """Production message pipeline entry point.
+
+    This is the explicit single ingress for one normalized incoming message.  It
+    delegates to the guarded implementation that performs metadata validation,
+    duplicate/old-message checks, night-hours gating, CRM lookup before any
+    first-touch/LLM path, state-machine routing, final answer guard, and debug
+    persistence. Sending to Wazzup remains in the webhook debounce worker so this
+    function is safe for tests and debug callers that only need the answer.
+    """
+    return await _build_answer_for_message(message)
 
 
 async def _send_answer_parts(

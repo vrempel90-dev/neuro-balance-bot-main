@@ -9,6 +9,7 @@ import asyncio
 import config
 import crm
 import dialog
+import main
 import state
 state.init_db()
 from schedule import is_bot_work_time
@@ -127,3 +128,25 @@ def test_first_touch_template_is_full_and_no_telegram_env_required(monkeypatch):
     assert not hasattr(settings, "telegram_bot_token")
     for fragment in ["Мы специализируемся на:", "плазмотерапию", "TikTok", "Подскажите, пожалуйста, что именно Вас беспокоит?"]:
         assert fragment in dialog.FIRST_TOUCH_CLINIC_INFO_RU
+
+
+def test_debug_payload_keeps_message_id_for_no_reply(monkeypatch):
+    monkeypatch.setenv("BOT_ACTIVATED_AT", "2026-07-07T00:00:00+05:00")
+    config.get_settings.cache_clear()
+    chat_id = "prod_debug_message_id_no_reply"
+    state.reset_session(chat_id)
+
+    message = {
+        "chat_id": chat_id,
+        "message_id": "msg-old-1",
+        "timestamp": "2026-07-06T23:59:00+05:00",
+        "direction": "incoming",
+    }
+    reason, is_duplicate, is_old = main._hard_inbound_block_reason(message, {})
+    main._mark_no_reply(chat_id, reason, message, duplicate=is_duplicate, old=is_old)
+
+    session = state.get_session(chat_id)
+    debug = main._dialog_debug(session, "")
+    assert debug["message_id"] == "msg-old-1"
+    assert debug["message_timestamp"] == "2026-07-06T23:59:00+05:00"
+    assert debug["no_reply_reason"] == "old_message_before_bot_activation"
