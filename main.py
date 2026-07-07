@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 import mimetypes
 import re
@@ -22,12 +23,14 @@ from voice import transcribe_wazzup_voice, transcribe_bytes, transcribe_upload, 
 from wazzup import extract_incoming_messages, is_audio_message_payload, send_text
 
 # Public seam for production webhook tests/patches.
-send_wazzup_message = send_text
+async def send_wazzup_message(**kwargs: Any) -> dict[str, Any]:
+    return await send_text(**kwargs)
 
 WAZZUP_WEBHOOK_PATHS = [
     "/wazzup/webhook",
     "/webhook",
     "/api/wazzup/webhook",
+    "/webhook/wazzup",
 ]
 
 try:
@@ -1159,21 +1162,81 @@ def _result_should_send(result: Any, chat_id: str) -> bool:
     return True
 
 
-async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) -> dict[str, Any]:
+async def _safe_read_webhook_payload(request: Request) -> tuple[dict[str, Any], dict[str, Any]]:
+    raw_body = await request.body()
+    content_type = request.headers.get("content-type", "")
+    raw_preview = raw_body[:500].decode("utf-8", errors="replace")
+    if not raw_body:
+        return {}, {
+            "ok": False,
+            "reason": "empty_body",
+            "content_type": content_type,
+            "raw_preview": "",
+        }
     try:
-        payload = await request.json()
-    except Exception:
-        state.log_event("wazzup", "wazzup_webhook_invalid_json", {"source": "wazzup", "path": request.url.path})
-        return {"ok": True, "ignored": True, "reason": "invalid_json"}
-    if not isinstance(payload, dict):
-        payload = {"payload": payload}
+        parsed = json.loads(raw_body.decode("utf-8"))
+        payload = parsed if isinstance(parsed, dict) else {"payload": parsed}
+        return payload, {
+            "ok": True,
+            "reason": "",
+            "content_type": content_type,
+            "raw_preview": raw_preview,
+        }
+    except Exception as exc:
+        return {}, {
+            "ok": False,
+            "reason": "invalid_json",
+            "error": str(exc),
+            "content_type": content_type,
+            "raw_preview": raw_preview,
+        }
+
+
+def _log_ignored_wazzup_webhook(request: Request, parse_meta: dict[str, Any]) -> None:
+    reason = str(parse_meta.get("reason") or "invalid_json")
+    event = "wazzup_webhook_empty_body" if reason == "empty_body" else "wazzup_webhook_invalid_json"
+    payload = {
+        "source": "wazzup",
+        "path": request.url.path,
+        "method": request.method,
+        "content_type": parse_meta.get("content_type") or "",
+        "payload_parse_ok": False,
+        "payload_parse_reason": reason,
+        "payload_keys": [],
+        "raw_preview": parse_meta.get("raw_preview") or "",
+    }
+    if parse_meta.get("error"):
+        payload["error"] = str(parse_meta.get("error"))[:500]
+    state.log_event("wazzup", event, payload)
+    state.log_event("wazzup", "wazzup_webhook_ignored", {"source": "wazzup", "reason": reason, "path": request.url.path})
+
+
+def wazzup_webhook_health_response(request: Request) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "webhook": "wazzup",
+        "method": request.method,
+        "message": "Use POST for incoming Wazzup messages",
+    }
+
+
+async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) -> dict[str, Any]:
+    payload, parse_meta = await _safe_read_webhook_payload(request)
+    if not parse_meta.get("ok"):
+        _log_ignored_wazzup_webhook(request, parse_meta)
+        return {"ok": True, "ignored": True, "reason": parse_meta.get("reason") or "invalid_json"}
 
     message = _normalize_wazzup_payload(payload)
     chat_id = message["chat_id"] or "wazzup"
     state.log_event(chat_id, "wazzup_webhook_received", {
         "source": "wazzup",
         "path": request.url.path,
+        "method": request.method,
+        "content_type": parse_meta.get("content_type") or "",
+        "payload_parse_ok": True,
+        "payload_parse_reason": "",
         "payload_keys": list(payload.keys()),
+        "raw_preview": parse_meta.get("raw_preview") or "",
         "chat_id": message["chat_id"],
         "phone": message["phone"],
         "text_preview": _preview(message["text"], 160),
@@ -1182,6 +1245,10 @@ async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) 
         "direction": message["direction"],
         "channel_id": message["channel_id"],
     })
+
+    if is_audio_message_payload(_primary_payload_message(payload)):
+        _ignore_voice_message(chat_id, message["message_id"], "webhook_payload")
+        return {"ok": True, "answer": "", "should_send_wazzup": False, "no_reply_reason": "voice_message_ignored"}
 
     if message["direction"] == "outgoing" or message["from_me"] or str(message["is_from_me"]).lower() == "true":
         session = _get_session_safe(chat_id)
@@ -1228,6 +1295,36 @@ async def api_wazzup_webhook_ingress(request: Request) -> dict[str, Any]:
     return await handle_wazzup_webhook(request)
 
 
+@app.post("/webhook/wazzup")
+async def webhook_wazzup_ingress(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    settings = get_settings()
+    if settings.webhook_secret:
+        expected = f"Bearer {settings.webhook_secret}"
+        if authorization != expected:
+            raise HTTPException(status_code=401, detail="Bad webhook secret")
+    return await handle_wazzup_webhook(request)
+
+
+@app.get("/wazzup/webhook")
+async def wazzup_webhook_health(request: Request) -> dict[str, Any]:
+    return wazzup_webhook_health_response(request)
+
+
+@app.get("/webhook")
+async def webhook_health(request: Request) -> dict[str, Any]:
+    return wazzup_webhook_health_response(request)
+
+
+@app.get("/api/wazzup/webhook")
+async def api_wazzup_webhook_health(request: Request) -> dict[str, Any]:
+    return wazzup_webhook_health_response(request)
+
+
+@app.get("/webhook/wazzup")
+async def webhook_wazzup_health(request: Request) -> dict[str, Any]:
+    return wazzup_webhook_health_response(request)
+
+
 @app.get("/debug/wazzup/config")
 def debug_wazzup_config() -> dict[str, Any]:
     settings = get_settings()
@@ -1241,101 +1338,30 @@ def debug_wazzup_config() -> dict[str, Any]:
 
 @app.post("/debug/wazzup/incoming-test")
 async def debug_wazzup_incoming_test(request: Request) -> dict[str, Any]:
+    payload, parse_meta = await _safe_read_webhook_payload(request)
+    if not parse_meta.get("ok"):
+        _log_ignored_wazzup_webhook(request, parse_meta)
+        reason = str(parse_meta.get("reason") or "invalid_json")
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": reason,
+            "parsed_message": {},
+            "handler_result": {"ok": True, "ignored": True, "reason": reason},
+            "would_send_wazzup": False,
+            "answer_preview": "",
+            "no_reply_reason": reason,
+        }
     response = await handle_wazzup_webhook(request, send_enabled=False)
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-    parsed = _normalize_wazzup_payload(payload if isinstance(payload, dict) else {"payload": payload})
+    parsed = _normalize_wazzup_payload(payload)
     answer = response.get("answer") or ""
     return {
         "parsed_message": parsed,
         "handler_result": response,
-        "would_send_wazzup": bool(answer and response.get("should_send_wazzup")),
+        "would_send_wazzup": False,
         "answer_preview": _preview(answer, 160),
         "no_reply_reason": response.get("no_reply_reason") or "",
     }
-
-
-@app.post("/webhook/wazzup")
-async def wazzup_webhook(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    settings = get_settings()
-    if settings.webhook_secret:
-        expected = f"Bearer {settings.webhook_secret}"
-        if authorization != expected:
-            raise HTTPException(status_code=401, detail="Bad webhook secret")
-
-    payload = await request.json()
-    _mark_manual_admin_interventions(payload)
-    ignored_raw_message_keys: set[str] = set()
-    ignored_raw_count = 0
-    for raw_msg in _raw_wazzup_messages(payload):
-        if not is_audio_message_payload(raw_msg):
-            continue
-        chat_id = str(raw_msg.get("chatId") or raw_msg.get("chat_id") or raw_msg.get("from") or "").strip()
-        if not chat_id:
-            continue
-        message_key = str(raw_msg.get("id") or raw_msg.get("messageId") or raw_msg.get("message_id") or "")
-        if message_key and state.is_processed_message(message_key):
-            continue
-        if message_key:
-            state.mark_processed_message(message_key, chat_id)
-            ignored_raw_message_keys.add(message_key)
-        _ignore_voice_message(chat_id, message_key, "raw_payload")
-        ignored_raw_count += 1
-
-    messages = extract_incoming_messages(payload)
-
-    # voice_fallback_extractor:
-    # Если текущий wazzup.extract_incoming_messages не распознал голосовое,
-    # аккуратно достаём audio/media из raw payload. Для обычного текста ничего не меняется.
-    try:
-        extra_voice_messages = _extract_voice_messages_from_payload(payload)
-        existing_keys = {str(m.get("message_key") or "") for m in messages}
-        existing_voice_urls = {
-            str(m.get("media_url") or m.get("file_url") or m.get("url") or "")
-            for m in messages
-        }
-        for vm in extra_voice_messages:
-            vm_key = str(vm.get("message_key") or "")
-            vm_url = str(vm.get("media_url") or "")
-            if (vm_key and vm_key in existing_keys) or (vm_url and vm_url in existing_voice_urls):
-                continue
-            messages.append(vm)
-    except Exception as exc:
-        state.log_event("system", "voice_payload_extract_error", {"error": str(exc)[:1000]})
-
-    accepted = ignored_raw_count
-    skipped = 0
-
-    for message in messages:
-        chat_id = str(message["chat_id"])
-        state.log_event(chat_id, "wazzup_received", {
-            "phone": str(message.get("phone") or chat_id),
-            "message_type": str(message.get("kind") or "text"),
-            "has_text": bool(message.get("text")),
-            "text_preview": _preview(message.get("text"), 120),
-            "source": "wazzup",
-        })
-        message_key = str(message.get("message_key") or "")
-
-        hard_reason, is_dup, is_old = _hard_inbound_block_reason(message, _get_session_safe(chat_id))
-        if message_key in ignored_raw_message_keys or hard_reason:
-            _mark_no_reply(chat_id, hard_reason or "duplicate_message_already_processed", message, duplicate=is_dup or bool(message_key in ignored_raw_message_keys), old=is_old)
-            skipped += 1
-            continue
-
-        if is_audio_message_payload(message):
-            _ignore_voice_message(chat_id, message_key, "extracted_message")
-            if message_key:
-                state.mark_processed_message(message_key, chat_id)
-            accepted += 1
-            continue
-
-        asyncio.create_task(_debounced_process_and_send(message))
-        accepted += 1
-
-    return {"ok": True, "accepted": accepted, "skipped": skipped}
 
 
 @app.get("/debug/crm/lookup")
