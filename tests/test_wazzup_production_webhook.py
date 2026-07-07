@@ -202,3 +202,102 @@ def test_debug_wazzup_config_works():
     assert body["wazzup_api_key_configured"] is True
     assert body["wazzup_channel_id_configured"] is True
     assert body["available_webhook_paths"] == ["/wazzup/webhook", "/webhook", "/api/wazzup/webhook", "/webhook/wazzup"]
+
+
+def _messages_payload(message):
+    return {"messages": [message]}
+
+
+def _real_inbound_message(**overrides):
+    data = {
+        "messageId": "msg1",
+        "dateTime": "2026-07-07T18:39:00.002Z",
+        "channelId": "ch1",
+        "chatType": "whatsapp",
+        "chatId": "77782964389",
+        "type": "text",
+        "isEcho": False,
+        "contact": {"phone": "77782964389"},
+        "text": "Здравствуйте",
+        "status": "inbound",
+    }
+    data.update(overrides)
+    return data
+
+
+def test_real_wazzup_inbound_text_is_processed_not_blocked(monkeypatch):
+    calls = {"handler": [], "sender": []}
+
+    async def handler(message):
+        calls["handler"].append(message)
+        return {"answer": "Здравствуйте!", "should_send_wazzup": True}
+
+    async def sender(**kwargs):
+        calls["sender"].append(kwargs)
+        return {"ok": True, "status_code": 200}
+
+    monkeypatch.setattr(main, "handle_incoming_message", handler)
+    monkeypatch.setattr(main, "send_wazzup_message", sender)
+    response = TestClient(main.app).post("/webhook/wazzup", json=_messages_payload(_real_inbound_message()))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["processed_count"] == 1
+    assert body["ignored_count"] == 0
+    assert body["results"][0]["no_reply_reason"] != "not_client_incoming_message"
+    assert calls["handler"]
+    parsed = calls["handler"][0]
+    assert parsed["is_incoming"] is True
+    assert parsed["message_type"] == "text"
+    assert parsed["direction"] == "inbound"
+    assert parsed["status"] == "inbound"
+    assert parsed["is_echo"] is False
+    assert parsed["from_me"] is False
+    assert parsed["phone"] == "77782964389"
+    assert calls["sender"]
+
+
+def test_real_wazzup_inbound_ad_text_type_text_is_processed(monkeypatch):
+    calls = []
+    ad_text = "Хочу записаться на консультацию по АКЦИИ и получить пробную процедуру в подарок https://www.instagram.com/p/..."
+
+    async def handler(message):
+        calls.append(message)
+        return "Оставьте, пожалуйста, номер телефона"
+
+    monkeypatch.setattr(main, "handle_incoming_message", handler)
+    monkeypatch.setattr(main, "send_wazzup_message", _fake_sender)
+    response = TestClient(main.app).post("/webhook/wazzup", json=_messages_payload(_real_inbound_message(messageId="msg-ad", text=ad_text)))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["processed_count"] == 1
+    assert body["ignored_count"] == 0
+    assert calls and calls[0]["is_incoming"] is True
+    assert calls[0]["message_type"] == "text"
+
+
+def test_wazzup_outbound_echo_is_ignored_without_handler_or_crm(monkeypatch):
+    handler_calls = []
+    monkeypatch.setattr(main, "handle_incoming_message", lambda message: handler_calls.append(message) or _fake_handler(message))
+    response = TestClient(main.app).post("/webhook/wazzup", json=_messages_payload(_real_inbound_message(isEcho=True, status="outbound")))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["processed_count"] == 0
+    assert body["ignored_count"] == 1
+    assert body["results"][0]["no_reply_reason"] == "non_incoming_message"
+    assert handler_calls == []
+
+
+def test_wazzup_from_me_true_is_ignored_without_handler(monkeypatch):
+    handler_calls = []
+    monkeypatch.setattr(main, "handle_incoming_message", lambda message: handler_calls.append(message) or _fake_handler(message))
+    response = TestClient(main.app).post("/webhook/wazzup", json=_messages_payload(_real_inbound_message(fromMe=True)))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["processed_count"] == 0
+    assert body["ignored_count"] == 1
+    assert body["results"][0]["no_reply_reason"] == "non_incoming_message"
+    assert handler_calls == []
