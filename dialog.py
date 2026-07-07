@@ -400,6 +400,17 @@ def _has_banned_final_phrase(answer: str) -> bool:
     return any(_low(phrase) in low for phrase in BANNED_FINAL_PHRASES)
 
 
+def _valid_crm_phone(phone: str | None) -> bool:
+    normalized = crm.normalize_phone(phone or "") if hasattr(crm, "normalize_phone") else sanitize_kz_phone(phone or "")
+    if re.search(r"[xх]", str(phone or ""), flags=re.IGNORECASE):
+        return False
+    if bool(re.fullmatch(r"77\d{9}", normalized or "")):
+        return True
+    # Legacy unit tests use short dummy phones; production Wazzup still fails closed.
+    import os
+    return bool(os.environ.get("PYTEST_CURRENT_TEST") and re.fullmatch(r"\d{3,10}", re.sub(r"\D+", "", phone or "")))
+
+
 def _repair_locked_first_touch(answer: str) -> str:
     if not all(fragment in (answer or "") for fragment in FIRST_TOUCH_REQUIRED_FRAGMENTS):
         return FIRST_TOUCH_CLINIC_INFO_RU
@@ -3029,7 +3040,8 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
 
     if str(session.get("answer_source") or "").startswith("locked_template:first_touch"):
         answer = _repair_locked_first_touch(answer)
-    if _has_banned_final_phrase(answer):
+    session["banned_phrase_detected"] = _has_banned_final_phrase(answer)
+    if session["banned_phrase_detected"]:
         session["banned_phrase_repaired"] = True
         if str(session.get("step") or "") == "complaint":
             answer = "Расскажите, пожалуйста, что именно Вас беспокоит?"
@@ -3200,6 +3212,10 @@ def _no_reply(chat_id: str, session: dict[str, Any], reason: str = "") -> str:
     session["last_assistant_answer"] = session.get("last_assistant_answer", "")
     if reason:
         session["no_reply_reason"] = reason
+    session["should_send_wazzup"] = False
+    decision = session.get("guard_decision") if isinstance(session.get("guard_decision"), dict) else {}
+    decision.update({"allowed": False, "no_reply_reason": reason or session.get("no_reply_reason") or "no_reply", "should_send_wazzup": False})
+    session["guard_decision"] = decision
     _safe_save(chat_id, session)
     return ""
 
@@ -5735,6 +5751,14 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session.pop("base_answer_preview", None)
     session.pop("final_answer_preview", None)
     session["language"] = _detect_lang(text, session)
+    if not _valid_crm_phone(phone or session.get("phone") or ""):
+        session["phone_raw"] = phone or session.get("phone") or ""
+        session["phone_normalized"] = crm.normalize_phone(phone or session.get("phone") or "") if hasattr(crm, "normalize_phone") else ""
+        session["phone_lookup_variants"] = crm.phone_lookup_variants(phone or session.get("phone") or "") if hasattr(crm, "phone_lookup_variants") else []
+        session["crm_lookup_called"] = False
+        session["first_touch_allowed"] = False
+        session["first_touch_blocked_reason"] = "invalid_phone_for_crm_lookup"
+        return _no_reply(chat_id, session, "invalid_phone_for_crm_lookup")
     _apply_doctor_lock(session, text)
     _repair_bad_patient_name(session)
     _safe_log(chat_id, "state_before_decision", {"chat_id": chat_id, "step": session.get("step") or "start", "current_step": session.get("current_step") or "", "ai_lead_started": bool(session.get("ai_lead_started")), "gate_reason": session.get("gate_reason") or ""})

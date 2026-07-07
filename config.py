@@ -61,9 +61,11 @@ class Settings(BaseSettings):
     operator_style_mode: bool = Field(default=True, validation_alias=AliasChoices("OPERATOR_STYLE_MODE", "operator_style_mode"))
     human_dialog_mode: bool = Field(default=True, validation_alias=AliasChoices("HUMAN_DIALOG_MODE", "human_dialog_mode"))
 
-    # Work-hours guard: бот отвечает только вне рабочего времени КЦ.
-    # По умолчанию активен 20:00–08:00 по времени Астаны UTC+5.
+    # Work-hours guard: бот отвечает только ночью по бизнес-таймзоне.
     work_hours_guard_enabled: bool = Field(default=True, validation_alias=AliasChoices("WORK_HOURS_GUARD_ENABLED", "work_hours_guard_enabled"))
+    bot_timezone: str = Field(default="Asia/Almaty", validation_alias=AliasChoices("BOT_TIMEZONE", "bot_timezone"))
+    bot_work_start: str = Field(default="20:00", validation_alias=AliasChoices("BOT_WORK_START", "bot_work_start"))
+    bot_work_end: str = Field(default="08:00", validation_alias=AliasChoices("BOT_WORK_END", "bot_work_end"))
     bot_active_from_hour: int = Field(default=20, validation_alias=AliasChoices("BOT_ACTIVE_FROM", "BOT_ACTIVE_FROM_HOUR", "bot_active_from_hour"))
     bot_active_until_hour: int = Field(default=8, validation_alias=AliasChoices("BOT_ACTIVE_TO", "BOT_ACTIVE_UNTIL_HOUR", "bot_active_until_hour"))
     bot_silent_outside_hours: bool = Field(default=True, validation_alias=AliasChoices("BOT_SILENT_OUTSIDE_HOURS", "bot_silent_outside_hours"))
