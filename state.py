@@ -24,6 +24,15 @@ _STDOUT_EVENTS = {
     "wazzup_send_success",
     "wazzup_send_failed",
     "wazzup_send_skipped",
+    "wazzup_message_normalized",
+    "bot_processing_start",
+    "time_gate_result",
+    "crm_lookup_start",
+    "crm_lookup_result",
+    "bot_decision",
+    "ai_or_template_response_ready",
+    "wazzup_send_start",
+    "bot_processing_finish",
     "openai_called",
     "openai_skipped",
     "humanize_skipped",
@@ -299,6 +308,37 @@ def pop_pending_messages(chat_id: str) -> str:
         if ids:
             conn.executemany("DELETE FROM pending_messages WHERE id=?", [(i,) for i in ids])
     return "\n".join(str(r["content"]).strip() for r in rows if str(r["content"]).strip())
+
+
+def recent_events_for_phone(phone: str, limit: int = 50) -> list[dict[str, Any]]:
+    phone = str(phone or "").strip()
+    if not phone:
+        return []
+    like = f'%"phone": "{phone}"%'
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT chat_id, event_type, payload_json, created_at
+            FROM events
+            WHERE chat_id=? OR payload_json LIKE ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (phone, like, int(limit or 50)),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        try:
+            payload = json.loads(row["payload_json"])
+        except Exception:
+            payload = {}
+        out.append({
+            "created_at": row["created_at"],
+            "chat_id": row["chat_id"],
+            "event": row["event_type"],
+            "payload": payload,
+        })
+    return out
 
 
 def get_history(chat_id: str, limit: int = 24) -> list[dict[str, str]]:

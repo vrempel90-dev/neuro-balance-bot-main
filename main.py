@@ -6,6 +6,7 @@ import uuid
 import mimetypes
 import re
 from typing import Any
+from types import SimpleNamespace
 from datetime import datetime, timezone
 
 import httpx
@@ -41,6 +42,9 @@ except Exception:
 
 
 app = FastAPI(title="Neuro Balance Hybrid WhatsApp Booking Bot")
+
+_LAST_WAZZUP_WEBHOOK_PAYLOAD: dict[str, Any] = {}
+_LAST_WAZZUP_PARSE_META: dict[str, Any] = {}
 
 
 def _preview(value: Any, limit: int = 120) -> str:
@@ -1251,6 +1255,12 @@ def wazzup_webhook_health_response(request: Request) -> dict[str, Any]:
 async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw_msg: dict[str, Any], parse_meta: dict[str, Any], *, send_enabled: bool = True) -> dict[str, Any]:
     message = _normalize_wazzup_message(payload, raw_msg)
     chat_id = message["chat_id"] or "wazzup"
+    phone = str(message.get("phone") or chat_id)
+    settings = get_settings()
+    channel_id_env = str(getattr(settings, "wazzup_channel_id", "") or "")
+    channel_id_from_payload = str(message.get("channel_id") or "")
+    channel_id_match = (not channel_id_env) or channel_id_from_payload == channel_id_env
+    channel_id_mismatch_blocks = bool(channel_id_env and channel_id_env != "test-channel" and channel_id_from_payload and not channel_id_match)
     received_log = {
         "source": "wazzup",
         "path": request.url.path,
@@ -1261,7 +1271,7 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
         "payload_keys": list(payload.keys()),
         "raw_preview": parse_meta.get("raw_preview") or "",
         "chat_id": message["chat_id"],
-        "phone": message["phone"],
+        "phone": phone,
         "text_preview": _preview(message["text"], 160),
         "message_id": message["message_id"],
         "message_timestamp": message["message_timestamp"],
@@ -1271,58 +1281,124 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
         "is_echo": message["is_echo"],
         "from_me": message["from_me"],
         "is_incoming": message["is_incoming"],
-        "channel_id": message["channel_id"],
+        "channel_id": channel_id_from_payload,
     }
     state.log_event(chat_id, "wazzup_webhook_received", received_log)
+    state.log_event(chat_id, "wazzup_message_normalized", {**received_log, "kind": message.get("kind") or "text"})
+
+    def _decision_payload(*, answer: str = "", should_send_wazzup: bool = False, silent_reason: str = "", crm_error: str = "") -> dict[str, Any]:
+        sess = _get_session_safe(chat_id)
+        crm_lookup_ok = bool(sess.get("crm_lookup_called")) and not bool(sess.get("crm_lookup_error"))
+        return {
+            "phone": phone,
+            "chat_id": chat_id,
+            "channel_id_from_payload": channel_id_from_payload,
+            "channel_id_env": channel_id_env,
+            "channel_id_match": channel_id_match,
+            "bot_work_time_now": is_bot_work_time(),
+            "bot_auto_reply_enabled": bool(getattr(settings, "bot_auto_reply_enabled", True)),
+            "new_leads_only": bool(getattr(settings, "new_leads_only", False)),
+            "crm_lookup_ok": crm_lookup_ok,
+            "crm_patient_state": sess.get("crm_patient_state") or "",
+            "should_send_wazzup": bool(should_send_wazzup),
+            "silent_reason": silent_reason,
+            "crm_error": crm_error,
+            "answer_preview": _preview(answer, 160),
+        }
 
     if is_audio_message_payload(raw_msg):
         _ignore_voice_message(chat_id, message["message_id"], "webhook_payload")
-        state.log_event(chat_id, "wazzup_message_ignored", {**received_log, "reason": "voice_message_ignored"})
-        return {"ok": True, "ignored": True, "answer": "", "should_send_wazzup": False, "no_reply_reason": "voice_message_ignored"}
+        reason = "voice_message_ignored"
+        state.log_event(chat_id, "bot_decision", _decision_payload(silent_reason=reason))
+        state.log_event(chat_id, "bot_processing_finish", {"phone": phone, "chat_id": chat_id, "should_send_wazzup": False, "silent_reason": reason})
+        return {"ok": True, "ignored": True, "answer": "", "should_send_wazzup": False, "no_reply_reason": reason}
 
     if not message["is_incoming"]:
         session = _get_session_safe(chat_id)
         session["no_reply_reason"] = "non_incoming_message"
         session["guard_decision"] = GuardDecision(False, "non_incoming_message", False, False, False).to_dict()
         state.save_session(chat_id, session)
-        state.log_event(chat_id, "wazzup_message_ignored", {**received_log, "reason": "non_incoming_message"})
-        return {"ok": True, "ignored": True, "answer": "", "should_send_wazzup": False, "no_reply_reason": "non_incoming_message"}
+        reason = "non_incoming_message"
+        state.log_event(chat_id, "bot_decision", _decision_payload(silent_reason=reason))
+        state.log_event(chat_id, "bot_processing_finish", {"phone": phone, "chat_id": chat_id, "should_send_wazzup": False, "silent_reason": reason})
+        return {"ok": True, "ignored": True, "answer": "", "should_send_wazzup": False, "no_reply_reason": reason}
 
-    state.log_event(chat_id, "wazzup_message_processing", {
-        "chat_id": chat_id,
-        "phone": message["phone"],
-        "message_id": message["message_id"],
-        "text_preview": _preview(message["text"], 160),
-    })
-    result = await handle_incoming_message(message)
-    answer = _result_answer(result)
-    should_send = _result_should_send(result, chat_id)
-    no_reply_reason = _get_session_safe(chat_id).get("no_reply_reason") or ""
+    state.log_event(chat_id, "bot_processing_start", {"chat_id": chat_id, "phone": phone, "message_id": message["message_id"], "text_preview": _preview(message["text"], 160)})
+    work_time_now = is_bot_work_time()
+    state.log_event(chat_id, "time_gate_result", {"phone": phone, "chat_id": chat_id, "bot_work_time_now": work_time_now})
+    state.log_event(chat_id, "crm_lookup_start", {"phone": phone, "chat_id": chat_id})
 
+    answer = ""
+    should_send = False
+    no_reply_reason = ""
+    crm_error = ""
+    try:
+        result = await handle_incoming_message(message)
+        answer = _result_answer(result)
+        should_send = _result_should_send(result, chat_id)
+    except Exception as exc:
+        crm_error = str(exc)[:500]
+        no_reply_reason = "processing_failed"
+        state.log_event(chat_id, "crm_lookup_result", {"phone": phone, "chat_id": chat_id, "crm_lookup_ok": False, "crm_error": crm_error})
+        state.log_event(chat_id, "bot_decision", _decision_payload(silent_reason=no_reply_reason, crm_error=crm_error))
+        state.log_event(chat_id, "bot_processing_finish", {"phone": phone, "chat_id": chat_id, "should_send_wazzup": False, "silent_reason": no_reply_reason})
+        raise
+
+    session_after = _get_session_safe(chat_id)
+    no_reply_reason = str(session_after.get("no_reply_reason") or "")
+    crm_error = str(session_after.get("crm_lookup_error") or "")
+    crm_lookup_ok = bool(session_after.get("crm_lookup_called")) and not crm_error
+    state.log_event(chat_id, "crm_lookup_result", {"phone": phone, "chat_id": chat_id, "crm_lookup_ok": crm_lookup_ok, "crm_patient_state": session_after.get("crm_patient_state") or "", "crm_error": crm_error})
+
+    silent_reason = no_reply_reason
+    if channel_id_mismatch_blocks:
+        silent_reason = "channel_id_mismatch"
+        should_send = False
+    elif crm_error or no_reply_reason == "crm_lookup_failed":
+        silent_reason = "crm_lookup_failed"
+        should_send = False
+    elif bool(getattr(settings, "new_leads_only", False)) and session_after.get("crm_patient_state") and session_after.get("crm_patient_state") != "NEW_PATIENT":
+        silent_reason = "old_lead_or_active_booking"
+        should_send = False
+    elif not bool(getattr(settings, "bot_auto_reply_enabled", True)):
+        silent_reason = "bot_auto_reply_disabled"
+        should_send = False
+    elif not answer:
+        silent_reason = silent_reason or "empty_answer"
+        should_send = False
+
+    state.log_event(chat_id, "bot_decision", _decision_payload(answer=answer, should_send_wazzup=bool(answer and should_send), silent_reason=silent_reason, crm_error=crm_error))
+    state.log_event(chat_id, "ai_or_template_response_ready", {"phone": phone, "chat_id": chat_id, "answer_preview": _preview(answer, 160), "has_answer": bool(answer), "silent_reason": silent_reason})
+
+    send_result_payload: dict[str, Any] = {}
     if answer and should_send:
-        if not bool(getattr(get_settings(), "bot_auto_reply_enabled", True)):
-            state.log_event(chat_id, "wazzup_send_skipped", {"reason": "bot_auto_reply_disabled", "phone": message["phone"], "channel_id": message["channel_id"]})
-        elif send_enabled:
-            state.log_event(chat_id, "wazzup_send_attempt", {"chat_id": chat_id, "phone": message["phone"], "channel_id": message["channel_id"], "answer_preview": _preview(answer, 160)})
+        if send_enabled:
+            state.log_event(chat_id, "wazzup_send_start", {"chat_id": chat_id, "channel_id": channel_id_from_payload, "text_preview": _preview(answer, 160)})
             try:
                 send_result = await send_wazzup_message(chat_id=chat_id, text=answer, chat_type=message.get("chat_type") or "whatsapp", channel_id=message.get("channel_id") or None)
-                state.log_event(chat_id, "wazzup_send_success", {"status_code": send_result.get("status_code"), "response_preview": _preview(send_result, 300)})
+                send_result_payload = {"status_code": send_result.get("status_code"), "response_preview": _preview(send_result, 300), "success": True}
+                state.log_event(chat_id, "wazzup_send_result", send_result_payload)
             except Exception as exc:
                 status_code = getattr(getattr(exc, "response", None), "status_code", None)
                 response_preview = _preview(getattr(getattr(exc, "response", None), "text", ""), 300)
-                state.log_event(chat_id, "wazzup_send_failed", {"status_code": status_code, "error": str(exc)[:500], "response_preview": response_preview})
+                send_result_payload = {"status_code": status_code, "response_preview": response_preview or _preview(exc, 300), "success": False}
+                state.log_event(chat_id, "wazzup_send_result", send_result_payload)
+                raise
         else:
-            state.log_event(chat_id, "wazzup_send_skipped", {"reason": "debug_incoming_test", "phone": message["phone"], "channel_id": message["channel_id"]})
-
-    return {"ok": True, "ignored": False, "answer": answer, "should_send_wazzup": bool(answer and should_send), "no_reply_reason": no_reply_reason}
+            state.log_event(chat_id, "wazzup_send_result", {"status_code": None, "response_preview": "dry_run", "success": False, "dry_run": True})
+    state.log_event(chat_id, "bot_processing_finish", {"phone": phone, "chat_id": chat_id, "should_send_wazzup": bool(answer and should_send and send_enabled), "silent_reason": silent_reason, "send_result": send_result_payload})
+    return {"ok": True, "ignored": False, "answer": answer, "should_send_wazzup": bool(answer and should_send), "no_reply_reason": silent_reason}
 
 
 async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) -> dict[str, Any]:
+    global _LAST_WAZZUP_WEBHOOK_PAYLOAD, _LAST_WAZZUP_PARSE_META
     payload, parse_meta = await _safe_read_webhook_payload(request)
     if not parse_meta.get("ok"):
         _log_ignored_wazzup_webhook(request, parse_meta)
         return {"ok": True, "ignored": True, "reason": parse_meta.get("reason") or "invalid_json"}
 
+    _LAST_WAZZUP_WEBHOOK_PAYLOAD = payload
+    _LAST_WAZZUP_PARSE_META = dict(parse_meta)
     raw_messages = _raw_wazzup_messages(payload) or [_primary_payload_message(payload)]
     results = []
     processed_count = 0
@@ -1396,6 +1472,29 @@ def debug_wazzup_config() -> dict[str, Any]:
         "wazzup_instagram_channel_id_configured": bool(getattr(settings, "wazzup_instagram_channel_id", "")),
         "available_webhook_paths": list(WAZZUP_WEBHOOK_PATHS),
     }
+
+
+@app.get("/debug/last-events")
+def debug_last_events(phone: str = Query(...), limit: int = Query(default=50, ge=1, le=200)) -> dict[str, Any]:
+    events = state.recent_events_for_phone(phone, limit=limit)
+    return {"ok": True, "phone": phone, "events": events}
+
+
+@app.post("/debug/replay-last-wazzup")
+async def debug_replay_last_wazzup(request: Request, dry_run: bool = Query(default=True)) -> dict[str, Any]:
+    payload = dict(_LAST_WAZZUP_WEBHOOK_PAYLOAD or {})
+    if not payload:
+        return {"ok": False, "reason": "no_last_wazzup_payload"}
+    parse_meta = dict(_LAST_WAZZUP_PARSE_META or {})
+    parse_meta.setdefault("ok", True)
+    parse_meta.setdefault("content_type", "application/json")
+    parse_meta.setdefault("raw_preview", _preview(payload, 500))
+    replay_request = SimpleNamespace(url=SimpleNamespace(path="/debug/replay-last-wazzup"), method="POST")
+    raw_messages = _raw_wazzup_messages(payload) or [_primary_payload_message(payload)]
+    results = []
+    for raw_msg in raw_messages:
+        results.append(await _process_wazzup_message(replay_request, payload, raw_msg, parse_meta, send_enabled=not dry_run))
+    return {"ok": True, "dry_run": dry_run, "results": results}
 
 
 @app.post("/debug/wazzup/incoming-test")
