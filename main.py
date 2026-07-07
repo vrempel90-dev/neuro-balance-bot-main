@@ -17,7 +17,7 @@ from config import get_settings
 from dialog import FIRST_TOUCH_CLINIC_INFO_RU, handle_message
 from guards import GuardDecision, should_auto_reply
 from ai import humanize_reply_with_openai
-from schedule import astana_now, is_bot_work_time
+from schedule import astana_now, is_bot_work_time, next_work_bounds
 from voice import transcribe_wazzup_voice, transcribe_bytes, transcribe_upload, voice_text_for_bot
 from wazzup import extract_incoming_messages, is_audio_message_payload, send_text
 
@@ -77,9 +77,16 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
     return {
         "source": session.get("source") or "",
         "NEW_LEADS_ONLY": bool(getattr(get_settings(), "new_leads_only", True)),
+        "timezone": getattr(get_settings(), "bot_timezone", "Asia/Almaty"),
+        "utc_time": datetime.now(timezone.utc).isoformat(),
         "local_time": session.get("local_time") or astana_now().isoformat(),
+        "bot_work_start": getattr(get_settings(), "bot_work_start", "20:00"),
+        "bot_work_end": getattr(get_settings(), "bot_work_end", "08:00"),
+        "bot_auto_reply_enabled": bool(getattr(get_settings(), "bot_auto_reply_enabled", True)),
+        "new_leads_only": bool(getattr(get_settings(), "new_leads_only", True)),
         "bot_work_time_now": is_bot_work_time(),
         "working_hours_allowed": bool(session.get("working_hours_allowed", is_bot_work_time())),
+        "working_hours_bypassed_by_force": bool(session.get("working_hours_bypassed_by_force")),
         "openai_used": bool(session.get("openai_used")),
         "openai_model": session.get("openai_model") or "",
         "openai_skip_reason": session.get("openai_skip_reason") or "",
@@ -216,13 +223,55 @@ def startup() -> None:
     state.init_db()
 
 
+def _time_debug_payload(now: datetime | None = None) -> dict[str, Any]:
+    settings = get_settings()
+    local = (now or astana_now()).astimezone(astana_now().tzinfo)
+    utc_now = local.astimezone(timezone.utc)
+    next_start, next_end = next_work_bounds(local)
+    active = is_bot_work_time(local)
+    return {
+        "utc_now": utc_now.isoformat(),
+        "local_now": local.isoformat(),
+        "utc_time": utc_now.isoformat(),
+        "local_time": local.isoformat(),
+        "timezone": getattr(settings, "bot_timezone", "Asia/Almaty"),
+        "is_bot_work_time": active,
+        "bot_work_time_now": active,
+        "work_start": getattr(settings, "bot_work_start", "20:00"),
+        "work_end": getattr(settings, "bot_work_end", "08:00"),
+        "bot_work_start": getattr(settings, "bot_work_start", "20:00"),
+        "bot_work_end": getattr(settings, "bot_work_end", "08:00"),
+        "bot_auto_reply_enabled": bool(getattr(settings, "bot_auto_reply_enabled", True)),
+        "new_leads_only": bool(getattr(settings, "new_leads_only", True)),
+        "next_start": next_start.isoformat(),
+        "next_end": next_end.isoformat(),
+        "next_bot_start_at": next_start.isoformat(),
+        "next_bot_end_at": next_end.isoformat(),
+        "reason": "inside_night_window" if active else "outside_bot_work_time",
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
+    payload = _time_debug_payload()
     return {
         "ok": True,
-        "mode": "gpt4o-mini-night-only",
-        "bot_work_time_now": is_bot_work_time(),
+        "timezone": payload["timezone"],
+        "utc_time": payload["utc_time"],
+        "local_time": payload["local_time"],
+        "bot_work_start": payload["bot_work_start"],
+        "bot_work_end": payload["bot_work_end"],
+        "bot_work_time_now": payload["bot_work_time_now"],
+        "bot_auto_reply_enabled": payload["bot_auto_reply_enabled"],
+        "new_leads_only": payload["new_leads_only"],
+        "next_bot_start_at": payload["next_bot_start_at"],
+        "next_bot_end_at": payload["next_bot_end_at"],
     }
+
+
+@app.get("/debug/time")
+def debug_time() -> dict[str, Any]:
+    return _time_debug_payload()
 
 
 _ALLOWED_HUMANIZE_STEPS = {"start", "complaint", "age", "contraindications", "date", "time", "name"}
