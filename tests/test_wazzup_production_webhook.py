@@ -123,13 +123,73 @@ def test_invalid_json_is_ignored():
     assert response.json() == {"ok": True, "ignored": True, "reason": "invalid_json"}
 
 
+
+def test_post_webhook_wazzup_empty_body_is_ignored(monkeypatch):
+    handler_calls = []
+    sender_calls = []
+    monkeypatch.setattr(main, "handle_incoming_message", lambda message: handler_calls.append(message) or _fake_handler(message))
+    monkeypatch.setattr(main, "send_wazzup_message", lambda **kwargs: sender_calls.append(kwargs) or _fake_sender(**kwargs))
+    client = TestClient(main.app)
+
+    response = client.post("/webhook/wazzup", content=b"")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "ignored": True, "reason": "empty_body"}
+    assert handler_calls == []
+    assert sender_calls == []
+
+
+def test_post_webhook_wazzup_invalid_json_is_ignored(monkeypatch):
+    handler_calls = []
+    sender_calls = []
+    monkeypatch.setattr(main, "handle_incoming_message", lambda message: handler_calls.append(message) or _fake_handler(message))
+    monkeypatch.setattr(main, "send_wazzup_message", lambda **kwargs: sender_calls.append(kwargs) or _fake_sender(**kwargs))
+    client = TestClient(main.app)
+
+    response = client.post("/webhook/wazzup", data="{not-json", headers={"content-type": "application/json"})
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "ignored": True, "reason": "invalid_json"}
+    assert handler_calls == []
+    assert sender_calls == []
+
+
+def test_post_webhook_wazzup_valid_json_calls_handler(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main, "handle_incoming_message", lambda message: calls.append(message) or _fake_handler(message))
+    monkeypatch.setattr(main, "send_wazzup_message", _fake_sender)
+    client = TestClient(main.app)
+
+    response = client.post("/webhook/wazzup", json=_payload(messageId="msg-webhook-wazzup"))
+
+    assert response.status_code == 200
+    assert calls and calls[0]["source"] == "wazzup"
+
+
+def test_get_wazzup_webhook_health():
+    client = TestClient(main.app)
+
+    response = client.get("/wazzup/webhook")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
+
+def test_get_webhook_wazzup_health():
+    client = TestClient(main.app)
+
+    response = client.get("/webhook/wazzup")
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+
 def test_health_contains_wazzup_webhook_paths():
     client = TestClient(main.app)
 
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json()["wazzup_webhook_paths"] == ["/wazzup/webhook", "/webhook", "/api/wazzup/webhook"]
+    assert response.json()["wazzup_webhook_paths"] == ["/wazzup/webhook", "/webhook", "/api/wazzup/webhook", "/webhook/wazzup"]
 
 
 def test_debug_wazzup_config_works():
@@ -141,4 +201,4 @@ def test_debug_wazzup_config_works():
     body = response.json()
     assert body["wazzup_api_key_configured"] is True
     assert body["wazzup_channel_id_configured"] is True
-    assert body["available_webhook_paths"] == ["/wazzup/webhook", "/webhook", "/api/wazzup/webhook"]
+    assert body["available_webhook_paths"] == ["/wazzup/webhook", "/webhook", "/api/wazzup/webhook", "/webhook/wazzup"]
