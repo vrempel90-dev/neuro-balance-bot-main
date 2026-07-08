@@ -15,6 +15,11 @@ state.init_db()
 from schedule import is_bot_work_time
 
 
+def setup_function():
+    state.init_db()
+
+
+
 def _enable_new_leads_only(monkeypatch):
     monkeypatch.setenv("NEW_LEADS_ONLY", "true")
     config.get_settings.cache_clear()
@@ -150,3 +155,72 @@ def test_debug_payload_keeps_message_id_for_no_reply(monkeypatch):
     assert debug["message_id"] == "msg-old-1"
     assert debug["message_timestamp"] == "2026-07-06T23:59:00+05:00"
     assert debug["no_reply_reason"] == "old_message_before_bot_activation"
+
+
+def test_crm_new_lead_with_found_true_is_new_patient(monkeypatch):
+    async def scenario():
+        _enable_new_leads_only(monkeypatch)
+        async def fake_lookup(phone):
+            return {"ok": True, "found": True, "isNew": True, "patient": None, "lead": {"status": "НОВАЯ"}, "lastAppointment": None, "hasActiveAppointment": False, "appointment": None, "appointments": []}
+        monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
+        chat_id = "prod_found_true_new_lead"
+        state.reset_session(chat_id)
+        answer = await dialog.handle_message(chat_id, "77008984505", "Здравствуйте")
+        session = state.get_session(chat_id)
+        assert session["crm_patient_state"] == "NEW_PATIENT"
+        assert session["crm_state_reason"] == "isNew=true, patient=null, lead.status=НОВАЯ, no active appointment => NEW_PATIENT"
+        assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+        assert session.get("no_reply_reason", "") == ""
+    asyncio.run(scenario())
+
+
+def test_crm_new_not_found_is_new_patient(monkeypatch):
+    async def scenario():
+        _enable_new_leads_only(monkeypatch)
+        async def fake_lookup(phone):
+            return {"ok": True, "found": False, "isNew": True, "patient": None, "lead": None, "lastAppointment": None, "hasActiveAppointment": False, "appointment": None, "appointments": []}
+        monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
+        chat_id = "prod_not_found_new_patient"
+        state.reset_session(chat_id)
+        answer = await dialog.handle_message(chat_id, "77008984505", "Здравствуйте")
+        assert state.get_session(chat_id)["crm_patient_state"] == "NEW_PATIENT"
+        assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+    asyncio.run(scenario())
+
+
+def test_old_lead_mute_resets_for_new_patient(monkeypatch):
+    async def scenario():
+        _enable_new_leads_only(monkeypatch)
+        async def fake_lookup(phone):
+            return {"ok": True, "found": True, "isNew": True, "patient": None, "lead": {"status": "NEW"}, "lastAppointment": None, "hasActiveAppointment": False, "appointment": None, "appointments": []}
+        monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
+        chat_id = "prod_reset_old_mute"
+        state.reset_session(chat_id)
+        session0 = state.get_session(chat_id)
+        session0.update({"ai_muted": True, "manual_takeover": True, "no_reply_reason": "old_lead_from_crm", "openai_skip_reason": "old_lead_from_crm"})
+        state.save_session(chat_id, session0)
+        answer = await dialog.handle_message(chat_id, "77008984505", "Здравствуйте")
+        session = state.get_session(chat_id)
+        assert session["crm_patient_state"] == "NEW_PATIENT"
+        assert session["ai_muted"] is False
+        assert session["manual_takeover"] is False
+        assert session.get("no_reply_reason", "") == ""
+        assert session.get("openai_skip_reason", "") == ""
+        assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+    asyncio.run(scenario())
+
+
+def test_active_booking_by_requested_status_is_silent(monkeypatch):
+    async def scenario():
+        _enable_new_leads_only(monkeypatch)
+        async def fake_lookup(phone):
+            return {"ok": True, "found": True, "isNew": False, "patient": {"name": "Тест"}, "lead": None, "lastAppointment": {"status": "ПОДТВЕРДИЛ_ЗАРАНЕЕ"}, "hasActiveAppointment": True, "appointment": None, "appointments": []}
+        monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
+        chat_id = "prod_active_requested_status"
+        state.reset_session(chat_id)
+        answer = await dialog.handle_message(chat_id, "77008984505", "Здравствуйте")
+        session = state.get_session(chat_id)
+        assert answer == ""
+        assert session["crm_patient_state"] == "ACTIVE_BOOKING"
+        assert session["no_reply_reason"] == "active_booking_old_lead"
+    asyncio.run(scenario())
