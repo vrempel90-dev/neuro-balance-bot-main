@@ -19,7 +19,7 @@ from config import get_settings
 from dialog import FIRST_TOUCH_CLINIC_INFO_RU, handle_message
 from guards import GuardDecision, should_auto_reply
 from ai import humanize_reply_with_openai
-from schedule import astana_now, is_bot_work_time, next_work_bounds
+from schedule import astana_now, is_bot_work_time, is_test_window_time, next_work_bounds, time_gate_status
 from voice import transcribe_wazzup_voice, transcribe_bytes, transcribe_upload, voice_text_for_bot
 from wazzup import extract_incoming_messages, is_audio_message_payload, send_text
 
@@ -99,6 +99,11 @@ def _dialog_debug(session: dict[str, Any], answer: str = "") -> dict[str, Any]:
         "local_time": session.get("local_time") or astana_now().isoformat(),
         "bot_work_start": getattr(get_settings(), "bot_work_start", "20:00"),
         "bot_work_end": getattr(get_settings(), "bot_work_end", "08:00"),
+        "bot_test_window_enabled": bool(getattr(get_settings(), "bot_test_window_enabled", False)),
+        "bot_test_window_start": getattr(get_settings(), "bot_test_window_start", "14:00"),
+        "bot_test_window_end": getattr(get_settings(), "bot_test_window_end", "14:30"),
+        "bot_test_window_date": getattr(get_settings(), "bot_test_window_date", "2026-07-08"),
+        "bot_test_window_now": is_test_window_time(),
         "bot_auto_reply_enabled": bool(getattr(get_settings(), "bot_auto_reply_enabled", True)),
         "new_leads_only": bool(getattr(get_settings(), "new_leads_only", True)),
         "bot_work_time_now": is_bot_work_time(),
@@ -245,7 +250,8 @@ def _time_debug_payload(now: datetime | None = None) -> dict[str, Any]:
     local = (now or astana_now()).astimezone(astana_now().tzinfo)
     utc_now = local.astimezone(timezone.utc)
     next_start, next_end = next_work_bounds(local)
-    active = is_bot_work_time(local)
+    gate = time_gate_status(local)
+    active = bool(gate["bot_work_time_now"])
     return {
         "utc_now": utc_now.isoformat(),
         "local_now": local.isoformat(),
@@ -258,13 +264,20 @@ def _time_debug_payload(now: datetime | None = None) -> dict[str, Any]:
         "work_end": getattr(settings, "bot_work_end", "08:00"),
         "bot_work_start": getattr(settings, "bot_work_start", "20:00"),
         "bot_work_end": getattr(settings, "bot_work_end", "08:00"),
+        "bot_test_window_enabled": bool(getattr(settings, "bot_test_window_enabled", False)),
+        "bot_test_window_start": getattr(settings, "bot_test_window_start", "14:00"),
+        "bot_test_window_end": getattr(settings, "bot_test_window_end", "14:30"),
+        "bot_test_window_date": getattr(settings, "bot_test_window_date", "2026-07-08"),
+        "bot_test_window_now": bool(gate["test_window_now"]),
+        "normal_work_time_now": bool(gate["normal_work_time_now"]),
         "bot_auto_reply_enabled": bool(getattr(settings, "bot_auto_reply_enabled", True)),
         "new_leads_only": bool(getattr(settings, "new_leads_only", True)),
         "next_start": next_start.isoformat(),
         "next_end": next_end.isoformat(),
         "next_bot_start_at": next_start.isoformat(),
         "next_bot_end_at": next_end.isoformat(),
-        "reason": "inside_night_window" if active else "outside_bot_work_time",
+        "time_gate_reason": str(gate["time_gate_reason"]),
+        "reason": str(gate["time_gate_reason"]),
     }
 
 
@@ -279,6 +292,11 @@ def health() -> dict[str, Any]:
         "bot_work_start": payload["bot_work_start"],
         "bot_work_end": payload["bot_work_end"],
         "bot_work_time_now": payload["bot_work_time_now"],
+        "bot_test_window_enabled": payload["bot_test_window_enabled"],
+        "bot_test_window_start": payload["bot_test_window_start"],
+        "bot_test_window_end": payload["bot_test_window_end"],
+        "bot_test_window_date": payload["bot_test_window_date"],
+        "bot_test_window_now": payload["bot_test_window_now"],
         "bot_auto_reply_enabled": payload["bot_auto_reply_enabled"],
         "new_leads_only": payload["new_leads_only"],
         "next_bot_start_at": payload["next_bot_start_at"],
@@ -1347,7 +1365,7 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
 
     def _finish_silent(reason: str, *, crm_error: str = "", crm_patient_state: str = "") -> dict[str, Any]:
         public_reason = _public_silent_reason(reason)
-        state.log_event(chat_id, "time_gate_result", {"phone": phone, "chat_id": chat_id, "bot_work_time_now": is_bot_work_time(), "silent_reason": public_reason})
+        state.log_event(chat_id, "time_gate_result", {"phone": phone, "chat_id": chat_id, **time_gate_status(), "silent_reason": public_reason})
         if public_reason == "empty_text":
             state.log_event(chat_id, "crm_lookup_skipped", {"phone": phone, "chat_id": chat_id, "reason": "empty_text", "silent_reason": public_reason})
         else:
@@ -1380,8 +1398,9 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
         state.save_session(chat_id, session)
         return _finish_silent("empty_text")
 
-    work_time_now = is_bot_work_time()
-    state.log_event(chat_id, "time_gate_result", {"phone": phone, "chat_id": chat_id, "bot_work_time_now": work_time_now})
+    gate = time_gate_status()
+    work_time_now = bool(gate["bot_work_time_now"])
+    state.log_event(chat_id, "time_gate_result", {"phone": phone, "chat_id": chat_id, **gate})
     state.log_event(chat_id, "crm_lookup_start", {"phone": phone, "chat_id": chat_id})
 
     answer = ""

@@ -224,3 +224,36 @@ def test_active_booking_by_requested_status_is_silent(monkeypatch):
         assert session["crm_patient_state"] == "ACTIVE_BOOKING"
         assert session["no_reply_reason"] == "active_booking_old_lead"
     asyncio.run(scenario())
+
+
+def test_daytime_test_window_almaty_boundaries(monkeypatch):
+    monkeypatch.setenv("BOT_TIMEZONE", "Asia/Almaty")
+    monkeypatch.setenv("BOT_WORK_START", "20:00")
+    monkeypatch.setenv("BOT_WORK_END", "08:00")
+    monkeypatch.setenv("BOT_TEST_WINDOW_ENABLED", "true")
+    monkeypatch.setenv("BOT_TEST_WINDOW_START", "14:00")
+    monkeypatch.setenv("BOT_TEST_WINDOW_END", "14:30")
+    monkeypatch.setenv("BOT_TEST_WINDOW_DATE", "2026-07-08")
+    config.get_settings.cache_clear()
+    cases = [
+        ("2026-07-08T13:59:00+05:00", False),
+        ("2026-07-08T14:00:00+05:00", True),
+        ("2026-07-08T14:15:00+05:00", True),
+        ("2026-07-08T14:29:00+05:00", True),
+        ("2026-07-08T14:30:00+05:00", False),
+        ("2026-07-08T20:00:00+05:00", True),
+    ]
+    for value, expected in cases:
+        assert is_bot_work_time(datetime.fromisoformat(value)) is expected
+
+
+def test_daytime_test_window_ignored_when_disabled(monkeypatch):
+    monkeypatch.setenv("BOT_TIMEZONE", "Asia/Almaty")
+    monkeypatch.setenv("BOT_WORK_START", "20:00")
+    monkeypatch.setenv("BOT_WORK_END", "08:00")
+    monkeypatch.setenv("BOT_TEST_WINDOW_ENABLED", "false")
+    monkeypatch.setenv("BOT_TEST_WINDOW_START", "14:00")
+    monkeypatch.setenv("BOT_TEST_WINDOW_END", "14:30")
+    monkeypatch.setenv("BOT_TEST_WINDOW_DATE", "2026-07-08")
+    config.get_settings.cache_clear()
+    assert is_bot_work_time(datetime.fromisoformat("2026-07-08T14:15:00+05:00")) is False
