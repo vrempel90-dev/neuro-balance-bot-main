@@ -3,15 +3,21 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from config import get_settings
+from schedule import astana_now, time_gate_status
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("production_events")
+_LAST_EVENTS_MEMORY: deque[dict[str, Any]] = deque(maxlen=500)
 
 _SECRET_KEY_PARTS = ("secret", "api_key", "apikey", "token", "authorization", "password")
+_STARTUP_HEALTH_EVENTS = {"bot_runtime_config", "health_check", "startup", "app_startup", "config_summary"}
+_WARNING_ERROR_WORDS = ("error", "warning", "critical", "exception", "failed", "invalid_json")
+
 _STDOUT_EVENTS = {
     "wazzup_received",
     "dialog_start",
@@ -53,9 +59,60 @@ def _safe_log_value(key: str, value: Any) -> Any:
     return value
 
 
+def log_window_status(now: datetime | None = None) -> dict[str, Any]:
+    local = (now or astana_now())
+    gate = time_gate_status(local)
+    allowed = bool(gate["bot_work_time_now"] or gate["test_window_now"])
+    return {
+        "local_time": local.isoformat(),
+        "timezone": getattr(get_settings(), "bot_timezone", "Asia/Almaty"),
+        "bot_work_time_now": bool(gate["bot_work_time_now"]),
+        "normal_work_time_now": bool(gate["normal_work_time_now"]),
+        "test_window_now": bool(gate["test_window_now"]),
+        "log_window_allowed": allowed,
+    }
+
+
+def _is_error_warning_event(event_type: str, payload: dict[str, Any]) -> bool:
+    event_low = str(event_type or "").lower()
+    if any(word in event_low for word in _WARNING_ERROR_WORDS):
+        return True
+    level = str((payload or {}).get("level") or (payload or {}).get("severity") or "").lower()
+    if level in {"error", "warning", "critical", "exception"}:
+        return True
+    if (payload or {}).get("skipped") or (payload or {}).get("dry_run"):
+        return False
+    silent_reason = str((payload or {}).get("silent_reason") or "").lower()
+    if silent_reason in {"send_failed", "crm_lookup_failed"}:
+        return True
+    if (payload or {}).get("success") is False and any(word in event_low for word in ("send", "crm", "parse")):
+        return True
+    if (payload or {}).get("ok") is False and any(word in event_low for word in ("send", "crm", "parse")):
+        return True
+    return False
+
+
+def _is_startup_health_event(event_type: str) -> bool:
+    event_low = str(event_type or "").lower()
+    return event_low in _STARTUP_HEALTH_EVENTS or "startup" in event_low or "health" in event_low or "runtime_config" in event_low
+
+
+def should_emit_production_event(event_type: str, payload: dict[str, Any] | None = None) -> bool:
+    settings = get_settings()
+    if not bool(getattr(settings, "production_log_active_window_only", True)):
+        return True
+    payload = payload or {}
+    if _is_error_warning_event(event_type, payload) or _is_startup_health_event(event_type):
+        return True
+    if str(payload.get("source") or "").lower() == "debug" and not (bool(payload.get("force")) or bool(payload.get("debug"))):
+        return False
+    return bool(log_window_status()["log_window_allowed"])
+
+
 def _safe_log_payload(chat_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    enriched = {**log_window_status(), **(payload or {})}
     safe = {"event": event_type, "chat_id": chat_id}
-    for key, value in (payload or {}).items():
+    for key, value in enriched.items():
         out_key = "text_preview" if str(key).lower() in {"text", "content", "transcript"} else str(key)
         safe[out_key] = _safe_log_value(str(key), value)
     return safe
@@ -143,13 +200,22 @@ def add_message(chat_id: str, role: str, content: str) -> None:
 
 
 def log_event(chat_id: str, event_type: str, payload: dict[str, Any]) -> None:
-    if event_type in _STDOUT_EVENTS:
-        logger.info(json.dumps(_safe_log_payload(chat_id, event_type, payload), ensure_ascii=False, default=str))
+    payload = dict(payload or {})
+    enriched_payload = {**log_window_status(), **payload}
+    event_record = {"chat_id": chat_id, "event_type": event_type, "payload": enriched_payload, "created_at": now_iso()}
+    _LAST_EVENTS_MEMORY.append(event_record)
+    if event_type in _STDOUT_EVENTS or _is_startup_health_event(event_type) or _is_error_warning_event(event_type, payload):
+        if should_emit_production_event(event_type, payload):
+            logger.info(json.dumps(_safe_log_payload(chat_id, event_type, payload), ensure_ascii=False, default=str))
     with _connect() as conn:
         conn.execute(
             "INSERT INTO events(chat_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
-            (chat_id, event_type, json.dumps(payload, ensure_ascii=False), now_iso()),
+            (chat_id, event_type, json.dumps(enriched_payload, ensure_ascii=False), now_iso()),
         )
+
+
+def recent_memory_events(limit: int = 100) -> list[dict[str, Any]]:
+    return list(_LAST_EVENTS_MEMORY)[-max(1, min(int(limit or 100), 500)):]
 
 
 def log_bot_action(

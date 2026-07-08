@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     bot_active_from_hour: int = Field(default=20, validation_alias=AliasChoices("BOT_ACTIVE_FROM", "BOT_ACTIVE_FROM_HOUR", "bot_active_from_hour"))
     bot_active_until_hour: int = Field(default=8, validation_alias=AliasChoices("BOT_ACTIVE_TO", "BOT_ACTIVE_UNTIL_HOUR", "bot_active_until_hour"))
     bot_silent_outside_hours: bool = Field(default=True, validation_alias=AliasChoices("BOT_SILENT_OUTSIDE_HOURS", "bot_silent_outside_hours"))
+    production_log_active_window_only: bool = Field(default=True, validation_alias=AliasChoices("PRODUCTION_LOG_ACTIVE_WINDOW_ONLY", "production_log_active_window_only"))
     message_debounce_seconds: int = Field(default=5, validation_alias=AliasChoices("MESSAGE_DEBOUNCE_SECONDS", "message_debounce_seconds"))
     timezone_offset_hours: int = Field(default=5, validation_alias=AliasChoices("TIMEZONE_OFFSET_HOURS", "timezone_offset_hours"))
     daytime_handoff_message: str = Field(
