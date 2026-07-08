@@ -24,11 +24,26 @@ WAZZUP_API_KEY=...
 WAZZUP_CHANNEL_ID=...
 WAZZUP_API_URL=https://api.wazzup24.com/v3
 
+PUBLIC_BASE_URL=https://neuro-balance-bot-main-production.up.railway.app
+DEPRECATED_PUBLIC_BASE_URLS=https://neuro-balance-bot-final-production.up.railway.app
+
 BOT_ACTIVE_FROM=20
 BOT_ACTIVE_TO=8
 BOT_SILENT_OUTSIDE_HOURS=true
 MESSAGE_DEBOUNCE_SECONDS=5
 ```
+
+## Wazzup webhook URL
+
+В CRM/Wazzup должен быть указан актуальный Railway URL:
+
+```text
+https://neuro-balance-bot-main-production.up.railway.app/webhook/wazzup
+```
+
+Старый домен `https://neuro-balance-bot-final-production.up.railway.app/webhook/wazzup` не должен использоваться: Railway отвечает на него `404 Application not found` с `x-railway-fallback: true`, поэтому запрос не доходит до приложения бота.
+
+Проверить URL можно через `GET /health`, `GET /webhook/wazzup` или `GET /debug/wazzup/config`: ответы возвращают `current_wazzup_webhook_url` и список `deprecated_wazzup_webhook_urls`.
 
 ## Start command
 

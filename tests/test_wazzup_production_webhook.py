@@ -219,6 +219,30 @@ def test_health_contains_wazzup_webhook_paths():
     assert response.json()["wazzup_webhook_paths"] == ["/wazzup/webhook", "/webhook", "/api/wazzup/webhook", "/webhook/wazzup"]
 
 
+
+def test_health_exposes_current_railway_wazzup_webhook_url():
+    client = TestClient(main.app)
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["current_public_base_url"] == "https://neuro-balance-bot-main-production.up.railway.app"
+    assert body["current_wazzup_webhook_url"] == "https://neuro-balance-bot-main-production.up.railway.app/webhook/wazzup"
+    assert "https://neuro-balance-bot-final-production.up.railway.app/webhook/wazzup" in body["deprecated_wazzup_webhook_urls"]
+
+
+def test_wazzup_webhook_health_exposes_url_warning():
+    client = TestClient(main.app)
+
+    response = client.get("/webhook/wazzup")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["current_wazzup_webhook_url"] == "https://neuro-balance-bot-main-production.up.railway.app/webhook/wazzup"
+    assert body["deprecated_wazzup_webhook_urls"] == ["https://neuro-balance-bot-final-production.up.railway.app/webhook/wazzup"]
+    assert "deprecated" in body["webhook_url_warning"]
+
 def test_debug_wazzup_config_works():
     client = TestClient(main.app)
 

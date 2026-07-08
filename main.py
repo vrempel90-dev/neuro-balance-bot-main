@@ -34,6 +34,32 @@ WAZZUP_WEBHOOK_PATHS = [
     "/api/wazzup/webhook",
     "/webhook/wazzup",
 ]
+WAZZUP_PRIMARY_WEBHOOK_PATH = "/webhook/wazzup"
+
+
+def _public_base_url() -> str:
+    return str(getattr(get_settings(), "public_base_url", "") or "").strip().rstrip("/")
+
+
+def _deprecated_public_base_urls() -> list[str]:
+    return [
+        url.strip().rstrip("/")
+        for url in str(getattr(get_settings(), "deprecated_public_base_urls", "") or "").split(",")
+        if url.strip()
+    ]
+
+
+def _wazzup_webhook_urls() -> dict[str, Any]:
+    base_url = _public_base_url()
+    current_url = f"{base_url}{WAZZUP_PRIMARY_WEBHOOK_PATH}" if base_url else WAZZUP_PRIMARY_WEBHOOK_PATH
+    deprecated_urls = [f"{url}{WAZZUP_PRIMARY_WEBHOOK_PATH}" for url in _deprecated_public_base_urls()]
+    return {
+        "current_public_base_url": base_url,
+        "primary_wazzup_webhook_path": WAZZUP_PRIMARY_WEBHOOK_PATH,
+        "current_wazzup_webhook_url": current_url,
+        "deprecated_wazzup_webhook_urls": deprecated_urls,
+        "webhook_url_warning": "CRM/Wazzup must use current_wazzup_webhook_url; deprecated URLs belong to removed Railway apps and may return Railway fallback 404.",
+    }
 
 try:
     from strict_prompt_guard import enforce_prompt_only
@@ -333,6 +359,7 @@ def health() -> dict[str, Any]:
         "wazzup_channel_id_configured": bool(getattr(get_settings(), "wazzup_channel_id", "")),
         "wazzup_instagram_channel_id_configured": bool(getattr(get_settings(), "wazzup_instagram_channel_id", "")),
         "wazzup_webhook_paths": list(WAZZUP_WEBHOOK_PATHS),
+        **_wazzup_webhook_urls(),
     }
 
 
@@ -1295,6 +1322,9 @@ def wazzup_webhook_health_response(request: Request) -> dict[str, Any]:
         "webhook": "wazzup",
         "method": request.method,
         "message": "Use POST for incoming Wazzup messages",
+        "request_path": request.url.path,
+        "available_webhook_paths": list(WAZZUP_WEBHOOK_PATHS),
+        **_wazzup_webhook_urls(),
     }
 
 
@@ -1585,6 +1615,7 @@ def debug_wazzup_config() -> dict[str, Any]:
         "wazzup_channel_id_configured": bool(getattr(settings, "wazzup_channel_id", "")),
         "wazzup_instagram_channel_id_configured": bool(getattr(settings, "wazzup_instagram_channel_id", "")),
         "available_webhook_paths": list(WAZZUP_WEBHOOK_PATHS),
+        **_wazzup_webhook_urls(),
     }
 
 
