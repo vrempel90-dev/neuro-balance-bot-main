@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     )
 
     # App / storage
+    public_base_url: str = Field(
+        default="https://neuro-balance-bot-main-production.up.railway.app",
+        validation_alias=AliasChoices("PUBLIC_BASE_URL", "RAILWAY_PUBLIC_DOMAIN", "public_base_url"),
+    )
+    deprecated_public_base_urls: str = Field(
+        default="https://neuro-balance-bot-final-production.up.railway.app",
+        validation_alias=AliasChoices("DEPRECATED_PUBLIC_BASE_URLS", "deprecated_public_base_urls"),
+    )
     webhook_secret: str = Field(default="", validation_alias=AliasChoices("WEBHOOK_SECRET", "webhook_secret"))
     sqlite_path: str = Field(default="bot.sqlite3", validation_alias=AliasChoices("SQLITE_PATH", "sqlite_path"))
 
@@ -81,6 +89,17 @@ class Settings(BaseSettings):
         default="Здравствуйте! Сейчас рабочее время контакт-центра, поэтому Ваше сообщение передано администратору. Он ответит Вам в порядке очереди🌿",
         validation_alias=AliasChoices("DAYTIME_HANDOFF_MESSAGE", "daytime_handoff_message"),
     )
+
+    @field_validator("public_base_url", mode="after")
+    @classmethod
+    def normalize_public_base_url(cls, value: str) -> str:
+        return str(value or "").strip().rstrip("/")
+
+    @field_validator("deprecated_public_base_urls", mode="after")
+    @classmethod
+    def normalize_deprecated_public_base_urls(cls, value: str) -> str:
+        urls = [url.strip().rstrip("/") for url in str(value or "").split(",") if url.strip()]
+        return ",".join(urls)
 
     @field_validator("bot_active_from_hour", "bot_active_until_hour", mode="before")
     @classmethod
