@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     # Wazzup
     wazzup_api_key: str = Field(default="", validation_alias=AliasChoices("WAZZUP_API_KEY", "wazzup_api_key"))
     wazzup_channel_id: str = Field(default="", validation_alias=AliasChoices("WAZZUP_CHANNEL_ID", "wazzup_channel_id"))
+    wazzup_allowed_channel_ids: str = Field(default="", validation_alias=AliasChoices("WAZZUP_ALLOWED_CHANNEL_IDS", "wazzup_allowed_channel_ids"))
     wazzup_instagram_channel_id: str = Field(default="", validation_alias=AliasChoices("WAZZUP_INSTAGRAM_CHANNEL_ID", "wazzup_instagram_channel_id"))
     wazzup_api_url: str = Field(default="https://api.wazzup24.com/v3", validation_alias=AliasChoices("WAZZUP_API_URL", "wazzup_api_url"))
     wazzup_media_endpoint_template: str = Field(

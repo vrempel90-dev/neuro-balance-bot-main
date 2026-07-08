@@ -174,7 +174,13 @@ def _store_appointment_fields(session: dict[str, Any], appt: dict[str, Any]) -> 
     session["appointment_doctor_login"] = appt.get("doctorLogin") or appt.get("doctor_login") or session.get("appointment_doctor_login") or ""
     session["appointment_status"] = appt.get("status") or appt.get("appointmentStatus") or session.get("appointment_status") or "booked"
 
-CRM_ACTIVE_STATUSES = {"active", "scheduled", "confirmed", "booked", "активна", "активный", "запланирован", "подтвержден", "подтверждён", "записан"}
+CRM_ACTIVE_STATUSES = {
+    "active", "scheduled", "confirmed", "booked", "new_booking",
+    "активна", "активный", "запланирован", "подтвержден", "подтверждён",
+    "записан", "записана", "подтвердил", "подтвердила", "подтвердил_заранее",
+    "ожидает",
+}
+CRM_NEW_LEAD_STATUSES = {"", "новая", "new"}
 
 
 def _crm_raw(lookup: dict[str, Any] | None) -> dict[str, Any]:
@@ -188,39 +194,70 @@ def _crm_appt_is_active(appt: dict[str, Any] | None) -> bool:
     if not isinstance(appt, dict) or not appt:
         return False
     status = _low(str(appt.get("status") or appt.get("appointmentStatus") or ""))
+    date_s = str(appt.get("date") or appt.get("appointmentDate") or "")[:10]
     if status and not any(s in status for s in CRM_ACTIVE_STATUSES):
         return False
-    date_s = str(appt.get("date") or appt.get("appointmentDate") or "")[:10]
     if date_s:
         try:
-            return datetime.fromisoformat(date_s).date() >= (datetime.now(timezone.utc) + timedelta(hours=5)).date()
+            future_or_today = datetime.fromisoformat(date_s).date() >= (datetime.now(timezone.utc) + timedelta(hours=5)).date()
+            return future_or_today if not status else (future_or_today and any(s in status for s in CRM_ACTIVE_STATUSES))
         except Exception:
             pass
     return any(s in status for s in CRM_ACTIVE_STATUSES)
 
 
+def _crm_lookup_log_fields(session: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "raw_crm_found": session.get("raw_crm_found"),
+        "raw_crm_isNew": session.get("raw_crm_isNew"),
+        "raw_crm_has_patient": bool(session.get("raw_crm_has_patient")),
+        "raw_crm_lead_status": session.get("raw_crm_lead_status") or "",
+        "raw_crm_has_lead": bool(session.get("raw_crm_has_lead")),
+        "raw_crm_has_lastAppointment": bool(session.get("raw_crm_has_lastAppointment")),
+        "raw_crm_hasActiveAppointment": bool(session.get("raw_crm_hasActiveAppointment")),
+        "crm_patient_state": session.get("crm_patient_state") or "",
+        "crm_state_reason": session.get("crm_state_reason") or "",
+    }
+
+
 def _set_crm_patient_debug(session: dict[str, Any], lookup: dict[str, Any] | None, appt: dict[str, Any] | None) -> None:
     raw = _crm_raw(lookup)
-    patient = raw.get("patient") if isinstance(raw.get("patient"), dict) else {}
-    lead = raw.get("lead") if isinstance(raw.get("lead"), dict) else {}
-    last = raw.get("lastAppointment") if isinstance(raw.get("lastAppointment"), dict) else {}
+    patient = raw.get("patient") if isinstance(raw.get("patient"), dict) else None
+    lead = raw.get("lead") if isinstance(raw.get("lead"), dict) else None
+    last = raw.get("lastAppointment") if isinstance(raw.get("lastAppointment"), dict) else None
+    lead_status = "" if not lead else str(lead.get("status") or "").strip()
+    lead_status_norm = _low(lead_status)
+    is_new = raw.get("isNew") is True
+    has_active = raw.get("hasActiveAppointment") is True
+    last_active = _crm_appt_is_active(last)
+    session["raw_crm_found"] = raw.get("found") if "found" in raw else None
+    session["raw_crm_isNew"] = raw.get("isNew") if "isNew" in raw else None
+    session["raw_crm_has_patient"] = bool(patient)
+    session["raw_crm_lead_status"] = lead_status
+    session["raw_crm_has_lead"] = bool(lead)
+    session["raw_crm_has_lastAppointment"] = bool(last)
+    session["raw_crm_hasActiveAppointment"] = bool(raw.get("hasActiveAppointment"))
     session["crm_patient_found"] = bool(raw.get("found")) if "found" in raw else bool(patient or lead or last)
     session["crm_patient_is_new"] = bool(raw.get("isNew")) if "isNew" in raw else not bool(patient or lead or last or appt)
-    session["crm_patient_name"] = patient.get("name") or raw.get("patientName") or ""
-    session["crm_lead_id"] = lead.get("id") or ""
-    session["crm_lead_status"] = lead.get("status") or ""
-    session["crm_lead_complaint"] = lead.get("complaint") or ""
-    session["crm_lead_request"] = lead.get("request") or ""
-    session["crm_last_appointment_id"] = last.get("id") or ""
-    session["crm_last_appointment_date"] = last.get("date") or last.get("appointmentDate") or ""
-    session["crm_last_appointment_time"] = last.get("timeStart") or last.get("time") or ""
-    session["crm_last_appointment_status"] = last.get("status") or last.get("appointmentStatus") or ""
-    if appt or raw.get("hasActiveAppointment") is True or raw.get("appointment") or raw.get("activeAppointment"):
+    session["crm_patient_name"] = (patient or {}).get("name") or raw.get("patientName") or ""
+    session["crm_lead_id"] = (lead or {}).get("id") or ""
+    session["crm_lead_status"] = lead_status
+    session["crm_lead_complaint"] = (lead or {}).get("complaint") or ""
+    session["crm_lead_request"] = (lead or {}).get("request") or ""
+    session["crm_last_appointment_id"] = (last or {}).get("id") or ""
+    session["crm_last_appointment_date"] = (last or {}).get("date") or (last or {}).get("appointmentDate") or ""
+    session["crm_last_appointment_time"] = (last or {}).get("timeStart") or (last or {}).get("time") or ""
+    session["crm_last_appointment_status"] = (last or {}).get("status") or (last or {}).get("appointmentStatus") or ""
+    if appt or has_active or last_active or raw.get("activeAppointment"):
         session["crm_patient_state"] = "ACTIVE_BOOKING"
-    elif bool(patient or lead or last or raw.get("found") is True or raw.get("isNew") is False):
-        session["crm_patient_state"] = "RETURNING_PATIENT_NO_ACTIVE_BOOKING"
-    else:
+        session["crm_state_reason"] = "hasActiveAppointment=true or active lastAppointment status => ACTIVE_BOOKING"
+    elif (is_new or (raw.get("isNew") is not False and raw.get("found") is not True)) and not patient and not last and not has_active and ((lead and lead_status_norm in CRM_NEW_LEAD_STATUSES) or not lead):
         session["crm_patient_state"] = "NEW_PATIENT"
+        prefix = "isNew=true" if is_new else "no existing patient markers"
+        session["crm_state_reason"] = f"{prefix}, patient=null, lead.status={lead_status or 'null'}, no active appointment => NEW_PATIENT"
+    else:
+        session["crm_patient_state"] = "RETURNING_PATIENT_NO_ACTIVE_BOOKING"
+        session["crm_state_reason"] = "patient exists or isNew=false or inactive lastAppointment or non-new lead.status => RETURNING_PATIENT_NO_ACTIVE_BOOKING"
 
 
 def _returning_patient_greeting(session: dict[str, Any]) -> str:
@@ -5745,7 +5782,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session["openai_skip_reason"] = ""
     session["openai_guard_failed"] = False
     _reset_openai_brain_debug(session)
-    for _k in ("crm_lookup_called","crm_lookup_status_code","crm_lookup_result","crm_lookup_error","crm_lookup_phone_variants","active_appointment_found","active_appointment_count","first_touch_allowed","first_touch_blocked_reason","post_booking_support_active","crm_patient_found","crm_patient_is_new","crm_patient_state","crm_patient_name","crm_lead_id","crm_lead_status","crm_lead_complaint","crm_lead_request","crm_last_appointment_id","crm_last_appointment_date","crm_last_appointment_time","crm_last_appointment_status"):
+    for _k in ("crm_lookup_called","crm_lookup_status_code","crm_lookup_result","crm_lookup_error","crm_lookup_phone_variants","active_appointment_found","active_appointment_count","first_touch_allowed","first_touch_blocked_reason","post_booking_support_active","crm_patient_found","crm_patient_is_new","crm_patient_state","crm_patient_name","crm_lead_id","crm_lead_status","crm_lead_complaint","crm_lead_request","crm_last_appointment_id","crm_last_appointment_date","crm_last_appointment_time","crm_last_appointment_status","raw_crm_found","raw_crm_isNew","raw_crm_has_patient","raw_crm_lead_status","raw_crm_has_lead","raw_crm_has_lastAppointment","raw_crm_hasActiveAppointment","crm_state_reason"):
         if _k not in {"post_booking_support_active"}:
             session.pop(_k, None)
     session.pop("base_answer_preview", None)
@@ -5773,7 +5810,16 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session["guard_decision"] = {"allowed": False, "no_reply_reason": "crm_lookup_failed", "should_call_openai": False, "should_call_crm": False, "should_send_wazzup": False}
             return _no_reply(chat_id, session, "crm_lookup_failed")
         return _finalize(chat_id, session, "Сейчас уточню Вашу запись у администратора 🌿")
-    if _is_new_leads_only_enabled() and session.get("crm_patient_state") != "NEW_PATIENT" and not _post_booking_support_is_active(session, chat_id):
+    if session.get("crm_patient_state") == "NEW_PATIENT":
+        if session.get("no_reply_reason") == "old_lead_from_crm" or session.get("ai_muted") or session.get("manual_takeover"):
+            session["ai_muted"] = False
+            session["manual_takeover"] = False
+            session["no_reply_reason"] = ""
+            session["openai_skip_reason"] = ""
+            session["openai_brain_skip_reason"] = ""
+            session["silent_old_lead"] = False
+            session["old_lead_reason"] = ""
+    if _is_new_leads_only_enabled() and session.get("crm_patient_state") in {"RETURNING_PATIENT_NO_ACTIVE_BOOKING", "ACTIVE_BOOKING"} and not _post_booking_support_is_active(session, chat_id):
         state_reason = "active_booking_old_lead" if session.get("crm_patient_state") == "ACTIVE_BOOKING" or appt else ("returning_patient_old_lead" if session.get("crm_patient_state") == "RETURNING_PATIENT_NO_ACTIVE_BOOKING" else "old_lead_from_crm")
         # Public no_reply_reason remains the requested old-lead value for generic returning patients.
         public_reason = "active_booking_old_lead" if state_reason == "active_booking_old_lead" else "old_lead_from_crm"

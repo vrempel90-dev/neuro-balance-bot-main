@@ -328,3 +328,45 @@ def test_wazzup_from_me_true_is_ignored_without_handler(monkeypatch):
     assert body["ignored_count"] == 1
     assert body["results"][0]["no_reply_reason"] == "echo_or_outgoing_message"
     assert handler_calls == []
+
+
+def test_allowed_channel_ids_accepts_secondary_channel_and_sends_on_payload_channel(monkeypatch):
+    calls = []
+    monkeypatch.setenv("WAZZUP_CHANNEL_ID", "7e4fc1db-0061-481c-9e67-309455af8aeb")
+    monkeypatch.setenv("WAZZUP_ALLOWED_CHANNEL_IDS", "7e4fc1db-0061-481c-9e67-309455af8aeb,15e83f65-253b-4c16-a894-effd547d6b76")
+    get_settings.cache_clear()
+
+    async def handler(message):
+        return {"answer": "Здравствуйте!", "should_send_wazzup": True}
+
+    async def sender(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "status_code": 200}
+
+    monkeypatch.setattr(main, "handle_incoming_message", handler)
+    monkeypatch.setattr(main, "send_wazzup_message", sender)
+    monkeypatch.setattr(main, "is_bot_work_time", lambda *a, **k: True)
+    client = TestClient(main.app)
+    secondary = "15e83f65-253b-4c16-a894-effd547d6b76"
+
+    response = client.post("/wazzup/webhook", json=_payload(channelId=secondary, messageId="msg-secondary-channel"))
+
+    assert response.status_code == 200
+    assert response.json()["should_send_wazzup"] is True
+    assert calls[0]["channel_id"] == secondary
+    events = state.recent_events_for_phone("77010000001", limit=20)
+    decisions = [e for e in events if e["event"] == "bot_decision"]
+    assert decisions[-1]["payload"]["channel_id_match"] is True
+
+
+def test_empty_text_logs_crm_lookup_skipped_not_result(monkeypatch):
+    monkeypatch.setattr(main, "handle_incoming_message", _fake_handler)
+    client = TestClient(main.app)
+
+    response = client.post("/wazzup/webhook", json=_payload(chatId="77010000999", phone="77010000999", text="", type="text", messageId="msg-empty-text"))
+
+    assert response.status_code == 200
+    events = state.recent_events_for_phone("77010000999", limit=20)
+    names = [event["event"] for event in events]
+    assert "crm_lookup_skipped" in names
+    assert "crm_lookup_result" not in names

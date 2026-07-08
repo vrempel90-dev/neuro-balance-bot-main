@@ -1259,8 +1259,12 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
     settings = get_settings()
     channel_id_env = str(getattr(settings, "wazzup_channel_id", "") or "")
     channel_id_from_payload = str(message.get("channel_id") or "")
-    channel_id_match = (not channel_id_env) or channel_id_from_payload == channel_id_env
-    channel_id_mismatch_blocks = bool(channel_id_env and channel_id_env != "test-channel" and channel_id_from_payload and not channel_id_match)
+    allowed_channel_ids = [c.strip() for c in str(getattr(settings, "wazzup_allowed_channel_ids", "") or "").split(",") if c.strip()]
+    if allowed_channel_ids:
+        channel_id_match = (not channel_id_from_payload) or channel_id_from_payload in allowed_channel_ids
+    else:
+        channel_id_match = (not channel_id_env) or channel_id_from_payload == channel_id_env
+    channel_id_mismatch_blocks = bool((allowed_channel_ids or (channel_id_env and channel_id_env != "test-channel")) and channel_id_from_payload and not channel_id_match)
     received_log = {
         "source": "wazzup",
         "path": request.url.path,
@@ -1294,12 +1298,21 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
             "chat_id": chat_id,
             "channel_id_from_payload": channel_id_from_payload,
             "channel_id_env": channel_id_env,
+            "allowed_channel_ids": allowed_channel_ids,
             "channel_id_match": channel_id_match,
             "bot_work_time_now": is_bot_work_time(),
             "bot_auto_reply_enabled": bool(getattr(settings, "bot_auto_reply_enabled", True)),
             "new_leads_only": bool(getattr(settings, "new_leads_only", False)),
             "crm_lookup_ok": crm_lookup_ok,
+            "raw_crm_found": sess.get("raw_crm_found"),
+            "raw_crm_isNew": sess.get("raw_crm_isNew"),
+            "raw_crm_has_patient": bool(sess.get("raw_crm_has_patient")),
+            "raw_crm_lead_status": sess.get("raw_crm_lead_status") or "",
+            "raw_crm_has_lead": bool(sess.get("raw_crm_has_lead")),
+            "raw_crm_has_lastAppointment": bool(sess.get("raw_crm_has_lastAppointment")),
+            "raw_crm_hasActiveAppointment": bool(sess.get("raw_crm_hasActiveAppointment")),
             "crm_patient_state": sess.get("crm_patient_state") or "",
+            "crm_state_reason": sess.get("crm_state_reason") or "",
             "should_send_wazzup": bool(should_send_wazzup),
             "silent_reason": silent_reason,
             "crm_error": crm_error,
@@ -1335,8 +1348,11 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
     def _finish_silent(reason: str, *, crm_error: str = "", crm_patient_state: str = "") -> dict[str, Any]:
         public_reason = _public_silent_reason(reason)
         state.log_event(chat_id, "time_gate_result", {"phone": phone, "chat_id": chat_id, "bot_work_time_now": is_bot_work_time(), "silent_reason": public_reason})
-        state.log_event(chat_id, "crm_lookup_start", {"phone": phone, "chat_id": chat_id, "skipped": True, "silent_reason": public_reason})
-        state.log_event(chat_id, "crm_lookup_result", {"phone": phone, "chat_id": chat_id, "crm_lookup_ok": False, "crm_patient_state": crm_patient_state, "crm_error": crm_error, "skipped": True, "silent_reason": public_reason})
+        if public_reason == "empty_text":
+            state.log_event(chat_id, "crm_lookup_skipped", {"phone": phone, "chat_id": chat_id, "reason": "empty_text", "silent_reason": public_reason})
+        else:
+            state.log_event(chat_id, "crm_lookup_start", {"phone": phone, "chat_id": chat_id, "skipped": True, "silent_reason": public_reason})
+            state.log_event(chat_id, "crm_lookup_result", {"phone": phone, "chat_id": chat_id, "crm_lookup_ok": False, "crm_patient_state": crm_patient_state, "crm_error": crm_error, "skipped": True, "silent_reason": public_reason})
         state.log_event(chat_id, "bot_decision", _decision_payload(silent_reason=public_reason, crm_error=crm_error))
         state.log_event(chat_id, "ai_or_template_response_ready", {"phone": phone, "chat_id": chat_id, "answer_preview": "", "has_answer": False, "silent_reason": public_reason})
         state.log_event(chat_id, "wazzup_send_start", {"chat_id": chat_id, "channel_id": channel_id_from_payload, "skipped": True, "silent_reason": public_reason})
@@ -1391,7 +1407,10 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
     no_reply_reason = str(session_after.get("no_reply_reason") or "")
     crm_error = str(session_after.get("crm_lookup_error") or "")
     crm_lookup_ok = bool(session_after.get("crm_lookup_called")) and not crm_error
-    state.log_event(chat_id, "crm_lookup_result", {"phone": phone, "chat_id": chat_id, "crm_lookup_ok": crm_lookup_ok, "crm_patient_state": session_after.get("crm_patient_state") or "", "crm_error": crm_error})
+    crm_log_payload = {"phone": phone, "chat_id": chat_id, "crm_lookup_ok": crm_lookup_ok, "crm_error": crm_error, "new_leads_only": bool(getattr(settings, "new_leads_only", False)), "should_send_wazzup": bool(answer and should_send), "silent_reason": ""}
+    for key in ("raw_crm_found", "raw_crm_isNew", "raw_crm_has_patient", "raw_crm_lead_status", "raw_crm_has_lead", "raw_crm_has_lastAppointment", "raw_crm_hasActiveAppointment", "crm_patient_state", "crm_state_reason"):
+        crm_log_payload[key] = session_after.get(key) if key in {"raw_crm_found", "raw_crm_isNew"} else (bool(session_after.get(key)) if key.startswith("raw_crm_has") or key == "raw_crm_hasActiveAppointment" else session_after.get(key) or "")
+    state.log_event(chat_id, "crm_lookup_result", crm_log_payload)
 
     silent_reason = _public_silent_reason(no_reply_reason) if no_reply_reason else ""
     if channel_id_mismatch_blocks:
@@ -1400,7 +1419,7 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
     elif crm_error or no_reply_reason == "crm_lookup_failed":
         silent_reason = "crm_lookup_failed"
         should_send = False
-    elif bool(getattr(settings, "new_leads_only", False)) and session_after.get("crm_patient_state") and session_after.get("crm_patient_state") != "NEW_PATIENT":
+    elif bool(getattr(settings, "new_leads_only", False)) and session_after.get("crm_patient_state") in {"RETURNING_PATIENT_NO_ACTIVE_BOOKING", "ACTIVE_BOOKING"}:
         silent_reason = "old_lead_or_active_booking"
         should_send = False
     elif not bool(getattr(settings, "bot_auto_reply_enabled", True)):
@@ -1418,7 +1437,8 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
         if send_enabled:
             state.log_event(chat_id, "wazzup_send_start", {"chat_id": chat_id, "channel_id": channel_id_from_payload, "text_preview": _preview(answer, 160)})
             try:
-                send_result = await send_wazzup_message(chat_id=chat_id, text=answer, chat_type=message.get("chat_type") or "whatsapp", channel_id=message.get("channel_id") or None)
+                outbound_channel_id = channel_id_from_payload if (channel_id_from_payload and channel_id_match) else (channel_id_env or None)
+                send_result = await send_wazzup_message(chat_id=chat_id, text=answer, chat_type=message.get("chat_type") or "whatsapp", channel_id=outbound_channel_id)
                 send_result_payload = {"status_code": send_result.get("status_code"), "response_preview": _preview(send_result, 300), "success": True}
                 state.log_event(chat_id, "wazzup_send_result", send_result_payload)
             except Exception as exc:
