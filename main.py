@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 import mimetypes
 import re
@@ -42,6 +43,20 @@ except Exception:
 
 
 app = FastAPI(title="Neuro Balance Hybrid WhatsApp Booking Bot")
+
+
+class _WebhookAccessLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        if "POST /webhook/wazzup" in message or "POST /wazzup/webhook" in message or "POST /api/wazzup/webhook" in message or "POST /webhook " in message:
+            return bool(state.log_window_status()["log_window_allowed"])
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_WebhookAccessLogFilter())
 
 _LAST_WAZZUP_WEBHOOK_PAYLOAD: dict[str, Any] = {}
 _LAST_WAZZUP_PARSE_META: dict[str, Any] = {}
@@ -243,6 +258,16 @@ def root() -> dict[str, Any]:
 @app.on_event("startup")
 def startup() -> None:
     state.init_db()
+    settings = get_settings()
+    allowed_channel_ids = [c.strip() for c in str(getattr(settings, "wazzup_allowed_channel_ids", "") or "").split(",") if c.strip()]
+    state.log_event("startup", "bot_runtime_config", {
+        "timezone": getattr(settings, "bot_timezone", "Asia/Almaty"),
+        "bot_work_start": getattr(settings, "bot_work_start", "20:00"),
+        "bot_work_end": getattr(settings, "bot_work_end", "08:00"),
+        "production_log_active_window_only": bool(getattr(settings, "production_log_active_window_only", True)),
+        "new_leads_only": bool(getattr(settings, "new_leads_only", True)),
+        "wazzup_allowed_channel_ids_count": len(allowed_channel_ids),
+    })
 
 
 def _time_debug_payload(now: datetime | None = None) -> dict[str, Any]:
@@ -297,6 +322,9 @@ def health() -> dict[str, Any]:
         "bot_test_window_end": payload["bot_test_window_end"],
         "bot_test_window_date": payload["bot_test_window_date"],
         "bot_test_window_now": payload["bot_test_window_now"],
+        "production_log_active_window_only": bool(getattr(get_settings(), "production_log_active_window_only", True)),
+        "current_log_window_allowed": bool(state.log_window_status()["log_window_allowed"]),
+        "log_policy": "active_window_only" if bool(getattr(get_settings(), "production_log_active_window_only", True)) else "all_events",
         "bot_auto_reply_enabled": payload["bot_auto_reply_enabled"],
         "new_leads_only": payload["new_leads_only"],
         "next_bot_start_at": payload["next_bot_start_at"],
@@ -1566,6 +1594,13 @@ def debug_last_events(phone: str = Query(...), limit: int = Query(default=50, ge
     return {"ok": True, "phone": phone, "events": events}
 
 
+
+
+@app.get("/debug/last-production-events")
+def debug_last_production_events(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
+    return {"ok": True, "events": state.recent_memory_events(limit=limit)}
+
+
 @app.post("/debug/replay-last-wazzup")
 async def debug_replay_last_wazzup(request: Request, dry_run: bool = Query(default=True)) -> dict[str, Any]:
     payload = dict(_LAST_WAZZUP_WEBHOOK_PAYLOAD or {})
@@ -1626,8 +1661,9 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
     phone = str(data.get("phone") or "77011234567")
     text = str(data.get("text") or "")
     force = bool(data.get("force") or False)
+    debug_enabled = bool(data.get("debug") or False)
 
-    state.log_event(chat_id, "incoming_message_received", {"phone": phone, "kind": "text", "source": "debug", "text_preview": _preview(text, 120), "force": force})
+    state.log_event(chat_id, "incoming_message_received", {"phone": phone, "kind": "text", "source": "debug", "text_preview": _preview(text, 120), "force": force, "debug": debug_enabled})
 
     pre_session = state.get_session(chat_id)
     if not force and not is_bot_work_time():
@@ -1664,7 +1700,7 @@ async def debug_chat(data: dict[str, Any]) -> dict[str, Any]:
         session["message_timestamp"] = str(data.get("timestamp") or "")
         session["bot_activated_at"] = _bot_activated_at().isoformat()
         state.save_session(chat_id, session)
-        state.log_event(chat_id, "dialog_start", {"phone": phone, "text_preview": _preview(text, 120), "force": force, "source": "debug"})
+        state.log_event(chat_id, "dialog_start", {"phone": phone, "text_preview": _preview(text, 120), "force": force, "debug": debug_enabled, "source": "debug"})
         raw_answer = await handle_message(chat_id=chat_id, phone=phone, user_text=text)
         answer = await _maybe_humanize_answer(chat_id, text, raw_answer)
         answer = _guard_answer(chat_id, answer)
