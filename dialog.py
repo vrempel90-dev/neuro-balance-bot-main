@@ -4001,13 +4001,12 @@ def _extract_name(text: str) -> str:
 
 
 def _method_answer(session: dict[str, Any]) -> str:
-    template = _clinic_info_template(session, "methods")
-    if template:
-        return "В клинике применяются безоперационные методы лечения: магнитотерапия, лазерная терапия, УВТ, PRP, иглотерапия и ЛФК 🌿\n\n" + template
+    bot_tools.mark_tool(session, "get_clinic_info", topic="methods")
+    session["last_clinic_info_topic"] = "methods"
     return _tr(
         session,
-        "В клинике применяются безоперационные методы лечения боли в спине, шее, грыж, протрузий и суставов: магнитотерапия, лазерная терапия, ударно-волновая терапия, PRP, иглотерапия и ЛФК 🌿",
-        "Клиникада арқа, мойын, грыжа, протрузия және буын ауруларын емдеудің операциясыз әдістері қолданылады: магнитотерапия, лазерлік терапия, соққы-толқынды терапия, PRP, инетерапия және ЕДШ 🌿",
+        "Мы лечим без операций.\n\nПодбираем лечение индивидуально после осмотра врача.\nИспользуем современные методы восстановления.\n\nЕсли интересно, могу подробнее рассказать именно по Вашей ситуации.\nЧто Вас беспокоит?",
+        "Біз операциясыз емдеу тәсілдерін қолданамыз.\n\nЕмді дәрігер қарағаннан кейін жеке таңдайды.\nҚалпына келтірудің заманауи әдістерін қолданамыз.\n\nҚаласаңыз, нақты жағдайыңыз бойынша толығырақ айтамын.\nСізді не мазалайды?",
     )
 
 
@@ -5620,6 +5619,69 @@ def _is_first_touch_due(session: dict[str, Any]) -> bool:
     return session.get("first_touch_info_sent") is not True and int(session.get("conversation_turns_count") or 0) == 0 and not session.get("ai_lead_started")
 
 
+def _is_greeting_only(text: str) -> bool:
+    low = _low(text).strip(" .,!?:;😊🙂🌿")
+    return low in {
+        "здравствуйте", "здравствуй", "добрый день", "доброе утро", "добрый вечер",
+        "привет", "салем", "сәлем", "салеметсіз бе", "сәлеметсіз бе",
+        "ассалаумагалейкум", "ассалаумағалейкум",
+    }
+
+
+def _classify_patient_intent(text: str) -> str:
+    """Controller-owned intent classification before any LLM/free-form answer.
+
+    The first turn must be routed by deterministic scenarios so the model cannot
+    decide to send a clinic presentation unless the patient explicitly asked for it.
+    """
+    low = _low(text)
+    if not low:
+        return "empty"
+    if _is_greeting_only(text):
+        return "greeting"
+    if _has_booking_intent(text) or _availability_request(text):
+        return "booking"
+    if _has_any(text, ADDRESS_WORDS):
+        return "address"
+    if _has_any(text, SCHEDULE_WORDS):
+        return "schedule"
+    if _has_any(text, PRICE_WORDS):
+        return "price"
+    if _has_any(text, RETURNING_PATIENT_WORDS) or _wants_existing_lookup(text):
+        return "returning_patient"
+    if any(w in low for w in ("противопоказ", "кардиостимулятор", "беремен", "онколог", "эпилеп", "металл", "қарсы көрсет", "карсы корсет")):
+        return "contraindications"
+    if _has_any(text, METHOD_WORDS) or any(p in low for p in ("что за клиника", "какая клиника", "почему именно вы", "как лечите", "какие методы", "что входит")):
+        return "clinic_info"
+    if _has_complaint(text) or _has_medical_complaint_text(text) or _profile_status(text) == "profile":
+        return "pain"
+    if "консультац" in low or "консультация" in low:
+        return "consultation"
+    return "unknown"
+
+
+def _greeting_only_answer(session: dict[str, Any]) -> str:
+    session["step"] = "start"
+    return _tr(
+        session,
+        "Здравствуйте 😊\n\nПодскажите, пожалуйста, что Вас беспокоит?",
+        "Сәлеметсіз бе 😊\n\nАйтыңызшы, Сізді не мазалайды?",
+    )
+
+
+def _pain_first_question_answer(session: dict[str, Any], text: str) -> str:
+    session["ai_lead_started"] = True
+    session["step"] = "complaint"
+    session["complaint"] = text.strip()
+    session["profile_status"] = "profile"
+    _record_complaint_tool(session, text.strip(), is_in_profile=True)
+    return _tr(
+        session,
+        "Поняла Вас.\n\nПодскажите, пожалуйста: где именно болит и давно появилась боль?",
+        "Түсіндім.\n\nАйтыңызшы: нақты қай жеріңіз ауырады және ауырсыну қашан басталды?",
+    )
+
+
 def _first_touch_answer(session: dict[str, Any], text: str) -> str:
     if not session.get("crm_lookup_called"):
         session["first_touch_allowed"] = False
@@ -5631,17 +5693,36 @@ def _first_touch_answer(session: dict[str, Any], text: str) -> str:
         return _returning_patient_answer(session, text)
     session["first_touch_allowed"] = True
     session["first_touch_info_sent"] = True
+    session["answer_source"] = "intent_router:first_touch"
     session["first_touch_answer_in_progress"] = True
-    session["ai_lead_started"] = True
-    session["answer_source"] = "locked_template:first_touch"
     session["skip_openai"] = True
     session["skip_humanize"] = True
     session["skip_fallback_question"] = True
-    if (_has_complaint(text) or _has_medical_complaint_text(text)) and _low(text).strip() not in {"хочу записаться", "запишите"}:
-        session["complaint"] = text.strip()
-        _record_complaint_tool(session, text.strip(), is_in_profile=True)
-    session["step"] = "complaint"
-    return FIRST_TOUCH_CLINIC_INFO_RU
+    intent = _classify_patient_intent(text)
+    session["first_touch_intent"] = intent
+    if intent == "greeting":
+        return _greeting_only_answer(session)
+    if intent == "pain":
+        return _pain_first_question_answer(session, text)
+    if intent == "booking":
+        session["ai_lead_started"] = True
+        session["step"] = "complaint"
+        return (
+            _appointment_request_answer(session, text)
+            or _tr(
+                session,
+                "Здравствуйте! Да, можно записаться на консультацию по акции 🌿\nПодскажите, пожалуйста, что Вас беспокоит?",
+                "Сәлеметсіз бе! Иә, акция бойынша консультацияға жазылуға болады 🌿\nСізді не мазалайды?",
+            )
+        )
+    if intent == "clinic_info":
+        session["ai_lead_started"] = True
+        session["step"] = "complaint"
+        return _short_clinic_info_answer(session)
+    info = _clinic_answer(text, session)
+    if info:
+        return info
+    return _greeting_only_answer(session)
 
 
 def _is_clinic_info_repeat_request(text: str) -> bool:
@@ -5651,7 +5732,15 @@ def _is_clinic_info_repeat_request(text: str) -> bool:
 def _short_clinic_info_answer(session: dict[str, Any]) -> str:
     if not session.get("complaint"):
         session["step"] = "complaint"
-    return "Мы занимаемся болями в спине, шее и суставах, а лечение врач подбирает индивидуально после осмотра 🌿 Подскажите, что именно Вас беспокоит?"
+    bot_tools.mark_tool(session, "get_clinic_info", topic="clinic_info")
+    session["last_clinic_info_topic"] = "clinic_info"
+    return (
+        "Мы лечим без операций.\n"
+        "План лечения подбирается индивидуально после осмотра.\n"
+        "Работаем с болью в спине, шее, суставах, грыжами и протрузиями.\n\n"
+        "Если хотите, расскажу подробнее именно по Вашей ситуации.\n"
+        "Что Вас беспокоит?"
+    )
 
 
 def _availability_request(text: str) -> bool:
