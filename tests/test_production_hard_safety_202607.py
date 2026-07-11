@@ -53,13 +53,43 @@ def test_outgoing_operator_no_reply(monkeypatch):
     assert state.get_session(chat_id)["no_reply_reason"] == "not_client_incoming_message"
 
 
-def test_new_chat_first_touch_locked(monkeypatch):
+def test_new_chat_greeting_does_not_send_clinic_presentation(monkeypatch):
     monkeypatch.setattr(main, "is_bot_work_time", lambda: True)
+    async def fake_lookup(phone):
+        return {"found": False, "isNew": True, "hasActiveAppointment": False}
+    monkeypatch.setattr(crm, "patient_lookup", fake_lookup)
     chat_id = "hard_new_first_touch"
     reset(chat_id)
-    ans = run(main._build_answer_for_message({"chat_id": chat_id, "phone": "7701", "text": "Здравствуйте", "message_key": "new-1", "timestamp": "2026-07-03T01:00:00+05:00", "direction": "incoming"}))
-    assert ans == dialog.FIRST_TOUCH_CLINIC_INFO_RU
-    assert "плазмотерапию" in ans and "TikTok" in ans
+    ans = run(dialog.handle_message(chat_id, "77011234567", "Здравствуйте"))
+    assert "Подскажите, пожалуйста, что Вас беспокоит" in ans
+    assert "Клиника Neuro Balance помогает" not in ans
+    assert "плазмотерап" not in ans and "TikTok" not in ans
+
+
+def test_new_chat_pain_starts_clarifying_dialog(monkeypatch):
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: True)
+    async def fake_lookup(phone):
+        return {"found": False, "isNew": True, "hasActiveAppointment": False}
+    monkeypatch.setattr(crm, "patient_lookup", fake_lookup)
+    chat_id = "hard_new_pain"
+    reset(chat_id)
+    ans = run(dialog.handle_message(chat_id, "77011234567", "Болит спина"))
+    assert "где именно болит" in ans
+    assert "давно появилась боль" in ans
+    assert "Клиника Neuro Balance помогает" not in ans
+
+
+def test_new_chat_methods_question_is_short(monkeypatch):
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: True)
+    async def fake_lookup(phone):
+        return {"found": False, "isNew": True, "hasActiveAppointment": False}
+    monkeypatch.setattr(crm, "patient_lookup", fake_lookup)
+    chat_id = "hard_new_methods"
+    reset(chat_id)
+    ans = run(dialog.handle_message(chat_id, "77011234567", "Как лечите?"))
+    assert "Мы лечим без операций" in ans
+    assert len([line for line in ans.splitlines() if line.strip()]) <= 7
+    assert "TikTok" not in ans
 
 
 def test_existing_old_chat_active_appointment_post_booking(monkeypatch):
