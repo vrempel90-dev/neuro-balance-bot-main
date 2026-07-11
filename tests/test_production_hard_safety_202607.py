@@ -79,7 +79,7 @@ def test_new_chat_pain_starts_clarifying_dialog(monkeypatch):
     assert "Клиника Neuro Balance помогает" not in ans
 
 
-def test_new_chat_methods_question_is_short(monkeypatch):
+def test_new_chat_methods_question_sends_requested_full_presentation(monkeypatch):
     monkeypatch.setattr(main, "is_bot_work_time", lambda: True)
     async def fake_lookup(phone):
         return {"found": False, "isNew": True, "hasActiveAppointment": False}
@@ -87,8 +87,52 @@ def test_new_chat_methods_question_is_short(monkeypatch):
     chat_id = "hard_new_methods"
     reset(chat_id)
     ans = run(dialog.handle_message(chat_id, "77011234567", "Как лечите?"))
-    assert "Мы лечим без операций" in ans
-    assert len([line for line in ans.splitlines() if line.strip()]) <= 7
+    assert ans == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+    assert "Клиника Neuro Balance помогает" in ans
+    assert "TikTok" in ans
+    assert "Подскажите, пожалуйста, что именно Вас беспокоит?" in ans
+
+
+def test_new_chat_booking_starts_booking_scenario(monkeypatch):
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: True)
+    async def fake_lookup(phone):
+        return {"found": False, "isNew": True, "hasActiveAppointment": False}
+    monkeypatch.setattr(crm, "patient_lookup", fake_lookup)
+    chat_id = "hard_new_booking_intent"
+    reset(chat_id)
+    ans = run(dialog.handle_message(chat_id, "77011234567", "Хочу записаться"))
+    s = state.get_session(chat_id)
+    assert "можно записаться" in ans.lower()
+    assert "что Вас беспокоит" in ans
+    assert "Клиника Neuro Balance помогает" not in ans
+    assert s["ai_lead_started"] is True
+    assert s["step"] == "complaint"
+
+
+def test_new_chat_detail_request_sends_full_presentation(monkeypatch):
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: True)
+    async def fake_lookup(phone):
+        return {"found": False, "isNew": True, "hasActiveAppointment": False}
+    monkeypatch.setattr(crm, "patient_lookup", fake_lookup)
+    for text in ["Расскажите подробнее", "Как лечите?"]:
+        chat_id = "hard_new_detail_" + str(abs(hash(text)))
+        reset(chat_id)
+        ans = run(dialog.handle_message(chat_id, "77011234567", text))
+        assert ans == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+        assert "Клиника Neuro Balance помогает" in ans
+        assert "Подскажите, пожалуйста, что именно Вас беспокоит?" in ans
+
+
+def test_new_chat_price_answers_only_price(monkeypatch):
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: True)
+    async def fake_lookup(phone):
+        return {"found": False, "isNew": True, "hasActiveAppointment": False}
+    monkeypatch.setattr(crm, "patient_lookup", fake_lookup)
+    chat_id = "hard_new_price_only"
+    reset(chat_id)
+    ans = run(dialog.handle_message(chat_id, "77011234567", "Сколько стоит консультация?"))
+    assert "5 000" in ans
+    assert "Клиника Neuro Balance помогает" not in ans
     assert "TikTok" not in ans
 
 

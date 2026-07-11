@@ -5639,19 +5639,23 @@ def _classify_patient_intent(text: str) -> str:
         return "empty"
     if _is_greeting_only(text):
         return "greeting"
-    if _has_booking_intent(text) or _availability_request(text):
-        return "booking"
     if _has_any(text, ADDRESS_WORDS):
         return "address"
     if _has_any(text, SCHEDULE_WORDS):
         return "schedule"
     if _has_any(text, PRICE_WORDS):
         return "price"
+    if _has_booking_intent(text) or _availability_request(text):
+        return "booking"
     if _has_any(text, RETURNING_PATIENT_WORDS) or _wants_existing_lookup(text):
         return "returning_patient"
     if any(w in low for w in ("противопоказ", "кардиостимулятор", "беремен", "онколог", "эпилеп", "металл", "қарсы көрсет", "карсы корсет")):
         return "contraindications"
-    if _has_any(text, METHOD_WORDS) or any(p in low for p in ("что за клиника", "какая клиника", "почему именно вы", "как лечите", "какие методы", "что входит")):
+    if _has_any(text, METHOD_WORDS) or any(p in low for p in (
+        "что за клиника", "какая клиника", "почему именно вы", "как лечите",
+        "какие методы", "что входит", "расскажите подробнее", "хочу узнать подробнее",
+        "подробнее", "чем занимаетесь", "как проходит лечение",
+    )):
         return "clinic_info"
     if _has_complaint(text) or _has_medical_complaint_text(text) or _profile_status(text) == "profile":
         return "pain"
@@ -5718,7 +5722,8 @@ def _first_touch_answer(session: dict[str, Any], text: str) -> str:
     if intent == "clinic_info":
         session["ai_lead_started"] = True
         session["step"] = "complaint"
-        return _short_clinic_info_answer(session)
+        session["answer_source"] = "locked_template:first_touch"
+        return FIRST_TOUCH_CLINIC_INFO_RU
     info = _clinic_answer(text, session)
     if info:
         return info
@@ -5993,10 +5998,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             answer = faq_info + "\n\n" + answer
         return _finalize(chat_id, session, answer)
     if (session.get("step") == "escalated" or session.get("escalated")) and not session.get("booked"):
-        session["no_reply_reason"] = "escalated_ai_disabled"
+        reason = "manual_takeover" if session.get("manual_takeover") or session.get("ai_muted") else "escalated_ai_disabled"
+        session["no_reply_reason"] = reason
         _reset_openai_brain_debug(session)
-        session["openai_brain_skip_reason"] = "escalated_ai_disabled"
-        return _no_reply(chat_id, session, "escalated_ai_disabled")
+        session["openai_brain_skip_reason"] = reason
+        return _no_reply(chat_id, session, reason)
     can_handle, reason = _should_ai_handle_new_lead(session, text)
     session["gate_reason"] = reason
     session["active_conversation_detected"] = bool(
