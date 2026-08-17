@@ -3097,6 +3097,15 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
         elif session.get("crm_patient_state") == "RETURNING_PATIENT_NO_ACTIVE_BOOKING":
             session["outbound_duplicate_guard_blocked"] = True
             answer = _returning_patient_answer(session, str(session.get("last_user_text") or ""))
+        elif str(session.get("step") or "") == "contraindications":
+            # contraindications_never_silent_guard: на этом шаге молчание недопустимо.
+            # Прод 17.08.2026 (chat_id 77478875259, WhatsApp, текст): пациент написал
+            # "Все равно болеет", затем "81 лет" — оба раза ответ шага совпал с прошлым
+            # вопросом о противопоказаниях, duplicate_answer_guard вернул "" и бот молчал
+            # в самый чувствительный момент. Повторить вопрос лучше, чем промолчать.
+            session["outbound_duplicate_guard_blocked"] = False
+            session["fallback_reason"] = "contraindications_never_silent"
+            answer = _ask_contra(session)
         else:
             session["outbound_duplicate_guard_blocked"] = True
             _safe_save(chat_id, session)
@@ -6095,7 +6104,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # thanks_after_info_guard:
     # Если пациент поблагодарил после адреса/цены/графика, не начинаем анкету заново.
     # В WhatsApp это должно выглядеть как молчание живого админа, а не как новый сценарий.
-    if _is_thanks_or_ok(text) and _last_answer_was_info(session):
+    # Исключение — шаг contraindications: там бот только что задал вопрос, а не выдал
+    # справку, и _last_answer_was_info ложно срабатывает на слове "приём" внутри
+    # locked-шаблона противопоказаний ("приём не проводится"). Молчать в ответ на
+    # собственный вопрос нельзя — переспрашиваем.
+    if _is_thanks_or_ok(text) and _last_answer_was_info(session) and str(session.get("step") or "") != "contraindications":
         return _no_reply(chat_id, session, "thanks/info")
 
     # no_duplicate_after_booking_guard:
