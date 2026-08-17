@@ -6230,9 +6230,6 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
                 ),
             )
 
-    if step in ("date", "preferred_time", "time", "select_slot") and _has_any(text, DOCTOR_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text)):
-        return _finalize(chat_id, session, _doctor_answer(session, chat_id))
-
     if step == "contraindications" and not _is_no_contra_answer(text) and not _contra_is_clear_no(text) and not _contra_has_hard_stop(text) and not _contra_term_answer(text, session) and not _faq_answer(text, session):
         if _has_complaint(text) or _has_medical_complaint_text(text):
             session["contraindications_raw"] = text
@@ -6268,6 +6265,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # недоступен, пропущен по гейтам или вернул action=fallback_rule_based.
     # Порядок между собой и относительно остальной rule-based цепочки сохранён.
     post_brain_step = str(session.get("step") or "start")
+
+    if post_brain_step in ("date", "preferred_time", "time", "select_slot") and _has_any(text, DOCTOR_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text)):
+        return _finalize(chat_id, session, _doctor_answer(session, chat_id))
 
     if post_brain_step == "complaint" and _is_greeting_only(text) and not session.get("complaint"):
         return _finalize(
