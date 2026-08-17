@@ -683,7 +683,16 @@ def _repair_forbidden_required_question(chat_id: str, session: dict[str, Any], a
     if not qtype:
         return answer
     step = "select_slot" if qtype == "time" else qtype
+    # answer_faq_and_continue спроектирован правильно: ответить по факту и вернуть
+    # на нужный шаг одним сообщением. Раньше он подпадал под эту блокировку, потому
+    # что _classify_bot_question смотрит ВЕСЬ текст: FAQ про противопоказания или
+    # цену определялся как "повторный вопрос шага", и фактический ответ пациенту
+    # выбрасывался целиком вместе с возвратом на шаг. Фактическую часть сохраняем.
+    faq_fact = str(session.get("faq_fact_reply") or "").strip()
     if not _has_required_data_for_step(session, step):
+        # Боковые вопросы с ответом по факту — не зацикливание, эскалация не нужна.
+        if faq_fact:
+            return answer
         if session.get("last_required_step") == ("time" if step == "select_slot" else step) and int(session.get("last_required_question_count") or 0) >= 2:
             session["llm_blocked"] = True
             session["llm_repaired"] = True
@@ -702,16 +711,25 @@ def _repair_forbidden_required_question(chat_id: str, session: dict[str, Any], a
     session["llm_repaired"] = True
     session["repair_reason"] = f"repeat_required_step_{step}_blocked"
     _safe_log(chat_id, "repeat_required_question_blocked", {"blocked_step": step, "next_step": next_step, "answer_preview": answer[:180]})
+
+    def _with_fact(prompt: str) -> str:
+        """Починка шага не должна стирать ответ по факту из answer_faq_and_continue."""
+        if not faq_fact:
+            return prompt
+        if not prompt:
+            return faq_fact
+        return faq_fact + "\n\n" + prompt
+
     if next_step == "book":
-        return ""
+        return _with_fact("")
     if next_step == "time":
         session["step"] = "time"
         session["questionnaire_step"] = "time"
-        return _mandatory_step_prompt(session, "time")
+        return _with_fact(_mandatory_step_prompt(session, "time"))
     session["step"] = next_step
     if next_step in {"date", "name", "contraindications"}:
         session["questionnaire_step"] = "contra" if next_step == "contraindications" else next_step
-    return _mandatory_step_prompt(session, next_step)
+    return _with_fact(_mandatory_step_prompt(session, next_step))
 
 
 def _repair_state_consistency(session: dict[str, Any], user_text: str = "") -> tuple[bool, str]:
@@ -1261,6 +1279,10 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         elif pending in {"complaint", "age", "contraindications", "date", "name"}:
             session["step"] = pending
         session["pending_step_after_faq"] = pending
+        # Ответ по факту нельзя потерять, даже если ниже починится шаг:
+        # _repair_forbidden_required_question классифицирует ВЕСЬ ответ и раньше
+        # выбрасывал фактическую часть вместе с вопросом шага.
+        session["faq_fact_reply"] = reply
         return _finalize(chat_id, session, reply + ("\n\n" + _mandatory_step_prompt(session, pending) if reply else ""))
     if action == "stop_contraindication":
         if not _contra_has_hard_stop(text):
@@ -5896,6 +5918,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session.setdefault("old_lead_reason", "")
     session["chat_id"] = chat_id
     session["answer_source"] = ""
+    # Фактическая часть ответа answer_faq_and_continue — только на текущий ход,
+    # чтобы _repair_forbidden_required_question не потерял её при починке шага.
+    session["faq_fact_reply"] = ""
     session["skip_openai"] = False
     session["skip_humanize"] = False
     session["skip_fallback_question"] = False
