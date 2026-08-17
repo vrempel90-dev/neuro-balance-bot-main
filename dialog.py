@@ -6088,14 +6088,6 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session["combined_recent_user_text"] = combined_recent_user_text
     _apply_patient_relation(session, combined_recent_user_text or text)
 
-    combined_answer = None
-    if str(session.get("step") or "") in {"complaint", "start", "age"} and (
-        _detect_patient_relation(combined_recent_user_text or text)[0] or len([i for i in recent_history if str(i.get("role") or "").lower() == "user"]) >= 2
-    ):
-        combined_answer = _combined_profile_booking_answer(session, combined_recent_user_text or text)
-    if combined_answer:
-        return _finalize(chat_id, session, combined_answer)
-
     # human_takeover_guard: если живой админ уже вмешался, AI молчит и не продолжает старый сценарий.
     if _is_ai_muted(session):
         session["ai_muted"] = True
@@ -6259,6 +6251,14 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # недоступен, пропущен по гейтам или вернул action=fallback_rule_based.
     # Порядок между собой и относительно остальной rule-based цепочки сохранён.
     post_brain_step = str(session.get("step") or "start")
+
+    combined_answer = None
+    if post_brain_step in {"complaint", "start", "age"} and (
+        _detect_patient_relation(combined_recent_user_text or text)[0] or len([i for i in recent_history if str(i.get("role") or "").lower() == "user"]) >= 2
+    ):
+        combined_answer = _combined_profile_booking_answer(session, combined_recent_user_text or text)
+    if combined_answer:
+        return _finalize(chat_id, session, combined_answer)
 
     if early_address_question:
         return _finalize(chat_id, session, _address_answer_then_optional_resume(session))
