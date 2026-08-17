@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -472,6 +473,32 @@ PROJECT OVERRIDES — Python enforces these above any older prompt text:
     return rendered + overrides + "\n\n" + OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
 
 
+def _requires_max_completion_tokens(model: str) -> bool:
+    """gpt-5.x отвергает max_tokens и требует max_completion_tokens.
+
+    Точный ответ API при передаче max_tokens в gpt-5.4-mini:
+      "Unsupported parameter: 'max_tokens' is not supported with this model.
+       Use 'max_completion_tokens' instead."
+    Без этой развилки брейн падал бы в openai_error и уходил в rule-based
+    fallback на КАЖДОМ вызове. Проверено 17.08.2026.
+
+    temperature gpt-5.4-mini поддерживает (проверено там же), поэтому
+    ai_brain_temperature не трогаем.
+    """
+    return str(model or "").strip().lower().startswith("gpt-5")
+
+
+def _brain_token_limit_kwargs(model: str) -> dict[str, int]:
+    """Потолок ответа брейна с учётом имени параметра для конкретной модели."""
+    settings = get_settings()
+    if _requires_max_completion_tokens(model):
+        # В max_completion_tokens входят токены рассуждения, поэтому лимит выше:
+        # иначе reasoning съедает бюджет и JSON приходит обрезанным.
+        limit = int(getattr(settings, "ai_brain_max_completion_tokens", 2000) or 2000)
+        return {"max_completion_tokens": limit}
+    return {"max_tokens": 700}
+
+
 def _dialog_brain_fallback(reason: str) -> tuple[dict, dict]:
     decision = {
         "intent": "unknown",
@@ -762,18 +789,32 @@ async def run_openai_dialog_brain(
         if state is not None:
             state.log_event(str(session.get("chat_id") or "system"), "openai_brain_called", {"chat_id": str(session.get("chat_id") or "system"), "model": model, "openai_brain_model": model, "openai_brain_temperature": temperature, "step": summary["step"], "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "extracted_preview": {}})
         client = _openai_client(settings.openai_api_key)
+        started_at = time.monotonic()
         response = await client.chat.completions.create(
             model=model,
             temperature=temperature,
-            max_tokens=700,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": _full_dialog_brain_system_prompt()},
                 {"role": "user", "content": json.dumps({"dialog_context": dialog_context}, ensure_ascii=False)},
             ],
+            **_brain_token_limit_kwargs(model),
         )
+        latency_ms = int((time.monotonic() - started_at) * 1000)
+        debug["openai_brain_latency_ms"] = latency_ms
         ai_budget.record_usage(response, model=model, purpose=ai_budget.PURPOSE_BRAIN)
         content = response.choices[0].message.content or ""
+        # Обрезанный ответ reasoning-модели виден по finish_reason=length: JSON тогда
+        # не парсится, и без явного лога причина выглядела бы как "модель глупая".
+        finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "")
+        if finish_reason == "length" and state is not None:
+            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_truncated_warning", {
+                "level": "warning",
+                "model": model,
+                "finish_reason": finish_reason,
+                "token_limit": _brain_token_limit_kwargs(model),
+                "note": "ответ брейна обрезан по лимиту токенов — поднимите AI_BRAIN_MAX_COMPLETION_TOKENS",
+            })
         try:
             raw = json.loads(content)
         except Exception:
@@ -787,7 +828,7 @@ async def run_openai_dialog_brain(
             return decision, debug
         debug.update({"openai_brain_used": True, "openai_brain_intent": decision["intent"], "openai_brain_action": decision["action"], "openai_brain_needs_python_tool": decision["needs_python_tool"], "openai_brain_extracted": decision["extracted"], "openai_brain_model": model, "openai_brain_temperature": temperature})
         if state is not None:
-            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_decision", {"chat_id": str(session.get("chat_id") or "system"), "step": summary["step"], "action": decision["action"], "needs_python_tool": decision["needs_python_tool"], "guard_failed": False, "guard_reason": "", "extracted_preview": {k: v for k, v in decision["extracted"].items() if v not in (None, "", [], {})}})
+            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_decision", {"chat_id": str(session.get("chat_id") or "system"), "step": summary["step"], "action": decision["action"], "needs_python_tool": decision["needs_python_tool"], "guard_failed": False, "guard_reason": "", "latency_ms": latency_ms, "model": model, "extracted_preview": {k: v for k, v in decision["extracted"].items() if v not in (None, "", [], {})}})
         return decision, debug
     except Exception as exc:
         decision, fb = _dialog_brain_fallback("openai_error")
