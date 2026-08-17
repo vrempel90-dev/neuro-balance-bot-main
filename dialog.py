@@ -5989,10 +5989,18 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["ai_started_at"] = datetime.now(timezone.utc).isoformat()
         return _finalize(chat_id, session, _first_touch_answer(session, text))
     early_step = str(session.get("step") or "start")
-    if _has_any(text, ADDRESS_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text)) and not (early_step in {"time", "select_slot"} and _select_slot(text, session.get("last_slots") or [])):
+    # Вопрос про адрес: активация лида — это гейт (без ai_lead_started брейн вообще
+    # не допускается к сообщению, _openai_brain_skip_reason → not_ai_lead), поэтому
+    # она остаётся ДО GPT. Сам заготовленный ответ про адрес перенесён ПОСЛЕ брейна
+    # (Фаза 2) и срабатывает только как fallback.
+    early_address_question = bool(
+        _has_any(text, ADDRESS_WORDS)
+        and not (_parse_date(text) or _contains_date_time_preference(text))
+        and not (early_step in {"time", "select_slot"} and _select_slot(text, session.get("last_slots") or []))
+    )
+    if early_address_question:
         session.setdefault("gate_reason", "new_lead_like_message")
         session["ai_lead_started"] = True
-        return _finalize(chat_id, session, _address_answer_then_optional_resume(session))
     if (session.get("step") == "contraindications" or session.get("last_required_step") == "contraindications") and _contra_details_question(text):
         session["step"] = "contraindications"
         session["questionnaire_step"] = "contra"
@@ -6251,6 +6259,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # недоступен, пропущен по гейтам или вернул action=fallback_rule_based.
     # Порядок между собой и относительно остальной rule-based цепочки сохранён.
     post_brain_step = str(session.get("step") or "start")
+
+    if early_address_question:
+        return _finalize(chat_id, session, _address_answer_then_optional_resume(session))
 
     if post_brain_step in ("start", "complaint") and session.get("last_bot_question_type") == "city" and text:
         session["city"] = text
