@@ -6172,8 +6172,6 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session["step"] = "name"
             step = "name"
             return _finalize(chat_id, session, _address_answer(session) + " " + _ask_name(session))
-    if _has_any(text, ADDRESS_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text)):
-        return _finalize(chat_id, session, _address_answer_then_optional_resume(session))
     if step in {"date", "preferred_time", "time", "select_slot", "name"} and _medical_risk_question(text):
         return _finalize(chat_id, session, _medical_risk_answer_then_resume(session, step))
     if step in {"time", "select_slot"}:
@@ -6260,7 +6258,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if combined_answer:
         return _finalize(chat_id, session, combined_answer)
 
-    if early_address_question:
+    if early_address_question or (
+        _has_any(text, ADDRESS_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text))
+    ):
         return _finalize(chat_id, session, _address_answer_then_optional_resume(session))
 
     if post_brain_step in ("start", "complaint") and session.get("last_bot_question_type") == "city" and text:
