@@ -6230,17 +6230,6 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
                 ),
             )
 
-    if step == "complaint" and _is_greeting_only(text) and not session.get("complaint"):
-        return _finalize(
-            chat_id,
-            session,
-            _tr(
-                session,
-                "Доброе утро 🌿 Подскажите, пожалуйста, что Вас беспокоит?",
-                "Қайырлы таң 🌿 Нақты не мазалайды?",
-            ),
-        )
-
     if step in ("date", "preferred_time", "time", "select_slot") and _has_any(text, DOCTOR_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text)):
         return _finalize(chat_id, session, _doctor_answer(session, chat_id))
 
@@ -6271,6 +6260,25 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["openai_used"] = True
         session["openai_skip_reason"] = ""
         return brain_answer
+
+    # ---- Ветки, перенесённые ПОСЛЕ брейна (Фаза 2) --------------------------
+    # Интерпретация смысла сообщения — работа GPT, а не keyword-заготовок.
+    # Эти ветки раньше стояли ДО брейна и завершали обработку раньше, чем текст
+    # доходил до модели. Теперь они срабатывают только как fallback: когда брейн
+    # недоступен, пропущен по гейтам или вернул action=fallback_rule_based.
+    # Порядок между собой и относительно остальной rule-based цепочки сохранён.
+    post_brain_step = str(session.get("step") or "start")
+
+    if post_brain_step == "complaint" and _is_greeting_only(text) and not session.get("complaint"):
+        return _finalize(
+            chat_id,
+            session,
+            _tr(
+                session,
+                "Доброе утро 🌿 Подскажите, пожалуйста, что Вас беспокоит?",
+                "Қайырлы таң 🌿 Нақты не мазалайды?",
+            ),
+        )
 
     fallback_answer = await _try_python_multi_entity_fallback(chat_id, session, text)
     if fallback_answer is not None:
