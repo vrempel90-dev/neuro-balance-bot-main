@@ -1236,6 +1236,16 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         session["questionnaire_step"] = "name"
         ask = _ask_name(session)
         return _finalize(chat_id, session, reply + ("\n\n" + ask if ask not in reply else ""))
+    if action == "ask_complaint":
+        # ask_complaint был в DIALOG_BRAIN_ACTIONS, но обработчика не имел: решение
+        # брейна молча отбрасывалось, управление уходило в keyword-ветки, и на
+        # приветствие/нестандартную формулировку пациент получал заготовку вместо
+        # ответа GPT. Без этого обработчика перенос веток Фазы 2 не даёт эффекта.
+        if extracted.get("complaint"):
+            session["complaint"] = extracted.get("complaint")
+            _record_complaint_tool(session, str(extracted.get("complaint")), is_in_profile=True)
+        session["step"] = "complaint"
+        return _finalize(chat_id, session, reply or _ask_complaint(session))
     if action == "ask_name":
         session["step"] = "name"
         return _finalize(chat_id, session, reply or _ask_name(session))
