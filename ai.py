@@ -16,6 +16,7 @@ try:
     import state
 except Exception:
     state = None
+import ai_budget
 from services import classify_by_keywords
 
 
@@ -204,6 +205,11 @@ async def generate_complaint_ack(text: str, lang: str = "ru", chat_id: str = "")
         if state is not None:
             state.log_event(chat_id or "system", "openai_skipped", {"chat_id": chat_id, "reason": "disabled_or_missing_api_key"})
         return _fallback_ack(text, lang)
+    allowed, block_reason = ai_budget.check_allowed(ai_budget.PURPOSE_COMPLAINT_ACK)
+    if not allowed:
+        if state is not None:
+            state.log_event(chat_id or "system", "openai_skipped", {"chat_id": chat_id, "reason": block_reason})
+        return _fallback_ack(text, lang)
     try:
         if state is not None:
             state.log_event(chat_id or "system", "openai_called", {"chat_id": chat_id, "model": settings.openai_model, "purpose": "complaint_ack"})
@@ -218,6 +224,7 @@ async def generate_complaint_ack(text: str, lang: str = "ru", chat_id: str = "")
                 {"role": "user", "content": text or "жалоба пациента"},
             ],
         )
+        ai_budget.record_usage(response, model=settings.openai_model, purpose=ai_budget.PURPOSE_COMPLAINT_ACK)
         content = _clean_model_text(response.choices[0].message.content or "")
         return content or _fallback_ack(text, lang)
     except Exception:
@@ -737,6 +744,12 @@ async def run_openai_dialog_brain(
         debug["openai_disabled_flags"] = detail["disabled_flags"]
         _log_openai_config_missing_detail(detail)
         return decision, debug
+    allowed, block_reason = ai_budget.check_allowed(ai_budget.PURPOSE_BRAIN)
+    if not allowed:
+        decision, fb = _dialog_brain_fallback(block_reason)
+        debug.update(fb)
+        debug["openai_brain_skip_reason"] = block_reason
+        return decision, debug
     try:
         dialog_context = build_dialog_context(
             user_text=user_text or "",
@@ -759,6 +772,7 @@ async def run_openai_dialog_brain(
                 {"role": "user", "content": json.dumps({"dialog_context": dialog_context}, ensure_ascii=False)},
             ],
         )
+        ai_budget.record_usage(response, model=model, purpose=ai_budget.PURPOSE_BRAIN)
         content = response.choices[0].message.content or ""
         try:
             raw = json.loads(content)
@@ -847,6 +861,11 @@ async def generate_human_message(draft: str, user_text: str = "", lang: str = "r
             state.log_event(chat_id or "system", "openai_skipped", {"chat_id": chat_id, "reason": "deterministic_reply"})
         return _fallback_humanize(draft)
 
+    allowed, block_reason = ai_budget.check_allowed(ai_budget.PURPOSE_HUMAN_MESSAGE)
+    if not allowed:
+        if state is not None:
+            state.log_event(chat_id or "system", "openai_skipped", {"chat_id": chat_id, "reason": block_reason})
+        return _fallback_humanize(draft)
     try:
         if state is not None:
             state.log_event(chat_id or "system", "openai_called", {"chat_id": chat_id, "model": settings.openai_model, "purpose": "humanize_reply"})
@@ -860,6 +879,7 @@ async def generate_human_message(draft: str, user_text: str = "", lang: str = "r
                 {"role": "system", "content": HUMANIZE_REPLY_PROMPT.format(lang=language_name, step=step or "", user_text=user_text or "", draft=draft)},
             ],
         )
+        ai_budget.record_usage(response, model=settings.openai_model, purpose=ai_budget.PURPOSE_HUMAN_MESSAGE)
         content = (response.choices[0].message.content or "").strip().strip('"')
         if not content:
             return _fallback_humanize(draft)
@@ -993,6 +1013,11 @@ async def humanize_reply_with_openai(
         _log_openai_config_missing_detail(detail)
         return base_answer, debug
 
+    allowed, block_reason = ai_budget.check_allowed(ai_budget.PURPOSE_HUMANIZE)
+    if not allowed:
+        debug["openai_skip_reason"] = block_reason
+        return base_answer, debug
+
     step = str(session.get("step") or session.get("current_step") or "start")
     chat_id = str(session.get("chat_id") or session.get("phone") or "")
     summary = {
@@ -1022,6 +1047,7 @@ async def humanize_reply_with_openai(
                 )},
             ],
         )
+        ai_budget.record_usage(response, model=model, purpose=ai_budget.PURPOSE_HUMANIZE)
         humanized = (response.choices[0].message.content or "").strip().strip('"')
         debug["openai_used"] = True
         if not _humanize_guard_ok(base_answer, humanized):

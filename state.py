@@ -187,8 +187,116 @@ def init_db() -> None:
                 chat_id TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS ai_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT NOT NULL,
+                month TEXT NOT NULL,
+                model TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_usage_month ON ai_usage(month);
+            CREATE INDEX IF NOT EXISTS idx_ai_usage_day ON ai_usage(day);
             """
         )
+
+
+_AI_USAGE_DDL = """
+CREATE TABLE IF NOT EXISTS ai_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    day TEXT NOT NULL,
+    month TEXT NOT NULL,
+    model TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    prompt_tokens INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+)
+"""
+
+
+def record_ai_usage(
+    *,
+    day: str,
+    month: str,
+    model: str,
+    purpose: str,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    cached_tokens: int = 0,
+    cost_usd: float = 0.0,
+) -> None:
+    """Сохранить расход токенов одного вызова OpenAI с разбивкой по дню/месяцу/модели."""
+    with _connect() as conn:
+        conn.execute(_AI_USAGE_DDL)
+        conn.execute(
+            "INSERT INTO ai_usage(day, month, model, purpose, prompt_tokens, completion_tokens,"
+            " cached_tokens, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(day),
+                str(month),
+                str(model),
+                str(purpose),
+                int(prompt_tokens or 0),
+                int(completion_tokens or 0),
+                int(cached_tokens or 0),
+                float(cost_usd or 0.0),
+                now_iso(),
+            ),
+        )
+
+
+def ai_usage_month_cost_usd(month: str) -> float:
+    """Суммарный расход в USD за расчётный месяц (YYYY-MM)."""
+    with _connect() as conn:
+        conn.execute(_AI_USAGE_DDL)
+        row = conn.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS total FROM ai_usage WHERE month=?",
+            (str(month),),
+        ).fetchone()
+    return float(row["total"] or 0.0) if row else 0.0
+
+
+def ai_usage_day_calls(day: str) -> int:
+    """Количество вызовов OpenAI за сутки (YYYY-MM-DD)."""
+    with _connect() as conn:
+        conn.execute(_AI_USAGE_DDL)
+        row = conn.execute(
+            "SELECT COUNT(*) AS calls FROM ai_usage WHERE day=?",
+            (str(day),),
+        ).fetchone()
+    return int(row["calls"] or 0) if row else 0
+
+
+def ai_usage_breakdown(*, month: str = "", day: str = "") -> list[dict[str, Any]]:
+    """Разбивка расхода по моделям — для /debug и отчётов."""
+    where: list[str] = []
+    params: list[Any] = []
+    if month:
+        where.append("month=?")
+        params.append(str(month))
+    if day:
+        where.append("day=?")
+        params.append(str(day))
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    with _connect() as conn:
+        conn.execute(_AI_USAGE_DDL)
+        rows = conn.execute(
+            "SELECT model, purpose, COUNT(*) AS calls,"
+            " COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,"
+            " COALESCE(SUM(completion_tokens), 0) AS completion_tokens,"
+            " COALESCE(SUM(cached_tokens), 0) AS cached_tokens,"
+            " COALESCE(SUM(cost_usd), 0) AS cost_usd"
+            f" FROM ai_usage{clause} GROUP BY model, purpose ORDER BY cost_usd DESC",
+            tuple(params),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def add_message(chat_id: str, role: str, content: str) -> None:
