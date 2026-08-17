@@ -40,6 +40,9 @@ except Exception:
 
 
 OPENAI_BRAIN_ALLOWED_STEPS = {"start", "complaint", "age", "contraindications", "date", "time", "select_slot", "name"}
+# gate_reason, при которых _should_ai_handle_new_lead уже разрешил боту отвечать.
+# Брейн допускается ровно к этому набору — шире гейта не открываем.
+OPENAI_BRAIN_ALLOWED_GATE_REASONS = {"new_lead", "new_lead_like_message", "active_conversation_reply", "active_ai_lead"}
 OPENAI_BRAIN_MULTI_ENTITY_STEPS = {"age", "contraindications", "date"}
 OPENAI_BRAIN_ALLOWED_GATES = {"new_lead", "new_lead_like_message", "active_ai_lead", "active_conversation_reply"}
 
@@ -994,7 +997,15 @@ def _openai_brain_skip_reason(session: dict[str, Any], text: str) -> str:
         return "voice_or_audio"
     if session.get("hard_contraindication_stop") or session.get("contraindication_hard_stop"):
         return "hard_contraindication_stop"
-    active_new_lead = session.get("ai_lead_started") is True or session.get("gate_reason") == "new_lead"
+    # Фаза 2: брейн допускается ко всем текстовым сообщениям, которые
+    # _should_ai_handle_new_lead уже разрешил обрабатывать, а не только к линейной
+    # воронке нового лида. Раньше active_conversation_reply/active_ai_lead/
+    # new_lead_like_message давали not_ai_lead, и понимание пациента доставалось
+    # keyword-веткам. Набор причин не шире того, что разрешает сам гейт.
+    active_new_lead = (
+        session.get("ai_lead_started") is True
+        or session.get("gate_reason") in OPENAI_BRAIN_ALLOWED_GATE_REASONS
+    )
     if not active_new_lead:
         return "not_ai_lead"
     if step not in OPENAI_BRAIN_ALLOWED_STEPS:
