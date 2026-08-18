@@ -8,7 +8,7 @@ import mimetypes
 import re
 from typing import Any
 from types import SimpleNamespace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -1328,6 +1328,87 @@ def wazzup_webhook_health_response(request: Request) -> dict[str, Any]:
     }
 
 
+
+def _allowed_channel_ids(settings: Any) -> list[str]:
+    """Каналы, которые боту разрешено обслуживать.
+
+    WAZZUP_ALLOWED_CHANNEL_IDS — список через запятую. Основной канал
+    WAZZUP_CHANNEL_ID добавляется к списку автоматически: иначе добавление
+    второго канала в список молча отключало бы первый, а такая ошибка не видна
+    ниоткуда, кроме молчания бота у пациентов.
+    """
+    raw = str(getattr(settings, "wazzup_allowed_channel_ids", "") or "")
+    allowed = [c.strip() for c in raw.split(",") if c.strip()]
+    if not allowed:
+        return []
+    primary = str(getattr(settings, "wazzup_channel_id", "") or "").strip()
+    if primary and primary not in allowed:
+        allowed.append(primary)
+    return allowed
+
+
+def _track_channel_check(
+    chat_id: str,
+    channel_id_from_payload: str,
+    channel_id_match: bool,
+    allowed_channel_ids: list[str],
+    channel_id_env: str,
+) -> None:
+    """Считать совпадения/расхождения каналов и поднимать алерт при всплеске.
+
+    Прод 18.08.2026: почти все входящие приходили с канала, которого не было
+    в конфиге, каждое сообщение блокировалось с silent_reason=channel_id_mismatch,
+    и бот молчал для пациентов. По логам это было видно только постфактум.
+    """
+    if not channel_id_from_payload:
+        return
+    settings = get_settings()
+    try:
+        state.log_event(
+            chat_id,
+            "wazzup_channel_matched" if channel_id_match else "wazzup_channel_mismatch",
+            {"chat_id": chat_id, "channel_id": channel_id_from_payload},
+        )
+        if channel_id_match:
+            return
+
+        window_minutes = max(1, int(getattr(settings, "channel_mismatch_alert_window_minutes", 15) or 15))
+        min_messages = max(1, int(getattr(settings, "channel_mismatch_alert_min_messages", 5) or 5))
+        ratio_threshold = float(getattr(settings, "channel_mismatch_alert_ratio", 0.5) or 0.5)
+        since = (datetime.now(timezone.utc) - timedelta(minutes=window_minutes)).isoformat()
+
+        mismatched = state.count_events_since("wazzup_channel_mismatch", since)
+        matched = state.count_events_since("wazzup_channel_matched", since)
+        total = mismatched + matched
+        if total < min_messages:
+            return
+        ratio = mismatched / total if total else 0.0
+        if ratio < ratio_threshold:
+            return
+        # Не спамим: один алерт на окно.
+        if state.count_events_since("wazzup_channel_mismatch_alert", since):
+            return
+
+        state.log_event(chat_id, "wazzup_channel_mismatch_alert", {
+            "level": "critical",
+            "window_minutes": window_minutes,
+            "mismatched": mismatched,
+            "matched": matched,
+            "total": total,
+            "mismatch_ratio": round(ratio, 3),
+            "unexpected_channel_id": channel_id_from_payload,
+            "configured_channel_id": channel_id_env,
+            "allowed_channel_ids": allowed_channel_ids,
+            "note": (
+                "бот не отправляет ответы: входящий канал не разрешён. "
+                "Проверьте WAZZUP_ALLOWED_CHANNEL_IDS / WAZZUP_CHANNEL_ID"
+            ),
+        })
+    except Exception:
+        # Наблюдаемость не должна ронять обработку сообщения пациента.
+        return
+
+
 async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw_msg: dict[str, Any], parse_meta: dict[str, Any], *, send_enabled: bool = True) -> dict[str, Any]:
     message = _normalize_wazzup_message(payload, raw_msg)
     chat_id = message["chat_id"] or "wazzup"
@@ -1335,12 +1416,13 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
     settings = get_settings()
     channel_id_env = str(getattr(settings, "wazzup_channel_id", "") or "")
     channel_id_from_payload = str(message.get("channel_id") or "")
-    allowed_channel_ids = [c.strip() for c in str(getattr(settings, "wazzup_allowed_channel_ids", "") or "").split(",") if c.strip()]
+    allowed_channel_ids = _allowed_channel_ids(settings)
     if allowed_channel_ids:
         channel_id_match = (not channel_id_from_payload) or channel_id_from_payload in allowed_channel_ids
     else:
         channel_id_match = (not channel_id_env) or channel_id_from_payload == channel_id_env
     channel_id_mismatch_blocks = bool((allowed_channel_ids or (channel_id_env and channel_id_env != "test-channel")) and channel_id_from_payload and not channel_id_match)
+    _track_channel_check(chat_id, channel_id_from_payload, channel_id_match, allowed_channel_ids, channel_id_env)
     received_log = {
         "source": "wazzup",
         "path": request.url.path,

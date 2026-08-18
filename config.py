@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     wazzup_channel_id: str = Field(default="", validation_alias=AliasChoices("WAZZUP_CHANNEL_ID", "wazzup_channel_id"))
     wazzup_allowed_channel_ids: str = Field(default="", validation_alias=AliasChoices("WAZZUP_ALLOWED_CHANNEL_IDS", "wazzup_allowed_channel_ids"))
     wazzup_instagram_channel_id: str = Field(default="", validation_alias=AliasChoices("WAZZUP_INSTAGRAM_CHANNEL_ID", "wazzup_instagram_channel_id"))
+    # Алерт на расхождение каналов: если за окно доля входящих с
+    # channel_id_mismatch выше порога, канал сменился и бот молчит для пациентов.
+    # Замечать это надо сразу, а не постфактум по логам.
+    channel_mismatch_alert_window_minutes: int = Field(default=15, validation_alias=AliasChoices("CHANNEL_MISMATCH_ALERT_WINDOW_MINUTES", "channel_mismatch_alert_window_minutes"))
+    channel_mismatch_alert_min_messages: int = Field(default=5, validation_alias=AliasChoices("CHANNEL_MISMATCH_ALERT_MIN_MESSAGES", "channel_mismatch_alert_min_messages"))
+    channel_mismatch_alert_ratio: float = Field(default=0.5, validation_alias=AliasChoices("CHANNEL_MISMATCH_ALERT_RATIO", "channel_mismatch_alert_ratio"))
     wazzup_api_url: str = Field(default="https://api.wazzup24.com/v3", validation_alias=AliasChoices("WAZZUP_API_URL", "wazzup_api_url"))
     wazzup_media_endpoint_template: str = Field(
         default="{api_url}/media/{file_id}",
