@@ -195,8 +195,8 @@ def test_model_roles_stay_separate() -> None:
     assert hasattr(settings, "ai_humanize_model")
 
 
-def test_humanize_call_untouched_by_phase_1b(monkeypatch: pytest.MonkeyPatch) -> None:
-    """generate_complaint_ack/humanize остаются на max_tokens — их эта фаза не трогает."""
+def test_humanize_call_keeps_max_tokens_on_gpt4o_mini(monkeypatch: pytest.MonkeyPatch) -> None:
+    """На gpt-4o-mini имя параметра прежнее — поведение не изменилось."""
     settings = get_settings()
     monkeypatch.setattr(settings, "openai_model", "gpt-4o-mini")
     client = _CapturingClient(content="Понимаю Вас")
@@ -205,4 +205,45 @@ def test_humanize_call_untouched_by_phase_1b(monkeypatch: pytest.MonkeyPatch) ->
     run(ai.generate_complaint_ack("болит спина", "ru", chat_id="compat_test"))
 
     assert client.captured["model"] == "gpt-4o-mini"
-    assert "max_tokens" in client.captured
+    assert client.captured["max_tokens"] == 170
+
+
+def test_complaint_ack_switches_param_on_gpt5(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Перевод тона/формы на gpt-5.x не должен ронять вызов в 400."""
+    settings = get_settings()
+    monkeypatch.setattr(settings, "openai_model", "gpt-5.4-mini")
+    client = _CapturingClient(content="Понимаю Вас")
+    monkeypatch.setattr(ai, "_openai_client", lambda *a, **k: client)
+
+    run(ai.generate_complaint_ack("болит спина", "ru", chat_id="compat_test"))
+
+    assert client.captured["max_completion_tokens"] == 170
+    assert "max_tokens" not in client.captured
+
+
+def test_humanize_reply_switches_param_on_gpt5(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "ai_humanize_model", "gpt-5.4-mini")
+    monkeypatch.setattr(settings, "openai_humanize_replies", True)
+    client = _CapturingClient(content="Подскажите, сколько Вам лет?")
+    monkeypatch.setattr(ai, "_openai_client", lambda *a, **k: client)
+
+    run(ai.humanize_reply_with_openai(
+        base_answer="Подскажите, сколько Вам лет?",
+        user_text="болит спина",
+        session={"chat_id": "compat_test", "step": "age"},
+    ))
+
+    assert client.captured["max_completion_tokens"] == 260
+    assert "max_tokens" not in client.captured
+
+
+@pytest.mark.parametrize("model,expected_key", [
+    ("gpt-4o-mini", "max_tokens"),
+    ("gpt-4o-mini-2024-07-18", "max_tokens"),
+    ("gpt-5.4-mini", "max_completion_tokens"),
+    ("gpt-5-mini", "max_completion_tokens"),
+])
+def test_token_limit_param_name_per_model(model: str, expected_key: str) -> None:
+    kwargs = ai._token_limit_kwargs(model, 123)
+    assert kwargs == {expected_key: 123}

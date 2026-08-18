@@ -219,7 +219,7 @@ async def generate_complaint_ack(text: str, lang: str = "ru", chat_id: str = "")
         response = await client.chat.completions.create(
             model=settings.openai_model,
             temperature=0.45,
-            max_tokens=170,
+            **_token_limit_kwargs(settings.openai_model, 170),
             messages=[
                 {"role": "system", "content": HUMAN_ACK_PROMPT.format(lang=language_name)},
                 {"role": "user", "content": text or "жалоба пациента"},
@@ -505,6 +505,19 @@ def _requires_max_completion_tokens(model: str) -> bool:
     ai_brain_temperature не трогаем.
     """
     return str(model or "").strip().lower().startswith("gpt-5")
+
+
+def _token_limit_kwargs(model: str, limit: int) -> dict[str, int]:
+    """Имя параметра лимита токенов зависит от семейства модели.
+
+    Применяется ко ВСЕМ вызовам OpenAI, а не только к брейну: сейчас тон и форма
+    ответа живут на gpt-4o-mini, но перевод любого из этих вызовов на gpt-5.x без
+    этой развилки вернул бы 400, вызов ушёл бы в свой except и молча деградировал
+    в fallback — снаружи это выглядит как "модель поглупела", а не как ошибка.
+    """
+    if _requires_max_completion_tokens(model):
+        return {"max_completion_tokens": limit}
+    return {"max_tokens": limit}
 
 
 def _brain_token_limit_kwargs(model: str) -> dict[str, int]:
@@ -937,7 +950,7 @@ async def generate_human_message(draft: str, user_text: str = "", lang: str = "r
         response = await client.chat.completions.create(
             model=settings.openai_model,
             temperature=0.55,
-            max_tokens=240,
+            **_token_limit_kwargs(settings.openai_model, 240),
             messages=[
                 {"role": "system", "content": HUMANIZE_REPLY_PROMPT.format(lang=language_name, step=step or "", user_text=user_text or "", draft=draft)},
             ],
@@ -1097,7 +1110,7 @@ async def humanize_reply_with_openai(
         response = await client.chat.completions.create(
             model=model,
             temperature=0.35,
-            max_tokens=260,
+            **_token_limit_kwargs(model, 260),
             messages=[
                 {"role": "system", "content": STRICT_HUMANIZE_REPLY_PROMPT},
                 {"role": "user", "content": (
