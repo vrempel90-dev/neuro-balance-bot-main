@@ -78,7 +78,14 @@ def _seed_contraindications_step(chat_id: str) -> None:
 
 
 def test_production_case_77478875259_never_silent() -> None:
-    """Точный сценарий из прод-логов: оба текстовых сообщения получают ответ."""
+    """Точный сценарий из прод-логов: оба текстовых сообщения получают ответ.
+
+    Ожидание по второму сообщению обновлено: раньше здесь проверялся повторный
+    вопрос о противопоказаниях, теперь "81 лет" распознаётся как возраст и
+    правило клиники ">75 лет" останавливает запись (см.
+    test_age_contraindication_at_contra_step.py). Гарантия этой фазы — "ответ не
+    пустой" — проверяется по-прежнему.
+    """
     chat_id = "contra_never_silent_prod_case"
     _seed_contraindications_step(chat_id)
 
@@ -90,7 +97,8 @@ def test_production_case_77478875259_never_silent() -> None:
 
     session = state.get_session(chat_id)
     assert session.get("outbound_duplicate_guard_blocked") is not True
-    assert dialog.CONTRAINDICATIONS_MESSAGE_RU in second
+    assert dialog.CONTRAINDICATIONS_MESSAGE_RU in first
+    assert "старше 75" in second
 
 
 def test_debounced_combined_text_never_silent() -> None:

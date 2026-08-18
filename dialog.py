@@ -6047,6 +6047,35 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if early_address_question:
         session.setdefault("gate_reason", "new_lead_like_message")
         session["ai_lead_started"] = True
+    # age_contraindication_guard: возраст входит в тот же список противопоказаний
+    # ("возраст до 16 или более 75 лет"), но на шаге contraindications не проверялся
+    # вовсе. Прод 17.08.2026 (chat_id 77478875259): пациент написал "81 лет", возраст
+    # не сохранился и запись не остановилась, хотя на шаге age то же самое сообщение
+    # корректно уводит диалог в over_75.
+    #
+    # Проверяется ТОЛЬКО over_75. under_16 здесь намеренно не применяется: на этом шаге
+    # пациенты описывают анамнез длительностями ("инсульт был 5 лет назад", "болею
+    # 3 года"), и _extract_age достаёт из них 5 и 3 — под правило "младше 16" такие
+    # сообщения попадали бы ошибочно, а это жёсткий отказ в приёме. Возраст младше 16
+    # надёжно отлавливается на шаге age, где число однозначно означает возраст.
+    if session.get("step") == "contraindications" or session.get("last_required_step") == "contraindications":
+        contra_age = _extract_age(text, "contraindications")
+        # "N лет назад" — давность события, а не возраст пациента.
+        if contra_age is not None and contra_age > 75 and "назад" not in _low(text):
+            session["age"] = contra_age
+            session["contraindications_raw"] = text
+            session["contraindications_ok"] = False
+            session["contraindications_verdict"] = "admin_contact"
+            session["step"] = "escalated"
+            session["escalated"] = True
+            _safe_log(chat_id, "age_contraindication_hard_stop", {
+                "chat_id": chat_id,
+                "step": "contraindications",
+                "age": contra_age,
+                "reason": "over_75",
+                "text_preview": text[:180],
+            })
+            return _finalize(chat_id, session, _stop_booking_text(session, "over_75"))
     if (session.get("step") == "contraindications" or session.get("last_required_step") == "contraindications") and _contra_details_question(text):
         session["step"] = "contraindications"
         session["questionnaire_step"] = "contra"
