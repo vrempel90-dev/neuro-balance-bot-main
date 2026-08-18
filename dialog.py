@@ -6026,7 +6026,17 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return _no_reply(chat_id, session, "crm_lookup_failed")
         return _finalize(chat_id, session, "Сейчас уточню Вашу запись у администратора 🌿")
     if session.get("crm_patient_state") == "NEW_PATIENT":
-        if session.get("no_reply_reason") == "old_lead_from_crm" or session.get("ai_muted") or session.get("manual_takeover"):
+        # Сбрасываем ТОЛЬКО мьют, поставленный классификацией "старый лид"
+        # (_mute_old_lead помечает сессию silent_old_lead/old_lead_reason).
+        # Раньше условие ловило любые ai_muted/manual_takeover, из-за чего
+        # ручной перехват администратором и эскалация после раздражения пациента
+        # молча снимались, стоило CRM ответить isNew — и бот начинал говорить
+        # поверх живого админа.
+        if (
+            session.get("no_reply_reason") == "old_lead_from_crm"
+            or session.get("silent_old_lead")
+            or session.get("old_lead_reason")
+        ):
             session["ai_muted"] = False
             session["manual_takeover"] = False
             session["no_reply_reason"] = ""
