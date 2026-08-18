@@ -27,22 +27,32 @@ def run(coro):
 
 
 @pytest.mark.parametrize("user", ["хочу записаться", "Сәлеметсіз", "+"])
-def test_new_chat_first_touch_is_exact_locked_template(user: str) -> None:
+def test_new_chat_first_touch_is_routed_by_intent(user: str) -> None:
+    """Первое касание маршрутизируется по интенту, а не шлёт презентацию всем.
+
+    Раньше здесь проверялся дословный FIRST_TOUCH_CLINIC_INFO_RU на любое первое
+    сообщение. Коммит "Route first-touch replies by patient intent" (11.07.2026)
+    изменил контракт: полную презентацию клиники получает только вопрос о методах
+    лечения (см. test_production_hard_safety_202607), а приветствие, запрос записи
+    и неясное сообщение — короткий ответ с вопросом о жалобе на языке пациента.
+    Проверка дословной презентации осталась в
+    test_new_chat_methods_question_sends_requested_full_presentation.
+    """
     chat_id = f"locked_first_{abs(hash(user))}"
     answer = run(handle_message(chat_id, "77010000000", user))
     session = state.get_session(chat_id)
 
-    assert answer == FIRST_TOUCH_CLINIC_INFO_RU
     assert session["first_touch_info_sent"] is True
-    assert session["step"] == "complaint"
-    assert session["answer_source"] == "locked_template:first_touch"
+    assert session["answer_source"] == "intent_router:first_touch"
+    assert answer.strip()
+    # Простыню клиники на такие сообщения не шлём.
+    assert "Мы специализируемся на:" not in answer
+    assert "TikTok" not in answer
+    # Но обязательно спрашиваем о жалобе — на языке пациента.
+    assert ("беспокоит" in answer) or ("мазалайды" in answer)
     assert "чем можем помочь" not in answer
     assert "хотите записаться или уточняете" not in answer
     assert "Не беспокоит" not in answer
-    assert "Мы специализируемся на:" in answer
-    assert "плазмотерапию" in answer
-    assert "TikTok" in answer
-    assert "Подскажите, пожалуйста, что именно Вас беспокоит?" in answer
 
 
 def test_age_to_contraindications_uses_full_locked_template() -> None:

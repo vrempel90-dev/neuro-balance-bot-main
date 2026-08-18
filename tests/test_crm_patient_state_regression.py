@@ -76,7 +76,12 @@ def test_1_new_patient_allows_first_touch(monkeypatch: Any) -> None:
 
     assert session["crm_patient_state"] == "NEW_PATIENT"
     assert session["first_touch_allowed"] is True
-    assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+    # Первое касание маршрутизируется по интенту (коммит "Route first-touch
+    # replies by patient intent", 11.07.2026): полную презентацию клиники
+    # получает только вопрос о методах, приветствие — короткий ответ с вопросом.
+    assert session["answer_source"] == "intent_router:first_touch"
+    assert "что Вас беспокоит" in answer
+    assert "Клиника Neuro Balance помогает" not in answer
 
 
 def test_2_returning_patient_greeting_is_silent(monkeypatch: Any) -> None:

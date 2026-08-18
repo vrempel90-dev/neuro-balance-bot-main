@@ -96,7 +96,11 @@ def test_no_active_appointment_allows_first_touch(monkeypatch: Any) -> None:
     assert session["crm_lookup_called"] is True
     assert session["active_appointment_found"] is False
     assert session["first_touch_allowed"] is True
-    assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+    # Первое касание маршрутизируется по интенту: "хочу записаться" — это booking,
+    # а не запрос презентации клиники.
+    assert session["answer_source"] == "intent_router:first_touch"
+    assert "можно записаться" in answer
+    assert "что Вас беспокоит" in answer
 
 
 def test_lookup_failure_fails_closed(monkeypatch: Any) -> None:

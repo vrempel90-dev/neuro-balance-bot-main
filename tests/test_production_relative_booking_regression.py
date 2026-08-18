@@ -83,7 +83,10 @@ def test_first_touch_booking_exact_welcome_once() -> None:
     answer = run(dialog.handle_message(chat_id, "77011234567", "хочу записаться"))
     session = state.get_session(chat_id)
 
-    assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+    # Первое касание маршрутизируется по интенту: booking получает короткий
+    # ответ с вопросом о жалобе, а не полную презентацию клиники.
+    assert "можно записаться" in answer
+    assert "что Вас беспокоит" in answer
     assert session["first_touch_info_sent"] is True
     assert session["step"] == "complaint"
     assert "чем можем помочь: хотите записаться" not in answer.lower()
