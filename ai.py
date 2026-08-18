@@ -315,6 +315,23 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 - придумывать противопоказания;
 - менять “нет” на “да”.
 
+Важное правило: запись бывает не для того, кто пишет.
+Пациент часто обращается за другого человека: "хочу узнать за родственника",
+"записать маму", "у бабушки болит спина", "спрашиваю за брата", "сестре нужна
+консультация", "для отца". Это НЕ значит, что болит у самого пишущего.
+
+Если запись для другого человека:
+- заполни patient_relation тем, кем этот человек приходится пишущему
+  (мама, папа, муж, жена, сын, дочь, ребенок, бабушка, дедушка, брат, сестра,
+  тётя, дядя, внук, внучка, свекровь, тёща, родственник и т.п.);
+- жалоба, возраст и противопоказания относятся к ПАЦИЕНТУ, то есть к этому
+  человеку, а не к тому, кто пишет;
+- спрашивай про него: "сколько лет маме?", а не "сколько Вам лет?";
+- имя для записи — тоже имя пациента, а не пишущего.
+Если запись для себя — оставь patient_relation пустым.
+Возрастные правила клиники (до 16 и более 75 лет) считаются по возрасту
+пациента, а не по возрасту того, кто написал.
+
 Важное правило:
 Отличай вопрос о термине от подтверждения противопоказания.
 
@@ -409,6 +426,7 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
     "time_preference": "",
     "slot_choice": null,
     "patient_name": "",
+    "patient_relation": "",
     "faq_type": "",
     "language": "ru"
   },
@@ -439,6 +457,7 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
     "time_preference": "",
     "slot_choice": null,
     "patient_name": "",
+    "patient_relation": "",
     "wants_human": false,
     "faq_type": "",
     "language": "ru"
@@ -576,6 +595,7 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
                 "time_preference": entities.get("time_preference") or "",
                 "slot_choice": entities.get("slot_choice"),
                 "patient_name": entities.get("patient_name") or "",
+                "patient_relation": entities.get("patient_relation") or "",
                 "wants_human": normalized_intent == "ask_human",
                 "faq_type": entities.get("faq_type") or "",
                 "language": entities.get("language") or "ru",
@@ -600,6 +620,7 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
         "complaint", "age", "contraindications_clear", "contraindication_confirmed",
         "contraindication_term_asked", "contraindication_red_flags", "preferred_date_text",
         "time_preference", "slot_choice", "patient_name", "wants_human", "faq_type", "language", "symptom_duration",
+        "patient_relation",
     }
     allowed_safety = {"hard_stop", "reason", "unsafe_medical_claim", "tries_to_book_without_rules"}
     if any(k not in allowed_extracted for k in extracted.keys()):
@@ -646,6 +667,7 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
             "time_preference": str(extracted.get("time_preference") or ""),
             "slot_choice": extracted.get("slot_choice"),
             "patient_name": str(extracted.get("patient_name") or ""),
+            "patient_relation": str(extracted.get("patient_relation") or ""),
             "wants_human": bool(extracted.get("wants_human")),
             "faq_type": str(extracted.get("faq_type") or ""),
             "language": str(extracted.get("language") or "ru"),
