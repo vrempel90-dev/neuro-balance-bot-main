@@ -40,6 +40,9 @@ except Exception:
 
 
 OPENAI_BRAIN_ALLOWED_STEPS = {"start", "complaint", "age", "contraindications", "date", "time", "select_slot", "name"}
+# gate_reason, при которых _should_ai_handle_new_lead уже разрешил боту отвечать.
+# Брейн допускается ровно к этому набору — шире гейта не открываем.
+OPENAI_BRAIN_ALLOWED_GATE_REASONS = {"new_lead", "new_lead_like_message", "active_conversation_reply", "active_ai_lead"}
 OPENAI_BRAIN_MULTI_ENTITY_STEPS = {"age", "contraindications", "date"}
 OPENAI_BRAIN_ALLOWED_GATES = {"new_lead", "new_lead_like_message", "active_ai_lead", "active_conversation_reply"}
 
@@ -680,7 +683,16 @@ def _repair_forbidden_required_question(chat_id: str, session: dict[str, Any], a
     if not qtype:
         return answer
     step = "select_slot" if qtype == "time" else qtype
+    # answer_faq_and_continue спроектирован правильно: ответить по факту и вернуть
+    # на нужный шаг одним сообщением. Раньше он подпадал под эту блокировку, потому
+    # что _classify_bot_question смотрит ВЕСЬ текст: FAQ про противопоказания или
+    # цену определялся как "повторный вопрос шага", и фактический ответ пациенту
+    # выбрасывался целиком вместе с возвратом на шаг. Фактическую часть сохраняем.
+    faq_fact = str(session.get("faq_fact_reply") or "").strip()
     if not _has_required_data_for_step(session, step):
+        # Боковые вопросы с ответом по факту — не зацикливание, эскалация не нужна.
+        if faq_fact:
+            return answer
         if session.get("last_required_step") == ("time" if step == "select_slot" else step) and int(session.get("last_required_question_count") or 0) >= 2:
             session["llm_blocked"] = True
             session["llm_repaired"] = True
@@ -699,16 +711,25 @@ def _repair_forbidden_required_question(chat_id: str, session: dict[str, Any], a
     session["llm_repaired"] = True
     session["repair_reason"] = f"repeat_required_step_{step}_blocked"
     _safe_log(chat_id, "repeat_required_question_blocked", {"blocked_step": step, "next_step": next_step, "answer_preview": answer[:180]})
+
+    def _with_fact(prompt: str) -> str:
+        """Починка шага не должна стирать ответ по факту из answer_faq_and_continue."""
+        if not faq_fact:
+            return prompt
+        if not prompt:
+            return faq_fact
+        return faq_fact + "\n\n" + prompt
+
     if next_step == "book":
-        return ""
+        return _with_fact("")
     if next_step == "time":
         session["step"] = "time"
         session["questionnaire_step"] = "time"
-        return _mandatory_step_prompt(session, "time")
+        return _with_fact(_mandatory_step_prompt(session, "time"))
     session["step"] = next_step
     if next_step in {"date", "name", "contraindications"}:
         session["questionnaire_step"] = "contra" if next_step == "contraindications" else next_step
-    return _mandatory_step_prompt(session, next_step)
+    return _with_fact(_mandatory_step_prompt(session, next_step))
 
 
 def _repair_state_consistency(session: dict[str, Any], user_text: str = "") -> tuple[bool, str]:
@@ -994,7 +1015,15 @@ def _openai_brain_skip_reason(session: dict[str, Any], text: str) -> str:
         return "voice_or_audio"
     if session.get("hard_contraindication_stop") or session.get("contraindication_hard_stop"):
         return "hard_contraindication_stop"
-    active_new_lead = session.get("ai_lead_started") is True or session.get("gate_reason") == "new_lead"
+    # Фаза 2: брейн допускается ко всем текстовым сообщениям, которые
+    # _should_ai_handle_new_lead уже разрешил обрабатывать, а не только к линейной
+    # воронке нового лида. Раньше active_conversation_reply/active_ai_lead/
+    # new_lead_like_message давали not_ai_lead, и понимание пациента доставалось
+    # keyword-веткам. Набор причин не шире того, что разрешает сам гейт.
+    active_new_lead = (
+        session.get("ai_lead_started") is True
+        or session.get("gate_reason") in OPENAI_BRAIN_ALLOWED_GATE_REASONS
+    )
     if not active_new_lead:
         return "not_ai_lead"
     if step not in OPENAI_BRAIN_ALLOWED_STEPS:
@@ -1150,6 +1179,12 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
         facts["symptom_duration"] = session["symptom_duration"]
         session["known_user_facts"] = facts
+    if extracted.get("patient_relation"):
+        # Запись за другого человека: GPT возвращает слово в любой форме
+        # ("маме", "мама", "для мамы"), поэтому нормализуем тем же детектором,
+        # что и rule-based путь. Дальше _ask_age/_faq_answer уже сами
+        # переключаются на "сколько лет маме?" вместо "сколько Вам лет?".
+        _apply_patient_relation(session, str(extracted.get("patient_relation") or ""))
     if decision.get("intent"):
         session["last_user_intent"] = str(decision.get("intent") or "")
     if extracted.get("time_preference"):
@@ -1225,6 +1260,16 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         session["questionnaire_step"] = "name"
         ask = _ask_name(session)
         return _finalize(chat_id, session, reply + ("\n\n" + ask if ask not in reply else ""))
+    if action == "ask_complaint":
+        # ask_complaint был в DIALOG_BRAIN_ACTIONS, но обработчика не имел: решение
+        # брейна молча отбрасывалось, управление уходило в keyword-ветки, и на
+        # приветствие/нестандартную формулировку пациент получал заготовку вместо
+        # ответа GPT. Без этого обработчика перенос веток Фазы 2 не даёт эффекта.
+        if extracted.get("complaint"):
+            session["complaint"] = extracted.get("complaint")
+            _record_complaint_tool(session, str(extracted.get("complaint")), is_in_profile=True)
+        session["step"] = "complaint"
+        return _finalize(chat_id, session, reply or _ask_complaint(session))
     if action == "ask_name":
         session["step"] = "name"
         return _finalize(chat_id, session, reply or _ask_name(session))
@@ -1240,6 +1285,10 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         elif pending in {"complaint", "age", "contraindications", "date", "name"}:
             session["step"] = pending
         session["pending_step_after_faq"] = pending
+        # Ответ по факту нельзя потерять, даже если ниже починится шаг:
+        # _repair_forbidden_required_question классифицирует ВЕСЬ ответ и раньше
+        # выбрасывал фактическую часть вместе с вопросом шага.
+        session["faq_fact_reply"] = reply
         return _finalize(chat_id, session, reply + ("\n\n" + _mandatory_step_prompt(session, pending) if reply else ""))
     if action == "stop_contraindication":
         if not _contra_has_hard_stop(text):
@@ -3097,6 +3146,15 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
         elif session.get("crm_patient_state") == "RETURNING_PATIENT_NO_ACTIVE_BOOKING":
             session["outbound_duplicate_guard_blocked"] = True
             answer = _returning_patient_answer(session, str(session.get("last_user_text") or ""))
+        elif str(session.get("step") or "") == "contraindications":
+            # contraindications_never_silent_guard: на этом шаге молчание недопустимо.
+            # Прод 17.08.2026 (chat_id 77478875259, WhatsApp, текст): пациент написал
+            # "Все равно болеет", затем "81 лет" — оба раза ответ шага совпал с прошлым
+            # вопросом о противопоказаниях, duplicate_answer_guard вернул "" и бот молчал
+            # в самый чувствительный момент. Повторить вопрос лучше, чем промолчать.
+            session["outbound_duplicate_guard_blocked"] = False
+            session["fallback_reason"] = "contraindications_never_silent"
+            answer = _ask_contra(session)
         else:
             session["outbound_duplicate_guard_blocked"] = True
             _safe_save(chat_id, session)
@@ -3533,10 +3591,56 @@ RELATION_ALIASES: dict[str, tuple[str, str]] = {
 }
 
 
+# Живые формулировки пациентов не укладываются в фиксированный список падежей:
+# "хочу записать маму", "узнать за родственника", "у бабушки болит спина",
+# "для отца", "сестре нужна консультация". Раньше распознавались только точные
+# формы из RELATION_ALIASES, поэтому запись за родственника считалась записью на
+# себя — и возраст с противопоказаниями собирались не про того человека.
+# Ниже — основы слов с падежными окончаниями. Порядок важен: более длинные и
+# однозначные основы идут раньше.
+RELATION_PATTERNS: tuple[tuple[str, str, str], ...] = (
+    (r"родственниц\w*", "родственник", "female"),
+    (r"родственник\w*", "родственник", "unknown"),
+    (r"свекров\w*", "свекровь", "female"),
+    (r"св[ёе]кр\w*", "свёкор", "male"),
+    (r"т[ёе]щ\w*", "тёща", "female"),
+    (r"тест[ья]\w*|\bтесть\b", "тесть", "male"),
+    (r"невестк\w*", "невестка", "female"),
+    (r"зят[ья]\w*|\bзять\b", "зять", "male"),
+    (r"бабушк\w*|бабул\w*|\bбабе?\b", "бабушка", "female"),
+    (r"дедушк\w*|\bдед(?:а|у|ом|е)?\b", "дедушка", "male"),
+    (r"внучк\w*", "внучка", "female"),
+    (r"внук\w*", "внук", "male"),
+    (r"сестр(?:а|ы|е|у|ой)\b|сестр[ёе]нк\w*", "сестра", "female"),
+    (r"\bбрат(?:а|у|ом|е|ик\w*)?\b", "брат", "male"),
+    (r"мам(?:а|ы|е|у|ой)\b|мамочк\w*|\bмат[ьи]\b|\bматери\b", "мама", "female"),
+    (r"пап(?:а|ы|е|у|ой)\b|папочк\w*|\bот(?:ец|ца|цу|цом)\b", "папа", "male"),
+    (r"супруг(?:а|и|е|у)\b", "жена", "female"),
+    (r"супруг\w*", "муж", "male"),
+    (r"\bмуж(?:а|у|ем|е)?\b", "муж", "male"),
+    (r"\bжен(?:а|ы|е|у|ой)\b", "жена", "female"),
+    (r"доч\w*", "дочь", "female"),
+    (r"\bсын(?:а|у|ом|е|ок|ишк\w*)?\b", "сын", "male"),
+    (r"реб[ёе]н\w*|\bдет(?:ей|ям|ьми)\b|малыш\w*", "ребенок", "unknown"),
+    (r"т[ёе]т(?:я|и|е|ю)\b", "тётя", "female"),
+    (r"дяд(?:я|и|е|ю)\b", "дядя", "male"),
+    (r"подруг(?:а|и|е|у)\b", "подруга", "female"),
+    (r"\bдруг(?:а|у|ом)?\b", "друг", "male"),
+    (r"знаком(?:ый|ого|ому|ая|ой)\b", "знакомый", "unknown"),
+    (r"близк(?:ий|ого|ому|ому)\s+человек\w*", "родственник", "unknown"),
+    (r"пациент\w*", "пациент", "unknown"),
+)
+
+
 def _detect_patient_relation(text: str) -> tuple[str, str] | tuple[None, None]:
     low = _low(text)
+    # Точные формы из старого списка проверяются первыми — поведение,
+    # на которое опираются существующие тесты, не меняется.
     for form, (relation, gender) in RELATION_ALIASES.items():
         if re.search(rf"\b(?:у\s+)?{re.escape(form)}\b", low):
+            return relation, gender
+    for pattern, relation, gender in RELATION_PATTERNS:
+        if re.search(rf"\b(?:{pattern})", low):
             return relation, gender
     return None, None
 
@@ -3556,6 +3660,11 @@ def _patient_dative(session: dict[str, Any]) -> str:
     return {
         "муж": "мужу", "жена": "жене", "мама": "маме", "папа": "папе",
         "сын": "сыну", "дочь": "дочери", "ребенок": "ребенку", "пациент": "пациенту",
+        "бабушка": "бабушке", "дедушка": "дедушке", "брат": "брату", "сестра": "сестре",
+        "тётя": "тёте", "дядя": "дяде", "внук": "внуку", "внучка": "внучке",
+        "родственник": "родственнику", "свекровь": "свекрови", "свёкор": "свёкру",
+        "тёща": "тёще", "тесть": "тестю", "зять": "зятю", "невестка": "невестке",
+        "друг": "другу", "подруга": "подруге", "знакомый": "знакомому",
     }.get(relation, "Вам" if str(session.get("patient_subject") or "self") == "self" else "пациенту")
 
 
@@ -3564,6 +3673,11 @@ def _patient_genitive(session: dict[str, Any]) -> str:
     return {
         "муж": "мужа", "жена": "жены", "мама": "мамы", "папа": "папы",
         "сын": "сына", "дочь": "дочери", "ребенок": "ребенка", "пациент": "пациента",
+        "бабушка": "бабушки", "дедушка": "дедушки", "брат": "брата", "сестра": "сестры",
+        "тётя": "тёти", "дядя": "дяди", "внук": "внука", "внучка": "внучки",
+        "родственник": "родственника", "свекровь": "свекрови", "свёкор": "свёкра",
+        "тёща": "тёщи", "тесть": "тестя", "зять": "зятя", "невестка": "невестки",
+        "друг": "друга", "подруга": "подруги", "знакомый": "знакомого",
     }.get(relation, "Вас" if str(session.get("patient_subject") or "self") == "self" else "пациента")
 
 
@@ -5866,6 +5980,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session.setdefault("old_lead_reason", "")
     session["chat_id"] = chat_id
     session["answer_source"] = ""
+    # Фактическая часть ответа answer_faq_and_continue — только на текущий ход,
+    # чтобы _repair_forbidden_required_question не потерял её при починке шага.
+    session["faq_fact_reply"] = ""
     session["skip_openai"] = False
     session["skip_humanize"] = False
     session["skip_fallback_question"] = False
@@ -5980,10 +6097,47 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["ai_started_at"] = datetime.now(timezone.utc).isoformat()
         return _finalize(chat_id, session, _first_touch_answer(session, text))
     early_step = str(session.get("step") or "start")
-    if _has_any(text, ADDRESS_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text)) and not (early_step in {"time", "select_slot"} and _select_slot(text, session.get("last_slots") or [])):
+    # Вопрос про адрес: активация лида — это гейт (без ai_lead_started брейн вообще
+    # не допускается к сообщению, _openai_brain_skip_reason → not_ai_lead), поэтому
+    # она остаётся ДО GPT. Сам заготовленный ответ про адрес перенесён ПОСЛЕ брейна
+    # (Фаза 2) и срабатывает только как fallback.
+    early_address_question = bool(
+        _has_any(text, ADDRESS_WORDS)
+        and not (_parse_date(text) or _contains_date_time_preference(text))
+        and not (early_step in {"time", "select_slot"} and _select_slot(text, session.get("last_slots") or []))
+    )
+    if early_address_question:
         session.setdefault("gate_reason", "new_lead_like_message")
         session["ai_lead_started"] = True
-        return _finalize(chat_id, session, _address_answer_then_optional_resume(session))
+    # age_contraindication_guard: возраст входит в тот же список противопоказаний
+    # ("возраст до 16 или более 75 лет"), но на шаге contraindications не проверялся
+    # вовсе. Прод 17.08.2026 (chat_id 77478875259): пациент написал "81 лет", возраст
+    # не сохранился и запись не остановилась, хотя на шаге age то же самое сообщение
+    # корректно уводит диалог в over_75.
+    #
+    # Проверяется ТОЛЬКО over_75. under_16 здесь намеренно не применяется: на этом шаге
+    # пациенты описывают анамнез длительностями ("инсульт был 5 лет назад", "болею
+    # 3 года"), и _extract_age достаёт из них 5 и 3 — под правило "младше 16" такие
+    # сообщения попадали бы ошибочно, а это жёсткий отказ в приёме. Возраст младше 16
+    # надёжно отлавливается на шаге age, где число однозначно означает возраст.
+    if session.get("step") == "contraindications" or session.get("last_required_step") == "contraindications":
+        contra_age = _extract_age(text, "contraindications")
+        # "N лет назад" — давность события, а не возраст пациента.
+        if contra_age is not None and contra_age > 75 and "назад" not in _low(text):
+            session["age"] = contra_age
+            session["contraindications_raw"] = text
+            session["contraindications_ok"] = False
+            session["contraindications_verdict"] = "admin_contact"
+            session["step"] = "escalated"
+            session["escalated"] = True
+            _safe_log(chat_id, "age_contraindication_hard_stop", {
+                "chat_id": chat_id,
+                "step": "contraindications",
+                "age": contra_age,
+                "reason": "over_75",
+                "text_preview": text[:180],
+            })
+            return _finalize(chat_id, session, _stop_booking_text(session, "over_75"))
     if (session.get("step") == "contraindications" or session.get("last_required_step") == "contraindications") and _contra_details_question(text):
         session["step"] = "contraindications"
         session["questionnaire_step"] = "contra"
@@ -6071,14 +6225,6 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session["combined_recent_user_text"] = combined_recent_user_text
     _apply_patient_relation(session, combined_recent_user_text or text)
 
-    combined_answer = None
-    if str(session.get("step") or "") in {"complaint", "start", "age"} and (
-        _detect_patient_relation(combined_recent_user_text or text)[0] or len([i for i in recent_history if str(i.get("role") or "").lower() == "user"]) >= 2
-    ):
-        combined_answer = _combined_profile_booking_answer(session, combined_recent_user_text or text)
-    if combined_answer:
-        return _finalize(chat_id, session, combined_answer)
-
     # human_takeover_guard: если живой админ уже вмешался, AI молчит и не продолжает старый сценарий.
     if _is_ai_muted(session):
         session["ai_muted"] = True
@@ -6095,7 +6241,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # thanks_after_info_guard:
     # Если пациент поблагодарил после адреса/цены/графика, не начинаем анкету заново.
     # В WhatsApp это должно выглядеть как молчание живого админа, а не как новый сценарий.
-    if _is_thanks_or_ok(text) and _last_answer_was_info(session):
+    # Исключение — шаг contraindications: там бот только что задал вопрос, а не выдал
+    # справку, и _last_answer_was_info ложно срабатывает на слове "приём" внутри
+    # locked-шаблона противопоказаний ("приём не проводится"). Молчать в ответ на
+    # собственный вопрос нельзя — переспрашиваем.
+    if _is_thanks_or_ok(text) and _last_answer_was_info(session) and str(session.get("step") or "") != "contraindications":
         return _no_reply(chat_id, session, "thanks/info")
 
     # no_duplicate_after_booking_guard:
@@ -6159,8 +6309,6 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session["step"] = "name"
             step = "name"
             return _finalize(chat_id, session, _address_answer(session) + " " + _ask_name(session))
-    if _has_any(text, ADDRESS_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text)):
-        return _finalize(chat_id, session, _address_answer_then_optional_resume(session))
     if step in {"date", "preferred_time", "time", "select_slot", "name"} and _medical_risk_question(text):
         return _finalize(chat_id, session, _medical_risk_answer_then_resume(session, step))
     if step in {"time", "select_slot"}:
@@ -6203,34 +6351,6 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         answer = await _book(chat_id, session, phone)
         return _finalize(chat_id, session, answer)
 
-    if step in ("start", "complaint") and session.get("last_bot_question_type") == "city" and text:
-        session["city"] = text
-        if "астан" not in _low(text):
-            session["last_bot_question_type"] = "astana_visit"
-            return _finalize(
-                chat_id,
-                session,
-                _tr(
-                    session,
-                    "Поняла Вас 🌿 Вы планируете приехать в Астану на консультацию?",
-                    "Түсіндім 🌿 Консультацияға Астанаға келуді жоспарлап отырсыз ба?",
-                ),
-            )
-
-    if step == "complaint" and _is_greeting_only(text) and not session.get("complaint"):
-        return _finalize(
-            chat_id,
-            session,
-            _tr(
-                session,
-                "Доброе утро 🌿 Подскажите, пожалуйста, что Вас беспокоит?",
-                "Қайырлы таң 🌿 Нақты не мазалайды?",
-            ),
-        )
-
-    if step in ("date", "preferred_time", "time", "select_slot") and _has_any(text, DOCTOR_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text)):
-        return _finalize(chat_id, session, _doctor_answer(session, chat_id))
-
     if step == "contraindications" and not _is_no_contra_answer(text) and not _contra_is_clear_no(text) and not _contra_has_hard_stop(text) and not _contra_term_answer(text, session) and not _faq_answer(text, session):
         if _has_complaint(text) or _has_medical_complaint_text(text):
             session["contraindications_raw"] = text
@@ -6258,6 +6378,55 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["openai_used"] = True
         session["openai_skip_reason"] = ""
         return brain_answer
+
+    # ---- Ветки, перенесённые ПОСЛЕ брейна (Фаза 2) --------------------------
+    # Интерпретация смысла сообщения — работа GPT, а не keyword-заготовок.
+    # Эти ветки раньше стояли ДО брейна и завершали обработку раньше, чем текст
+    # доходил до модели. Теперь они срабатывают только как fallback: когда брейн
+    # недоступен, пропущен по гейтам или вернул action=fallback_rule_based.
+    # Порядок между собой и относительно остальной rule-based цепочки сохранён.
+    post_brain_step = str(session.get("step") or "start")
+
+    combined_answer = None
+    if post_brain_step in {"complaint", "start", "age"} and (
+        _detect_patient_relation(combined_recent_user_text or text)[0] or len([i for i in recent_history if str(i.get("role") or "").lower() == "user"]) >= 2
+    ):
+        combined_answer = _combined_profile_booking_answer(session, combined_recent_user_text or text)
+    if combined_answer:
+        return _finalize(chat_id, session, combined_answer)
+
+    if early_address_question or (
+        _has_any(text, ADDRESS_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text))
+    ):
+        return _finalize(chat_id, session, _address_answer_then_optional_resume(session))
+
+    if post_brain_step in ("start", "complaint") and session.get("last_bot_question_type") == "city" and text:
+        session["city"] = text
+        if "астан" not in _low(text):
+            session["last_bot_question_type"] = "astana_visit"
+            return _finalize(
+                chat_id,
+                session,
+                _tr(
+                    session,
+                    "Поняла Вас 🌿 Вы планируете приехать в Астану на консультацию?",
+                    "Түсіндім 🌿 Консультацияға Астанаға келуді жоспарлап отырсыз ба?",
+                ),
+            )
+
+    if post_brain_step in ("date", "preferred_time", "time", "select_slot") and _has_any(text, DOCTOR_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text)):
+        return _finalize(chat_id, session, _doctor_answer(session, chat_id))
+
+    if post_brain_step == "complaint" and _is_greeting_only(text) and not session.get("complaint"):
+        return _finalize(
+            chat_id,
+            session,
+            _tr(
+                session,
+                "Доброе утро 🌿 Подскажите, пожалуйста, что Вас беспокоит?",
+                "Қайырлы таң 🌿 Нақты не мазалайды?",
+            ),
+        )
 
     fallback_answer = await _try_python_multi_entity_fallback(chat_id, session, text)
     if fallback_answer is not None:

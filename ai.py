@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,7 @@ try:
     import state
 except Exception:
     state = None
+import ai_budget
 from services import classify_by_keywords
 
 
@@ -204,6 +206,11 @@ async def generate_complaint_ack(text: str, lang: str = "ru", chat_id: str = "")
         if state is not None:
             state.log_event(chat_id or "system", "openai_skipped", {"chat_id": chat_id, "reason": "disabled_or_missing_api_key"})
         return _fallback_ack(text, lang)
+    allowed, block_reason = ai_budget.check_allowed(ai_budget.PURPOSE_COMPLAINT_ACK)
+    if not allowed:
+        if state is not None:
+            state.log_event(chat_id or "system", "openai_skipped", {"chat_id": chat_id, "reason": block_reason})
+        return _fallback_ack(text, lang)
     try:
         if state is not None:
             state.log_event(chat_id or "system", "openai_called", {"chat_id": chat_id, "model": settings.openai_model, "purpose": "complaint_ack"})
@@ -218,6 +225,7 @@ async def generate_complaint_ack(text: str, lang: str = "ru", chat_id: str = "")
                 {"role": "user", "content": text or "жалоба пациента"},
             ],
         )
+        ai_budget.record_usage(response, model=settings.openai_model, purpose=ai_budget.PURPOSE_COMPLAINT_ACK)
         content = _clean_model_text(response.choices[0].message.content or "")
         return content or _fallback_ack(text, lang)
     except Exception:
@@ -306,6 +314,23 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 - придумывать цену курса;
 - придумывать противопоказания;
 - менять “нет” на “да”.
+
+Важное правило: запись бывает не для того, кто пишет.
+Пациент часто обращается за другого человека: "хочу узнать за родственника",
+"записать маму", "у бабушки болит спина", "спрашиваю за брата", "сестре нужна
+консультация", "для отца". Это НЕ значит, что болит у самого пишущего.
+
+Если запись для другого человека:
+- заполни patient_relation тем, кем этот человек приходится пишущему
+  (мама, папа, муж, жена, сын, дочь, ребенок, бабушка, дедушка, брат, сестра,
+  тётя, дядя, внук, внучка, свекровь, тёща, родственник и т.п.);
+- жалоба, возраст и противопоказания относятся к ПАЦИЕНТУ, то есть к этому
+  человеку, а не к тому, кто пишет;
+- спрашивай про него: "сколько лет маме?", а не "сколько Вам лет?";
+- имя для записи — тоже имя пациента, а не пишущего.
+Если запись для себя — оставь patient_relation пустым.
+Возрастные правила клиники (до 16 и более 75 лет) считаются по возрасту
+пациента, а не по возрасту того, кто написал.
 
 Важное правило:
 Отличай вопрос о термине от подтверждения противопоказания.
@@ -401,6 +426,7 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
     "time_preference": "",
     "slot_choice": null,
     "patient_name": "",
+    "patient_relation": "",
     "faq_type": "",
     "language": "ru"
   },
@@ -431,6 +457,7 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
     "time_preference": "",
     "slot_choice": null,
     "patient_name": "",
+    "patient_relation": "",
     "wants_human": false,
     "faq_type": "",
     "language": "ru"
@@ -463,6 +490,32 @@ PROJECT OVERRIDES — Python enforces these above any older prompt text:
 - booked/manual/refund/voice/escalated/old-chat states must not call OpenAI.
 """
     return rendered + overrides + "\n\n" + OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
+
+
+def _requires_max_completion_tokens(model: str) -> bool:
+    """gpt-5.x отвергает max_tokens и требует max_completion_tokens.
+
+    Точный ответ API при передаче max_tokens в gpt-5.4-mini:
+      "Unsupported parameter: 'max_tokens' is not supported with this model.
+       Use 'max_completion_tokens' instead."
+    Без этой развилки брейн падал бы в openai_error и уходил в rule-based
+    fallback на КАЖДОМ вызове. Проверено 17.08.2026.
+
+    temperature gpt-5.4-mini поддерживает (проверено там же), поэтому
+    ai_brain_temperature не трогаем.
+    """
+    return str(model or "").strip().lower().startswith("gpt-5")
+
+
+def _brain_token_limit_kwargs(model: str) -> dict[str, int]:
+    """Потолок ответа брейна с учётом имени параметра для конкретной модели."""
+    settings = get_settings()
+    if _requires_max_completion_tokens(model):
+        # В max_completion_tokens входят токены рассуждения, поэтому лимит выше:
+        # иначе reasoning съедает бюджет и JSON приходит обрезанным.
+        limit = int(getattr(settings, "ai_brain_max_completion_tokens", 2000) or 2000)
+        return {"max_completion_tokens": limit}
+    return {"max_tokens": 700}
 
 
 def _dialog_brain_fallback(reason: str) -> tuple[dict, dict]:
@@ -542,6 +595,7 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
                 "time_preference": entities.get("time_preference") or "",
                 "slot_choice": entities.get("slot_choice"),
                 "patient_name": entities.get("patient_name") or "",
+                "patient_relation": entities.get("patient_relation") or "",
                 "wants_human": normalized_intent == "ask_human",
                 "faq_type": entities.get("faq_type") or "",
                 "language": entities.get("language") or "ru",
@@ -566,6 +620,7 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
         "complaint", "age", "contraindications_clear", "contraindication_confirmed",
         "contraindication_term_asked", "contraindication_red_flags", "preferred_date_text",
         "time_preference", "slot_choice", "patient_name", "wants_human", "faq_type", "language", "symptom_duration",
+        "patient_relation",
     }
     allowed_safety = {"hard_stop", "reason", "unsafe_medical_claim", "tries_to_book_without_rules"}
     if any(k not in allowed_extracted for k in extracted.keys()):
@@ -612,6 +667,7 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
             "time_preference": str(extracted.get("time_preference") or ""),
             "slot_choice": extracted.get("slot_choice"),
             "patient_name": str(extracted.get("patient_name") or ""),
+            "patient_relation": str(extracted.get("patient_relation") or ""),
             "wants_human": bool(extracted.get("wants_human")),
             "faq_type": str(extracted.get("faq_type") or ""),
             "language": str(extracted.get("language") or "ru"),
@@ -737,6 +793,12 @@ async def run_openai_dialog_brain(
         debug["openai_disabled_flags"] = detail["disabled_flags"]
         _log_openai_config_missing_detail(detail)
         return decision, debug
+    allowed, block_reason = ai_budget.check_allowed(ai_budget.PURPOSE_BRAIN)
+    if not allowed:
+        decision, fb = _dialog_brain_fallback(block_reason)
+        debug.update(fb)
+        debug["openai_brain_skip_reason"] = block_reason
+        return decision, debug
     try:
         dialog_context = build_dialog_context(
             user_text=user_text or "",
@@ -749,17 +811,32 @@ async def run_openai_dialog_brain(
         if state is not None:
             state.log_event(str(session.get("chat_id") or "system"), "openai_brain_called", {"chat_id": str(session.get("chat_id") or "system"), "model": model, "openai_brain_model": model, "openai_brain_temperature": temperature, "step": summary["step"], "action": "", "needs_python_tool": "", "guard_failed": False, "guard_reason": "", "extracted_preview": {}})
         client = _openai_client(settings.openai_api_key)
+        started_at = time.monotonic()
         response = await client.chat.completions.create(
             model=model,
             temperature=temperature,
-            max_tokens=700,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": _full_dialog_brain_system_prompt()},
                 {"role": "user", "content": json.dumps({"dialog_context": dialog_context}, ensure_ascii=False)},
             ],
+            **_brain_token_limit_kwargs(model),
         )
+        latency_ms = int((time.monotonic() - started_at) * 1000)
+        debug["openai_brain_latency_ms"] = latency_ms
+        ai_budget.record_usage(response, model=model, purpose=ai_budget.PURPOSE_BRAIN)
         content = response.choices[0].message.content or ""
+        # Обрезанный ответ reasoning-модели виден по finish_reason=length: JSON тогда
+        # не парсится, и без явного лога причина выглядела бы как "модель глупая".
+        finish_reason = str(getattr(response.choices[0], "finish_reason", "") or "")
+        if finish_reason == "length" and state is not None:
+            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_truncated_warning", {
+                "level": "warning",
+                "model": model,
+                "finish_reason": finish_reason,
+                "token_limit": _brain_token_limit_kwargs(model),
+                "note": "ответ брейна обрезан по лимиту токенов — поднимите AI_BRAIN_MAX_COMPLETION_TOKENS",
+            })
         try:
             raw = json.loads(content)
         except Exception:
@@ -773,7 +850,7 @@ async def run_openai_dialog_brain(
             return decision, debug
         debug.update({"openai_brain_used": True, "openai_brain_intent": decision["intent"], "openai_brain_action": decision["action"], "openai_brain_needs_python_tool": decision["needs_python_tool"], "openai_brain_extracted": decision["extracted"], "openai_brain_model": model, "openai_brain_temperature": temperature})
         if state is not None:
-            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_decision", {"chat_id": str(session.get("chat_id") or "system"), "step": summary["step"], "action": decision["action"], "needs_python_tool": decision["needs_python_tool"], "guard_failed": False, "guard_reason": "", "extracted_preview": {k: v for k, v in decision["extracted"].items() if v not in (None, "", [], {})}})
+            state.log_event(str(session.get("chat_id") or "system"), "openai_brain_decision", {"chat_id": str(session.get("chat_id") or "system"), "step": summary["step"], "action": decision["action"], "needs_python_tool": decision["needs_python_tool"], "guard_failed": False, "guard_reason": "", "latency_ms": latency_ms, "model": model, "extracted_preview": {k: v for k, v in decision["extracted"].items() if v not in (None, "", [], {})}})
         return decision, debug
     except Exception as exc:
         decision, fb = _dialog_brain_fallback("openai_error")
@@ -847,6 +924,11 @@ async def generate_human_message(draft: str, user_text: str = "", lang: str = "r
             state.log_event(chat_id or "system", "openai_skipped", {"chat_id": chat_id, "reason": "deterministic_reply"})
         return _fallback_humanize(draft)
 
+    allowed, block_reason = ai_budget.check_allowed(ai_budget.PURPOSE_HUMAN_MESSAGE)
+    if not allowed:
+        if state is not None:
+            state.log_event(chat_id or "system", "openai_skipped", {"chat_id": chat_id, "reason": block_reason})
+        return _fallback_humanize(draft)
     try:
         if state is not None:
             state.log_event(chat_id or "system", "openai_called", {"chat_id": chat_id, "model": settings.openai_model, "purpose": "humanize_reply"})
@@ -860,6 +942,7 @@ async def generate_human_message(draft: str, user_text: str = "", lang: str = "r
                 {"role": "system", "content": HUMANIZE_REPLY_PROMPT.format(lang=language_name, step=step or "", user_text=user_text or "", draft=draft)},
             ],
         )
+        ai_budget.record_usage(response, model=settings.openai_model, purpose=ai_budget.PURPOSE_HUMAN_MESSAGE)
         content = (response.choices[0].message.content or "").strip().strip('"')
         if not content:
             return _fallback_humanize(draft)
@@ -993,6 +1076,11 @@ async def humanize_reply_with_openai(
         _log_openai_config_missing_detail(detail)
         return base_answer, debug
 
+    allowed, block_reason = ai_budget.check_allowed(ai_budget.PURPOSE_HUMANIZE)
+    if not allowed:
+        debug["openai_skip_reason"] = block_reason
+        return base_answer, debug
+
     step = str(session.get("step") or session.get("current_step") or "start")
     chat_id = str(session.get("chat_id") or session.get("phone") or "")
     summary = {
@@ -1022,6 +1110,7 @@ async def humanize_reply_with_openai(
                 )},
             ],
         )
+        ai_budget.record_usage(response, model=model, purpose=ai_budget.PURPOSE_HUMANIZE)
         humanized = (response.choices[0].message.content or "").strip().strip('"')
         debug["openai_used"] = True
         if not _humanize_guard_ok(base_answer, humanized):

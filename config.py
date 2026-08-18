@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     openai_dialog_temperature: float = Field(default=0.2, validation_alias=AliasChoices("OPENAI_DIALOG_TEMPERATURE", "openai_dialog_temperature"))
     openai_humanize_temperature: float = Field(default=0.3, validation_alias=AliasChoices("OPENAI_HUMANIZE_TEMPERATURE", "openai_humanize_temperature"))
     openai_max_tokens: int = Field(default=700, validation_alias=AliasChoices("OPENAI_MAX_TOKENS", "openai_max_tokens"))
+    # Потолок ответа брейна для gpt-5.x: в max_completion_tokens входят и токены
+    # рассуждения, поэтому 700 может уйти на reasoning и обрезать JSON.
+    ai_brain_max_completion_tokens: int = Field(default=2000, validation_alias=AliasChoices("AI_BRAIN_MAX_COMPLETION_TOKENS", "ai_brain_max_completion_tokens"))
 
     # Wazzup
     wazzup_api_key: str = Field(default="", validation_alias=AliasChoices("WAZZUP_API_KEY", "wazzup_api_key"))
@@ -66,6 +69,9 @@ class Settings(BaseSettings):
 
     # AI budget / style
     monthly_ai_budget_kzt: int = Field(default=20000, validation_alias=AliasChoices("MONTHLY_AI_BUDGET_KZT", "monthly_ai_budget_kzt"))
+    # Реальный лимит трат в USD. По умолчанию 17.5 = $70 на 4 месяца работы.
+    # Enforcement живёт в ai_budget.py: 80% — warning в логи, 100% — rule-based fallback.
+    monthly_ai_budget_usd: float = Field(default=17.5, validation_alias=AliasChoices("MONTHLY_AI_BUDGET_USD", "monthly_ai_budget_usd"))
     ai_max_classifier_calls_per_day: int = Field(default=300, validation_alias=AliasChoices("AI_MAX_CLASSIFIER_CALLS_PER_DAY", "ai_max_classifier_calls_per_day"))
     operator_style_mode: bool = Field(default=True, validation_alias=AliasChoices("OPERATOR_STYLE_MODE", "operator_style_mode"))
     human_dialog_mode: bool = Field(default=True, validation_alias=AliasChoices("HUMAN_DIALOG_MODE", "human_dialog_mode"))
