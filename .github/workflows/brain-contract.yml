@@ -53,6 +53,9 @@ jobs:
       - name: Slot provenance contract
         run: pytest -q tests/test_polyglot_slot_contract.py
 
+      - name: Booking race recovery contract
+        run: pytest -q tests/test_booking_race_recovery_contract.py
+
       - name: Safe post-booking reschedule contract
         run: pytest -q tests/test_post_booking_reschedule_contract.py
 
