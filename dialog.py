@@ -846,6 +846,39 @@ def _repair_after_contraindications_ok(session: dict[str, Any]) -> tuple[str, st
     return str(session.get("step") or "date"), answer
 
 
+def _apply_brain_language_hint(session: dict[str, Any], extracted: dict[str, Any], user_text: str) -> None:
+    """Языковая подсказка брейна — только подсказка, решает Python.
+
+    Мнение модели о языке до сих пор парсилось и выбрасывалось. Теперь оно
+    сохраняется для логов и применяется в одном-единственном случае: когда
+    Python в сообщении языкового сигнала не нашёл вообще (detected =
+    unknown), язык не зафиксирован явной просьбой пациента, а модель
+    уверена. Во всех остальных случаях побеждает решение Python.
+    """
+    hint = str(extracted.get("preferred_response_language") or "")
+    session["brain_detected_language"] = str(extracted.get("detected_language") or "")
+    session["brain_preferred_response_language"] = hint
+    session["brain_language_confidence"] = extracted.get("language_confidence") or 0.0
+    session["brain_language_hint_applied"] = False
+
+    if hint not in ("ru", "kk") or session.get("language_locked"):
+        return
+    if float(extracted.get("language_confidence") or 0.0) < 0.7:
+        return
+    if analyze_message_language is None:
+        return
+    try:
+        analysis = analyze_message_language(user_text, session.get("language"))
+    except Exception:
+        return
+    if analysis.detected_language != "unknown":
+        return
+    if hint == (session.get("language") or "ru"):
+        return
+    session["language"] = hint
+    session["brain_language_hint_applied"] = True
+
+
 def _apply_brain_contraindications_clear(
     session: dict[str, Any],
     user_text: str,
@@ -1184,6 +1217,7 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         return None
     action = decision.get("action")
     extracted = decision.get("extracted") or {}
+    _apply_brain_language_hint(session, extracted, text)
     if extracted.get("symptom_duration"):
         session["symptom_duration"] = str(extracted.get("symptom_duration") or "")
         facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
