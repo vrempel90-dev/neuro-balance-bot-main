@@ -409,6 +409,37 @@ def is_processed_message(message_key: str) -> bool:
     return bool(row)
 
 
+def claim_message(message_key: str, chat_id: str) -> bool:
+    """Атомарно занимает message_key. True — заняли мы, False — уже занят.
+
+    is_processed_message + mark_processed_message разделены всем пайплайном
+    (CRM, OpenAI, отправка), поэтому два одновременных вебхука с одним и тем
+    же ключом успевали пройти проверку оба: пациент получал два ответа, а
+    запись могла уйти в CRM дважды. INSERT OR IGNORE + rowcount закрывает
+    это окно на уровне БД.
+    """
+    if not message_key:
+        return True
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO processed_messages(message_key, chat_id, created_at) VALUES (?, ?, ?)",
+            (message_key, chat_id, now_iso()),
+        )
+        return cur.rowcount == 1
+
+
+def release_message(message_key: str) -> None:
+    """Снимает захват, если обработка упала до отправки ответа.
+
+    Без этого повторная доставка того же вебхука после сбоя молча
+    игнорировалась бы, и пациент остался бы без ответа.
+    """
+    if not message_key:
+        return
+    with _connect() as conn:
+        conn.execute("DELETE FROM processed_messages WHERE message_key=?", (message_key,))
+
+
 def mark_processed_message(message_key: str, chat_id: str) -> None:
     if not message_key:
         return

@@ -960,6 +960,17 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
         _mark_no_reply(chat_id, hard_reason, message, duplicate=is_dup, old=is_old)
         return ""
 
+    # duplicate_webhook_race_guard:
+    # Проверка выше ловит только повтор, пришедший после того, как первый
+    # вебхук уже дошёл до конца. Два одновременных вебхука с одним ключом
+    # проходили её оба — между проверкой и пометкой лежит весь пайплайн с
+    # await'ами (CRM, OpenAI, отправка). Захватываем ключ атомарно, чтобы
+    # пациент не получил два ответа, а CRM — две записи.
+    inbound_message_key = str(message.get("message_key") or message.get("message_id") or "")
+    if inbound_message_key and not state.claim_message(inbound_message_key, chat_id):
+        _mark_no_reply(chat_id, "duplicate_message_already_processed", message, duplicate=True, old=False)
+        return ""
+
     source = str(message.get("source") or "wazzup")
     if not bool(getattr(get_settings(), "bot_auto_reply_enabled", True)):
         _mark_bot_auto_reply_disabled(chat_id=chat_id, phone=phone, source=source, force=False, kind=kind, text=str(message.get("text") or ""))
@@ -1110,6 +1121,12 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
 
     except Exception as exc:
         state.log_event(chat_id, "background_processing_error", {"error": str(exc)[:1000]})
+        # Захват ключа снимаем: обработка не дошла до ответа, и повторная
+        # доставка того же вебхука должна получить второй шанс.
+        try:
+            state.release_message(str(message.get("message_key") or message.get("message_id") or ""))
+        except Exception:
+            pass
         try:
             if kind == "voice" or _message_has_voice_url(message):
                 fallback_text = _voice_fallback_answer()
