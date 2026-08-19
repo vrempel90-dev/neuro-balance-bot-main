@@ -59,7 +59,8 @@ def ready_session(*, language: str = "ru") -> dict[str, Any]:
         "selected_slot": dict(selected),
         "last_slots": [dict(selected)],
     }
-    bot_tools.check_complaint(session, "болит спина", is_in_profile=True)
+    bot_tools.record_chief_complaint(session, "болит спина", is_in_profile=True)
+    bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, "нет")
     return session
 
 
