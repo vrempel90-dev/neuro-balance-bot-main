@@ -59,6 +59,12 @@ jobs:
       - name: Booking race recovery contract
         run: pytest -q tests/test_booking_race_recovery_contract.py
 
+      - name: Explicit CRM 409 booking truth contract
+        run: pytest -q tests/test_booking_failure_truth_contract.py
+
+      - name: Mid-booking change-of-mind contract
+        run: pytest -q tests/test_polyglot_change_of_mind_contract.py
+
       - name: Safe post-booking reschedule contract
         run: pytest -q tests/test_post_booking_reschedule_contract.py
 
