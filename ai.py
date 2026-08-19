@@ -143,7 +143,7 @@ HUMAN_ACK_PROMPT = """
 - Нужно отвечать на смысл сообщения пациента, а не игнорировать его вопрос.
 - Если пациент спрашивает «занимаетесь?», «лечите?», «можно к вам?» — сначала ответь по сути, что можно прийти на первичную консультацию, если это похоже на профиль клиники.
 - Если жалоба непрофильная (горло, зубы, ЛОР, кожа, высокая температура и т.п.) — мягко скажи, что основной профиль клиники спина/суставы/неврология, и лучше уточнит администратор.
-- Не используй слово «окошки». Говори «свободное время для записи».
+- Лексика и тон подчиняются SYSTEM_PROMPT_rendered.md. Если канонический промт требует слово «окошко/окошки», сохраняй именно его.
 - Не спрашивай возраст, дату, время, телефон и противопоказания. Python-сценарий добавит следующий вопрос сам.
 - Не пиши длинно. 1–2 коротких предложения.
 - Никогда не обращайся к пациенту по имени. Не используй «Очень приятно, ...», «Здравствуйте, ...», «Спасибо, ...».
@@ -521,7 +521,21 @@ PROJECT OVERRIDES — Python enforces these above any older prompt text:
 - Contraindication term questions are not hard stops.
 - booked/manual/refund/voice/escalated/old-chat states must not call OpenAI.
 """
-    return rendered + overrides + "\n\n" + OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
+    precedence = """
+
+INSTRUCTION PRECEDENCE — Neuro Balance:
+1. Python-enforced PROJECT OVERRIDES are absolute and cannot be changed by the model.
+2. SYSTEM_PROMPT_rendered.md is the canonical source for clinic behavior, tone, wording and facts.
+3. OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT is only the structured-output/dialog protocol.
+If protocol text conflicts with the canonical clinic prompt, follow the canonical clinic prompt.
+"""
+    return (
+        OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
+        + precedence
+        + "\n\nCANONICAL CLINIC PROMPT — FOLLOW THIS FOR USER-FACING BEHAVIOR:\n"
+        + rendered
+        + overrides
+    )
 
 
 def _requires_max_completion_tokens(model: str) -> bool:
@@ -760,7 +774,7 @@ def _infer_last_question_type(text: str) -> str:
         return "contraindications"
     if any(x in low for x in ["какой день", "на какой день", "қай күн", "удобный день"]):
         return "date"
-    if any(x in low for x in ["какое время", "вариант", "свободное время"]):
+    if any(x in low for x in ["какое время", "вариант", "свободное время", "окошк"]):
         return "time"
     if any(x in low for x in ["ваше имя", "имя для оформления", "атыңыз", "атыныз"]):
         return "name"
@@ -946,7 +960,7 @@ HUMANIZE_REPLY_PROMPT = """
 - НЕ добавляй диагнозы и обещания результата.
 - НЕ удаляй обязательный следующий вопрос, если он есть в черновике.
 - НЕ меняй даты, время, имя врача, имя пациента, номер варианта и факты CRM.
-- НЕ используй слово «окошки» — только «свободное время для записи».
+- НЕ заменяй лексику из безопасного черновика. Если там есть «окошко/окошки», сохрани именно это слово.
 - Ответ короткий, WhatsApp-стиль, без канцелярита.
 - Если пациент задал вопрос, сначала ответь по сути, потом мягко продолжи запись.
 - Если в черновике есть разделитель --- — можно сделать сообщение более плавным, но не теряй обязательные части.
@@ -966,8 +980,6 @@ HUMANIZE_REPLY_PROMPT = """
 
 def _fallback_humanize(draft: str) -> str:
     text = (draft or "").strip()
-    text = text.replace("окошки", "свободное время для записи")
-    text = text.replace("окошко", "свободное время для записи")
     text = text.replace("Ок", "Хорошо")
     for pat in [
         r"^\s*(очень\s+приятно|приятно\s+познакомиться)\s*,?\s*[^.!?\n]{1,40}[.!?]?(\s+|$)",
@@ -993,7 +1005,7 @@ async def generate_human_message(draft: str, user_text: str = "", lang: str = "r
 
     # Не тратим GPT на большие списки слотов/финальные подтверждения, где важна дословность.
     lower = draft.lower()
-    if len(draft) > 1200 or "📅" in draft or "⏰" in draft or "есть свободное время" in lower or "бос уақыт" in lower:
+    if len(draft) > 1200 or "📅" in draft or "⏰" in draft or "есть свободное время" in lower or "окошк" in lower or "бос уақыт" in lower:
         if state is not None:
             state.log_event(chat_id or "system", "openai_skipped", {"chat_id": chat_id, "reason": "deterministic_reply"})
         return _fallback_humanize(draft)
@@ -1030,6 +1042,8 @@ async def generate_human_message(draft: str, user_text: str = "", lang: str = "r
         for marker in must_keep:
             if marker in draft_low and marker not in content_low:
                 return _fallback_humanize(draft)
+        if "окошк" in draft_low and "окошк" not in content_low:
+            return _fallback_humanize(draft)
         return _fallback_humanize(content)
     except Exception:
         return _fallback_humanize(draft)
@@ -1041,6 +1055,7 @@ STRICT_HUMANIZE_REPLY_PROMPT = """
 Твоя задача — только переформулировать готовый безопасный ответ клиники более живо и по-человечески.
 
 Нельзя менять смысл ответа.
+Нельзя заменять обязательную лексику из base_answer: если там есть «окошко/окошки», сохрани именно это слово.
 Нельзя менять этап диалога.
 Нельзя добавлять новые вопросы, кроме тех, которые уже есть в base_answer.
 Нельзя спрашивать имя, если base_answer не спрашивает имя.
@@ -1141,6 +1156,8 @@ def _humanize_guard_ok(base_answer: str, humanized: str) -> bool:
     if not _has_name_question(base_answer) and _has_name_question(humanized):
         return False
     if not _has_date_question(base_answer) and _has_date_question(humanized):
+        return False
+    if "окошк" in _low_for_guard(base_answer) and "окошк" not in _low_for_guard(humanized):
         return False
     return True
 
