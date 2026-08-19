@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 import tempfile
@@ -24,6 +23,8 @@ import dialog
 import main
 import state
 from config import get_settings
+
+state.init_db()
 
 
 def run(coro: Any) -> Any:
