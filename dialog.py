@@ -832,6 +832,19 @@ def _cleanup_contraindications_after_ok(session: dict[str, Any]) -> None:
         session["pending_step_after_faq"] = ""
 
 
+def _is_only_contraindications_checklist(answer: str, session: dict[str, Any]) -> bool:
+    """Ответ состоит ровно из чек-листа противопоказаний, без побочного текста.
+
+    Сравниваем по схлопнутым пробелам: предыдущие слои чистки убирают
+    переносы строк, из-за чего дословно равный чек-лист перестаёт совпадать
+    с утверждённым шаблоном.
+    """
+    def _squash(text: str) -> str:
+        return re.sub(r"\s+", " ", str(text or "")).strip()
+
+    return _squash(answer) == _squash(_contraindications_locked_message(session))
+
+
 def _answer_contains_contraindications_question(answer: str) -> bool:
     low = _low(answer)
     if not low:
@@ -1551,14 +1564,23 @@ COURSE_DURATION_WORDS = [
     "длительность курса", "курс сколько", "сколько сеансов", "сколько лечение длится",
 ]
 
-INSTALLMENT_WORDS = ["рассрочка", "каспи ред", "kaspi red", "kaspi", "кредит"]
+INSTALLMENT_WORDS = ["рассрочка", "каспи ред", "kaspi red", "kaspi", "кредит",
+                     "болип толеу", "болип толеуге"]
 REFUND_WORDS = ["возврат", "предоплат", "претенз", "жалоба", "отдел забот", "асем"]
 PHONE_CALL_WORDS = ["позвоните", "перезвоните", "можете позвонить", "звонок", "позвонить мне"]
 RETURNING_PATIENT_WORDS = ["был у вас", "была у вас", "были у вас", "лечился у вас", "лечилась у вас", "приходил", "приходила раньше", "повторно"]
 OTHER_CITY_WORDS = ["я из ", "не из астаны", "костанай", "караганда", "кокшетау", "алматы", "павлодар", "семей", "усть-каменогорск", "шымкент"]
-TOO_EXPENSIVE_WORDS = ["дорого", "нет денег", "не по карману", "дороговато"]
-WILL_THINK_WORDS = ["подумаю", "посоветуюсь", "изучу", "если что напишу"]
-HELPS_WORDS = ["поможет", "помогает", "гарантия", "правда лечит", "эффективно"]
+# Возражения и боковые темы — на обоих языках. Без казахских вариантов
+# «қымбат екен» и «ойланайын» проходили мимо обработчика возражений, и
+# пациент получал дословный повтор чек-листа противопоказаний.
+# Казахские формы записаны так, как их видит _low (казахские буквы там уже
+# приведены к русским): қымбат -> кымбат, ақша жоқ -> акша жок и т.д.
+TOO_EXPENSIVE_WORDS = ["дорого", "нет денег", "не по карману", "дороговато",
+                       "кымбат", "кымбат екен", "акша жок", "кымбаттау"]
+WILL_THINK_WORDS = ["подумаю", "посоветуюсь", "изучу", "если что напишу",
+                    "ойланайын", "ойланып корейин", "ойланамын", "кенесейин"]
+HELPS_WORDS = ["поможет", "помогает", "гарантия", "правда лечит", "эффективно",
+               "комектесе ме", "комектеседи ме", "комеги бар ма"]
 IMMOBILITY_WORDS = ["коляска", "костыли", "лежит", "не ходит", "тяжело ходить", "ходунки"]
 
 
@@ -1806,6 +1828,20 @@ def _repair_bad_patient_name(session: dict[str, Any]) -> bool:
 
 def _clean(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _clean_outgoing(text: str) -> str:
+    """Нормализует исходящий текст, сохраняя абзацы.
+
+    _clean схлопывает любые пробельные символы в один пробел, включая
+    переносы строк. Для разбора входящего сообщения это правильно, а для
+    ответа пациенту — нет: адрес, график и чек-лист превращались в
+    сплошную строку. Здесь схлопываем только пробелы и табы, а разбиение
+    на абзацы сохраняем.
+    """
+    out = re.sub(r"[ \t]+", " ", str(text or "").strip())
+    out = re.sub(r"[ \t]*\n[ \t]*", "\n", out)
+    return re.sub(r"\n{3,}", "\n\n", out)
 
 
 def _normalize_typos(text: str) -> str:
@@ -3017,7 +3053,16 @@ def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
 
     sentences = re.split(r"(?<=[.!?])\s+", cleaned.strip())
     if len(sentences) > 2:
-        cleaned = " ".join(sentences[:2]).strip()
+        kept = sentences[:2]
+        # answer-first: последнее предложение почти всегда — возврат к
+        # незавершённому шагу воронки. Обрезка по двум предложениям молча
+        # съедала его, и бот отвечал на вопрос, ничего не спросив дальше:
+        # диалог останавливался. Такая же защита стоит в _limit_length, но
+        # эта обрезка выполняется раньше, поэтому её одной было мало.
+        tail = sentences[-1].strip()
+        if tail.endswith("?") and tail not in kept:
+            kept = kept + [tail]
+        cleaned = " ".join(kept).strip()
 
     return cleaned.strip()
 
@@ -3098,7 +3143,7 @@ def _cleanup_final_wazzup_text(answer: str) -> str:
 
 def _validate_final_fact_answer(chat_id: str, session: dict[str, Any], answer: str) -> str:
     """Python/CRM remains the only source of truth for clinic facts and slots."""
-    text = _clean(answer)
+    text = _clean_outgoing(answer)
     low = _low(text)
     slots = session.get("last_slots") or []
     step = _low(str(session.get("step") or ""))
@@ -3134,7 +3179,7 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     session["chat_id"] = chat_id
     before_step = str(session.get("step") or "start")
     first_touch_in_progress = bool(session.pop("first_touch_answer_in_progress", False))
-    answer = str(answer or "").strip() if first_touch_in_progress else _clean(answer)
+    answer = str(answer or "").strip() if first_touch_in_progress else _clean_outgoing(answer)
     if first_touch_in_progress:
         repaired, repair_reason = False, ""
         session["state_repaired"] = False
@@ -3181,18 +3226,38 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
             _safe_log(chat_id, "contraindications_ok_final_answer_repaired", {"chat_id": chat_id, "step": session.get("step") or "", "answer_preview": answer[:180]})
             session["step"] = "date"
             session["questionnaire_step"] = "date"
-            answer = _ask_date(session)
+            # Противопоказания уже пройдены: повторять чек-лист нельзя, но и
+            # затирать содержательный ответ пациенту незачем — добавляем к
+            # нему следующий шаг воронки.
+            if _answer_contains_contraindications_question(answer) or not str(answer or "").strip():
+                answer = _ask_date(session)
+            else:
+                answer = answer.rstrip() + "\n\n" + _ask_date(session)
     elif str(session.get("step") or "") == "contraindications" and not _contra_details_question(str(session.get("last_user_text") or "")):
-        safe_contra_answer = _ask_contra(session)
-        if _has_any(str(session.get("last_user_text") or ""), ADDRESS_WORDS):
-            address_answer = _address_answer(session)
-            expected = address_answer + "\n\n" + safe_contra_answer
-            if answer != expected:
-                _safe_log(chat_id, "contraindications_address_faq_final_repaired", {"chat_id": chat_id, "answer_preview": answer[:180]})
-            answer = expected
-        elif answer != safe_contra_answer:
-            _safe_log(chat_id, "contraindications_checklist_final_repaired", {"chat_id": chat_id, "answer_preview": answer[:180]})
-            answer = safe_contra_answer
+        # Инвариант шага: пациент обязан получить вопрос про противопоказания.
+        # Раньше он выполнялся ПОДМЕНОЙ — любой ответ на этом шаге заменялся
+        # чек-листом. Из-за этого «дорого», «подумаю» и вопрос про цену
+        # получали дословный повтор чек-листа, а duplicate_answer_guard
+        # превращал следующий такой ответ в молчание: воронка вставала.
+        # Теперь инвариант выполняется ДОБАВЛЕНИЕМ: сначала ответ на вопрос
+        # пациента, затем возврат к незавершённому шагу.
+        if not _answer_contains_contraindications_question(answer):
+            if str(answer or "").strip() and answer.rstrip().endswith("?"):
+                # Ответ уже заканчивается вопросом (например уточнением по
+                # термину из чек-листа). Два вопроса подряд выглядят как
+                # автоответчик — возврат к шагу придёт следующим ходом.
+                _safe_log(chat_id, "contraindications_followup_skipped_question_present", {"chat_id": chat_id, "answer_preview": answer[:180]})
+            elif str(answer or "").strip():
+                _safe_log(chat_id, "contraindications_followup_appended", {"chat_id": chat_id, "answer_preview": answer[:180]})
+                answer = answer.rstrip() + "\n\n" + _contra_followup_question(session)
+            else:
+                _safe_log(chat_id, "contraindications_checklist_final_repaired", {"chat_id": chat_id, "answer_preview": answer[:180]})
+                answer = _ask_contra(session)
+        elif _is_only_contraindications_checklist(answer, session):
+            # Ответ и так является чек-листом, но предыдущие чистки схлопнули
+            # переносы строк. Locked-шаблон обязан уходить пациенту ровно в
+            # утверждённом виде, поэтому восстанавливаем канонический текст.
+            answer = _contraindications_locked_message(session)
     if not answer and str(session.get("step") or "") == "age" and _is_active_new_ai_request(session):
         extracted_age = _extract_age(str(session.get("last_user_text") or ""), step="age")
         if extracted_age:
@@ -4431,7 +4496,27 @@ def _senior_contra_intro(session: dict[str, Any]) -> str:
 def _ask_contra(session: dict[str, Any]) -> str:
     session["answer_source"] = "locked_template:contraindications"
     session["skip_humanize"] = True
+    session["contraindications_question_sent_count"] = int(session.get("contraindications_question_sent_count") or 0) + 1
     return _contraindications_locked_message(session)
+
+
+def _contra_followup_question(session: dict[str, Any]) -> str:
+    """Короткий возврат к шагу противопоказаний после ответа на вопрос пациента.
+
+    Первый раз пациент получает полный чек-лист. Дальше — короткое
+    напоминание: дословно повторять длинный чек-лист после каждой реплики
+    значит выглядеть автоответчиком, а инвариант («вопрос про
+    противопоказания задан») короткая форма выполняет ровно так же.
+    """
+    sent = int(session.get("contraindications_question_sent_count") or 0)
+    session["contraindications_question_sent_count"] = sent + 1
+    if sent == 0:
+        return _contraindications_locked_message(session)
+    return _tr(
+        session,
+        "Подскажите, пожалуйста, противопоказаний из списка выше нет?",
+        "Айтыңызшы, жоғарыдағы тізімдегі қарсы көрсетілімдер жоқ па?",
+    )
 
 
 def _contra_details_question(text: str) -> bool:
@@ -5249,7 +5334,11 @@ def _mandatory_step_prompt(session: dict[str, Any], step: str) -> str:
     if step == "age":
         return _ask_age(session)
     if step == "contraindications":
-        return _ask_contra(session)
+        # Возврат к шагу после ответа на вопрос пациента: полный чек-лист
+        # только в первый раз, дальше — короткое напоминание. Дословно
+        # повторять длинный чек-лист после каждой реплики значит выглядеть
+        # автоответчиком, а инвариант короткая форма выполняет так же.
+        return _contra_followup_question(session)
     if step in ("date", "preferred_time"):
         return _ask_date(session)
     if step in ("time", "select_slot"):
@@ -5290,6 +5379,31 @@ def _faq_answer(text: str, session: dict[str, Any]) -> str | None:
         return _address_answer(session)
     if _has_any(text, SCHEDULE_WORDS):
         return _schedule_answer(session)
+
+    # Возражения и боковые темы в середине воронки.
+    # Раньше они жили только в _clinic_answer, который отдаётся лишь пока не
+    # собрана жалоба. Поэтому «дорого» и «подумаю» на шаге противопоказаний
+    # молча выбрасывались, и пациент получал дословный повтор чек-листа.
+    # Эти темы невозможно перепутать с ответом про возраст, противопоказания,
+    # дату, время или имя, поэтому их безопасно отвечать на любом шаге —
+    # вызывающий код сам добавит возврат к незавершённому шагу.
+    if _has_any(text, TOO_EXPENSIVE_WORDS):
+        session["last_answered_faq_type"] = "objection_price"
+        session["objection_handled"] = True
+        return _clinic_info_template(session, "objection_too_expensive")
+    if _has_any(text, WILL_THINK_WORDS):
+        session["last_answered_faq_type"] = "objection_think"
+        session["objection_handled"] = True
+        return _clinic_info_template(session, "objection_will_think")
+    if _has_any(text, INSTALLMENT_WORDS):
+        session["last_answered_faq_type"] = "installment"
+        return _clinic_info_template(session, "installment")
+    if _has_any(text, OTHER_CITY_WORDS):
+        session["last_answered_faq_type"] = "other_city"
+        return _clinic_info_template(session, "other_city")
+    if _has_any(text, HELPS_WORDS):
+        session["last_answered_faq_type"] = "helps"
+        return _clinic_info_template(session, "helps_question")
     return None
 
 
