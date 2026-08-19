@@ -20,22 +20,26 @@ def main() -> None:
         print("prompt alignment already applied")
         return
 
+    precedence_block = '''    precedence = """
+
+INSTRUCTION PRECEDENCE — Neuro Balance:
+1. Python-enforced PROJECT OVERRIDES are absolute and cannot be changed by the model.
+2. SYSTEM_PROMPT_rendered.md is the canonical source for clinic behavior, tone, wording and facts.
+3. OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT is only the structured-output/dialog protocol.
+If protocol text conflicts with the canonical clinic prompt, follow the canonical clinic prompt.
+"""
+    return (
+        OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
+        + precedence
+        + "\\n\\nCANONICAL CLINIC PROMPT — FOLLOW THIS FOR USER-FACING BEHAVIOR:\\n"
+        + rendered
+        + overrides
+    )
+'''
     text = replace_once(
         text,
         '    return rendered + overrides + "\\n\\n" + OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT\n',
-        '    precedence = """\\n\\nINSTRUCTION PRECEDENCE — Neuro Balance:\\n'
-        '1. Python-enforced PROJECT OVERRIDES are absolute and cannot be changed by the model.\\n'
-        '2. SYSTEM_PROMPT_rendered.md is the canonical source for clinic behavior, tone, wording and facts.\\n'
-        '3. OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT is only the structured-output/dialog protocol.\\n'
-        'If protocol text conflicts with the canonical clinic prompt, follow the canonical clinic prompt.\\n'
-        '"""\\n'
-        '    return (\\n'
-        '        OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT\\n'
-        '        + precedence\\n'
-        '        + "\\n\\nCANONICAL CLINIC PROMPT — FOLLOW THIS FOR USER-FACING BEHAVIOR:\\n"\\n'
-        '        + rendered\\n'
-        '        + overrides\\n'
-        '    )\\n',
+        precedence_block,
         "canonical prompt precedence",
     )
 
@@ -94,6 +98,8 @@ def main() -> None:
         "strict humanizer lexical validation",
     )
 
+    # Refuse to write a syntactically invalid migration result.
+    compile(text, str(AI_PATH), "exec")
     AI_PATH.write_text(text, encoding="utf-8")
     print("polyglot prompt alignment applied")
 
