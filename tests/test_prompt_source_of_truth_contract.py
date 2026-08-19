@@ -50,11 +50,33 @@ def test_strict_humanizer_guard_rejects_canonical_vocabulary_rewrite() -> None:
 
 
 def test_slot_reply_with_window_word_is_deterministic_for_legacy_humanizer() -> None:
-    # Regression contract: slot facts and canonical vocabulary should never be
-    # sent through a stylistic rewrite that can alter CRM facts or wording.
     source = Path(ai.__file__).read_text(encoding="utf-8")
     assert 'or "окошк" in lower' in source
 
 
 def test_time_question_detector_understands_canonical_window_word() -> None:
     assert ai._infer_last_question_type("Есть окошко на 15:00, Вам удобно?") == "time"
+
+
+def test_dialog_protocol_does_not_duplicate_mutable_clinic_facts() -> None:
+    """Clinic facts belong only to SYSTEM_PROMPT_rendered.md, not the JSON protocol."""
+    protocol = ai.OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
+    forbidden_duplicates = (
+        "Первичный приём — 5 000 тг.",
+        "Кабанбай батыра 28",
+        "МРТ/снимки заранее делать не обязательно",
+        "Суббота/воскресенье — процедурные дни",
+        "Клиника Neuro Balance помогает с:",
+        "Клиника НЕ занимается:",
+    )
+    for marker in forbidden_duplicates:
+        assert marker not in protocol
+    assert "Клинические факты, профиль, цены, адрес, методы и стиль" in protocol
+    assert "CANONICAL CLINIC PROMPT" in protocol
+
+
+def test_full_prompt_still_contains_canonical_clinic_facts() -> None:
+    full = ai._full_dialog_brain_system_prompt()
+    assert "Стоимость первого приёма: 5 000 тг." in full
+    assert "Адрес: Кабанбай батыра 28" in full
+    assert "Снимки/МРТ: в клинике не делают" in full
