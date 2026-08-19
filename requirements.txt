@@ -5,3 +5,4 @@ openai==1.59.7
 python-dotenv==1.0.1
 pydantic-settings==2.7.1
 python-multipart==0.0.12
+PyJWT[crypto]==2.10.1
