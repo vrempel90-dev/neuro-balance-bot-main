@@ -65,6 +65,36 @@ def _slot_in_offered_set(slot: dict[str, Any], offered: list[Any]) -> bool:
     new_membership = 'if last_slots and not _slot_in_offered_set(slot, last_slots):'
     text = replace_exact(text, old_membership, new_membership, "offered-set membership", expected=2)
 
+    # A rejected selection must not leave stale denormalized time behind.
+    old_remember_reject = '''    if last_slots and not _slot_in_offered_set(slot, last_slots):
+        session.pop("selected_slot", None)
+        session["slot_selection_rejected_reason"] = "not_in_session_last_slots"
+        return
+'''
+    new_remember_reject = '''    if last_slots and not _slot_in_offered_set(slot, last_slots):
+        session.pop("selected_slot", None)
+        session["selected_time"] = ""
+        session["slot_selection_rejected_reason"] = "not_in_session_last_slots"
+        return
+'''
+    text = replace_exact(text, old_remember_reject, new_remember_reject, "remember stale slot cleanup")
+
+    old_book_reject = '''    if last_slots and not _slot_in_offered_set(slot, last_slots):
+        session.pop("selected_slot", None)
+        session["step"] = "time" if last_slots else "date"
+        _safe_log(chat_id, "booking_payload_blocked_not_from_last_slots", {"chat_id": chat_id, "step": session.get("step") or "", "slots_count": len(last_slots) if isinstance(last_slots, list) else 0})
+        return _mandatory_step_prompt(session, session["step"])
+'''
+    new_book_reject = '''    if last_slots and not _slot_in_offered_set(slot, last_slots):
+        session.pop("selected_slot", None)
+        session["selected_time"] = ""
+        session["booking_ready"] = False
+        session["step"] = "time" if last_slots else "date"
+        _safe_log(chat_id, "booking_payload_blocked_not_from_last_slots", {"chat_id": chat_id, "step": session.get("step") or "", "slots_count": len(last_slots) if isinstance(last_slots, list) else 0})
+        return _mandatory_step_prompt(session, session["step"])
+'''
+    text = replace_exact(text, old_book_reject, new_book_reject, "booking stale slot cleanup")
+
     old_legacy = '''    if not last_slots:
         _safe_log(chat_id, "booking_payload_legacy_selected_slot_without_last_slots", {"chat_id": chat_id, "step": session.get("step") or ""})
 
