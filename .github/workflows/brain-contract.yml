@@ -77,6 +77,12 @@ jobs:
       - name: FAQ must not trigger false loop repair
         run: pytest -q tests/test_faq_not_blocked_by_step_repair.py
 
+      - name: Existing appointment and cancellation routing
+        run: |
+          pytest -q \
+            tests/test_dialog_intent_router.py::test_existing_appointment_lookup_wins_over_booking_flow \
+            tests/test_dialog_intent_router.py::test_cancel_and_negative_visit_use_crm_not_confirmation
+
       - name: Booking regression contract
         run: pytest -q tests/test_production_booking_flow.py
 
