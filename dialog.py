@@ -1095,18 +1095,24 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
         if not session.get("selected_slot"):
             return False, "asked_name_too_early"
     if (
-        re.search(r"\b\d+\s*(?:минут|час|часа|часов)\b", low_reply)
-        or any(x in low_reply for x in ["около часа", "полчаса", "пол часа", "30 минут", "40 минут", "60 минут"])
-    ) and any(x in low_reply for x in ["длитель", "процедур", "займ", "идет", "идёт"]):
+        re.search(r"\b\d+\s*(?:минут|час|часа|часов|сагат)\b", low_reply)
+        or any(x in low_reply for x in ("около часа", "полчаса", "пол часа", "30 минут", "40 минут", "60 минут") + _kkl("жарты сағат"))
+    ) and any(x in low_reply for x in ("длитель", "процедур", "займ", "идет", "идёт") + _kkl("созылады", "алады", "жүреді")):
         return False, "duration_hallucination"
-    if any(x in _low(user_text) for x in ["доктор", "врач", "кто принимает", "какой специалист"]) and any(x in low_reply for x in ["доктор", "врач"]) and not (session.get("last_slots") or []):
+    # Вопрос про врача и упоминание врача в ответе — на обоих языках.
+    # Раньше проверялись только русские слова, поэтому «Қай дәрігер
+    # қабылдайды?» проходило мимо guard'а выдуманных врачей.
+    _doctor_question_words = ("доктор", "врач", "кто принимает", "какой специалист") + _kkl(
+        "дәрігер", "маман", "кім қабылдайды")
+    _doctor_reply_words = ("доктор", "врач") + _kkl("дәрігер", "маман")
+    if any(x in _low(user_text) for x in _doctor_question_words) and any(x in low_reply for x in _doctor_reply_words) and not (session.get("last_slots") or []):
         return False, "doctor_hallucination"
     if not (session.get("last_slots") or []) and (_TIME_PATTERN.search(reply) or any(p in low_reply for p in _FORBIDDEN_EMPTY_SLOT_PHRASES)):
         return False, "slot_hallucination"
     if action in {"ask_date", "show_slots"} and session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not _text_confirms_no_contra(session, user_text):
         return False, "offered_date_before_contra"
     if step == "contraindications" and session.get("contraindications_ok") is not True and action not in {"ask_date", "stop_contraindication", "handoff_admin", "fallback_rule_based", "no_reply", "answer_faq_and_continue"}:
-        if "противопоказ" not in low_reply and "қарсы" not in low_reply:
+        if "противопоказ" not in low_reply and not any(x in low_reply for x in _kkl("қарсы", "көрсетілім")):
             return False, "contra_question_missing"
     return True, ""
 
@@ -1944,6 +1950,18 @@ def _low(text: str) -> str:
     return _normalize_typos(text)
 
 
+def _kkl(*phrases: str) -> tuple[str, ...]:
+    """Нормализует казахские фразы так же, как _low нормализует сообщение.
+
+    _low (через _normalize_typos) приводит казахские буквы к русским:
+    «қарсы» становится «карсы», «уақыт» — «уакыт». Из-за этого литерал с
+    буквами ә/ғ/қ/ң/ө/ұ/ү/һ/і в сравнении с _low(...) не мог совпасть
+    никогда — такие условия были мёртвым кодом. Хелпер позволяет писать
+    казахский читаемо и при этом реально сравнивать.
+    """
+    return tuple(dict.fromkeys(_low(p) for p in phrases if p))
+
+
 def _similar_text(left: str, right: str) -> bool:
     a = re.sub(r"[^a-zа-я0-9]+", " ", _low(left)).strip()
     b = re.sub(r"[^a-zа-я0-9]+", " ", _low(right)).strip()
@@ -2257,9 +2275,9 @@ def _relative_dual_task_answer(session: dict[str, Any], text: str) -> str:
         details.append("жалоба: шея")
     elif any(w in low for w in ["спина", "поясница", "бел"]):
         details.append("жалоба: спина/поясница")
-    elif any(w in low for w in ["колено", "тізе"]):
+    elif any(w in low for w in ("колено",) + _kkl("тізе")):
         details.append("жалоба: колено")
-    elif any(w in low for w in ["нога", "аяқ"]):
+    elif any(w in low for w in ("нога",) + _kkl("аяқ")):
         details.append("жалоба: нога")
 
     if _contra_is_clear_no(text):
@@ -2784,14 +2802,14 @@ def _avoid_repeating_same_question(answer: str, session: dict[str, Any]) -> str:
         return answer
 
     # Если ответ полностью совпал с прошлым, даём мягкую альтернативу.
-    if "на какой день" in _low(current) or "қай күн" in _low(current):
+    if "на какой день" in _low(current) or any(x in _low(current) for x in _kkl("қай күн")):
         return _tr(
             session,
             "Когда определитесь с удобным днём и временем — напишите сюда, я продолжу запись 🌿",
             "Қай күн мен уақыт ыңғайлы екенін анықтағанда осында жазыңыз, жазылуды жалғастырамын 🌿",
         )
 
-    if "что вас беспокоит" in _low(current) or "сізді не мазалайды" in _low(current):
+    if "что вас беспокоит" in _low(current) or any(x in _low(current) for x in _kkl("сізді не мазалайды")):
         return _tr(
             session,
             "Опишите, пожалуйста, жалобу одним сообщением: что болит или что беспокоит 🌿",
@@ -2960,6 +2978,16 @@ _FORBIDDEN_EMPTY_SLOT_PHRASES = (
     "свободные слоты",
     "выберите подходящий",
     "выберите удобный",
+) + _kkl(
+    # То же самое по-казахски: без этих фраз казахоязычный пациент
+    # проходил мимо guard'а выдуманных слотов.
+    "бос уақыт бар",
+    "бос уақыттар",
+    "бос орын бар",
+    "мына уақыттар бар",
+    "ыңғайлысын таңдаңыз",
+    "бірін таңдаңыз",
+    "қолайлысын таңдаңыз",
 )
 
 
@@ -3354,7 +3382,7 @@ def _classify_bot_question(text: str) -> str:
         return "unknown"
     if any(x in low for x in ["из какого города", "какого города", "қай қаладан", "кай каладан"]):
         return "city"
-    if any(x in low for x in ["планируете приехать в астану", "сможете приехать в астану", "астанаға кел", "астанага кел"]):
+    if any(x in low for x in ["планируете приехать в астану", "сможете приехать в астану", *_kkl("астанаға кел"), "астанага кел"]):
         return "astana_visit"
     if any(x in low for x in ["что вас беспокоит", "чем можем помочь", "не мазалай", "мәселе мазалай", "меселе мазалай"]):
         return "complaint"
@@ -4887,7 +4915,7 @@ def _wants_existing_lookup(text: str) -> bool:
         return True
     has_existing = any(w in low for w in ["уже", "моя", "мою", "у меня", "менің", "меним"])
     has_record = any(w in low for w in ["запис", "запись", "жазыл", "жазба"])
-    has_time = any(w in low for w in ["когда", "время", "дат", "во сколько", "напом", "қашан", "уақыт"])
+    has_time = any(w in low for w in ("когда", "время", "дат", "во сколько", "напом") + _kkl("қашан", "уақыт"))
     return (has_existing and has_record) or (has_record and has_time)
 
 
