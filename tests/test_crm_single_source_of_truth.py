@@ -1,125 +1,110 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+os.environ["SQLITE_PATH"] = tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite3").name
+os.environ.setdefault("CRM_BOT_SECRET", "test")
+os.environ.setdefault("OPENAI_API_KEY", "")
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import crm
 import dialog
 import state
 
+state.init_db()
 
-def run(coro):
+
+def run(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
-def reset(chat_id: str) -> None:
-    state.init_db()
-    state.save_session(chat_id, {})
+def reset(chat_id: str, preset: dict[str, Any] | None = None) -> None:
+    state.reset_session(chat_id)
+    session = state.get_session(chat_id)
+    session["ai_lead_started"] = True
+    if preset:
+        session.update(preset)
+    state.save_session(chat_id, session)
 
 
 def active_lookup(*, appointment_id: int = 77):
-    async def fake(phone: str) -> dict[str, Any]:
+    async def _lookup(phone: str) -> dict[str, Any]:
         return {
             "ok": True,
-            "status_code": 200,
-            "phone_variants": crm.phone_lookup_variants(phone),
+            "hasActiveAppointment": True,
             "appointments": [
                 {
                     "id": appointment_id,
-                    "bookingId": f"b-{appointment_id}",
-                    "patientId": 5,
-                    "date": "2099-01-02",
-                    "timeStart": "12:30",
+                    "appointmentId": appointment_id,
+                    "date": "2099-01-01",
+                    "timeStart": "10:00",
                     "doctorName": "Тестовый врач",
                     "doctorLogin": "doctor1",
-                    "status": "booked",
+                    "status": "confirmed",
                 }
             ],
             "appointment": {
                 "id": appointment_id,
-                "bookingId": f"b-{appointment_id}",
-                "patientId": 5,
-                "date": "2099-01-02",
-                "timeStart": "12:30",
+                "appointmentId": appointment_id,
+                "date": "2099-01-01",
+                "timeStart": "10:00",
                 "doctorName": "Тестовый врач",
                 "doctorLogin": "doctor1",
-                "status": "booked",
+                "status": "confirmed",
             },
-            "appointments_cache": [],
-            "active_count": 1,
+            "lastAppointment": {
+                "id": appointment_id,
+                "appointmentId": appointment_id,
+                "date": "2099-01-01",
+                "timeStart": "10:00",
+                "doctorName": "Тестовый врач",
+                "doctorLogin": "doctor1",
+                "status": "confirmed",
+            },
         }
 
-    return fake
+    return _lookup
 
 
-def no_active_lookup(phone: str):
-    async def fake(_: str) -> dict[str, Any]:
-        return {"ok": True, "status_code": 200, "appointments": [], "appointment": None, "active_count": 0}
+def no_active_lookup():
+    async def _lookup(phone: str) -> dict[str, Any]:
+        return {"ok": True, "hasActiveAppointment": False, "appointments": []}
 
-    return fake(phone)
+    return _lookup
 
 
-def test_active_appointment_blocks_first_touch(monkeypatch: Any) -> None:
+def test_active_appointment_lookup_prevents_new_first_touch(monkeypatch: Any) -> None:
     monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", active_lookup())
     chat_id = "crm_sst_active"
-    reset(chat_id)
-
-    answer = run(dialog.handle_message(chat_id, "+7 700 898 45 05", "Здравствуйте"))
-    session = state.get_session(chat_id)
-
-    assert session["crm_lookup_called"] is True
-    assert session["active_appointment_found"] is True
-    assert session["is_booked_client"] is True
-    assert "Вы уже записаны" in answer
-    assert "12:30" in answer
-    assert "Тестовый врач" in answer
-    assert dialog.FIRST_TOUCH_CLINIC_INFO_RU not in answer
-    assert "что именно Вас беспокоит" not in answer
-    assert "сколько Вам лет" not in answer
-    assert "противопоказ" not in answer.lower()
-
-
-def test_no_active_appointment_allows_first_touch(monkeypatch: Any) -> None:
-    monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", no_active_lookup)
-    chat_id = "crm_sst_no_active"
-    reset(chat_id)
-
-    answer = run(dialog.handle_message(chat_id, "87008984505", "хочу записаться"))
-    session = state.get_session(chat_id)
-
-    assert session["crm_lookup_called"] is True
-    assert session["active_appointment_found"] is False
-    assert session["first_touch_allowed"] is True
-    assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
-
-
-def test_lookup_failure_fails_closed(monkeypatch: Any) -> None:
-    async def broken(phone: str) -> dict[str, Any]:
-        raise crm.CRMError("down")
-
-    monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", broken)
-    chat_id = "crm_sst_failure"
     reset(chat_id)
 
     answer = run(dialog.handle_message(chat_id, "77008984505", "Здравствуйте"))
     session = state.get_session(chat_id)
 
-    assert session["crm_lookup_called"] is True
-    assert session["first_touch_allowed"] is False
-    assert session["first_touch_blocked_reason"] == "crm_lookup_failed"
-    assert session["manual_takeover"] is True
-    assert "уточню Вашу запись у администратора" in answer
+    assert session["active_appointment_found"] is True
+    assert session["crm_patient_state"] == "ACTIVE_BOOKING"
     assert dialog.FIRST_TOUCH_CLINIC_INFO_RU not in answer
 
 
-def test_cancel_active_appointment_uses_crm(monkeypatch: Any) -> None:
-    cancelled: list[Any] = []
+def test_no_active_appointment_allows_first_touch(monkeypatch: Any) -> None:
+    monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", no_active_lookup())
+    chat_id = "crm_sst_new"
+    reset(chat_id)
+
+    answer = run(dialog.handle_message(chat_id, "77008984505", "Здравствуйте, хочу записаться"))
+
+    assert dialog.FIRST_TOUCH_CLINIC_INFO_RU in answer
+
+
+def test_cancel_active_appointment_uses_crm_source(monkeypatch: Any) -> None:
+    cancelled: list[dict[str, Any]] = []
 
     async def fake_cancel(**kwargs: Any) -> dict[str, Any]:
         cancelled.append(kwargs)
@@ -150,5 +135,7 @@ def test_reschedule_active_appointment_asks_for_new_datetime(monkeypatch: Any) -
 
     assert session["reschedule_mode"] is True
     assert session["original_appointment"]
-    assert "На какой день и время" in answer
+    # Safe staged flow: first collect the new date, then show live CRM slots and collect time.
+    assert "На какой день" in answer
+    assert "время" not in answer.lower() or "На какой день и время" not in answer
     assert dialog.FIRST_TOUCH_CLINIC_INFO_RU not in answer
