@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - refactor/polyglot-brain-contract
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,7 +17,7 @@ jobs:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout branch
+      - name: Checkout migration branch
         uses: actions/checkout@v4
         with:
           ref: refactor/polyglot-brain-contract
