@@ -1,0 +1,46 @@
+# Neuro Balance — Polyglot reference contract
+
+Reference repository: `abiotov/polyglot-booking-agent`
+Pinned reference commit: `30de6266ecf2be3bf2fee734e21d1896ee3d94f5`
+Neuro baseline commit: `98587c37278373b0f269bad9f7aef9e9c4d750ab`
+
+## Scope
+
+Polyglot is an architectural reference for the internal conversational brain only.
+It is **not** a replacement for Neuro Balance infrastructure.
+
+The following production contracts are frozen and must not be changed by this refactor:
+
+- Wazzup / WhatsApp webhook transport and payload contracts;
+- Railway runtime/deployment contract;
+- CRM endpoints, authentication, request/response formats and booking integration;
+- existing booking/reschedule/cancel behavior that is already covered by regression tests;
+- current persistence/state compatibility with production sessions;
+- clinic operator templates and `SYSTEM_PROMPT_rendered.md` content unless a separate reviewed business change explicitly requests it.
+
+## Source-of-truth hierarchy
+
+1. Python safety/business invariants are absolute: state transitions, contraindications, CRM availability, selected slot, booking payload, working-hours gates and human takeover.
+2. `SYSTEM_PROMPT_rendered.md` is the canonical source for user-facing clinic facts, tone, wording, RU/KK behavior and dialog policy.
+3. Secondary AI prompts are task/protocol prompts only. They must not contradict or silently rewrite the canonical clinic prompt.
+
+## Polyglot invariants adopted
+
+- The LLM converses; deterministic code decides whether an external action is valid.
+- The model must never invent availability. Only CRM-derived slots may be offered or selected.
+- A booking action must be impossible unless required gates are satisfied.
+- Tool/action arguments are validated before touching the outside world.
+- Language/date context is deterministic where Python can know it.
+- A model failure must fail safe, not create an unbounded loop or unsafe external action.
+- Multi-turn regression/evaluation scenarios are treated as a first-class production gate.
+
+## Deliberately not copied
+
+- Polyglot channel adapters: Neuro keeps Wazzup/WhatsApp.
+- Polyglot calendar adapter: Neuro keeps the existing CRM.
+- Polyglot business qualification schema: Neuro keeps complaint → age → contraindications → date → CRM slots → time → name → booking.
+- Polyglot user-facing prompt text: Neuro keeps `SYSTEM_PROMPT_rendered.md`.
+
+## Migration rule
+
+Every change must be incremental and reversible. A PR may change internal brain behavior only when existing regression tests remain green and new characterization tests cover the changed invariant. External integration contracts are out of scope unless explicitly approved in a separate change.
