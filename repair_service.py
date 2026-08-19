@@ -23,6 +23,10 @@ _EXPECTED_REPOSITORY = os.getenv(
     "CLAUDE_REPAIR_GITHUB_REPOSITORY",
     "vrempel90-dev/neuro-balance-bot-main",
 )
+_EXPECTED_WORKFLOW_REF = os.getenv(
+    "CLAUDE_REPAIR_WORKFLOW_REF",
+    "vrempel90-dev/neuro-balance-bot-main/.github/workflows/claude-real-repair.yml@refs/heads/main",
+)
 _PRODUCTION_URL = os.getenv(
     "NEURO_PRODUCTION_URL",
     "https://neuro-balance-bot-main-production.up.railway.app",
@@ -169,6 +173,8 @@ def _verify_github_oidc(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=401, detail="Invalid GitHub OIDC token") from exc
     if str(claims.get("repository") or "") != _EXPECTED_REPOSITORY:
         raise HTTPException(status_code=403, detail="Repository is not allowed")
+    if _EXPECTED_WORKFLOW_REF and str(claims.get("workflow_ref") or "") != _EXPECTED_WORKFLOW_REF:
+        raise HTTPException(status_code=403, detail="Workflow is not allowed")
     return dict(claims)
 
 
