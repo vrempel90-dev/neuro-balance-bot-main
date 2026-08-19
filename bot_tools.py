@@ -40,10 +40,20 @@ def log_tool(chat_id: str, session: dict[str, Any], name: str, **payload: Any) -
 
 
 def get_clinic_info(session: dict[str, Any], topic: str) -> str | None:
-    text = clinic_info.get_clinic_info(topic)
+    """Отдаёт операторский шаблон темы на языке текущего диалога.
+
+    Раньше язык сессии сюда не доходил вообще, поэтому казахоязычный
+    пациент на любой FAQ получал русский текст.
+    """
+    lang = str((session or {}).get("language") or "ru")
+    text = clinic_info.get_clinic_info(topic, lang)
     if text:
         mark_tool(session, "get_clinic_info", topic=topic)
         session["last_clinic_info_topic"] = topic
+        session["last_clinic_info_lang"] = lang
+        session["last_clinic_info_lang_fallback"] = bool(
+            lang == "kk" and not clinic_info.has_kazakh_template(topic)
+        )
     return text
 
 
