@@ -267,6 +267,17 @@ def record_usage(response: Any, *, model: str, purpose: str) -> dict[str, Any]:
                     "note": "бюджет исчерпан, бот переходит в rule-based fallback до следующего месяца",
                 })
         return {"cost_usd": cost, **tokens}
-    except Exception:
-        # Учёт расхода никогда не должен ронять ответ пациенту.
+    except Exception as exc:
+        # Учёт расхода никогда не должен ронять ответ пациенту, но failure должен быть видим в Railway.
+        if state is not None:
+            try:
+                state.log_event("system", "ai_usage_record_failed", {
+                    "level": "warning",
+                    "purpose": purpose,
+                    "model": model,
+                    "error_type": type(exc).__name__,
+                    "error_preview": str(exc).replace("\n", " ")[:300],
+                })
+            except Exception:
+                pass
         return {"cost_usd": 0.0}

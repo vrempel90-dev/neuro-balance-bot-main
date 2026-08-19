@@ -833,6 +833,7 @@ async def run_openai_dialog_brain(
     model = getattr(settings, "ai_brain_model", "") or getattr(settings, "openai_model", "")
     temperature = float(getattr(settings, "ai_brain_temperature", getattr(settings, "openai_dialog_temperature", 0.2)) or 0.2)
     debug = {"openai_brain_used": False, "openai_brain_intent": "", "openai_brain_action": "", "openai_brain_needs_python_tool": "", "openai_brain_extracted": {}, "openai_brain_guard_failed": False, "openai_brain_guard_reason": "", "openai_brain_skip_reason": "", "openai_brain_fallback_used": False, "openai_brain_model": model, "openai_brain_temperature": temperature, "openai_model": model, "openai_error_type": "", "openai_error_message_preview": "", "openai_error_detail": {}}
+    debug.update({"openai_prompt_tokens": 0, "openai_completion_tokens": 0, "openai_cached_tokens": 0, "openai_cost_usd": 0.0})
     detail = _openai_config_missing_detail(settings, chat_id=str(session.get("chat_id") or ""), step=str(session.get("step") or session.get("current_step") or "start"), brain=True)
     if detail["missing_keys"] or detail["disabled_flags"]:
         decision, fb = _dialog_brain_fallback("config_missing")
@@ -873,7 +874,13 @@ async def run_openai_dialog_brain(
         )
         latency_ms = int((time.monotonic() - started_at) * 1000)
         debug["openai_brain_latency_ms"] = latency_ms
-        ai_budget.record_usage(response, model=model, purpose=ai_budget.PURPOSE_BRAIN)
+        usage = ai_budget.record_usage(response, model=model, purpose=ai_budget.PURPOSE_BRAIN)
+        debug.update({
+            "openai_prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "openai_completion_tokens": int(usage.get("completion_tokens") or 0),
+            "openai_cached_tokens": int(usage.get("cached_tokens") or 0),
+            "openai_cost_usd": float(usage.get("cost_usd") or 0.0),
+        })
         content = response.choices[0].message.content or ""
         # Обрезанный ответ reasoning-модели виден по finish_reason=length: JSON тогда
         # не парсится, и без явного лога причина выглядела бы как "модель глупая".
