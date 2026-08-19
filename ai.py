@@ -20,6 +20,12 @@ except Exception:
 import ai_budget
 from services import classify_by_keywords
 
+try:
+    from language_guard import analyze_language, response_language_violation
+except Exception:  # pragma: no cover - language guard is always available in prod
+    analyze_language = None
+    response_language_violation = None
+
 
 @lru_cache(maxsize=1)
 def _rendered_system_prompt() -> str:
@@ -374,6 +380,26 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 - понимать “жоқ/жок” как “нет” по контексту;
 - отвечать на языке клиента: русский или казахский.
 
+ЯЗЫК — обязательная часть разбора.
+Определи для текущего сообщения:
+- detected_language: ru | kk | mixed | unknown — язык самого сообщения;
+- preferred_response_language: ru | kk — на каком языке отвечать;
+- language_confidence: 0.0–1.0 — насколько ты уверен.
+
+Правила выбора языка ответа:
+1. Сообщение явно на русском — отвечай на русском.
+2. Сообщение явно на казахском — отвечай на казахском.
+3. Сообщение смешанное — смотри на доминирующий язык и на язык предыдущих
+   сообщений, язык менять хаотично нельзя.
+4. Явная просьба пациента («қазақша жазыңыз», «можно на русском») важнее всего.
+5. Язык непонятен — оставь язык, на котором шёл диалог (session_state.language).
+6. Не заставляй пациента выбирать язык вручную, если язык понятен из текста.
+
+Казахский ответ должен звучать как речь живого казахоязычного администратора,
+а не дословный перевод русской фразы. Нельзя смешивать русский и казахский в
+одном ответе. Нельзя переводить: Neuro Balance, ФИО врачей, адрес, ссылки,
+номера телефонов, Kaspi RED, 2GIS, названия услуг и цены.
+
 Цена:
 Первичный приём — 5 000 тг.
 Курс лечения рассчитывается только после осмотра врача.
@@ -428,7 +454,10 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
     "patient_name": "",
     "patient_relation": "",
     "faq_type": "",
-    "language": "ru"
+    "language": "ru",
+    "detected_language": "ru | kk | mixed | unknown",
+    "preferred_response_language": "ru | kk",
+    "language_confidence": 0.0
   },
   "next_required_step": "complaint | age | contraindications | date | time | name | booked | escalated | keep_current",
   "needs_python_tool": "none | check_slots | book_appointment | handoff_admin",
@@ -460,7 +489,10 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
     "patient_relation": "",
     "wants_human": false,
     "faq_type": "",
-    "language": "ru"
+    "language": "ru",
+    "detected_language": "ru | kk | mixed | unknown",
+    "preferred_response_language": "ru | kk",
+    "language_confidence": 0.0
   },
   "needs_python_tool": "none | check_slots | book_appointment | refresh_slots | handoff_admin",
   "safety": {
@@ -530,6 +562,7 @@ def _dialog_brain_fallback(reason: str) -> tuple[dict, dict]:
             "contraindication_confirmed": False, "contraindication_term_asked": "",
             "contraindication_red_flags": [], "preferred_date_text": "", "time_preference": "", "slot_choice": None,
             "patient_name": "", "wants_human": False, "faq_type": "", "language": "ru",
+            "detected_language": "", "preferred_response_language": "", "language_confidence": 0.0,
         },
         "needs_python_tool": "none",
         "safety": {"hard_stop": False, "reason": "", "unsafe_medical_claim": False, "tries_to_book_without_rules": False},
@@ -570,6 +603,27 @@ def _action_from_structured(intent: str, next_step: str, tool: str, safety: dict
     return "fallback_rule_based" if intent == "unknown" else "answer_faq_and_continue"
 
 
+def _valid_detected_language(value: Any) -> str:
+    """Мнение модели о языке принимается, только если оно из словаря."""
+    text = str(value or "").strip().lower()
+    return text if text in {"ru", "kk", "mixed", "unknown"} else ""
+
+
+def _valid_reply_language(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in {"ru", "kk"} else ""
+
+
+def _valid_confidence(value: Any) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number != number:  # NaN
+        return 0.0
+    return max(0.0, min(1.0, number))
+
+
 def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
     if not isinstance(raw, dict):
         return {}, "not_object"
@@ -599,6 +653,9 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
                 "wants_human": normalized_intent == "ask_human",
                 "faq_type": entities.get("faq_type") or "",
                 "language": entities.get("language") or "ru",
+                "detected_language": entities.get("detected_language") or ctx.get("detected_language") or "",
+                "preferred_response_language": entities.get("preferred_response_language") or ctx.get("preferred_response_language") or "",
+                "language_confidence": entities.get("language_confidence", ctx.get("language_confidence")),
             },
             "needs_python_tool": raw.get("needs_python_tool") or "none",
             "safety": {
@@ -621,6 +678,7 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
         "contraindication_term_asked", "contraindication_red_flags", "preferred_date_text",
         "time_preference", "slot_choice", "patient_name", "wants_human", "faq_type", "language", "symptom_duration",
         "patient_relation",
+        "detected_language", "preferred_response_language", "language_confidence",
     }
     allowed_safety = {"hard_stop", "reason", "unsafe_medical_claim", "tries_to_book_without_rules"}
     if any(k not in allowed_extracted for k in extracted.keys()):
@@ -671,6 +729,9 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
             "wants_human": bool(extracted.get("wants_human")),
             "faq_type": str(extracted.get("faq_type") or ""),
             "language": str(extracted.get("language") or "ru"),
+            "detected_language": _valid_detected_language(extracted.get("detected_language")),
+            "preferred_response_language": _valid_reply_language(extracted.get("preferred_response_language")),
+            "language_confidence": _valid_confidence(extracted.get("language_confidence")),
         },
         "needs_python_tool": tool,
         "safety": {
@@ -755,14 +816,27 @@ def build_dialog_context(*, user_text: str, session: dict, recent_history: list 
         "dialog_summary": session.get("dialog_summary") or auto_summary,
         "known_user_facts": session.get("known_user_facts") or {},
         "conversation_turns_count": session.get("conversation_turns_count") or len(history),
+        # Язык диалога брейну раньше не передавался вообще, поэтому он не мог
+        # ни удержать язык, ни заметить, что пациент на него перешёл.
+        "language": session.get("language") or "ru",
+        "language_locked": bool(session.get("language_locked")),
     }
     if session.get("last_bot_question_type") and last_bot_question.get("type") == "unknown":
         last_bot_question["type"] = str(session.get("last_bot_question_type"))
+    message_language: dict[str, Any] = {}
+    if analyze_language is not None:
+        try:
+            message_language = analyze_language(user_text or "", session.get("language")).to_dict()
+        except Exception:
+            message_language = {}
     return {
         "session_state": session_state,
         "recent_history": history,
         "last_bot_question": last_bot_question,
         "current_user_message": user_text or "",
+        # Разбор языка текущего сообщения от Python. Это подсказка для модели,
+        # а не приказ: окончательное решение о языке принимает Python.
+        "message_language": message_language,
         "known_facts": {
             "clinic_prompt_source": "SYSTEM_PROMPT_rendered.md",
             "allowed_contraindications": clinic_context.get("allowed_contraindications") if isinstance(clinic_context, dict) else [],
@@ -980,6 +1054,15 @@ STRICT_HUMANIZE_REPLY_PROMPT = """
 Нельзя советовать медицинское лечение.
 Нельзя отвечать на старые записи/возвраты/жалобы — если base_answer пустой, верни пусто.
 
+ЯЗЫК — жёсткое правило.
+Пиши ответ ровно на том языке, на котором написан base_answer.
+Если base_answer на русском — ответ полностью на русском.
+Если base_answer на казахском — ответ полностью на казахском.
+Нельзя переводить base_answer на другой язык.
+Нельзя смешивать русский и казахский в одном ответе.
+Нельзя переводить: Neuro Balance, ФИО врачей, адрес, ссылки, номера телефонов,
+Kaspi RED, 2GIS, названия услуг и цены — они остаются как есть.
+
 Пиши коротко, как администратор в WhatsApp.
 Стиль: спокойно, заботливо, без канцелярита.
 Можно использовать 1 emoji 🌿, но не больше.
@@ -1028,9 +1111,26 @@ def _contra_markers(text: str) -> set[str]:
     return {name for name, variants in markers.items() if any(v in low for v in variants)}
 
 
+def _humanize_language_ok(base_answer: str, humanized: str) -> bool:
+    """Гуманизатор не имеет права менять язык ответа.
+
+    Раньше эта проверка отсутствовала: правила guard'а искали вопрос про
+    возраст/имя/дату сразу на двух языках, поэтому перевод русского ответа
+    на казахский (и наоборот) проходил как корректный.
+    """
+    if analyze_language is None or response_language_violation is None:
+        return True
+    base_lang = analyze_language(base_answer, None).detected_language
+    if base_lang not in ("ru", "kk"):
+        return True
+    return response_language_violation(humanized, base_lang) == ""
+
+
 def _humanize_guard_ok(base_answer: str, humanized: str) -> bool:
     if not (base_answer or "").strip():
         return not (humanized or "").strip()
+    if not _humanize_language_ok(base_answer, humanized):
+        return False
     if _has_age_question(base_answer) and not _has_age_question(humanized):
         return False
     if _has_contra_question(base_answer):

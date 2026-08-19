@@ -67,6 +67,12 @@ except Exception:
     def enforce_prompt_only(answer: str, session: dict[str, Any] | None = None) -> str:
         return answer or ""
 
+try:
+    from language_guard import enforce_response_language
+except Exception:
+    def enforce_response_language(answer: str, expected: str) -> tuple[str, str]:
+        return answer or "", ""
+
 
 app = FastAPI(title="Neuro Balance Hybrid WhatsApp Booking Bot")
 
@@ -264,6 +270,20 @@ def _log_dialog_result(chat_id: str, phone: str, answer: str) -> None:
         "answer_empty": debug["answer_empty"],
         "answer_preview": _preview(answer, 160),
         **{k: debug[k] for k in ("source", "local_time", "bot_work_time_now", "working_hours_allowed", "step", "gate_reason", "no_reply_reason", "ai_muted", "manual_takeover", "ai_lead_started", "openai_used", "openai_skip_reason")},
+        # Языковая телеметрия: на чём говорит пациент, на чём ответил бот,
+        # что решил Python и что предложила модель. Секретов здесь нет.
+        "state_before_step": session.get("state_before_step") or "",
+        "detected_language": session.get("language") or "",
+        "brain_detected_language": session.get("brain_detected_language") or "",
+        "brain_preferred_response_language": session.get("brain_preferred_response_language") or "",
+        "brain_language_confidence": session.get("brain_language_confidence") or 0.0,
+        "brain_language_hint_applied": bool(session.get("brain_language_hint_applied")),
+        "language_locked": bool(session.get("language_locked")),
+        "language_guard_result": session.get("language_guard_result") or "",
+        "clinic_info_lang_fallback": bool(session.get("last_clinic_info_lang_fallback")),
+        "detected_intent": session.get("last_user_intent") or "",
+        "openai_brain_guard_reason": session.get("openai_brain_guard_reason") or "",
+        "fallback_reason": session.get("fallback_reason") or "",
     })
     if not answer:
         state.log_event(chat_id, "bot_no_reply", {
@@ -652,7 +672,40 @@ def _guard_answer(chat_id: str, answer: str) -> str:
     session = _get_session_safe(chat_id)
     if str(session.get("answer_source") or "").startswith("locked_template") or (answer or "").strip() == FIRST_TOUCH_CLINIC_INFO_RU:
         return (answer or "").strip()
-    return enforce_prompt_only(answer or "", session)
+    guarded = enforce_prompt_only(answer or "", session)
+    return _guard_answer_language(chat_id, guarded, session)
+
+
+def _guard_answer_language(chat_id: str, answer: str, session: dict[str, Any]) -> str:
+    """Проверяет, что ответ написан на языке пациента.
+
+    Единственная разрешённая правка — подстановка утверждённого казахского
+    шаблона клиники вместо русского. Переводить текст на лету нельзя, поэтому
+    остальные нарушения только логируются: доставить верный факт на другом
+    языке безопаснее, чем сочинить казахский текст или промолчать.
+    """
+    expected = str(session.get("language") or "")
+    if expected not in ("ru", "kk") or not (answer or "").strip():
+        return answer
+    try:
+        repaired, violation = enforce_response_language(answer, expected)
+    except Exception as exc:
+        state.log_event(chat_id, "language_guard_error", {"error": str(exc)[:300]})
+        return answer
+    if violation:
+        state.log_event(chat_id, "language_guard_violation", {
+            "chat_id": chat_id,
+            "expected_language": expected,
+            "violation": violation,
+            "repaired": repaired != answer,
+            "answer_preview": _preview(answer, 160),
+        })
+    session["language_guard_result"] = violation or "ok"
+    try:
+        state.save_session(chat_id, session)
+    except Exception:
+        pass
+    return repaired
 
 
 def _voice_fallback_answer() -> str:
@@ -907,6 +960,17 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
         _mark_no_reply(chat_id, hard_reason, message, duplicate=is_dup, old=is_old)
         return ""
 
+    # duplicate_webhook_race_guard:
+    # Проверка выше ловит только повтор, пришедший после того, как первый
+    # вебхук уже дошёл до конца. Два одновременных вебхука с одним ключом
+    # проходили её оба — между проверкой и пометкой лежит весь пайплайн с
+    # await'ами (CRM, OpenAI, отправка). Захватываем ключ атомарно, чтобы
+    # пациент не получил два ответа, а CRM — две записи.
+    inbound_message_key = str(message.get("message_key") or message.get("message_id") or "")
+    if inbound_message_key and not state.claim_message(inbound_message_key, chat_id):
+        _mark_no_reply(chat_id, "duplicate_message_already_processed", message, duplicate=True, old=False)
+        return ""
+
     source = str(message.get("source") or "wazzup")
     if not bool(getattr(get_settings(), "bot_auto_reply_enabled", True)):
         _mark_bot_auto_reply_disabled(chat_id=chat_id, phone=phone, source=source, force=False, kind=kind, text=str(message.get("text") or ""))
@@ -1057,6 +1121,12 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
 
     except Exception as exc:
         state.log_event(chat_id, "background_processing_error", {"error": str(exc)[:1000]})
+        # Захват ключа снимаем: обработка не дошла до ответа, и повторная
+        # доставка того же вебхука должна получить второй шанс.
+        try:
+            state.release_message(str(message.get("message_key") or message.get("message_id") or ""))
+        except Exception:
+            pass
         try:
             if kind == "voice" or _message_has_voice_url(message):
                 fallback_text = _voice_fallback_answer()

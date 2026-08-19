@@ -203,7 +203,16 @@ def _limit_length(answer: str) -> str:
 
     sentences = re.split(r"(?<=[.!?])\s+", answer.strip())
     if len(sentences) > 2 and "---" not in answer:
-        answer = " ".join(sentences[:2]).strip()
+        kept = sentences[:2]
+        # answer-first: сначала отвечаем на вопрос пациента, потом
+        # возвращаемся к незавершённому шагу сценария. Этот возврат почти
+        # всегда идёт последним предложением и заканчивается «?». Обрезка
+        # по двум предложениям молча съедала его, и воронка вставала:
+        # бот отвечал на FAQ и больше ничего не спрашивал.
+        tail = sentences[-1].strip()
+        if tail.endswith("?") and tail not in kept:
+            kept = kept + [tail]
+        answer = " ".join(kept).strip()
 
     return answer.strip()
 

@@ -30,8 +30,12 @@ except Exception:
 
 try:
     from language_guard import detect_language as detect_message_language
+    from language_guard import analyze_language as analyze_message_language
+    from language_guard import explicit_language_request as _lg_explicit_language_request
 except Exception:
     detect_message_language = None
+    analyze_message_language = None
+    _lg_explicit_language_request = None
 
 try:
     from config import get_settings
@@ -85,6 +89,25 @@ CONTRAINDICATIONS_MESSAGE_RU = """Перед записью нужно подт�
 
 Подскажите, пожалуйста, у Вас ничего из этого нет?"""
 
+# Казахская версия того же самого чек-листа. Состав противопоказаний и
+# возрастные границы полностью совпадают с русской версией — это перевод
+# утверждённого списка, а не новые медицинские факты.
+CONTRAINDICATIONS_MESSAGE_KK = """Жазылу алдында нақтылап алайын: Сізде қарсы көрсетілімдер жоқ па — кардиостимулятор, жүктілік, онкология, ем аймағындағы металл, эпилепсия, 16-дан кіші немесе 75-тен үлкен жас?
+
+Сондай-ақ назарыңызға саламыз:
+емнің қауіпсіздігі мен тиімділігі үшін қабылдау жүргізілмейді:
+• қозғалысы шектеулі пациенттерге (арба, балдақ)
+• 16 жасқа толмағандарға
+• 16-дан 18 жасқа дейінгілерге — тек ата-анасының сүйемелдеуімен
+
+Айтыңызшы, Сізде осылардың ешқайсысы жоқ па?"""
+
+UNKNOWN_CONTRA_SAFE_ANSWER_KK = (
+    "Рахмет, түсіндім. Бұл тармақ біздің негізгі қарсы көрсетілімдер тізімінде жоқ, "
+    "бірақ медициналық жағынан қателеспеу үшін нақтылауды әкімшіге беремін 🌿\n\n"
+    "Айтыңызшы, тізімдегі басқа қарсы көрсетілімдер жоқ па?"
+)
+
 FIRST_TOUCH_REQUIRED_FRAGMENTS = (
     "Клиника Neuro Balance помогает",
     "Мы специализируемся на:",
@@ -130,6 +153,12 @@ UNKNOWN_CONTRA_SAFE_ANSWER_RU = (
 
 
 def _contraindications_locked_message(session: dict[str, Any]) -> str:
+    if (session.get("language") or "ru") == "kk":
+        # Для записи за другого человека берём нейтральное «Пациентте»:
+        # это безопаснее, чем строить казахские падежи от русской связки.
+        if str(session.get("patient_subject") or "self") != "self" or session.get("patient_gender"):
+            return CONTRAINDICATIONS_MESSAGE_KK.replace("Сізде", "Пациентте")
+        return CONTRAINDICATIONS_MESSAGE_KK
     prep = _patient_pronoun_prep(session)
     if prep == "у Вас":
         return CONTRAINDICATIONS_MESSAGE_RU
@@ -842,6 +871,39 @@ def _repair_after_contraindications_ok(session: dict[str, Any]) -> tuple[str, st
     return str(session.get("step") or "date"), answer
 
 
+def _apply_brain_language_hint(session: dict[str, Any], extracted: dict[str, Any], user_text: str) -> None:
+    """Языковая подсказка брейна — только подсказка, решает Python.
+
+    Мнение модели о языке до сих пор парсилось и выбрасывалось. Теперь оно
+    сохраняется для логов и применяется в одном-единственном случае: когда
+    Python в сообщении языкового сигнала не нашёл вообще (detected =
+    unknown), язык не зафиксирован явной просьбой пациента, а модель
+    уверена. Во всех остальных случаях побеждает решение Python.
+    """
+    hint = str(extracted.get("preferred_response_language") or "")
+    session["brain_detected_language"] = str(extracted.get("detected_language") or "")
+    session["brain_preferred_response_language"] = hint
+    session["brain_language_confidence"] = extracted.get("language_confidence") or 0.0
+    session["brain_language_hint_applied"] = False
+
+    if hint not in ("ru", "kk") or session.get("language_locked"):
+        return
+    if float(extracted.get("language_confidence") or 0.0) < 0.7:
+        return
+    if analyze_message_language is None:
+        return
+    try:
+        analysis = analyze_message_language(user_text, session.get("language"))
+    except Exception:
+        return
+    if analysis.detected_language != "unknown":
+        return
+    if hint == (session.get("language") or "ru"):
+        return
+    session["language"] = hint
+    session["brain_language_hint_applied"] = True
+
+
 def _apply_brain_contraindications_clear(
     session: dict[str, Any],
     user_text: str,
@@ -1091,18 +1153,24 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
         if not session.get("selected_slot"):
             return False, "asked_name_too_early"
     if (
-        re.search(r"\b\d+\s*(?:минут|час|часа|часов)\b", low_reply)
-        or any(x in low_reply for x in ["около часа", "полчаса", "пол часа", "30 минут", "40 минут", "60 минут"])
-    ) and any(x in low_reply for x in ["длитель", "процедур", "займ", "идет", "идёт"]):
+        re.search(r"\b\d+\s*(?:минут|час|часа|часов|сагат)\b", low_reply)
+        or any(x in low_reply for x in ("около часа", "полчаса", "пол часа", "30 минут", "40 минут", "60 минут") + _kkl("жарты сағат"))
+    ) and any(x in low_reply for x in ("длитель", "процедур", "займ", "идет", "идёт") + _kkl("созылады", "алады", "жүреді")):
         return False, "duration_hallucination"
-    if any(x in _low(user_text) for x in ["доктор", "врач", "кто принимает", "какой специалист"]) and any(x in low_reply for x in ["доктор", "врач"]) and not (session.get("last_slots") or []):
+    # Вопрос про врача и упоминание врача в ответе — на обоих языках.
+    # Раньше проверялись только русские слова, поэтому «Қай дәрігер
+    # қабылдайды?» проходило мимо guard'а выдуманных врачей.
+    _doctor_question_words = ("доктор", "врач", "кто принимает", "какой специалист") + _kkl(
+        "дәрігер", "маман", "кім қабылдайды")
+    _doctor_reply_words = ("доктор", "врач") + _kkl("дәрігер", "маман")
+    if any(x in _low(user_text) for x in _doctor_question_words) and any(x in low_reply for x in _doctor_reply_words) and not (session.get("last_slots") or []):
         return False, "doctor_hallucination"
     if not (session.get("last_slots") or []) and (_TIME_PATTERN.search(reply) or any(p in low_reply for p in _FORBIDDEN_EMPTY_SLOT_PHRASES)):
         return False, "slot_hallucination"
     if action in {"ask_date", "show_slots"} and session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not _text_confirms_no_contra(session, user_text):
         return False, "offered_date_before_contra"
     if step == "contraindications" and session.get("contraindications_ok") is not True and action not in {"ask_date", "stop_contraindication", "handoff_admin", "fallback_rule_based", "no_reply", "answer_faq_and_continue"}:
-        if "противопоказ" not in low_reply and "қарсы" not in low_reply:
+        if "противопоказ" not in low_reply and not any(x in low_reply for x in _kkl("қарсы", "көрсетілім")):
             return False, "contra_question_missing"
     return True, ""
 
@@ -1174,6 +1242,7 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         return None
     action = decision.get("action")
     extracted = decision.get("extracted") or {}
+    _apply_brain_language_hint(session, extracted, text)
     if extracted.get("symptom_duration"):
         session["symptom_duration"] = str(extracted.get("symptom_duration") or "")
         facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
@@ -1940,6 +2009,18 @@ def _low(text: str) -> str:
     return _normalize_typos(text)
 
 
+def _kkl(*phrases: str) -> tuple[str, ...]:
+    """Нормализует казахские фразы так же, как _low нормализует сообщение.
+
+    _low (через _normalize_typos) приводит казахские буквы к русским:
+    «қарсы» становится «карсы», «уақыт» — «уакыт». Из-за этого литерал с
+    буквами ә/ғ/қ/ң/ө/ұ/ү/һ/і в сравнении с _low(...) не мог совпасть
+    никогда — такие условия были мёртвым кодом. Хелпер позволяет писать
+    казахский читаемо и при этом реально сравнивать.
+    """
+    return tuple(dict.fromkeys(_low(p) for p in phrases if p))
+
+
 def _similar_text(left: str, right: str) -> bool:
     a = re.sub(r"[^a-zа-я0-9]+", " ", _low(left)).strip()
     b = re.sub(r"[^a-zа-я0-9]+", " ", _low(right)).strip()
@@ -2063,62 +2144,91 @@ def _explicit_language_request(text: str) -> str | None:
     return None
 
 
-def _detect_lang(text: str, session: dict[str, Any]) -> str:
-    """Определяет язык без скачков туда-сюда.
+# Порог уверенности, при котором пациент считается перешедшим на другой язык.
+LANGUAGE_SWITCH_CONFIDENCE = 0.6
 
-    Правило:
-    - первый осмысленный язык диалога фиксируется;
-    - короткие ответы типа "жоқ/рахмет/37 жаста" не переключают язык;
-    - смешанные сообщения не переключают язык;
-    - смена языка только если клиент явно попросил: "пишите на казахском/русском".
-    """
-    current = session.get("language") or "ru"
+_SHORT_ANSWER_RE = re.compile(
+    r"\s*(?:\d{1,3}\s*(?:жаста|жас|лет|года|год)?|жоқ|жок|ия|иә|жақсы|жаксы|рахмет|"
+    r"рақмет|спасибо|ок|окей|нет|да|ага|угу|неа|иа)\s*[.!?🙏🌿]*\s*"
+)
+
+
+def _is_short_language_neutral_answer(text: str) -> bool:
+    """Короткое подтверждение/число, которое не должно менять язык диалога."""
     low = _low(text)
-    text_stripped = (text or "").strip()
+    if _SHORT_ANSWER_RE.fullmatch(low):
+        return True
+    words = re.findall(r"[a-zA-Zа-яёәғқңөұүһі]+", low)
+    return len(words) <= 1
 
-    # Если язык уже зафиксирован — держим его.
-    # Явная просьба сменить язык обрабатывается в handle_message через _explicit_language_request.
-    if session.get("language_locked") and current in ("ru", "kk"):
-        return current
 
-    step_now = session.get("step") or "start"
-    if session.get("language") in ("ru", "kk") and step_now not in ("start", "", None):
-        return current
+def _detect_lang(text: str, session: dict[str, Any]) -> str:
+    """Определяет язык ответа для текущего сообщения.
 
-    short_answer = bool(
-        re.fullmatch(
-            r"\s*(?:\d{1,3}\s*(?:жаста|жас|лет|года|год)?|жоқ|жок|ия|иә|жақсы|жаксы|рахмет|спасибо|ок|окей|нет|да)\s*[.!?🙏🌿]*\s*",
-            low,
-        )
-    )
-    if short_answer and current in ("ru", "kk"):
-        return current
+    Пациент может перейти на другой язык посреди диалога, и бот обязан
+    перейти вместе с ним. Но язык не должен скакать от каждого «жоқ» или
+    «да», поэтому переключение требует уверенного сигнала:
 
-    has_kz_letters = bool(re.search(r"[әғқңөұүһіӘҒҚҢӨҰҮҺІ]", text_stripped))
-    has_kz_words = any(w in low for w in KZ_MARKERS) or bool(
-        re.search(r"(емдей\s+аласыз|емдей\s+аласыздар|аласыздар\s+ма)", low)
-    )
-    has_ru = any(w in low for w in RU_MARKERS)
+    - явная просьба ("қазақша жазыңыз") — сильнее всего и фиксирует язык;
+    - зафиксированный явной просьбой язык не меняется автоматически;
+    - пока язык диалога не установлен, берём язык первого осмысленного
+      сообщения;
+    - короткие ответы ("иә", "да", "44") язык не переключают;
+    - смешанное RU+KK сообщение язык диалога не переключает;
+    - уверенное сообщение целиком на другом языке — переключает.
+    """
+    current = session.get("language")
+    if current not in ("ru", "kk"):
+        current = "ru"
+        established = False
+    else:
+        established = True
 
-    # Смешанный текст: держим текущий язык.
-    if has_ru and (has_kz_letters or has_kz_words) and current in ("ru", "kk"):
-        return current
-
-    if has_kz_letters or has_kz_words:
-        return "kk"
-
-    if has_ru:
-        return "ru"
-
-    if detect_message_language:
+    # 1. Явная просьба пациента имеет наивысший приоритет.
+    if _lg_explicit_language_request:
         try:
-            detected = detect_message_language(text, current)
-            if detected in ("ru", "kk"):
-                return detected
+            explicit = _lg_explicit_language_request(text)
+            if explicit in ("ru", "kk"):
+                return explicit
         except Exception:
             pass
 
-    return current if current in ("ru", "kk") else "ru"
+    # 2. Язык, зафиксированный явной просьбой, автоматически не меняем.
+    if session.get("language_locked") and established:
+        return current
+
+    if not analyze_message_language:
+        return current
+
+    try:
+        analysis = analyze_message_language(text, current)
+    except Exception:
+        return current
+
+    detected = analysis.detected_language
+    preferred = analysis.preferred_response_language
+
+    # 3. Языка диалога ещё нет — берём язык первого осмысленного сообщения.
+    if not established:
+        return preferred if preferred in ("ru", "kk") else "ru"
+
+    # 4. Сигнала нет вообще ("44", "+", эмодзи) — держим текущий язык.
+    if detected == "unknown":
+        return current
+
+    # 5. Смешанное сообщение язык диалога не переключает.
+    if detected == "mixed":
+        return current
+
+    # 6. Короткий ответ язык не переключает.
+    if detected != current and _is_short_language_neutral_answer(text):
+        return current
+
+    # 7. Уверенный переход пациента на другой язык — идём за ним.
+    if detected != current and analysis.confidence >= LANGUAGE_SWITCH_CONFIDENCE:
+        return detected
+
+    return current
 def _tr(session_or_lang: dict[str, Any] | str, ru: str, kk: str) -> str:
     if isinstance(session_or_lang, dict):
         lang = session_or_lang.get("language") or "ru"
@@ -2224,9 +2334,9 @@ def _relative_dual_task_answer(session: dict[str, Any], text: str) -> str:
         details.append("жалоба: шея")
     elif any(w in low for w in ["спина", "поясница", "бел"]):
         details.append("жалоба: спина/поясница")
-    elif any(w in low for w in ["колено", "тізе"]):
+    elif any(w in low for w in ("колено",) + _kkl("тізе")):
         details.append("жалоба: колено")
-    elif any(w in low for w in ["нога", "аяқ"]):
+    elif any(w in low for w in ("нога",) + _kkl("аяқ")):
         details.append("жалоба: нога")
 
     if _contra_is_clear_no(text):
@@ -2751,14 +2861,14 @@ def _avoid_repeating_same_question(answer: str, session: dict[str, Any]) -> str:
         return answer
 
     # Если ответ полностью совпал с прошлым, даём мягкую альтернативу.
-    if "на какой день" in _low(current) or "қай күн" in _low(current):
+    if "на какой день" in _low(current) or any(x in _low(current) for x in _kkl("қай күн")):
         return _tr(
             session,
             "Когда определитесь с удобным днём и временем — напишите сюда, я продолжу запись 🌿",
             "Қай күн мен уақыт ыңғайлы екенін анықтағанда осында жазыңыз, жазылуды жалғастырамын 🌿",
         )
 
-    if "что вас беспокоит" in _low(current) or "сізді не мазалайды" in _low(current):
+    if "что вас беспокоит" in _low(current) or any(x in _low(current) for x in _kkl("сізді не мазалайды")):
         return _tr(
             session,
             "Опишите, пожалуйста, жалобу одним сообщением: что болит или что беспокоит 🌿",
@@ -2927,6 +3037,16 @@ _FORBIDDEN_EMPTY_SLOT_PHRASES = (
     "свободные слоты",
     "выберите подходящий",
     "выберите удобный",
+) + _kkl(
+    # То же самое по-казахски: без этих фраз казахоязычный пациент
+    # проходил мимо guard'а выдуманных слотов.
+    "бос уақыт бар",
+    "бос уақыттар",
+    "бос орын бар",
+    "мына уақыттар бар",
+    "ыңғайлысын таңдаңыз",
+    "бірін таңдаңыз",
+    "қолайлысын таңдаңыз",
 )
 
 
@@ -3321,7 +3441,7 @@ def _classify_bot_question(text: str) -> str:
         return "unknown"
     if any(x in low for x in ["из какого города", "какого города", "қай қаладан", "кай каладан"]):
         return "city"
-    if any(x in low for x in ["планируете приехать в астану", "сможете приехать в астану", "астанаға кел", "астанага кел"]):
+    if any(x in low for x in ["планируете приехать в астану", "сможете приехать в астану", *_kkl("астанаға кел"), "астанага кел"]):
         return "astana_visit"
     if any(x in low for x in ["что вас беспокоит", "чем можем помочь", "не мазалай", "мәселе мазалай", "меселе мазалай"]):
         return "complaint"
@@ -4854,7 +4974,7 @@ def _wants_existing_lookup(text: str) -> bool:
         return True
     has_existing = any(w in low for w in ["уже", "моя", "мою", "у меня", "менің", "меним"])
     has_record = any(w in low for w in ["запис", "запись", "жазыл", "жазба"])
-    has_time = any(w in low for w in ["когда", "время", "дат", "во сколько", "напом", "қашан", "уақыт"])
+    has_time = any(w in low for w in ("когда", "время", "дат", "во сколько", "напом") + _kkl("қашан", "уақыт"))
     return (has_existing and has_record) or (has_record and has_time)
 
 
@@ -6233,10 +6353,16 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _no_reply(chat_id, session, reason)
 
     # language_lock_guard:
-    # Фиксируем язык диалога, чтобы бот не прыгал RU/KZ от коротких ответов.
-    # Сменить язык можно только явной просьбой клиента.
-    if not session.get("language_locked") and text and not _is_thanks_or_ok(text):
-        session["language_locked"] = True
+    # Раньше здесь язык диалога фиксировался на первом же осмысленном
+    # сообщении, и снять фиксацию можно было только явной просьбой клиента.
+    # Из-за этого пациент, перешедший на другой язык посреди разговора,
+    # до конца диалога получал ответы на прежнем языке.
+    #
+    # Задачу «не прыгать RU/KZ от коротких ответов» теперь решает сам
+    # _detect_lang: короткие подтверждения («иә», «да», «44») и смешанные
+    # RU+KK сообщения язык не переключают, для перехода нужен уверенный
+    # сигнал целиком на другом языке. Поэтому language_locked снова
+    # означает только одно — пациент явно попросил конкретный язык.
 
     # thanks_after_info_guard:
     # Если пациент поблагодарил после адреса/цены/графика, не начинаем анкету заново.
@@ -6877,7 +7003,6 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["phone"] = phone or ""
         session["language"] = _detect_lang(text, session)
         _repair_bad_patient_name(session)
-        session["language_locked"] = True
         _record_complaint_tool(session, text, is_in_profile=True)
         session["step"] = "age"
         return _finalize(
