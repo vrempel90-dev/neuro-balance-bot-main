@@ -20,6 +20,12 @@ except Exception:
 import ai_budget
 from services import classify_by_keywords
 
+try:
+    from language_guard import analyze_language, response_language_violation
+except Exception:  # pragma: no cover - language guard is always available in prod
+    analyze_language = None
+    response_language_violation = None
+
 
 @lru_cache(maxsize=1)
 def _rendered_system_prompt() -> str:
@@ -980,6 +986,15 @@ STRICT_HUMANIZE_REPLY_PROMPT = """
 Нельзя советовать медицинское лечение.
 Нельзя отвечать на старые записи/возвраты/жалобы — если base_answer пустой, верни пусто.
 
+ЯЗЫК — жёсткое правило.
+Пиши ответ ровно на том языке, на котором написан base_answer.
+Если base_answer на русском — ответ полностью на русском.
+Если base_answer на казахском — ответ полностью на казахском.
+Нельзя переводить base_answer на другой язык.
+Нельзя смешивать русский и казахский в одном ответе.
+Нельзя переводить: Neuro Balance, ФИО врачей, адрес, ссылки, номера телефонов,
+Kaspi RED, 2GIS, названия услуг и цены — они остаются как есть.
+
 Пиши коротко, как администратор в WhatsApp.
 Стиль: спокойно, заботливо, без канцелярита.
 Можно использовать 1 emoji 🌿, но не больше.
@@ -1028,9 +1043,26 @@ def _contra_markers(text: str) -> set[str]:
     return {name for name, variants in markers.items() if any(v in low for v in variants)}
 
 
+def _humanize_language_ok(base_answer: str, humanized: str) -> bool:
+    """Гуманизатор не имеет права менять язык ответа.
+
+    Раньше эта проверка отсутствовала: правила guard'а искали вопрос про
+    возраст/имя/дату сразу на двух языках, поэтому перевод русского ответа
+    на казахский (и наоборот) проходил как корректный.
+    """
+    if analyze_language is None or response_language_violation is None:
+        return True
+    base_lang = analyze_language(base_answer, None).detected_language
+    if base_lang not in ("ru", "kk"):
+        return True
+    return response_language_violation(humanized, base_lang) == ""
+
+
 def _humanize_guard_ok(base_answer: str, humanized: str) -> bool:
     if not (base_answer or "").strip():
         return not (humanized or "").strip()
+    if not _humanize_language_ok(base_answer, humanized):
+        return False
     if _has_age_question(base_answer) and not _has_age_question(humanized):
         return False
     if _has_contra_question(base_answer):
