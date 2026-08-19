@@ -18,7 +18,7 @@ permissions:
 jobs:
   contract-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       OPENAI_API_KEY: ''
       CRM_BOT_SECRET: test
@@ -39,7 +39,13 @@ jobs:
           pip install -r requirements.txt pytest
 
       - name: Compile protected brain modules
-        run: python -m py_compile ai.py dialog.py bot_tools.py state.py language_guard.py
+        run: python -m py_compile ai.py ai_budget.py dialog.py main.py bot_tools.py state.py language_guard.py
+
+      - name: OpenAI runtime telemetry contract
+        run: pytest -q tests/test_openai_runtime_telemetry_contract.py
+
+      - name: OpenAI budget accounting contract
+        run: pytest -q tests/test_ai_budget_enforcement.py
 
       - name: Canonical prompt contract
         run: pytest -q tests/test_prompt_source_of_truth_contract.py
