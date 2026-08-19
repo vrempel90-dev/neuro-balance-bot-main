@@ -79,8 +79,6 @@ async def _recover_booking_slot_race(
         })
         return None
 
-    # If the exact selected slot is still advertised, the booking failed for a
-    # reason other than a race. Preserve the normal fail-closed handoff path.
     if any(_same_slot_identity(candidate, selected_slot) for candidate in fresh_slots):
         return None
 
@@ -127,14 +125,23 @@ async def _recover_booking_slot_race(
         DIALOG.write_text(text, encoding="utf-8")
 
     test = TEST.read_text(encoding="utf-8")
-    old_assert = '    assert r == "Дана, запись подтверждена 🌿 С Вами свяжется специалист."\n'
-    new_assert = '    assert "подтверждена" not in r.lower()\n    assert "не удалось" in r.lower() or "администратор" in r.lower()\n'
-    if old_assert in test:
-        test = test.replace(old_assert, new_assert, 1)
+    old_failure_assert = '''def test_booking_500_soft_client_text_honest_state(monkeypatch: Any) -> None:
+'''
+    start = test.find(old_failure_assert)
+    if start < 0:
+        raise RuntimeError("CRM 500 regression test not found")
+    next_test = test.find("\ndef test_", start + len(old_failure_assert))
+    end = len(test) if next_test < 0 else next_test
+    block = test[start:end]
+    old_line = '    assert r == "Дана, запись подтверждена 🌿 С Вами свяжется специалист."\n'
+    new_lines = '    assert "подтверждена" not in r.lower()\n    assert "не удалось" in r.lower() or "администратор" in r.lower()\n'
+    if old_line in block:
+        block = block.replace(old_line, new_lines, 1)
+        test = test[:start] + block + test[end:]
         compile(test, str(TEST), "exec")
         TEST.write_text(test, encoding="utf-8")
-    elif 'assert "подтверждена" not in r.lower()' not in test:
-        raise RuntimeError("production booking failure assertion not found")
+    elif 'assert "подтверждена" not in r.lower()' not in block:
+        raise RuntimeError("CRM 500 failure assertion not found in target test")
 
     print("honest booking failure and race recovery migration applied")
 
