@@ -354,3 +354,63 @@ def response_language_violation(answer: str, expected: str) -> str:
         return "wrong_language_response"
 
     return ""
+
+
+# ============================================================
+# Безопасное исправление языка ответа
+# ============================================================
+
+def _template_pairs() -> list[tuple[str, str]]:
+    """Пары (русский шаблон, казахский шаблон) из утверждённой базы клиники.
+
+    Это единственный разрешённый способ «перевести» ответ: мы не переводим
+    текст на лету, а подставляем заранее утверждённый казахский шаблон.
+    Длинные шаблоны идут первыми, чтобы короткий шаблон не съел кусок
+    длинного.
+    """
+    try:
+        import clinic_info
+    except Exception:  # pragma: no cover
+        return []
+    pairs: list[tuple[str, str]] = []
+    for topic, kk in getattr(clinic_info, "CLINIC_INFO_TEMPLATES_KK", {}).items():
+        ru = clinic_info.CLINIC_INFO_TEMPLATES.get(topic)
+        if ru and kk and ru != kk:
+            pairs.append((ru, kk))
+    pairs.sort(key=lambda pair: len(pair[0]), reverse=True)
+    return pairs
+
+
+def enforce_response_language(answer: str, expected: str) -> tuple[str, str]:
+    """Проверяет язык готового ответа и безопасно чинит его.
+
+    Возвращает ``(answer, violation)``:
+
+    - если язык совпадает — текст возвращается без изменений;
+    - если в ответе стоит русский шаблон клиники, а ждали казахский, он
+      заменяется на утверждённый казахский шаблон той же темы;
+    - если утверждённого эквивалента нет, текст НЕ переводится и НЕ
+      выбрасывается: он возвращается как есть, а код нарушения уходит в
+      логи. Доставить верный факт на другом языке безопаснее, чем
+      сочинить казахский текст или промолчать.
+
+    Имена, адреса, ссылки, телефоны и бренды не трогаются никогда.
+    """
+    text = str(answer or "")
+    if expected not in (LANG_RU, LANG_KK) or not text.strip():
+        return text, ""
+
+    violation = response_language_violation(text, expected)
+    if not violation:
+        return text, ""
+
+    if expected == LANG_KK:
+        repaired = text
+        for ru_template, kk_template in _template_pairs():
+            if ru_template in repaired:
+                repaired = repaired.replace(ru_template, kk_template)
+        if repaired != text:
+            still = response_language_violation(repaired, expected)
+            return repaired, (still or violation + "_repaired_from_template")
+
+    return text, violation
