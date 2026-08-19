@@ -1,13 +1,14 @@
 from pathlib import Path
+import re
 
 p = Path('dialog.py')
 s = p.read_text(encoding='utf-8')
 
-old = '''def _booking_failed_answer(session: dict[str, Any]) -> str:\n    return _final_confirmation_text(session)\n'''
 new = '''def _booking_failed_answer(session: dict[str, Any]) -> str:\n    return _tr(\n        session,\n        "Не получилось подтвердить запись в CRM. Ваша запись пока не подтверждена — передам диалог администратору, чтобы он помог завершить запись 🌿",\n        "CRM жүйесінде жазбаны растау мүмкін болмады. Жазбаңыз әзірге расталған жоқ — аяқтауға көмектесу үшін диалогты әкімшіге беремін 🌿",\n    )\n'''
-if old not in s:
-    raise SystemExit('booking_failed_answer anchor not found')
-s = s.replace(old, new, 1)
+pat = re.compile(r'def _booking_failed_answer\(session: dict\[str, Any\]\) -> str:\n.*?(?=\ndef _no_slots_text)', re.S)
+s, count = pat.subn(new.rstrip('\n'), s, count=1)
+if count != 1:
+    raise SystemExit(f'booking_failed_answer regex matched {count}')
 
 anchor = '''    except crm.CRMResponseError as exc:\n        log_payload = {\n'''
 if anchor not in s:
