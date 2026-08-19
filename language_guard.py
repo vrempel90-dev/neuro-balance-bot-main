@@ -285,14 +285,18 @@ def analyze_language(text: str, current: str | None = None) -> LanguageAnalysis:
     else:
         detected = dominant
 
+    # Уверенность = насколько один язык перевесил другой (margin)
+    # И насколько вообще много языкового материала в сообщении (strength).
+    # Одно короткое слово не должно давать уверенность 1.0.
+    strength = min(1.0, total / 8.0)
     if detected == LANG_MIXED:
         # У смешанного сообщения отвечаем на доминирующем языке;
         # при равенстве сигналов держим язык диалога.
         preferred = fallback if margin < 0.2 else dominant
-        confidence = round(min(0.6, 0.3 + margin), 2)
+        confidence = round(min(0.6, 0.3 * margin + 0.3 * strength), 2)
     else:
         preferred = detected
-        confidence = round(min(1.0, 0.5 + margin / 2 + min(total, 8.0) / 32.0), 2)
+        confidence = round(min(1.0, 0.45 * margin + 0.55 * strength), 2)
 
     if explicit:
         preferred = explicit

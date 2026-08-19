@@ -30,8 +30,12 @@ except Exception:
 
 try:
     from language_guard import detect_language as detect_message_language
+    from language_guard import analyze_language as analyze_message_language
+    from language_guard import explicit_language_request as _lg_explicit_language_request
 except Exception:
     detect_message_language = None
+    analyze_message_language = None
+    _lg_explicit_language_request = None
 
 try:
     from config import get_settings
@@ -2063,62 +2067,91 @@ def _explicit_language_request(text: str) -> str | None:
     return None
 
 
-def _detect_lang(text: str, session: dict[str, Any]) -> str:
-    """Определяет язык без скачков туда-сюда.
+# Порог уверенности, при котором пациент считается перешедшим на другой язык.
+LANGUAGE_SWITCH_CONFIDENCE = 0.6
 
-    Правило:
-    - первый осмысленный язык диалога фиксируется;
-    - короткие ответы типа "жоқ/рахмет/37 жаста" не переключают язык;
-    - смешанные сообщения не переключают язык;
-    - смена языка только если клиент явно попросил: "пишите на казахском/русском".
-    """
-    current = session.get("language") or "ru"
+_SHORT_ANSWER_RE = re.compile(
+    r"\s*(?:\d{1,3}\s*(?:жаста|жас|лет|года|год)?|жоқ|жок|ия|иә|жақсы|жаксы|рахмет|"
+    r"рақмет|спасибо|ок|окей|нет|да|ага|угу|неа|иа)\s*[.!?🙏🌿]*\s*"
+)
+
+
+def _is_short_language_neutral_answer(text: str) -> bool:
+    """Короткое подтверждение/число, которое не должно менять язык диалога."""
     low = _low(text)
-    text_stripped = (text or "").strip()
+    if _SHORT_ANSWER_RE.fullmatch(low):
+        return True
+    words = re.findall(r"[a-zA-Zа-яёәғқңөұүһі]+", low)
+    return len(words) <= 1
 
-    # Если язык уже зафиксирован — держим его.
-    # Явная просьба сменить язык обрабатывается в handle_message через _explicit_language_request.
-    if session.get("language_locked") and current in ("ru", "kk"):
-        return current
 
-    step_now = session.get("step") or "start"
-    if session.get("language") in ("ru", "kk") and step_now not in ("start", "", None):
-        return current
+def _detect_lang(text: str, session: dict[str, Any]) -> str:
+    """Определяет язык ответа для текущего сообщения.
 
-    short_answer = bool(
-        re.fullmatch(
-            r"\s*(?:\d{1,3}\s*(?:жаста|жас|лет|года|год)?|жоқ|жок|ия|иә|жақсы|жаксы|рахмет|спасибо|ок|окей|нет|да)\s*[.!?🙏🌿]*\s*",
-            low,
-        )
-    )
-    if short_answer and current in ("ru", "kk"):
-        return current
+    Пациент может перейти на другой язык посреди диалога, и бот обязан
+    перейти вместе с ним. Но язык не должен скакать от каждого «жоқ» или
+    «да», поэтому переключение требует уверенного сигнала:
 
-    has_kz_letters = bool(re.search(r"[әғқңөұүһіӘҒҚҢӨҰҮҺІ]", text_stripped))
-    has_kz_words = any(w in low for w in KZ_MARKERS) or bool(
-        re.search(r"(емдей\s+аласыз|емдей\s+аласыздар|аласыздар\s+ма)", low)
-    )
-    has_ru = any(w in low for w in RU_MARKERS)
+    - явная просьба ("қазақша жазыңыз") — сильнее всего и фиксирует язык;
+    - зафиксированный явной просьбой язык не меняется автоматически;
+    - пока язык диалога не установлен, берём язык первого осмысленного
+      сообщения;
+    - короткие ответы ("иә", "да", "44") язык не переключают;
+    - смешанное RU+KK сообщение язык диалога не переключает;
+    - уверенное сообщение целиком на другом языке — переключает.
+    """
+    current = session.get("language")
+    if current not in ("ru", "kk"):
+        current = "ru"
+        established = False
+    else:
+        established = True
 
-    # Смешанный текст: держим текущий язык.
-    if has_ru and (has_kz_letters or has_kz_words) and current in ("ru", "kk"):
-        return current
-
-    if has_kz_letters or has_kz_words:
-        return "kk"
-
-    if has_ru:
-        return "ru"
-
-    if detect_message_language:
+    # 1. Явная просьба пациента имеет наивысший приоритет.
+    if _lg_explicit_language_request:
         try:
-            detected = detect_message_language(text, current)
-            if detected in ("ru", "kk"):
-                return detected
+            explicit = _lg_explicit_language_request(text)
+            if explicit in ("ru", "kk"):
+                return explicit
         except Exception:
             pass
 
-    return current if current in ("ru", "kk") else "ru"
+    # 2. Язык, зафиксированный явной просьбой, автоматически не меняем.
+    if session.get("language_locked") and established:
+        return current
+
+    if not analyze_message_language:
+        return current
+
+    try:
+        analysis = analyze_message_language(text, current)
+    except Exception:
+        return current
+
+    detected = analysis.detected_language
+    preferred = analysis.preferred_response_language
+
+    # 3. Языка диалога ещё нет — берём язык первого осмысленного сообщения.
+    if not established:
+        return preferred if preferred in ("ru", "kk") else "ru"
+
+    # 4. Сигнала нет вообще ("44", "+", эмодзи) — держим текущий язык.
+    if detected == "unknown":
+        return current
+
+    # 5. Смешанное сообщение язык диалога не переключает.
+    if detected == "mixed":
+        return current
+
+    # 6. Короткий ответ язык не переключает.
+    if detected != current and _is_short_language_neutral_answer(text):
+        return current
+
+    # 7. Уверенный переход пациента на другой язык — идём за ним.
+    if detected != current and analysis.confidence >= LANGUAGE_SWITCH_CONFIDENCE:
+        return detected
+
+    return current
 def _tr(session_or_lang: dict[str, Any] | str, ru: str, kk: str) -> str:
     if isinstance(session_or_lang, dict):
         lang = session_or_lang.get("language") or "ru"
