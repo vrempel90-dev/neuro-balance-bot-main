@@ -1,0 +1,555 @@
+[
+  {
+    "name": "01_profile_complaint_to_booking",
+    "why": "Профильная жалоба должна дойти до выбора времени, а не встать на полпути",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит поясница, отдаёт в ногу",
+      "Мне 42",
+      "нет ничего такого",
+      "завтра"
+    ],
+    "expect": {
+      "final_step_in": [
+        "date",
+        "time"
+      ],
+      "language": "ru",
+      "every_answer_nonempty": true
+    }
+  },
+  {
+    "name": "02_non_profile_complaint",
+    "why": "Непрофильную жалобу нельзя записывать, её эскалируют",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит живот и тошнит"
+    ],
+    "expect": {
+      "language": "ru",
+      "must_not_contain": [
+        "сколько Вам лет"
+      ]
+    }
+  },
+  {
+    "name": "03_age_under_16",
+    "why": "Возраст вне 16-74 останавливает запись",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит спина",
+      "Мне 12"
+    ],
+    "expect": {
+      "final_step_not_in": [
+        "date",
+        "time",
+        "name",
+        "booked"
+      ],
+      "language": "ru"
+    }
+  },
+  {
+    "name": "04_age_over_74",
+    "why": "Верхняя граница возраста тоже останавливает запись",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит спина",
+      "мне 80 лет"
+    ],
+    "expect": {
+      "final_step_not_in": [
+        "date",
+        "time",
+        "name",
+        "booked"
+      ],
+      "language": "ru"
+    }
+  },
+  {
+    "name": "05_hard_contraindication",
+    "why": "Жёсткое противопоказание — стоп записи",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит спина",
+      "Мне 45",
+      "у меня кардиостимулятор"
+    ],
+    "expect": {
+      "final_step_not_in": [
+        "date",
+        "time",
+        "name",
+        "booked"
+      ],
+      "language": "ru"
+    }
+  },
+  {
+    "name": "06_contraindication_term_question",
+    "why": "Вопрос про термин из списка — это НЕ подтверждение противопоказания",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит спина",
+      "Мне 45",
+      "а что такое кохлеарный имплант?"
+    ],
+    "expect": {
+      "language": "ru",
+      "every_answer_nonempty": true
+    }
+  },
+  {
+    "name": "07_price_first_visit",
+    "why": "Цена приёма — факт из базы клиники",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Сколько стоит приём?"
+    ],
+    "expect": {
+      "must_contain": [
+        "5 000"
+      ],
+      "language": "ru"
+    }
+  },
+  {
+    "name": "08_price_course",
+    "why": "Стоимость курса нельзя называть до осмотра",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит спина",
+      "а сколько стоит всё лечение?"
+    ],
+    "expect": {
+      "language": "ru",
+      "every_answer_nonempty": true
+    }
+  },
+  {
+    "name": "09_address",
+    "why": "Адрес — факт из базы, ссылка и номер дома не искажаются",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Какой у вас адрес?"
+    ],
+    "expect": {
+      "must_contain": [
+        "28"
+      ],
+      "language": "ru"
+    }
+  },
+  {
+    "name": "10_schedule",
+    "why": "График работы — факт из базы",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Как вы работаете, какой график?"
+    ],
+    "expect": {
+      "language": "ru",
+      "every_answer_nonempty": true
+    }
+  },
+  {
+    "name": "11_installment",
+    "why": "Рассрочка — факт из базы (Kaspi RED)",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "А рассрочка есть?"
+    ],
+    "expect": {
+      "language": "ru",
+      "every_answer_nonempty": true
+    }
+  },
+  {
+    "name": "12_mri_images",
+    "why": "Снимки заранее не обязательны — факт из базы",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Нужно ли делать МРТ перед приёмом?"
+    ],
+    "expect": {
+      "language": "ru",
+      "every_answer_nonempty": true
+    }
+  },
+  {
+    "name": "13_objection_expensive",
+    "why": "Возражение 'дорого' должно получать ответ по существу, а не чек-лист",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит колено",
+      "Мне 50",
+      "дорого"
+    ],
+    "expect": {
+      "language": "ru",
+      "every_answer_nonempty": true,
+      "last_answer_not_repeat_of_previous": true
+    }
+  },
+  {
+    "name": "14_objection_will_think",
+    "why": "Возражение 'подумаю' должно получать ответ по существу",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит колено",
+      "Мне 50",
+      "я подумаю"
+    ],
+    "expect": {
+      "language": "ru",
+      "every_answer_nonempty": true,
+      "last_answer_not_repeat_of_previous": true
+    }
+  },
+  {
+    "name": "15_other_city",
+    "why": "Пациент из другого города — филиалов нет",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Я из Алматы, вы там принимаете?"
+    ],
+    "expect": {
+      "language": "ru",
+      "every_answer_nonempty": true
+    }
+  },
+  {
+    "name": "16_reschedule_request",
+    "why": "Перенос записи идёт через CRM, а не выдумывается",
+    "preset": {
+      "step": "booked",
+      "booked": true,
+      "booking_confirmed": true
+    },
+    "messages": [
+      "Хочу перенести запись на другой день"
+    ],
+    "expect": {}
+  },
+  {
+    "name": "17_cancel_request",
+    "why": "Отмена записи идёт через CRM",
+    "preset": {
+      "step": "booked",
+      "booked": true,
+      "booking_confirmed": true
+    },
+    "messages": [
+      "Отмените мою запись пожалуйста"
+    ],
+    "expect": {}
+  },
+  {
+    "name": "18_already_booked_thanks",
+    "why": "После брони короткое 'спасибо' не запускает сценарий заново",
+    "preset": {
+      "step": "booked",
+      "booked": true,
+      "booking_confirmed": true
+    },
+    "messages": [
+      "спасибо"
+    ],
+    "expect": {
+      "all_answers_empty": true
+    },
+    "via_main": true
+  },
+  {
+    "name": "19_admin_takeover",
+    "why": "При вмешательстве администратора бот молчит",
+    "preset": {
+      "step": "age",
+      "manual_takeover": true
+    },
+    "messages": [
+      "Болит спина"
+    ],
+    "expect": {
+      "all_answers_empty": true
+    },
+    "via_main": true
+  },
+  {
+    "name": "20_mixed_language",
+    "why": "Смешанное RU+KK сообщение не должно ломать язык диалога",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит спина",
+      "Белім ауырады, врач сегодня принимает?"
+    ],
+    "expect": {
+      "language": "ru"
+    }
+  },
+  {
+    "name": "21_translit",
+    "why": "Транслит должен пониматься",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "salem, belim aurady"
+    ],
+    "expect": {
+      "every_answer_nonempty": true
+    }
+  },
+  {
+    "name": "22_typos_ru",
+    "why": "Опечатки не должны ломать распознавание жалобы",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "поясница бкспокоит"
+    ],
+    "expect": {
+      "final_step_in": [
+        "age"
+      ],
+      "language": "ru"
+    }
+  },
+  {
+    "name": "23_one_word_answers",
+    "why": "Односложные ответы понимаются по контексту шага",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит спина",
+      "42",
+      "нет"
+    ],
+    "expect": {
+      "language": "ru",
+      "every_answer_nonempty": true
+    }
+  },
+  {
+    "name": "24_digit_only",
+    "why": "Только цифра на шаге возраста — это возраст",
+    "preset": {
+      "step": "age",
+      "complaint": "спина"
+    },
+    "messages": [
+      "44"
+    ],
+    "expect": {
+      "final_step_in": [
+        "contraindications"
+      ],
+      "language": "ru"
+    }
+  },
+  {
+    "name": "25_emoji_only",
+    "why": "Только эмодзи не должно ломать состояние",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "🌿"
+    ],
+    "expect": {}
+  },
+  {
+    "name": "26_kk_profile_complaint",
+    "why": "Казахская жалоба ведёт по воронке на казахском",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Белім ауырады",
+      "Жасым 42",
+      "жоқ"
+    ],
+    "expect": {
+      "language": "kk",
+      "every_answer_nonempty": true
+    }
+  },
+  {
+    "name": "27_kk_price_question",
+    "why": "Казахский FAQ отвечается по-казахски",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Консультация қанша тұрады?"
+    ],
+    "expect": {
+      "language": "kk",
+      "must_contain": [
+        "5 000"
+      ]
+    }
+  },
+  {
+    "name": "28_kk_objection",
+    "why": "Казахское возражение получает ответ по существу",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Белім ауырады",
+      "Жасым 50",
+      "қымбат екен"
+    ],
+    "expect": {
+      "language": "kk",
+      "every_answer_nonempty": true
+    }
+  },
+  {
+    "name": "29_kk_contraindications",
+    "why": "Казахский чек-лист противопоказаний, а не русский",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Белім ауырады",
+      "Жасым 42"
+    ],
+    "expect": {
+      "language": "kk"
+    }
+  },
+  {
+    "name": "30_switch_ru_to_kk",
+    "why": "Пациент перешёл на казахский — бот идёт за ним",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит спина",
+      "Мне 42",
+      "Жоқ, ондай нәрсе жоқ. Мекенжайыңыз қайда?"
+    ],
+    "expect": {
+      "language": "kk"
+    }
+  },
+  {
+    "name": "31_switch_kk_to_ru",
+    "why": "Пациент перешёл на русский — бот идёт за ним",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Белім ауырады",
+      "Жасым 42",
+      "Нет, ничего такого. А какой адрес?"
+    ],
+    "expect": {
+      "language": "ru"
+    }
+  },
+  {
+    "name": "32_multi_intent_one_message",
+    "why": "Несколько намерений в одном сообщении разбираются вместе",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Здравствуйте, болит спина, мне 35, сколько стоит приём?"
+    ],
+    "expect": {
+      "every_answer_nonempty": true,
+      "language": "ru"
+    }
+  },
+  {
+    "name": "33_faq_during_contraindications",
+    "why": "КЛЮЧЕВОЕ: вопрос на шаге противопоказаний получает ответ, а не повтор чек-листа",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит спина",
+      "Мне 42",
+      "а сколько стоит приём?"
+    ],
+    "expect": {
+      "language": "ru",
+      "every_answer_nonempty": true,
+      "must_contain": [
+        "5 000"
+      ],
+      "last_answer_not_repeat_of_previous": true
+    }
+  },
+  {
+    "name": "34_address_during_contraindications",
+    "why": "Адрес на шаге противопоказаний — единственный случай, который работал и раньше",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Болит спина",
+      "Мне 42",
+      "какой адрес?"
+    ],
+    "expect": {
+      "language": "ru",
+      "must_contain": [
+        "28"
+      ],
+      "every_answer_nonempty": true
+    }
+  },
+  {
+    "name": "35_returning_patient",
+    "why": "Повторный пациент не проходит анкету заново с нуля",
+    "preset": {
+      "step": "complaint"
+    },
+    "messages": [
+      "Я у вас уже была, хочу снова записаться"
+    ],
+    "expect": {
+      "every_answer_nonempty": true
+    }
+  }
+]
