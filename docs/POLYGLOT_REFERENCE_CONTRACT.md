@@ -23,6 +23,8 @@ The following production contracts are frozen and must not be changed by this re
 1. Python safety/business invariants are absolute: state transitions, contraindications, CRM availability, selected slot, booking payload, working-hours gates and human takeover.
 2. `SYSTEM_PROMPT_rendered.md` is the canonical source for user-facing clinic facts, tone, wording, RU/KK behavior and dialog policy.
 3. Secondary AI prompts are task/protocol prompts only. They must not contradict or silently rewrite the canonical clinic prompt.
+4. Mutable clinic facts such as profile, prices, address, MRI guidance, schedule, methods, promotions and operator style must not be duplicated in `OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT`; the protocol may reference the canonical prompt but must not maintain a second copy of those facts.
+5. If the canonical clinic prompt cannot be loaded, the model must fail closed for clinic-fact questions rather than inventing an answer.
 
 ## Polyglot invariants adopted
 
@@ -33,6 +35,14 @@ The following production contracts are frozen and must not be changed by this re
 - Language/date context is deterministic where Python can know it.
 - A model failure must fail safe, not create an unbounded loop or unsafe external action.
 - Multi-turn regression/evaluation scenarios are treated as a first-class production gate.
+
+## Verified Neuro safeguards
+
+- Canonical prompt precedence is regression-tested; secondary humanizer/protocol prompts cannot silently replace required clinic wording such as `окошко`.
+- Slot provenance is enforced: a normal booking uses a CRM-derived slot from `session.last_slots`; a legacy in-flight session that lost `last_slots` must revalidate the exact doctor/date/time through the existing CRM availability call before booking.
+- Cross-turn anti-loop behavior is regression-tested in RU/KK, including safe escalation after repeated mandatory questions, forward progress when data is already known and protection against false positives on FAQ answers.
+- Mutable clinic facts have been removed from the dialog protocol prompt; `SYSTEM_PROMPT_rendered.md` remains the only clinic fact source while Python keeps safety/business authority.
+- `.github/workflows/brain-contract.yml` provides a deterministic CI gate for prompt, slot, anti-loop, RU/KK, hallucination, booking, CRM source-of-truth, webhook idempotency and working-hours contracts without live OpenAI or live CRM calls.
 
 ## Deliberately not copied
 
