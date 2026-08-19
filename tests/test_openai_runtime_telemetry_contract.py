@@ -190,3 +190,24 @@ def test_startup_source_logs_non_secret_ai_configuration() -> None:
     assert '"openai_brain_enabled"' in source
     assert '"openai_brain_model"' in source
     assert '"openai_humanize_replies"' in source
+
+
+def test_disabled_humanizer_is_not_reported_as_missing_openai_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(settings, "ai_enabled", True)
+    monkeypatch.setattr(settings, "openai_humanize_replies", False)
+
+    answer, debug = run(
+        ai.humanize_reply_with_openai(
+            base_answer="Подскажите, пожалуйста, сколько Вам лет?",
+            user_text="болит спина",
+            session={"chat_id": "humanizer-disabled", "step": "age"},
+        )
+    )
+
+    assert answer == "Подскажите, пожалуйста, сколько Вам лет?"
+    assert debug["openai_used"] is False
+    assert debug["openai_skip_reason"] == "humanizer_disabled"
+    assert debug.get("openai_missing_keys") in (None, [])
+    assert debug["openai_disabled_flags"] == ["OPENAI_HUMANIZE_REPLIES=false"]
