@@ -1,0 +1,72 @@
+name: Apply Polyglot slot contract
+
+on:
+  push:
+    branches:
+      - refactor/polyglot-brain-contract
+
+concurrency:
+  group: polyglot-slot-contract
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout migration branch
+        uses: actions/checkout@v4
+        with:
+          ref: refactor/polyglot-brain-contract
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Apply guarded slot-contract migration
+        run: python scripts/apply_polyglot_slot_contract.py
+
+      - name: Syntax check
+        run: python -m py_compile dialog.py ai.py bot_tools.py
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Run slot and regression tests
+        env:
+          OPENAI_API_KEY: ''
+          CRM_BOT_SECRET: test
+        run: |
+          pytest -q \
+            tests/test_polyglot_slot_contract.py \
+            tests/test_production_booking_flow.py \
+            tests/test_crm_single_source_of_truth.py \
+            tests/test_production_stabilization.py \
+            tests/test_prompt_source_of_truth_contract.py \
+            tests/test_bilingual_hallucination_guards.py \
+            tests/test_multiturn_bilingual_flow.py
+
+      - name: Remove one-shot migration machinery
+        run: |
+          rm -f scripts/apply_polyglot_slot_contract.py
+          rm -f .github/workflows/apply-polyglot-slot-contract.yml
+
+      - name: Commit verified slot contract
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "fix: revalidate legacy selected slots before booking"
+          git pull --rebase origin refactor/polyglot-brain-contract
+          git push origin HEAD:refactor/polyglot-brain-contract
