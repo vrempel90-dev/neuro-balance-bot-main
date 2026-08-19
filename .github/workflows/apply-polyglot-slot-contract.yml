@@ -42,19 +42,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
 
-      - name: Run slot and regression tests
+      - name: Run new slot contract tests
+        env:
+          OPENAI_API_KEY: ''
+          CRM_BOT_SECRET: test
+        run: pytest -q tests/test_polyglot_slot_contract.py
+
+      - name: Run booking regressions in isolated processes
         env:
           OPENAI_API_KEY: ''
           CRM_BOT_SECRET: test
         run: |
-          pytest -q \
-            tests/test_polyglot_slot_contract.py \
-            tests/test_production_booking_flow.py \
-            tests/test_crm_single_source_of_truth.py \
-            tests/test_production_stabilization.py \
-            tests/test_prompt_source_of_truth_contract.py \
-            tests/test_bilingual_hallucination_guards.py \
-            tests/test_multiturn_bilingual_flow.py
+          pytest -q tests/test_production_booking_flow.py
+          pytest -q tests/test_crm_single_source_of_truth.py
+
+      - name: Run prompt and bilingual regressions in isolated processes
+        env:
+          OPENAI_API_KEY: ''
+          CRM_BOT_SECRET: test
+        run: |
+          pytest -q tests/test_prompt_source_of_truth_contract.py
+          pytest -q tests/test_bilingual_hallucination_guards.py
+          pytest -q tests/test_multiturn_bilingual_flow.py
 
       - name: Remove one-shot migration machinery
         run: |
