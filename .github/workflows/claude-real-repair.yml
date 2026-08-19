@@ -199,6 +199,7 @@ jobs:
 
       - name: Prove regression fails on untouched main and passes with fix
         if: steps.scope.outputs.changed == 'true'
+        id: proof
         shell: bash
         env:
           TEST_FILES: ${{ steps.scope.outputs.test_files }}
@@ -226,17 +227,20 @@ jobs:
           set -e
           if [ "$BASELINE_RC" -eq 0 ]; then
             echo "Regression test already passes on current main. Bug is not proven; no repair PR."
-            exit 78
+            git reset --hard HEAD
+            git clean -fd
+            echo "proven=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           git reset --hard HEAD
           git clean -fd
           git apply --index /tmp/claude-repair.patch
-
           python -m pytest -q $TEST_FILES
+          echo "proven=true" >> "$GITHUB_OUTPUT"
 
       - name: Run deterministic nearby contracts
-        if: steps.scope.outputs.changed == 'true'
+        if: steps.proof.outputs.proven == 'true'
         shell: bash
         run: |
           python -m py_compile dialog.py ai.py bot_tools.py language_guard.py strict_prompt_guard.py clinic_info.py
@@ -252,7 +256,7 @@ jobs:
           python tests/run_golden.py
 
       - name: Open draft repair PR, never merge automatically
-        if: steps.scope.outputs.changed == 'true'
+        if: steps.proof.outputs.proven == 'true'
         shell: bash
         run: |
           BRANCH="claude/real-wazzup-${GITHUB_RUN_ID}"
