@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - refactor/polyglot-brain-contract
+  pull_request:
+    branches:
+      - main
 
 concurrency:
   group: canonical-fact-dedup
