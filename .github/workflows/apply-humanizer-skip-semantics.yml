@@ -1,0 +1,60 @@
+name: Apply humanizer skip semantics
+
+on:
+  push:
+    branches:
+      - refactor/polyglot-brain-contract
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: humanizer-skip-semantics
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OPENAI_API_KEY: test-key
+      CRM_BOT_SECRET: test
+      CRM_BASE_URL: http://127.0.0.1:9
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refactor/polyglot-brain-contract
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply guarded correction
+        run: python scripts/apply_humanizer_skip_semantics.py
+      - name: Compile
+        run: python -m py_compile ai.py main.py dialog.py state.py
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Verify telemetry and brain contracts
+        run: |
+          pytest -q tests/test_openai_runtime_telemetry_contract.py
+          pytest -q tests/test_ai_budget_enforcement.py
+          pytest -q tests/test_prompt_source_of_truth_contract.py
+      - name: Remove one-shot machinery
+        run: |
+          rm -f scripts/apply_humanizer_skip_semantics.py
+          rm -f .github/workflows/apply-humanizer-skip-semantics.yml
+      - name: Commit verified correction
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "fix: separate disabled humanizer from missing OpenAI config"
+          git pull --rebase origin refactor/polyglot-brain-contract
+          git push origin HEAD:refactor/polyglot-brain-contract
