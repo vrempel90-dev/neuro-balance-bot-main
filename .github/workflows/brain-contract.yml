@@ -18,7 +18,7 @@ permissions:
 jobs:
   contract-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       OPENAI_API_KEY: ''
       CRM_BOT_SECRET: test
@@ -56,6 +56,9 @@ jobs:
       - name: Bilingual language guard
         run: pytest -q tests/test_bilingual_language_guard.py
 
+      - name: Explicit RU-KK language switching
+        run: pytest -q tests/test_language_switching.py
+
       - name: Bilingual hallucination guard
         run: pytest -q tests/test_bilingual_hallucination_guards.py
 
@@ -64,6 +67,12 @@ jobs:
 
       - name: RU-KK multi-turn flow
         run: pytest -q tests/test_multiturn_bilingual_flow.py
+
+      - name: Relative-patient booking contract
+        run: pytest -q tests/test_booking_for_relative.py
+
+      - name: Contraindications must never go silent
+        run: pytest -q tests/test_contraindications_never_silent.py
 
       - name: FAQ must not trigger false loop repair
         run: pytest -q tests/test_faq_not_blocked_by_step_repair.py
