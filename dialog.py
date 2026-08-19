@@ -89,6 +89,25 @@ CONTRAINDICATIONS_MESSAGE_RU = """Перед записью нужно подт�
 
 Подскажите, пожалуйста, у Вас ничего из этого нет?"""
 
+# Казахская версия того же самого чек-листа. Состав противопоказаний и
+# возрастные границы полностью совпадают с русской версией — это перевод
+# утверждённого списка, а не новые медицинские факты.
+CONTRAINDICATIONS_MESSAGE_KK = """Жазылу алдында нақтылап алайын: Сізде қарсы көрсетілімдер жоқ па — кардиостимулятор, жүктілік, онкология, ем аймағындағы металл, эпилепсия, 16-дан кіші немесе 75-тен үлкен жас?
+
+Сондай-ақ назарыңызға саламыз:
+емнің қауіпсіздігі мен тиімділігі үшін қабылдау жүргізілмейді:
+• қозғалысы шектеулі пациенттерге (арба, балдақ)
+• 16 жасқа толмағандарға
+• 16-дан 18 жасқа дейінгілерге — тек ата-анасының сүйемелдеуімен
+
+Айтыңызшы, Сізде осылардың ешқайсысы жоқ па?"""
+
+UNKNOWN_CONTRA_SAFE_ANSWER_KK = (
+    "Рахмет, түсіндім. Бұл тармақ біздің негізгі қарсы көрсетілімдер тізімінде жоқ, "
+    "бірақ медициналық жағынан қателеспеу үшін нақтылауды әкімшіге беремін 🌿\n\n"
+    "Айтыңызшы, тізімдегі басқа қарсы көрсетілімдер жоқ па?"
+)
+
 FIRST_TOUCH_REQUIRED_FRAGMENTS = (
     "Клиника Neuro Balance помогает",
     "Мы специализируемся на:",
@@ -134,6 +153,12 @@ UNKNOWN_CONTRA_SAFE_ANSWER_RU = (
 
 
 def _contraindications_locked_message(session: dict[str, Any]) -> str:
+    if (session.get("language") or "ru") == "kk":
+        # Для записи за другого человека берём нейтральное «Пациентте»:
+        # это безопаснее, чем строить казахские падежи от русской связки.
+        if str(session.get("patient_subject") or "self") != "self" or session.get("patient_gender"):
+            return CONTRAINDICATIONS_MESSAGE_KK.replace("Сізде", "Пациентте")
+        return CONTRAINDICATIONS_MESSAGE_KK
     prep = _patient_pronoun_prep(session)
     if prep == "у Вас":
         return CONTRAINDICATIONS_MESSAGE_RU
@@ -6328,10 +6353,16 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _no_reply(chat_id, session, reason)
 
     # language_lock_guard:
-    # Фиксируем язык диалога, чтобы бот не прыгал RU/KZ от коротких ответов.
-    # Сменить язык можно только явной просьбой клиента.
-    if not session.get("language_locked") and text and not _is_thanks_or_ok(text):
-        session["language_locked"] = True
+    # Раньше здесь язык диалога фиксировался на первом же осмысленном
+    # сообщении, и снять фиксацию можно было только явной просьбой клиента.
+    # Из-за этого пациент, перешедший на другой язык посреди разговора,
+    # до конца диалога получал ответы на прежнем языке.
+    #
+    # Задачу «не прыгать RU/KZ от коротких ответов» теперь решает сам
+    # _detect_lang: короткие подтверждения («иә», «да», «44») и смешанные
+    # RU+KK сообщения язык не переключают, для перехода нужен уверенный
+    # сигнал целиком на другом языке. Поэтому language_locked снова
+    # означает только одно — пациент явно попросил конкретный язык.
 
     # thanks_after_info_guard:
     # Если пациент поблагодарил после адреса/цены/графика, не начинаем анкету заново.
@@ -6972,7 +7003,6 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["phone"] = phone or ""
         session["language"] = _detect_lang(text, session)
         _repair_bad_patient_name(session)
-        session["language_locked"] = True
         _record_complaint_tool(session, text, is_in_profile=True)
         session["step"] = "age"
         return _finalize(

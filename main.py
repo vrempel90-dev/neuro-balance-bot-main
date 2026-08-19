@@ -270,6 +270,20 @@ def _log_dialog_result(chat_id: str, phone: str, answer: str) -> None:
         "answer_empty": debug["answer_empty"],
         "answer_preview": _preview(answer, 160),
         **{k: debug[k] for k in ("source", "local_time", "bot_work_time_now", "working_hours_allowed", "step", "gate_reason", "no_reply_reason", "ai_muted", "manual_takeover", "ai_lead_started", "openai_used", "openai_skip_reason")},
+        # Языковая телеметрия: на чём говорит пациент, на чём ответил бот,
+        # что решил Python и что предложила модель. Секретов здесь нет.
+        "state_before_step": session.get("state_before_step") or "",
+        "detected_language": session.get("language") or "",
+        "brain_detected_language": session.get("brain_detected_language") or "",
+        "brain_preferred_response_language": session.get("brain_preferred_response_language") or "",
+        "brain_language_confidence": session.get("brain_language_confidence") or 0.0,
+        "brain_language_hint_applied": bool(session.get("brain_language_hint_applied")),
+        "language_locked": bool(session.get("language_locked")),
+        "language_guard_result": session.get("language_guard_result") or "",
+        "clinic_info_lang_fallback": bool(session.get("last_clinic_info_lang_fallback")),
+        "detected_intent": session.get("last_user_intent") or "",
+        "openai_brain_guard_reason": session.get("openai_brain_guard_reason") or "",
+        "fallback_reason": session.get("fallback_reason") or "",
     })
     if not answer:
         state.log_event(chat_id, "bot_no_reply", {
