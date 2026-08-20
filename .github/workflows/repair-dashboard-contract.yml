@@ -6,16 +6,26 @@ on:
       - "repair_app.py"
       - "repair_status.py"
       - "repair_service.py"
+      - "repair_live.py"
+      - "repair_observer.py"
+      - "live_main.py"
       - "tests/test_repair_status.py"
+      - "tests/test_claude_live_new_leads.py"
       - ".github/workflows/repair-dashboard-contract.yml"
+      - ".github/workflows/claude-real-repair.yml"
   push:
     branches: [main]
     paths:
       - "repair_app.py"
       - "repair_status.py"
       - "repair_service.py"
+      - "repair_live.py"
+      - "repair_observer.py"
+      - "live_main.py"
       - "tests/test_repair_status.py"
+      - "tests/test_claude_live_new_leads.py"
       - ".github/workflows/repair-dashboard-contract.yml"
+      - ".github/workflows/claude-real-repair.yml"
 
 permissions:
   contents: read
@@ -33,7 +43,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
-      - name: Compile dashboard modules
-        run: python -m py_compile repair_status.py repair_app.py repair_service.py
-      - name: Run dashboard regression tests
-        run: python -m pytest -q tests/test_repair_status.py
+      - name: Compile repair modules
+        run: python -m py_compile repair_status.py repair_app.py repair_service.py repair_live.py repair_observer.py live_main.py
+      - name: Run repair regression tests
+        run: python -m pytest -q tests/test_repair_status.py tests/test_claude_live_new_leads.py
