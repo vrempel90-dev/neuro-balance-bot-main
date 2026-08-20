@@ -7,10 +7,12 @@ from fastapi import HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 import repair_service as base
+from repair_live import router as live_router
 from repair_status import dashboard_document, github_repair_summary, record_claude_call, record_scan, snapshot
 
 
 app = base.app
+app.include_router(live_router)
 
 # Replace only the routes whose activity we want to measure. All auth and proxy
 # logic remains in repair_service.py and is called unchanged below.
@@ -32,8 +34,7 @@ async def _production_reachable() -> bool | None:
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.5)) as client:
             response = await client.get(
-                f"{base._PRODUCTION_URL}/debug/last-production-events",
-                params={"limit": 1},
+                f"{base._PRODUCTION_URL}/health",
             )
         return response.status_code == 200
     except Exception:
