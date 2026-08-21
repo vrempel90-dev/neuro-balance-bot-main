@@ -27,6 +27,10 @@ MONTHLY_AI_BUDGET_USD=17.5
 AI_MAX_CLASSIFIER_CALLS_PER_DAY=300
 HUMAN_DIALOG_MODE=true
 
+# Dedicated secret for protected OpenAI operational diagnostics.
+# Never reuse OPENAI_API_KEY, CRM_BOT_SECRET or Wazzup credentials here.
+OPENAI_DEBUG_ADMIN_TOKEN=<strong-random-secret>
+
 CRM_BASE_URL=https://neuro-balance-crm.vercel.app
 CRM_BOT_SECRET=...
 
@@ -45,13 +49,16 @@ MESSAGE_DEBOUNCE_SECONDS=5
 
 ## OpenAI production diagnostics
 
-После деплоя проверить:
+После деплоя diagnostics доступны только администратору:
 
 ```text
 GET /debug/openai/status
+Authorization: Bearer <OPENAI_DEBUG_ADMIN_TOKEN>
 ```
 
-Endpoint не возвращает сам `OPENAI_API_KEY`. Он показывает только безопасный operational status:
+Анонимный или неверно авторизованный запрос получает `401`. Если `OPENAI_DEBUG_ADMIN_TOKEN` не настроен на сервере, endpoint закрывается fail-closed ответом `503`.
+
+Endpoint не возвращает сам `OPENAI_API_KEY` и не возвращает `OPENAI_DEBUG_ADMIN_TOKEN`. Он показывает только operational status:
 
 - `openai_api_key_present` — реально ли runtime получил непустой ключ;
 - `ai_enabled` / `openai_brain_enabled`;
@@ -94,7 +101,7 @@ uvicorn main:app --host 0.0.0.0 --port $PORT
 - На профильные жалобы сначала отвечает по смыслу, потом ведёт к записи.
 - На непрофильные жалобы не записывает автоматически, передаёт оператору.
 - Не выдумывает врачей/слоты/записи — только через CRM tools.
-- Ошибка или лимит OpenAI деградирует в Python fallback, но причина должна быть видна в диагностике.
+- Ошибка или лимит OpenAI деградирует в Python fallback, но причина должна быть видна в защищённой диагностике.
 
 ## Важное по CRM API
 
