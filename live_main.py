@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import Header, HTTPException
 
+import ai as openai_runtime
 import ai_budget
 import main as neuro
 import state
@@ -76,8 +77,13 @@ def _require_openai_debug_admin(authorization: str | None) -> None:
         raise HTTPException(status_code=503, detail="OpenAI diagnostics are disabled")
 
     provided = str(authorization or "").strip()
-    expected = f"Bearer {token}"
-    if not hmac.compare_digest(provided, expected):
+    parts = provided.split(None, 1)
+    valid = (
+        len(parts) == 2
+        and parts[0].lower() == "bearer"
+        and hmac.compare_digest(parts[1], token)
+    )
+    if not valid:
         raise HTTPException(
             status_code=401,
             detail="Unauthorized",
@@ -92,10 +98,14 @@ def _openai_production_status() -> dict[str, Any]:
     ai_enabled = bool(getattr(settings, "ai_enabled", True))
     brain_enabled = bool(getattr(settings, "openai_brain_enabled", True))
     brain_model = str(getattr(settings, "ai_brain_model", "") or getattr(settings, "openai_model", "") or "").strip()
+    openai_package_available = openai_runtime.AsyncOpenAI is not None
 
+    budget_status_available = True
     try:
         budget = ai_budget.budget_status()
+        budget_status_available = bool(budget.get("budget_status_available", True))
     except Exception:
+        budget_status_available = False
         budget = {
             "budget_status_available": False,
             "over_budget": False,
@@ -111,22 +121,31 @@ def _openai_production_status() -> dict[str, Any]:
         blockers.append("OPENAI_BRAIN_ENABLED=false")
     if not brain_model:
         blockers.append("AI_BRAIN_MODEL_or_OPENAI_MODEL")
+    if not openai_package_available:
+        blockers.append("openai_package")
+    if not budget_status_available:
+        blockers.append("budget_status_unavailable")
     if bool(budget.get("over_budget")):
         blockers.append("monthly_budget_exceeded")
     if bool(budget.get("daily_calls_exhausted")):
         blockers.append("daily_call_limit_exceeded")
 
+    configured_temperature = getattr(settings, "ai_brain_temperature", None)
+    brain_temperature = 0.2 if configured_temperature is None else float(configured_temperature)
+
     return {
         "openai_api_key_present": api_key_present,
+        "openai_package_available": openai_package_available,
         "ai_enabled": ai_enabled,
         "openai_brain_enabled": brain_enabled,
         "ai_brain_model": brain_model,
-        "ai_brain_temperature": float(getattr(settings, "ai_brain_temperature", 0.2) or 0.2),
+        "ai_brain_temperature": brain_temperature,
         "ai_brain_max_completion_tokens": int(getattr(settings, "ai_brain_max_completion_tokens", 2000) or 2000),
         "openai_model": str(getattr(settings, "openai_model", "") or ""),
         "openai_humanize_replies": bool(getattr(settings, "openai_humanize_replies", True)),
         "monthly_ai_budget_usd": float(getattr(settings, "monthly_ai_budget_usd", 0.0) or 0.0),
         "ai_max_classifier_calls_per_day": int(getattr(settings, "ai_max_classifier_calls_per_day", 0) or 0),
+        "budget_status_available": budget_status_available,
         "budget": budget,
         "brain_config_ready": not blockers,
         "brain_blockers": blockers,
