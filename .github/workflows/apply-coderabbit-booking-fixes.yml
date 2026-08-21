@@ -5,8 +5,14 @@ on:
     branches:
       - refactor/polyglot-brain-contract
 
+concurrency:
+  group: coderabbit-booking-fix
+  cancel-in-progress: true
+
 permissions:
   contents: write
+  issues: write
+  pull-requests: write
 
 jobs:
   apply-fixes:
@@ -35,430 +41,141 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
 
-      - name: Apply conversion fixes and regression tests
+      - name: Apply minimal production patch
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
 
-          dialog_path = Path('dialog.py')
-          text = dialog_path.read_text(encoding='utf-8')
+          path = Path("dialog.py")
+          text = path.read_text(encoding="utf-8")
 
-          # 1) Human named dates: RU + KK, with strict validation and safe year rollover.
-          parse_start = text.index('def _parse_date(text: str) -> str | None:')
-          numeric_marker = '    m = re.search(r"\\b(\\d{1,2})[.\\-/](\\d{1,2})(?:[.\\-/](\\d{2,4}))?\\b", low)\n'
-          numeric_pos = text.index(numeric_marker, parse_start)
-          named_month_block = r'''    month_aliases = {
-        # Russian: nominative + common genitive forms used in dates.
-        "январь": 1, "января": 1,
-        "февраль": 2, "февраля": 2,
-        "март": 3, "марта": 3,
-        "апрель": 4, "апреля": 4,
-        "май": 5, "мая": 5,
-        "июнь": 6, "июня": 6,
-        "июль": 7, "июля": 7,
-        "август": 8, "августа": 8,
-        "сентябрь": 9, "сентября": 9,
-        "октябрь": 10, "октября": 10,
-        "ноябрь": 11, "ноября": 11,
-        "декабрь": 12, "декабря": 12,
-        # Kazakh + keyboard-friendly variants.
-        "қаңтар": 1, "кантар": 1,
-        "ақпан": 2, "акпан": 2,
-        "наурыз": 3,
-        "сәуір": 4, "сауир": 4,
-        "мамыр": 5,
-        "маусым": 6,
-        "шілде": 7, "шилде": 7,
-        "тамыз": 8,
-        "қыркүйек": 9, "кыркүйек": 9, "кыркуйек": 9,
-        "қазан": 10, "казан": 10,
-        "қараша": 11, "караша": 11,
-        "желтоқсан": 12, "желтоксан": 12,
-    }
-    named = re.search(r"\b(\d{1,2})\s+([^\W\d_]+)(?:\s+(\d{4}))?\b", low, flags=re.UNICODE)
-    if named:
-        day_raw, month_word, year_raw = named.groups()
-        month_word = month_word.strip().lower().replace("ё", "е")
-        month = month_aliases.get(month_word)
-        if month is None:
-            # Kazakh dates are commonly written with locative/genitive suffixes:
-            # "22 тамызда", "5 қаңтардың". Accept only known suffixes.
-            suffixes = ("да", "де", "та", "те", "дың", "дің", "тың", "тің")
-            for alias, number in month_aliases.items():
-                if month_word.startswith(alias) and month_word[len(alias):] in suffixes:
-                    month = number
-                    break
-        if month is not None:
-            day = int(day_raw)
-            if year_raw:
-                try:
-                    return datetime(int(year_raw), month, day).date().isoformat()
-                except ValueError:
-                    return None
-            # Without an explicit year choose the nearest non-past valid date.
-            # This also handles 29 February by looking ahead to the next leap year.
-            for year_offset in range(0, 5):
-                try:
-                    candidate = datetime(today.year + year_offset, month, day).date()
-                except ValueError:
-                    continue
-                if candidate >= today:
-                    return candidate.isoformat()
-            return None
+          parse_start = text.index("def _parse_date(text: str) -> str | None:")
+          parse_end = text.index("\ndef _time_from_text", parse_start)
+          if "month_aliases = {" not in text[parse_start:parse_end]:
+              numeric_marker = '    m = re.search(r"\\b(\\d{1,2})[.\\-/](\\d{1,2})'
+              numeric_pos = text.index(numeric_marker, parse_start, parse_end)
+              named_lines = [
+                  '    month_aliases = {',
+                  '        "январь": 1, "января": 1, "февраль": 2, "февраля": 2,',
+                  '        "март": 3, "марта": 3, "апрель": 4, "апреля": 4,',
+                  '        "май": 5, "мая": 5, "июнь": 6, "июня": 6,',
+                  '        "июль": 7, "июля": 7, "август": 8, "августа": 8,',
+                  '        "сентябрь": 9, "сентября": 9, "октябрь": 10, "октября": 10,',
+                  '        "ноябрь": 11, "ноября": 11, "декабрь": 12, "декабря": 12,',
+                  '        "қаңтар": 1, "кантар": 1, "ақпан": 2, "акпан": 2, "наурыз": 3,',
+                  '        "сәуір": 4, "сауир": 4, "мамыр": 5, "маусым": 6,',
+                  '        "шілде": 7, "шилде": 7, "тамыз": 8,',
+                  '        "қыркүйек": 9, "кыркүйек": 9, "кыркуйек": 9,',
+                  '        "қазан": 10, "казан": 10, "қараша": 11, "караша": 11,',
+                  '        "желтоқсан": 12, "желтоксан": 12,',
+                  '    }',
+                  '    named = re.search(r"\\b(\\d{1,2})\\s+([^\\W\\d_]+)(?:\\s+(\\d{4}))?\\b", low, flags=re.UNICODE)',
+                  '    if named:',
+                  '        day_raw, month_word, year_raw = named.groups()',
+                  '        month_word = month_word.strip().lower().replace("ё", "е")',
+                  '        month = month_aliases.get(month_word)',
+                  '        if month is None:',
+                  '            suffixes = ("да", "де", "та", "те", "дың", "дің", "тың", "тің")',
+                  '            for alias, number in month_aliases.items():',
+                  '                if month_word.startswith(alias) and month_word[len(alias):] in suffixes:',
+                  '                    month = number',
+                  '                    break',
+                  '        if month is not None:',
+                  '            day = int(day_raw)',
+                  '            if year_raw:',
+                  '                try:',
+                  '                    return datetime(int(year_raw), month, day).date().isoformat()',
+                  '                except ValueError:',
+                  '                    return None',
+                  '            for year_offset in range(0, 5):',
+                  '                try:',
+                  '                    candidate = datetime(today.year + year_offset, month, day).date()',
+                  '                except ValueError:',
+                  '                    continue',
+                  '                if candidate >= today:',
+                  '                    return candidate.isoformat()',
+                  '            return None',
+                  '',
+              ]
+              text = text[:numeric_pos] + "\n".join(named_lines) + "\n" + text[numeric_pos:]
 
-'''
-          if 'month_aliases = {' not in text[parse_start:numeric_pos]:
-              text = text[:numeric_pos] + named_month_block + text[numeric_pos:]
-
-          # 2) Safe natural confirmation when CRM offered exactly one concrete slot.
-          select_marker = '\ndef _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | None:\n'
+          select_marker = "\ndef _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | None:\n"
           select_pos = text.index(select_marker)
-          confirmation_helper = r'''
+          if "def _is_single_slot_confirmation(text: str) -> bool:" not in text:
+              helper_lines = [
+                  '',
+                  'def _is_single_slot_confirmation(text: str) -> bool:',
+                  '    """Accept exact natural consent only for a single CRM slot."""',
+                  '    low = _low(text).replace("ё", "е")',
+                  '    normalized = re.sub(r"[^\\w]+", " ", low, flags=re.UNICODE).strip()',
+                  '    normalized = re.sub(r"\\s+", " ", normalized)',
+                  '    if not normalized:',
+                  '        return False',
+                  '    negative_markers = (',
+                  '        "не подходит", "не надо", "не нужно", "не хочу", "не это время",',
+                  '        "другое время", "другой день", "другую дату", "другой вариант",',
+                  '        "басқа уақыт", "баска уакыт", "басқа күн", "баска кун",',
+                  '        "жоқ", "жок", "керек емес",',
+                  '    )',
+                  '    if any(marker in normalized for marker in negative_markers):',
+                  '        return False',
+                  '    confirmations = {',
+                  '        "да", "давайте", "да подходит", "подходит", "мне подходит",',
+                  '        "запишите", "запишите меня", "да запишите", "хорошо", "ок", "окей",',
+                  '        "на это время", "это время подходит", "беру", "согласен", "согласна",',
+                  '        "иә", "ия", "болады", "жарайды", "келісемін", "келисемин",',
+                  '        "осы уақыт", "осы уакыт", "осы уақытқа", "осы уакытка",',
+                  '        "жазыңыз", "жазып қойыңыз", "жазып коиниз",',
+                  '    }',
+                  '    return normalized in confirmations',
+                  '',
+              ]
+              text = text[:select_pos] + "\n".join(helper_lines) + text[select_pos:]
 
-def _is_single_slot_confirmation(text: str) -> bool:
-    """Accept natural consent only when caller has exactly one CRM slot.
+          select_start = text.index("def _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | None:")
+          select_end = text.index("\ndef _explicit_slot_selection_text", select_start)
+          if "len(slots) == 1 and _is_single_slot_confirmation(text)" not in text[select_start:select_end]:
+              low_marker = "    low = _low(text)\n"
+              low_pos = text.index(low_marker, select_start, select_end) + len(low_marker)
+              logic_lines = [
+                  '',
+                  '    if len(slots) == 1 and _is_single_slot_confirmation(text):',
+                  '        only = slots[0]',
+                  '        if (',
+                  '            isinstance(only, dict)',
+                  '            and not _is_reserve_slot(only)',
+                  '            and _slot_date(only)',
+                  '            and _slot_time(only)',
+                  '            and _slot_doctor_login(only)',
+                  '            and _slot_doctor_name(only)',
+                  '        ):',
+                  '            return only',
+                  '',
+              ]
+              text = text[:low_pos] + "\n".join(logic_lines) + text[low_pos:]
 
-    This deliberately uses exact normalized phrases rather than substring matching,
-    so messages such as "не надо" can never become an accidental booking choice.
-    """
-    low = _low(text).replace("ё", "е")
-    normalized = re.sub(r"[^\w]+", " ", low, flags=re.UNICODE).strip()
-    normalized = re.sub(r"\s+", " ", normalized)
-    if not normalized:
-        return False
-
-    negative_markers = (
-        "не подходит", "не надо", "не нужно", "не хочу", "не это время",
-        "другое время", "другой день", "другую дату", "другой вариант",
-        "басқа уақыт", "баска уакыт", "басқа күн", "баска кун",
-        "жоқ", "жок", "керек емес",
-    )
-    if any(marker in normalized for marker in negative_markers):
-        return False
-
-    confirmations = {
-        "да", "давайте", "да подходит", "подходит", "мне подходит",
-        "запишите", "запишите меня", "да запишите", "хорошо", "ок", "окей",
-        "на это время", "это время подходит", "беру", "согласен", "согласна",
-        "иә", "ия", "болады", "жарайды", "келісемін", "келисемин",
-        "осы уақыт", "осы уакыт", "осы уақытқа", "осы уакытка",
-        "жазыңыз", "жазып қойыңыз", "жазып коиниз",
-    }
-    return normalized in confirmations
-'''
-          if 'def _is_single_slot_confirmation(text: str) -> bool:' not in text:
-              text = text[:select_pos] + confirmation_helper + text[select_pos:]
-
-          select_start = text.index('def _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | None:')
-          low_marker = '    low = _low(text)\n'
-          low_pos = text.index(low_marker, select_start) + len(low_marker)
-          single_slot_logic = r'''
-
-    if len(slots) == 1 and _is_single_slot_confirmation(text):
-        only = slots[0]
-        if (
-            isinstance(only, dict)
-            and not _is_reserve_slot(only)
-            and _slot_date(only)
-            and _slot_time(only)
-            and _slot_doctor_login(only)
-            and _slot_doctor_name(only)
-        ):
-            return only
-'''
-          select_end = text.index('\ndef _explicit_slot_selection_text', select_start)
-          if 'len(slots) == 1 and _is_single_slot_confirmation(text)' not in text[select_start:select_end]:
-              text = text[:low_pos] + single_slot_logic + text[low_pos:]
-
-          dialog_path.write_text(text, encoding='utf-8')
-
-          test_content = r'''from __future__ import annotations
-
-import asyncio
-import os
-import sys
-import tempfile
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any
-
-import pytest
-
-os.environ["SQLITE_PATH"] = tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite3").name
-os.environ.setdefault("CRM_BOT_SECRET", "test")
-os.environ.setdefault("OPENAI_API_KEY", "")
-os.environ.setdefault("CRM_BASE_URL", "http://127.0.0.1:9")
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-import crm
-import dialog
-import state
-
-state.init_db()
-
-PHONE = "77011234567"
-DOCTOR_LOGIN = "zhuma_md"
-DOCTOR_NAME = "Жумабек Мади Мухтарович"
-
-
-def run(coro: Any) -> Any:
-    return asyncio.run(coro)
-
-
-def answer(chat_id: str, text: str) -> str:
-    return run(dialog.handle_message(chat_id, PHONE, text))
-
-
-def reset(chat_id: str, preset: dict[str, Any] | None = None) -> None:
-    state.reset_session(chat_id)
-    session = state.get_session(chat_id)
-    session.update({"ai_lead_started": True, "phone": PHONE})
-    if preset:
-        session.update(preset)
-    state.save_session(chat_id, session)
-
-
-def slot(date_iso: str, time_start: str = "14:00") -> dict[str, str]:
-    return {
-        "doctorLogin": DOCTOR_LOGIN,
-        "doctorName": DOCTOR_NAME,
-        "date": date_iso,
-        "timeStart": time_start,
-        "doctor_login": DOCTOR_LOGIN,
-        "doctor_name": DOCTOR_NAME,
-        "time": time_start,
-    }
-
-
-def install_crm(monkeypatch: pytest.MonkeyPatch, times: list[str]) -> dict[str, list[Any]]:
-    calls: dict[str, list[Any]] = {"slots": [], "book": [], "lookup": []}
-
-    async def fake_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
-        calls["slots"].append({"date": date, "doctor_login": doctor_login})
-        return {
-            "availability": [{
-                "doctorLogin": doctor_login or DOCTOR_LOGIN,
-                "doctorName": DOCTOR_NAME,
-                "date": date,
-                "availableSlots": list(times),
-            }]
-        }
-
-    async def fake_book(**kwargs: Any) -> dict[str, Any]:
-        calls["book"].append(kwargs)
-        return {
-            "ok": True,
-            "id": "booking-1",
-            "date": kwargs["date"],
-            "timeStart": kwargs["time_start"],
-            "doctorLogin": kwargs["doctor_login"],
-            "doctorName": kwargs.get("doctor_name") or DOCTOR_NAME,
-            "status": "booked",
-        }
-
-    async def fake_lookup(phone: str) -> dict[str, Any]:
-        calls["lookup"].append(phone)
-        if not calls["book"]:
-            return {"appointments": []}
-        booked = calls["book"][-1]
-        return {
-            "appointments": [{
-                "id": "booking-1",
-                "date": booked["date"],
-                "timeStart": booked["time_start"],
-                "doctorLogin": booked["doctor_login"],
-                "doctorName": booked.get("doctor_name") or DOCTOR_NAME,
-                "status": "booked",
-            }]
-        }
-
-    monkeypatch.setattr(crm, "check_slots", fake_slots)
-    monkeypatch.setattr(crm, "book_appointment", fake_book)
-    monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
-    return calls
-
-
-def expected_named_date(day: int, month: int) -> str:
-    today = (datetime.now(timezone.utc) + timedelta(hours=5)).date()
-    for offset in range(0, 5):
-        try:
-            candidate = datetime(today.year + offset, month, day).date()
-        except ValueError:
-            continue
-        if candidate >= today:
-            return candidate.isoformat()
-    raise AssertionError("could not resolve expected date")
-
-
-@pytest.mark.parametrize("text", ["22 августа", "22 август", "22 тамыз", "22 тамызда"])
-def test_named_month_dates_are_parsed_ru_and_kk(text: str) -> None:
-    assert dialog._parse_date(text) == expected_named_date(22, 8)
-
-
-def test_named_month_invalid_date_is_rejected() -> None:
-    assert dialog._parse_date("31 февраля") is None
-
-
-def test_existing_relative_and_numeric_date_formats_still_work() -> None:
-    today = (datetime.now(timezone.utc) + timedelta(hours=5)).date()
-    assert dialog._parse_date("завтра") == (today + timedelta(days=1)).isoformat()
-    assert dialog._parse_date("22.08") == expected_named_date(22, 8)
-    parsed_saturday = dialog._parse_date("в субботу")
-    assert parsed_saturday is not None
-    assert datetime.fromisoformat(parsed_saturday).date().weekday() == 5
-
-
-@pytest.mark.parametrize("confirmation", ["да", "подходит", "давайте", "запишите", "хорошо", "на это время"])
-def test_natural_confirmation_selects_the_only_crm_slot(confirmation: str) -> None:
-    only = slot("2026-09-01")
-    assert dialog._select_slot(confirmation, [only]) == only
-
-
-@pytest.mark.parametrize("confirmation", ["да", "подходит", "давайте", "запишите", "хорошо", "на это время"])
-def test_natural_confirmation_never_guesses_between_multiple_slots(confirmation: str) -> None:
-    slots = [slot("2026-09-01", "14:00"), slot("2026-09-01", "15:00")]
-    assert dialog._select_slot(confirmation, slots) is None
-
-
-@pytest.mark.parametrize("negative", ["не подходит", "не надо", "другое время", "не это время", "басқа уақыт", "жоқ"])
-def test_negative_reply_never_selects_single_slot(negative: str) -> None:
-    assert dialog._select_slot(negative, [slot("2026-09-01")]) is None
-
-
-def next_named_weekday() -> tuple[str, str]:
-    months = {
-        1: "января", 2: "февраля", 3: "марта", 4: "апреля", 5: "мая", 6: "июня",
-        7: "июля", 8: "августа", 9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
-    }
-    today = (datetime.now(timezone.utc) + timedelta(hours=5)).date()
-    for offset in range(2, 40):
-        candidate = today + timedelta(days=offset)
-        if candidate.weekday() < 5:
-            return f"{candidate.day} {months[candidate.month]}", candidate.isoformat()
-    raise AssertionError("weekday not found")
-
-
-def test_named_date_step_calls_real_crm_slot_source(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = install_crm(monkeypatch, ["14:00"])
-    date_text, expected_iso = next_named_weekday()
-    reset("named-date-crm", {
-        "step": "date",
-        "questionnaire_step": "date",
-        "complaint": "поясница болит",
-        "complaint_gate": "COMPLAINT_OK",
-        "age": 54,
-        "contraindications_ok": True,
-        "contraindications_verdict": "proceed",
-    })
-
-    response = answer("named-date-crm", date_text)
-    session = state.get_session("named-date-crm")
-
-    assert calls["slots"] == [{"date": expected_iso, "doctor_login": None}]
-    assert session["step"] == "time"
-    assert session["last_slots"]
-    assert session["last_slots"][0]["doctorLogin"] == DOCTOR_LOGIN
-    assert "14:00" in response
-
-
-def test_real_transcript_reaches_exactly_one_crm_booking(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = install_crm(monkeypatch, ["14:00"])
-    chat_id = "real-transcript-booking"
-    reset(chat_id)
-
-    response = answer(chat_id, "Поясница болит")
-    session = state.get_session(chat_id)
-    assert session["step"] == "age"
-    assert session.get("complaint")
-    assert "лет" in response.lower()
-
-    response = answer(chat_id, "54")
-    session = state.get_session(chat_id)
-    assert session["age"] == 54
-    assert session["step"] == "contraindications"
-    assert "противопоказ" in response.lower()
-
-    response = answer(chat_id, "Нету никаких противопоказаний")
-    session = state.get_session(chat_id)
-    assert session["contraindications_ok"] is True
-    assert session["contraindications_verdict"] == "proceed"
-    assert session["step"] == "date"
-
-    date_text, expected_iso = next_named_weekday()
-    response = answer(chat_id, date_text)
-    session = state.get_session(chat_id)
-    assert calls["slots"][-1] == {"date": expected_iso, "doctor_login": None}
-    assert session["step"] == "time"
-    assert len(session["last_slots"]) == 1
-    assert session["last_slots"][0]["timeStart"] == "14:00"
-    assert "14:00" in response
-
-    response = answer(chat_id, "давайте")
-    session = state.get_session(chat_id)
-    assert session["step"] == "name"
-    assert session["selected_slot"]["doctorLogin"] == DOCTOR_LOGIN
-    assert session["selected_date"] == expected_iso
-    assert session["selected_time"] == "14:00"
-    assert "имя" in response.lower()
-
-    response = answer(chat_id, "Алия")
-    session = state.get_session(chat_id)
-    assert len(calls["book"]) == 1
-    booking = calls["book"][0]
-    assert booking["doctor_login"] == DOCTOR_LOGIN
-    assert booking["date"] == expected_iso
-    assert booking["time_start"] == "14:00"
-    assert session["step"] == "booked"
-    assert session["booking_confirmed"] is True
-    assert session["booking_visible_in_crm"] is True
-    assert "подтверждена" in response.lower()
-
-    # A later patient message must never create a duplicate appointment.
-    answer(chat_id, "спасибо")
-    assert len(calls["book"]) == 1
-
-
-def test_multi_slot_davaite_stays_on_time_step(monkeypatch: pytest.MonkeyPatch) -> None:
-    install_crm(monkeypatch, ["14:00", "15:00"])
-    date_iso = "2026-09-01"
-    reset("multi-slot-confirm", {
-        "step": "time",
-        "questionnaire_step": "time",
-        "complaint": "поясница болит",
-        "complaint_gate": "COMPLAINT_OK",
-        "age": 54,
-        "contraindications_ok": True,
-        "contraindications_verdict": "proceed",
-        "preferred_date": date_iso,
-        "last_slots": [slot(date_iso, "14:00"), slot(date_iso, "15:00")],
-    })
-
-    response = answer("multi-slot-confirm", "давайте")
-    session = state.get_session("multi-slot-confirm")
-    assert session["step"] == "time"
-    assert not session.get("selected_slot")
-    assert "14:00" in response or "15:00" in response or "время" in response.lower()
-'''
-          Path('tests/test_coderabbit_booking_conversion_contract.py').write_text(test_content, encoding='utf-8')
+          path.write_text(text, encoding="utf-8")
           PY
 
       - name: Compile changed module
         run: python -m py_compile dialog.py
 
       - name: Run CodeRabbit conversion contract
-        run: pytest -q tests/test_coderabbit_booking_conversion_contract.py
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest -q tests/test_coderabbit_booking_conversion_contract.py 2>&1 | tee /tmp/coderabbit-tests.log
 
       - name: Run neighboring booking contracts
+        shell: bash
         run: |
+          set -o pipefail
           pytest -q \
             tests/test_production_booking_flow.py \
             tests/test_polyglot_slot_contract.py \
             tests/test_polyglot_change_of_mind_contract.py \
-            tests/test_polyglot_anti_loop_contract.py
+            tests/test_polyglot_anti_loop_contract.py 2>&1 | tee /tmp/neighbor-tests.log
 
       - name: Commit verified fixes and remove one-shot workflow
         shell: bash
@@ -466,7 +183,23 @@ def test_multi_slot_davaite_stays_on_time_step(monkeypatch: pytest.MonkeyPatch) 
           rm -f .github/workflows/apply-coderabbit-booking-fixes.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add dialog.py tests/test_coderabbit_booking_conversion_contract.py .github/workflows/apply-coderabbit-booking-fixes.yml
+          git add dialog.py .github/workflows/apply-coderabbit-booking-fixes.yml
           git diff --cached --check
           git commit -m "fix: close booking conversion gaps found by CodeRabbit"
           git push origin HEAD:refactor/polyglot-brain-contract
+
+      - name: Report failure without changing production code
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          {
+            echo "One-shot CodeRabbit repair did not commit production changes because a patch/test step failed."
+            echo
+            echo '```text'
+            tail -80 /tmp/coderabbit-tests.log 2>/dev/null || true
+            tail -80 /tmp/neighbor-tests.log 2>/dev/null || true
+            echo '```'
+          } > /tmp/failure.md
+          gh pr comment 90 --body-file /tmp/failure.md
