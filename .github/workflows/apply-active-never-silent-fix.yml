@@ -1,5 +1,6 @@
 name: Apply active booking never-silent fix
 
+# One-shot verified repair for CodeRabbit duplicate-answer finding.
 on:
   push:
     branches:
@@ -43,8 +44,7 @@ jobs:
           new = '''        elif str(session.get("step") or "") in {"complaint", "age", "date", "time", "select_slot", "name"} and _is_active_new_ai_request(session):\n            # A genuinely new patient turn in an active booking funnel must never be\n            # silenced merely because the safe answer text matches the previous one.\n            # Webhook/event idempotency is enforced separately in main.py.\n            session["outbound_duplicate_guard_blocked"] = False\n            session["fallback_reason"] = "active_booking_repeat_answer_allowed"\n        else:\n            session["outbound_duplicate_guard_blocked"] = True\n            _safe_save(chat_id, session)\n            return ""\n\n    # final_no_empty_guard: this must be the last answer mutation before saving/returning.\n'''
           if old not in text:
               raise SystemExit('duplicate guard target not found')
-          text = text.replace(old, new, 1)
-          dialog.write_text(text, encoding='utf-8')
+          dialog.write_text(text.replace(old, new, 1), encoding='utf-8')
 
           router = Path('tests/test_dialog_intent_router.py')
           rt = router.read_text(encoding='utf-8')
