@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import ai_budget
 import main as neuro
 import state
 from repair_observer import dispatch_new_lead_turn
@@ -57,3 +58,57 @@ async def _process_wazzup_message_with_claude_observer(
 neuro._process_wazzup_message = _process_wazzup_message_with_claude_observer
 
 app = neuro.app
+
+
+def _openai_production_status() -> dict[str, Any]:
+    """Return non-secret production OpenAI readiness and budget state."""
+    settings = neuro.get_settings()
+    api_key_present = bool(str(getattr(settings, "openai_api_key", "") or "").strip())
+    ai_enabled = bool(getattr(settings, "ai_enabled", True))
+    brain_enabled = bool(getattr(settings, "openai_brain_enabled", True))
+    brain_model = str(getattr(settings, "ai_brain_model", "") or getattr(settings, "openai_model", "") or "").strip()
+
+    try:
+        budget = ai_budget.budget_status()
+    except Exception:
+        budget = {
+            "budget_status_available": False,
+            "over_budget": False,
+            "daily_calls_exhausted": False,
+        }
+
+    blockers: list[str] = []
+    if not api_key_present:
+        blockers.append("OPENAI_API_KEY")
+    if not ai_enabled:
+        blockers.append("AI_ENABLED=false")
+    if not brain_enabled:
+        blockers.append("OPENAI_BRAIN_ENABLED=false")
+    if not brain_model:
+        blockers.append("AI_BRAIN_MODEL_or_OPENAI_MODEL")
+    if bool(budget.get("over_budget")):
+        blockers.append("monthly_budget_exceeded")
+    if bool(budget.get("daily_calls_exhausted")):
+        blockers.append("daily_call_limit_exceeded")
+
+    return {
+        "openai_api_key_present": api_key_present,
+        "ai_enabled": ai_enabled,
+        "openai_brain_enabled": brain_enabled,
+        "ai_brain_model": brain_model,
+        "ai_brain_temperature": float(getattr(settings, "ai_brain_temperature", 0.2) or 0.2),
+        "ai_brain_max_completion_tokens": int(getattr(settings, "ai_brain_max_completion_tokens", 2000) or 2000),
+        "openai_model": str(getattr(settings, "openai_model", "") or ""),
+        "openai_humanize_replies": bool(getattr(settings, "openai_humanize_replies", True)),
+        "monthly_ai_budget_usd": float(getattr(settings, "monthly_ai_budget_usd", 0.0) or 0.0),
+        "ai_max_classifier_calls_per_day": int(getattr(settings, "ai_max_classifier_calls_per_day", 0) or 0),
+        "budget": budget,
+        "brain_config_ready": not blockers,
+        "brain_blockers": blockers,
+        "production_entrypoint": "live_main:app -> main.app",
+    }
+
+
+@app.get("/debug/openai/status")
+def openai_production_status() -> dict[str, Any]:
+    return {"ok": True, "openai": _openai_production_status()}
