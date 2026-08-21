@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import hmac
+import os
 from typing import Any
+
+from fastapi import Header, HTTPException
 
 import ai_budget
 import main as neuro
@@ -60,6 +64,27 @@ neuro._process_wazzup_message = _process_wazzup_message_with_claude_observer
 app = neuro.app
 
 
+def _openai_debug_admin_token() -> str:
+    """Return the dedicated diagnostics token without ever exposing it in payloads."""
+    return str(os.getenv("OPENAI_DEBUG_ADMIN_TOKEN") or "").strip()
+
+
+def _require_openai_debug_admin(authorization: str | None) -> None:
+    """Fail closed unless the caller presents the dedicated Bearer token."""
+    token = _openai_debug_admin_token()
+    if not token:
+        raise HTTPException(status_code=503, detail="OpenAI diagnostics are disabled")
+
+    provided = str(authorization or "").strip()
+    expected = f"Bearer {token}"
+    if not hmac.compare_digest(provided, expected):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
 def _openai_production_status() -> dict[str, Any]:
     """Return non-secret production OpenAI readiness and budget state."""
     settings = neuro.get_settings()
@@ -110,5 +135,9 @@ def _openai_production_status() -> dict[str, Any]:
 
 
 @app.get("/debug/openai/status")
-def openai_production_status() -> dict[str, Any]:
+def openai_production_status(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Return protected, non-secret OpenAI runtime diagnostics for administrators."""
+    _require_openai_debug_admin(authorization)
     return {"ok": True, "openai": _openai_production_status()}
