@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from fastapi.testclient import TestClient
+
 import live_main
 
 
 def _settings(**overrides):
+    """Build deterministic OpenAI settings for production-status contract tests."""
     values = dict(
         openai_api_key="sk-secret-must-never-leak",
         ai_enabled=True,
@@ -23,6 +26,7 @@ def _settings(**overrides):
 
 
 def test_production_status_is_safe_and_ready(monkeypatch):
+    """A healthy configuration reports readiness without leaking the API key."""
     monkeypatch.setattr(live_main.neuro, "get_settings", lambda: _settings())
     monkeypatch.setattr(
         live_main.ai_budget,
@@ -53,6 +57,7 @@ def test_production_status_is_safe_and_ready(monkeypatch):
 
 
 def test_production_status_explains_all_common_blockers(monkeypatch):
+    """Missing config and exhausted limits are surfaced as explicit blockers."""
     monkeypatch.setattr(
         live_main.neuro,
         "get_settings",
@@ -86,7 +91,30 @@ def test_production_status_explains_all_common_blockers(monkeypatch):
     }
 
 
-def test_debug_endpoint_returns_only_safe_status(monkeypatch):
+def test_debug_endpoint_rejects_anonymous_client(monkeypatch):
+    """Production OpenAI diagnostics must not be readable without admin auth."""
+    monkeypatch.setenv("OPENAI_DEBUG_ADMIN_TOKEN", "debug-admin-secret")
+
+    response = TestClient(live_main.app).get("/debug/openai/status")
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Unauthorized"
+    assert response.headers.get("www-authenticate") == "Bearer"
+
+
+def test_debug_endpoint_fails_closed_without_admin_token(monkeypatch):
+    """A missing server-side admin token disables diagnostics instead of opening them."""
+    monkeypatch.delenv("OPENAI_DEBUG_ADMIN_TOKEN", raising=False)
+
+    response = TestClient(live_main.app).get("/debug/openai/status")
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "OpenAI diagnostics are disabled"
+
+
+def test_debug_endpoint_returns_only_safe_status_to_authorized_admin(monkeypatch):
+    """An authorized admin receives diagnostics while all secrets remain hidden."""
+    monkeypatch.setenv("OPENAI_DEBUG_ADMIN_TOKEN", "debug-admin-secret")
     monkeypatch.setattr(live_main.neuro, "get_settings", lambda: _settings())
     monkeypatch.setattr(
         live_main.ai_budget,
@@ -94,8 +122,14 @@ def test_debug_endpoint_returns_only_safe_status(monkeypatch):
         lambda: {"over_budget": False, "daily_calls_exhausted": False},
     )
 
-    payload = live_main.openai_production_status()
+    response = TestClient(live_main.app).get(
+        "/debug/openai/status",
+        headers={"Authorization": "Bearer debug-admin-secret"},
+    )
 
+    assert response.status_code == 200
+    payload = response.json()
     assert payload["ok"] is True
     assert payload["openai"]["production_entrypoint"] == "live_main:app -> main.app"
     assert "sk-secret-must-never-leak" not in repr(payload)
+    assert "debug-admin-secret" not in repr(payload)
