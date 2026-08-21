@@ -4073,6 +4073,47 @@ def _parse_date(text: str) -> str | None:
 
             return (today + timedelta(days=delta)).isoformat()
 
+    month_aliases = {
+        "январь": 1, "января": 1, "февраль": 2, "февраля": 2,
+        "март": 3, "марта": 3, "апрель": 4, "апреля": 4,
+        "май": 5, "мая": 5, "июнь": 6, "июня": 6,
+        "июль": 7, "июля": 7, "август": 8, "августа": 8,
+        "сентябрь": 9, "сентября": 9, "октябрь": 10, "октября": 10,
+        "ноябрь": 11, "ноября": 11, "декабрь": 12, "декабря": 12,
+        "қаңтар": 1, "кантар": 1, "ақпан": 2, "акпан": 2, "наурыз": 3,
+        "сәуір": 4, "сауир": 4, "мамыр": 5, "маусым": 6,
+        "шілде": 7, "шилде": 7, "тамыз": 8,
+        "қыркүйек": 9, "кыркүйек": 9, "кыркуйек": 9,
+        "қазан": 10, "казан": 10, "қараша": 11, "караша": 11,
+        "желтоқсан": 12, "желтоксан": 12,
+    }
+    named = re.search(r"\b(\d{1,2})\s+([^\W\d_]+)(?:\s+(\d{4}))?\b", low, flags=re.UNICODE)
+    if named:
+        day_raw, month_word, year_raw = named.groups()
+        month_word = month_word.strip().lower().replace("ё", "е")
+        month = month_aliases.get(month_word)
+        if month is None:
+            suffixes = ("да", "де", "та", "те", "дың", "дің", "тың", "тің")
+            for alias, number in month_aliases.items():
+                if month_word.startswith(alias) and month_word[len(alias):] in suffixes:
+                    month = number
+                    break
+        if month is not None:
+            day = int(day_raw)
+            if year_raw:
+                try:
+                    return datetime(int(year_raw), month, day).date().isoformat()
+                except ValueError:
+                    return None
+            for year_offset in range(0, 5):
+                try:
+                    candidate = datetime(today.year + year_offset, month, day).date()
+                except ValueError:
+                    continue
+                if candidate >= today:
+                    return candidate.isoformat()
+            return None
+
     m = re.search(r"\b(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?\b", low)
     if m:
         d, mo, y = m.groups()
@@ -4354,8 +4395,45 @@ def _booking_ready(session: dict[str, Any], phone: str = "") -> bool:
     )
 
 
+def _is_single_slot_confirmation(text: str) -> bool:
+    """Accept exact natural consent only for a single CRM slot."""
+    low = _low(text).replace("ё", "е")
+    normalized = re.sub(r"[^\w]+", " ", low, flags=re.UNICODE).strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    if not normalized:
+        return False
+    negative_markers = (
+        "не подходит", "не надо", "не нужно", "не хочу", "не это время",
+        "другое время", "другой день", "другую дату", "другой вариант",
+        "басқа уақыт", "баска уакыт", "басқа күн", "баска кун",
+        "жоқ", "жок", "керек емес",
+    )
+    if any(marker in normalized for marker in negative_markers):
+        return False
+    confirmations = {
+        "да", "давайте", "да подходит", "подходит", "мне подходит",
+        "запишите", "запишите меня", "да запишите", "хорошо", "ок", "окей",
+        "на это время", "это время подходит", "беру", "согласен", "согласна",
+        "иә", "ия", "болады", "жарайды", "келісемін", "келисемин",
+        "осы уақыт", "осы уакыт", "осы уақытқа", "осы уакытка",
+        "жазыңыз", "жазып қойыңыз", "жазып коиниз",
+    }
+    return normalized in confirmations
+
 def _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | None:
     low = _low(text)
+
+    if len(slots) == 1 and _is_single_slot_confirmation(text):
+        only = slots[0]
+        if (
+            isinstance(only, dict)
+            and not _is_reserve_slot(only)
+            and _slot_date(only)
+            and _slot_time(only)
+            and _slot_doctor_login(only)
+            and _slot_doctor_name(only)
+        ):
+            return only
 
     m = re.search(r"\b([1-9])\b", low)
     if m:
