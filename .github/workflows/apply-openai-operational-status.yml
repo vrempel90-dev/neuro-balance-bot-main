@@ -1,5 +1,6 @@
 name: Apply OpenAI operational status fix
 
+# Trigger verified OpenAI operational diagnostics patch.
 on:
   push:
     branches:
