@@ -1,0 +1,42 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: "ru-RU"
+early_access: false
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: true
+  review_details: true
+  auto_review:
+    enabled: true
+    auto_incremental_review: true
+    drafts: false
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+      - "[skip review]"
+    ignore_usernames:
+      - "dependabot[bot]"
+      - "renovate[bot]"
+      - "github-actions[bot]"
+  path_instructions:
+    - path: "**/*.py"
+      instructions: |
+        Проверяй изменения строго как production-код медицинского/клинического чат-бота.
+        Приоритеты ревью:
+        - не допускать регрессий в записи, переносе, отмене, эскалации оператору и CRM-контракте;
+        - выявлять ошибки async/concurrency, повторную обработку webhook, дублирование сообщений и записей;
+        - выявлять утечки API-ключей, секретов, персональных данных пациентов и небезопасное логирование;
+        - проверять обработку недоверенного пользовательского ввода и prompt-injection вокруг LLM/tool-вызовов;
+        - не допускать выдуманных врачей, слотов или успешных CRM-операций без подтверждённого результата API;
+        - отмечать изменения, которые могут непреднамеренно увеличить расход OpenAI API или создать циклы вызовов;
+        - требовать безопасную обработку ошибок внешних API без ложного сообщения пользователю об успехе;
+        - отличать критические дефекты от косметических замечаний и не создавать шум без практической пользы.
+    - path: "**/*.md"
+      instructions: |
+        Проверяй документацию на расхождения с фактической конфигурацией и API-контрактами. Отмечай реальные секреты и токены, но не считай секретами очевидные placeholder-значения.
+
+chat:
+  auto_reply: true
