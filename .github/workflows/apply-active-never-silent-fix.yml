@@ -69,15 +69,29 @@ jobs:
       - name: Compile
         run: python -m py_compile dialog.py
 
-      - name: Verify focused regressions
+      - name: Verify active booking never-silent contract
         shell: bash
         run: |
           set -o pipefail
-          pytest -q \
-            tests/test_active_booking_never_silent_contract.py \
-            tests/test_coderabbit_booking_conversion_contract.py \
-            tests/test_polyglot_anti_loop_contract.py \
-            tests/test_production_booking_flow.py 2>&1 | tee /tmp/never-silent-tests.log
+          pytest -q tests/test_active_booking_never_silent_contract.py 2>&1 | tee /tmp/never-silent-tests.log
+
+      - name: Verify CodeRabbit booking conversion contract
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest -q tests/test_coderabbit_booking_conversion_contract.py 2>&1 | tee -a /tmp/never-silent-tests.log
+
+      - name: Verify neighboring anti-loop contract
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest -q tests/test_polyglot_anti_loop_contract.py 2>&1 | tee -a /tmp/never-silent-tests.log
+
+      - name: Verify production booking contract
+        shell: bash
+        run: |
+          set -o pipefail
+          pytest -q tests/test_production_booking_flow.py 2>&1 | tee -a /tmp/never-silent-tests.log
 
       - name: Commit only after tests pass
         run: |
@@ -98,7 +112,7 @@ jobs:
             echo "Active booking never-silent fix was NOT committed because verification failed."
             echo
             echo '```text'
-            tail -120 /tmp/never-silent-tests.log 2>/dev/null || true
+            tail -160 /tmp/never-silent-tests.log 2>/dev/null || true
             echo '```'
           } > /tmp/failure.md
           gh pr comment 90 --body-file /tmp/failure.md
