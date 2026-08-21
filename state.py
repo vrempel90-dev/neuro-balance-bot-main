@@ -40,6 +40,11 @@ _STDOUT_EVENTS = {
     "wazzup_send_start",
     "bot_processing_finish",
     "openai_called",
+    "openai_brain_called",
+    "openai_brain_decision",
+    "openai_config_missing_detail",
+    "openai_error_detail",
+    "ai_usage_recorded",
     "openai_skipped",
     "humanize_skipped",
 }

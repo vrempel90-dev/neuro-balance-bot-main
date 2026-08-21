@@ -386,23 +386,216 @@ async def _lookup_active_appointment(chat_id: str, phone: str, session: dict[str
         raise
     return None
 
+def _reschedule_original_appointment(session: dict[str, Any]) -> dict[str, Any] | None:
+    original = session.get("original_appointment") if isinstance(session.get("original_appointment"), dict) else None
+    if original:
+        return original
+    nearest = session.get("nearest_active_appointment") if isinstance(session.get("nearest_active_appointment"), dict) else None
+    if nearest:
+        return nearest
+    if session.get("appointment_id") or (session.get("appointment_date") and session.get("appointment_time")):
+        return {
+            "id": session.get("appointment_id"),
+            "date": session.get("appointment_date") or "",
+            "timeStart": session.get("appointment_time") or "",
+            "doctorLogin": session.get("appointment_doctor_login") or "",
+            "doctorName": session.get("appointment_doctor_name") or "",
+            "status": session.get("appointment_status") or "booked",
+        }
+    return None
+
+
+def _reschedule_appointment_id(appt: dict[str, Any] | None) -> Any:
+    appt = appt or {}
+    return appt.get("id") or appt.get("appointmentId") or appt.get("record_id") or appt.get("recordId") or appt.get("bookingId")
+
+
+def _clear_reschedule_state(session: dict[str, Any], *, keep_original: bool = False) -> None:
+    session["reschedule_mode"] = False
+    session["reschedule_step"] = ""
+    session["reschedule_date"] = ""
+    session["reschedule_slots"] = []
+    if not keep_original:
+        session.pop("original_appointment", None)
+
+
+def _reschedule_slots_answer(session: dict[str, Any], slots: list[dict[str, Any]]) -> str:
+    lang = str(session.get("language") or "ru")
+    if not slots:
+        return (
+            "Бұл күнге бос уақыт табылмады 🌿 Басқа ыңғайлы күнді айтыңызшы."
+            if lang == "kk"
+            else "На этот день свободных окошек не нашла 🌿 Подскажите, пожалуйста, другой удобный день."
+        )
+    lines = _slots_text(slots, lang)
+    if lang == "kk":
+        return f"Ауыстыруға бос уақыттар:\n{lines}\n\nҚай уақыт ыңғайлы?"
+    return f"Для переноса есть такие свободные окошки:\n{lines}\n\nКакое время Вам удобно?"
+
+
+async def _continue_post_booking_reschedule(chat_id: str, phone: str, session: dict[str, Any], text: str) -> str:
+    lang = str(session.get("language") or "ru")
+    original = _reschedule_original_appointment(session)
+    if not original:
+        try:
+            original = await _lookup_active_appointment(chat_id, phone, session)
+        except Exception:
+            original = None
+    if not original:
+        session["manual_takeover"] = True
+        session["escalated"] = True
+        _clear_reschedule_state(session, keep_original=True)
+        return (
+            "Жазбаны CRM-нен нақтылай алмадым. Әкімші тексеріп, ауыстыруға көмектеседі 🌿"
+            if lang == "kk"
+            else "Не смогла надёжно подтвердить текущую запись в CRM. Передам администратору, чтобы он помог перенести её 🌿"
+        )
+
+    session["original_appointment"] = dict(original)
+    appointment_id = _reschedule_appointment_id(original) or session.get("appointment_id")
+    doctor_login = str(original.get("doctorLogin") or original.get("doctor_login") or session.get("appointment_doctor_login") or "").strip()
+    doctor_name = str(original.get("doctorName") or original.get("doctor_name") or session.get("appointment_doctor_name") or "").strip()
+    if not appointment_id or not doctor_login:
+        session["manual_takeover"] = True
+        session["escalated"] = True
+        _clear_reschedule_state(session, keep_original=True)
+        return (
+            "Жазбаның деректері толық емес. Қате ауыстырмау үшін әкімші тексеріп көмектеседі 🌿"
+            if lang == "kk"
+            else "В текущей записи не хватает данных для безопасного автоматического переноса. Передам администратору, чтобы он всё проверил 🌿"
+        )
+
+    step = str(session.get("reschedule_step") or "date")
+    if step == "date":
+        new_date = _parse_date(text)
+        if not new_date:
+            return "Қай күнге ауыстырған ыңғайлы? 🌿" if lang == "kk" else "На какой день Вам удобно перенести запись? 🌿"
+        try:
+            data = await crm.check_slots(new_date, doctor_login=doctor_login)
+            if isinstance(data, dict):
+                data.setdefault("date", new_date)
+            slots = _format_slots(data if isinstance(data, dict) else {}, max_count=10)
+            slots = [slot for slot in slots if _slot_doctor_login(slot).strip().lower() == doctor_login.lower()]
+        except Exception as exc:
+            session["manual_takeover"] = True
+            session["escalated"] = True
+            session["reschedule_error"] = str(exc)[:300]
+            return (
+                "Қазір бос уақытты CRM арқылы тексере алмадым. Бастапқы жазбаңыз сақталады, әкімші ауыстыруға көмектеседі 🌿"
+                if lang == "kk"
+                else "Сейчас не удалось проверить свободное время в CRM. Ваша текущая запись остаётся без изменений; передам администратору для переноса 🌿"
+            )
+        session["reschedule_date"] = new_date
+        session["reschedule_slots"] = slots[:5]
+        if not session["reschedule_slots"]:
+            session["reschedule_step"] = "date"
+            return _reschedule_slots_answer(session, [])
+        session["reschedule_step"] = "time"
+        return _reschedule_slots_answer(session, session["reschedule_slots"])
+
+    slots = [slot for slot in (session.get("reschedule_slots") or []) if isinstance(slot, dict)]
+    selected = _select_slot(text, slots)
+    if not selected or not _slot_in_offered_set(selected, slots):
+        return _reschedule_slots_answer(session, slots)
+
+    new_date = _slot_date(selected) or str(session.get("reschedule_date") or "")
+    new_time = _slot_time(selected)
+    try:
+        # Polyglot-style race protection: refresh the exact doctor/date before
+        # changing an existing appointment. Do not trust a stale offered slot.
+        if hasattr(crm, "clear_slots_cache"):
+            crm.clear_slots_cache(new_date)
+        fresh = await crm.check_slots(new_date, doctor_login=doctor_login)
+        if isinstance(fresh, dict):
+            fresh.setdefault("date", new_date)
+        fresh_slots = _format_slots(fresh if isinstance(fresh, dict) else {}, max_count=1000)
+        matched = next((slot for slot in fresh_slots if _same_slot_identity(slot, selected)), None)
+        if matched is None:
+            safe_fresh = [slot for slot in fresh_slots if _slot_doctor_login(slot).strip().lower() == doctor_login.lower()]
+            session["reschedule_slots"] = safe_fresh[:5]
+            session["reschedule_step"] = "time" if session["reschedule_slots"] else "date"
+            return (
+                _reschedule_slots_answer(session, session["reschedule_slots"])
+                if session["reschedule_slots"]
+                else ("Бұл уақыт енді бос емес 🌿 Басқа күнді таңдаңызшы." if lang == "kk" else "Это окошко уже занято 🌿 Подскажите другой удобный день — проверю актуальные варианты.")
+            )
+        selected = matched
+        new_date = _slot_date(selected)
+        new_time = _slot_time(selected)
+        result = await crm.reschedule_appointment(
+            phone=crm.normalize_phone(phone or session.get("phone") or ""),
+            appointment_id=appointment_id,
+            new_date=new_date,
+            new_time_start=new_time,
+            reason="перенос через бота",
+        )
+        if isinstance(result, dict) and (result.get("ok") is False or result.get("rescheduled") is False):
+            raise crm.CRMError("CRM reschedule returned unsuccessful result")
+    except Exception as exc:
+        # Never cancel or create a second appointment as a fallback. The original
+        # booking fields deliberately remain untouched on failure.
+        session["manual_takeover"] = True
+        session["escalated"] = True
+        session["reschedule_error"] = str(exc)[:300]
+        session["booking_confirmed"] = True
+        return (
+            "Ауыстыруды CRM-де растай алмадым. Бастапқы жазбаңыз сақталады, әкімші көмектеседі 🌿"
+            if lang == "kk"
+            else "Не удалось подтвердить перенос в CRM. Ваша текущая запись остаётся без изменений; передам администратору 🌿"
+        )
+
+    session["reschedule_original_appointment"] = dict(original)
+    session["appointment_id"] = appointment_id
+    session["appointment_date"] = new_date
+    session["appointment_time"] = new_time
+    session["appointment_doctor_login"] = _slot_doctor_login(selected) or doctor_login
+    session["appointment_doctor_name"] = _slot_doctor_name(selected) or doctor_name
+    session["nearest_active_appointment"] = {
+        **dict(original),
+        "id": appointment_id,
+        "date": new_date,
+        "timeStart": new_time,
+        "doctorLogin": session["appointment_doctor_login"],
+        "doctorName": session["appointment_doctor_name"],
+        "status": "booked",
+    }
+    session["booking_confirmed"] = True
+    session["booking_visible_in_crm"] = True
+    session["post_booking_support_active"] = True
+    session["rescheduled"] = True
+    session["step"] = "booked"
+    _clear_reschedule_state(session)
+    if lang == "kk":
+        return f"Жазбаңыз ауыстырылды 🌿 Жаңа уақыт: {new_date} {new_time}."
+    return f"Запись перенесли 🌿 Новое время: {_format_booking_date_human(new_date, 'ru')} в {new_time}."
+
+
 async def _post_booking_support_answer(chat_id: str, phone: str, session: dict[str, Any], text: str) -> str:
     low = _low(text)
     session["is_booked_client"] = True
     session["post_booking_support_active"] = True
     session["first_touch_blocked_reason"] = session.get("first_touch_blocked_reason") or "active_appointment"
+    if session.get("reschedule_mode") and _is_cancel_direct_request(text):
+        _clear_reschedule_state(session)
+        ans = await _handle_cancel_appointment(chat_id, phone, session, text)
+        return "Запись отменена 🌿 Хорошо, что предупредили. Запись отменили." if session.get("cancelled") else ans
+    if session.get("reschedule_mode"):
+        return await _continue_post_booking_reschedule(chat_id, phone, session, text)
     if _has_any(low, ADDRESS_WORDS):
         return "Адрес: Кабанбай батыра 28, внутренний двор, подъезд 3.\nЗаезд со стороны Кунаева, после ворот поверните направо 📍\n\n2ГИС: https://2gis.kz/astana/inside/9570784863354265/firm/70000001105992248?m=71.416112%2C51.134091%2F16"
-    if _has_any(low, POST_BOOKING_RESCHEDULE_WORDS):
+    if _is_reschedule_request(text):
         appt = session.get("nearest_active_appointment") if isinstance(session.get("nearest_active_appointment"), dict) else None
         if not appt:
             appt = await _lookup_active_appointment(chat_id, phone, session)
         if appt:
             session["reschedule_mode"] = True
-            session["original_appointment"] = appt
-            return "Хорошо, перенесём 🌿 На какой день и время Вам было бы удобно?"
+            session["reschedule_step"] = "date"
+            session["reschedule_date"] = ""
+            session["reschedule_slots"] = []
+            session["original_appointment"] = dict(appt)
+            return "Қай күнге ауыстырған ыңғайлы? 🌿" if str(session.get("language") or "ru") == "kk" else "Хорошо, перенесём 🌿 На какой день Вам было бы удобно?"
         session["manual_takeover"] = True
-        return "Сейчас передам администратору, чтобы он помог перенести запись 🌿"
+        return "Әкімші жазбаны тексеріп, ауыстыруға көмектеседі 🌿" if str(session.get("language") or "ru") == "kk" else "Сейчас передам администратору, чтобы он помог перенести запись 🌿"
     if _is_cancel(text):
         ans = await _handle_cancel_appointment(chat_id, phone, session, text)
         return "Запись отменена 🌿 Хорошо, что предупредили. Запись отменили." if session.get("cancelled") else ans
@@ -520,6 +713,10 @@ def _reset_openai_brain_debug(session: dict[str, Any]) -> None:
     session["openai_config_missing_detail"] = {}
     session["openai_missing_keys"] = []
     session["openai_disabled_flags"] = []
+    session["openai_prompt_tokens"] = 0
+    session["openai_completion_tokens"] = 0
+    session["openai_cached_tokens"] = 0
+    session["openai_cost_usd"] = 0.0
     session["humanize_skipped_because_brain_valid"] = False
     session["humanize_fallback_used"] = False
     _reset_llm_repair_debug(session)
@@ -532,6 +729,7 @@ def _apply_openai_brain_debug(session: dict[str, Any], debug: dict[str, Any]) ->
         "openai_brain_skip_reason", "openai_brain_fallback_used", "openai_brain_model", "openai_brain_temperature",
         "openai_error_type", "openai_error_message_preview", "openai_error_detail",
         "openai_config_missing_detail", "openai_missing_keys", "openai_disabled_flags",
+        "openai_prompt_tokens", "openai_completion_tokens", "openai_cached_tokens", "openai_cost_usd",
     ):
         if key in debug:
             session[key] = debug[key]
@@ -3940,6 +4138,47 @@ def _parse_date(text: str) -> str | None:
 
             return (today + timedelta(days=delta)).isoformat()
 
+    month_aliases = {
+        "январь": 1, "января": 1, "февраль": 2, "февраля": 2,
+        "март": 3, "марта": 3, "апрель": 4, "апреля": 4,
+        "май": 5, "мая": 5, "июнь": 6, "июня": 6,
+        "июль": 7, "июля": 7, "август": 8, "августа": 8,
+        "сентябрь": 9, "сентября": 9, "октябрь": 10, "октября": 10,
+        "ноябрь": 11, "ноября": 11, "декабрь": 12, "декабря": 12,
+        "қаңтар": 1, "кантар": 1, "ақпан": 2, "акпан": 2, "наурыз": 3,
+        "сәуір": 4, "сауир": 4, "мамыр": 5, "маусым": 6,
+        "шілде": 7, "шилде": 7, "тамыз": 8,
+        "қыркүйек": 9, "кыркүйек": 9, "кыркуйек": 9,
+        "қазан": 10, "казан": 10, "қараша": 11, "караша": 11,
+        "желтоқсан": 12, "желтоксан": 12,
+    }
+    named = re.search(r"\b(\d{1,2})\s+([^\W\d_]+)(?:\s+(\d{4}))?\b", low, flags=re.UNICODE)
+    if named:
+        day_raw, month_word, year_raw = named.groups()
+        month_word = month_word.strip().lower().replace("ё", "е")
+        month = month_aliases.get(month_word)
+        if month is None:
+            suffixes = ("да", "де", "та", "те", "дың", "дің", "тың", "тің")
+            for alias, number in month_aliases.items():
+                if month_word.startswith(alias) and month_word[len(alias):] in suffixes:
+                    month = number
+                    break
+        if month is not None:
+            day = int(day_raw)
+            if year_raw:
+                try:
+                    return datetime(int(year_raw), month, day).date().isoformat()
+                except ValueError:
+                    return None
+            for year_offset in range(0, 5):
+                try:
+                    candidate = datetime(today.year + year_offset, month, day).date()
+                except ValueError:
+                    continue
+                if candidate >= today:
+                    return candidate.isoformat()
+            return None
+
     m = re.search(r"\b(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{2,4}))?\b", low)
     if m:
         d, mo, y = m.groups()
@@ -4117,6 +4356,41 @@ def _slot_time(slot: dict[str, Any]) -> str:
     return str(slot.get("time") or slot.get("timeStart") or slot.get("time_start") or "")
 
 
+def _same_slot_identity(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Compare the stable CRM identity of two slot payloads, independent of key shape."""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+
+    def normalize_time(value: str) -> str:
+        raw = str(value or "").strip()
+        match = re.fullmatch(r"(\d{1,2}):(\d{2})(?::\d{2})?", raw)
+        if not match:
+            return raw
+        return f"{int(match.group(1)):02d}:{match.group(2)}"
+
+    left_login = _slot_doctor_login(left).strip().lower()
+    right_login = _slot_doctor_login(right).strip().lower()
+    left_date = _slot_date(left).strip()
+    right_date = _slot_date(right).strip()
+    left_time = normalize_time(_slot_time(left))
+    right_time = normalize_time(_slot_time(right))
+    return bool(
+        left_login
+        and right_login
+        and left_date
+        and right_date
+        and left_time
+        and right_time
+        and left_login == right_login
+        and left_date == right_date
+        and left_time == right_time
+    )
+
+
+def _slot_in_offered_set(slot: dict[str, Any], offered: list[Any]) -> bool:
+    return any(_same_slot_identity(existing, slot) for existing in offered if isinstance(existing, dict))
+
+
 RESERVE_LOGINS = {"", "reserve", "rezerv", "reserved", "fallback"}
 
 
@@ -4186,8 +4460,45 @@ def _booking_ready(session: dict[str, Any], phone: str = "") -> bool:
     )
 
 
+def _is_single_slot_confirmation(text: str) -> bool:
+    """Accept exact natural consent only for a single CRM slot."""
+    low = _low(text).replace("ё", "е")
+    normalized = re.sub(r"[^\w]+", " ", low, flags=re.UNICODE).strip()
+    normalized = re.sub(r"\s+", " ", normalized)
+    if not normalized:
+        return False
+    negative_markers = (
+        "не подходит", "не надо", "не нужно", "не хочу", "не это время",
+        "другое время", "другой день", "другую дату", "другой вариант",
+        "басқа уақыт", "баска уакыт", "басқа күн", "баска кун",
+        "жоқ", "жок", "керек емес",
+    )
+    if any(marker in normalized for marker in negative_markers):
+        return False
+    confirmations = {
+        "да", "давайте", "да подходит", "подходит", "мне подходит",
+        "запишите", "запишите меня", "да запишите", "хорошо", "ок", "окей",
+        "на это время", "это время подходит", "беру", "согласен", "согласна",
+        "иә", "ия", "болады", "жарайды", "келісемін", "келисемин",
+        "осы уақыт", "осы уакыт", "осы уақытқа", "осы уакытка",
+        "жазыңыз", "жазып қойыңыз", "жазып коиниз",
+    }
+    return normalized in confirmations
+
 def _select_slot(text: str, slots: list[dict[str, str]]) -> dict[str, str] | None:
     low = _low(text)
+
+    if len(slots) == 1 and _is_single_slot_confirmation(text):
+        only = slots[0]
+        if (
+            isinstance(only, dict)
+            and not _is_reserve_slot(only)
+            and _slot_date(only)
+            and _slot_time(only)
+            and _slot_doctor_login(only)
+            and _slot_doctor_name(only)
+        ):
+            return only
 
     m = re.search(r"\b([1-9])\b", low)
     if m:
@@ -4245,8 +4556,9 @@ def _remember_selected_slot(session: dict[str, Any], slot: dict[str, Any]) -> No
         session["selected_doctor_name"] = ""
         return
     last_slots = session.get("last_slots") or []
-    if last_slots and not any(existing == slot for existing in last_slots if isinstance(existing, dict)):
+    if last_slots and not _slot_in_offered_set(slot, last_slots):
         session.pop("selected_slot", None)
+        session["selected_time"] = ""
         session["slot_selection_rejected_reason"] = "not_in_session_last_slots"
         return
     if session.get("contraindications_ok") is True and not session.get("contraindications_verdict"):
@@ -4261,6 +4573,44 @@ def _remember_selected_slot(session: dict[str, Any], slot: dict[str, Any]) -> No
     session["selected_doctor_name"] = _slot_doctor_name(slot)
     session["selected_date"] = _slot_date(slot) or session.get("preferred_date")
     session["selected_time"] = _slot_time(slot)
+
+
+def _reset_slot_choice_for_change(session: dict[str, Any], *, clear_offered: bool) -> None:
+    """Clear only slot-choice state when the patient changes date/time.
+
+    Clinical gates and complaint context remain intact; no questionnaire restart.
+    """
+    session.pop("selected_slot", None)
+    session["selected_date"] = ""
+    session["selected_time"] = ""
+    session["selected_doctor_login"] = ""
+    session["selected_doctor_name"] = ""
+    session["booking_ready"] = False
+    session["slot_selection_rejected_reason"] = ""
+    if clear_offered:
+        session["last_slots"] = []
+        session["preferred_date"] = ""
+        session["preferred_date_text"] = ""
+
+
+def _wants_another_booking_day(text: str) -> bool:
+    low = _low(text)
+    return any(marker in low for marker in (
+        "другой день", "другую дату", "другая дата", "на другой день",
+        "не этот день", "день не подходит", "дата не подходит",
+        "басқа күн", "баска кун", "басқа күнге", "баска кунге",
+        "басқа дата", "баска дата", "күнді ауыстыр", "кунди ауыстыр",
+    ))
+
+
+def _wants_another_booking_time(text: str) -> bool:
+    low = _low(text)
+    return any(marker in low for marker in (
+        "другое время", "другой вариант", "другое окошко", "другое окно",
+        "не это время", "время не подходит", "это время не подходит",
+        "басқа уақыт", "баска уакыт", "басқа уақытқа", "баска уакытка",
+        "уақытты ауыстыр", "уакытты ауыстыр",
+    ))
 
 
 def _looks_like_name(text: str) -> bool:
@@ -4598,7 +4948,92 @@ def _booking_success_answer(session: dict[str, Any], booked: dict[str, Any], slo
 
 
 def _booking_failed_answer(session: dict[str, Any]) -> str:
-    return _final_confirmation_text(session)
+    return _tr(
+        session,
+        "Не удалось подтвердить запись в CRM. Я передала информацию администратору — он проверит запись и свяжется с Вами 🌿",
+        "Жазбаны CRM-де растай алмадым. Ақпаратты әкімшіге бердім — ол жазбаны тексеріп, Сізбен байланысады 🌿",
+    )
+
+
+def _booking_race_answer(session: dict[str, Any], slots: list[dict[str, Any]]) -> str:
+    if slots:
+        times = _join_times([_slot_time(slot) for slot in slots])
+        return _tr(
+            session,
+            f"Пока оформляла запись, это окошко уже заняли 🌿 Сейчас свободны: {times}. Какое время Вам удобно?",
+            f"Жазбаны рәсімдеп жатқанда бұл уақыт бос болмай қалды 🌿 Қазір бос уақыттар: {times}. Қай уақыт ыңғайлы?",
+        )
+    return _tr(
+        session,
+        "Пока оформляла запись, это окошко уже заняли 🌿 На этот день свободных вариантов больше не вижу. Подскажите другой удобный день — проверю актуальные окошки.",
+        "Жазбаны рәсімдеп жатқанда бұл уақыт бос болмай қалды 🌿 Бұл күнге басқа бос уақыт көріп тұрған жоқпын. Басқа ыңғайлы күнді айтыңызшы — өзекті уақыттарды тексеремін.",
+    )
+
+
+async def _recover_booking_slot_race(
+    chat_id: str,
+    session: dict[str, Any],
+    selected_slot: dict[str, Any],
+    exc: crm.CRMResponseError,
+) -> str | None:
+    """Recover when a CRM booking fails because the offered slot disappeared.
+
+    The CRM route may surface uniqueness/slot conflicts as a generic 500, so the
+    only trustworthy signal is current CRM availability after clearing cache.
+    Authentication/permission failures are never treated as slot races.
+    """
+    if exc.status_code in {401, 403}:
+        return None
+
+    date = _slot_date(selected_slot).strip()
+    doctor_login = _slot_doctor_login(selected_slot).strip()
+    if not date or not doctor_login:
+        return None
+
+    try:
+        if hasattr(crm, "clear_slots_cache"):
+            crm.clear_slots_cache(date)
+        data = await crm.check_slots(date, doctor_login=doctor_login)
+        if isinstance(data, dict):
+            data.setdefault("date", date)
+        fresh_slots = _format_slots(data if isinstance(data, dict) else {}, max_count=1000)
+    except Exception as refresh_exc:
+        _safe_log(chat_id, "crm_booking_race_recheck_failed", {
+            "status_code": exc.status_code,
+            "date": date,
+            "doctor_login": doctor_login,
+            "error": str(refresh_exc)[:300],
+        })
+        return None
+
+    if any(_same_slot_identity(candidate, selected_slot) for candidate in fresh_slots):
+        return None
+
+    same_doctor = [
+        candidate
+        for candidate in fresh_slots
+        if _slot_doctor_login(candidate).strip().lower() == doctor_login.lower()
+    ]
+    session["booking_confirmed"] = False
+    session["booking_ready"] = False
+    session["manual_takeover"] = False
+    session["escalated"] = False
+    session["ai_muted"] = False
+    session["handoff_reason"] = ""
+    session["crm_result"] = "slot_race_recovered"
+    session["slot_race_recovered"] = True
+    session.pop("selected_slot", None)
+    session["selected_time"] = ""
+    session["last_slots"] = same_doctor[:5]
+    session["step"] = "time" if session["last_slots"] else "date"
+    _safe_log(chat_id, "crm_booking_slot_race_recovered", {
+        "status_code": exc.status_code,
+        "date": date,
+        "doctor_login": doctor_login,
+        "requested_time": _slot_time(selected_slot),
+        "replacement_slots_count": len(session["last_slots"]),
+    })
+    return _booking_race_answer(session, session["last_slots"])
 
 
 def _no_slots_text(session: dict[str, Any]) -> str:
@@ -4828,13 +5263,76 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         _safe_log(chat_id, "booking_payload_blocked_reserve_or_invalid_slot", {"chat_id": chat_id, "step": session.get("step") or "", "doctor_login": _slot_doctor_login(slot), "doctor_name": _slot_doctor_name(slot)})
         return "Сейчас уточню свободное время у администратора, чтобы записать Вас корректно 🌿"
     last_slots = session.get("last_slots") or []
-    if last_slots and not any(existing == slot for existing in last_slots if isinstance(existing, dict)):
+    if last_slots and not _slot_in_offered_set(slot, last_slots):
         session.pop("selected_slot", None)
+        session["selected_time"] = ""
+        session["booking_ready"] = False
         session["step"] = "time" if last_slots else "date"
         _safe_log(chat_id, "booking_payload_blocked_not_from_last_slots", {"chat_id": chat_id, "step": session.get("step") or "", "slots_count": len(last_slots) if isinstance(last_slots, list) else 0})
         return _mandatory_step_prompt(session, session["step"])
     if not last_slots:
-        _safe_log(chat_id, "booking_payload_legacy_selected_slot_without_last_slots", {"chat_id": chat_id, "step": session.get("step") or ""})
+        # Compatibility-safe Polyglot invariant: a legacy in-flight session may
+        # have preserved selected_slot while losing last_slots. Revalidate the
+        # exact doctor/date/time against current CRM availability before booking.
+        slot_date = _slot_date(slot).strip()
+        slot_login = _slot_doctor_login(slot).strip()
+        try:
+            data = await crm.check_slots(slot_date, doctor_login=(slot_login or None))
+            if isinstance(data, dict):
+                data.setdefault("date", slot_date)
+            refreshed_slots = _format_slots(data if isinstance(data, dict) else {}, max_count=1000)
+        except Exception as exc:
+            session["booking_ready"] = False
+            session["crm_called"] = False
+            session["booking_confirmed"] = False
+            session["manual_takeover"] = True
+            session["escalated"] = True
+            session["ai_muted"] = True
+            session["handoff_reason"] = "legacy_slot_revalidation_failed"
+            bot_tools.escalate_to_human(session, "legacy_slot_revalidation_failed")
+            _safe_log(chat_id, "booking_payload_legacy_slot_revalidation_failed", {
+                "chat_id": chat_id,
+                "date": slot_date,
+                "doctor_login": slot_login,
+                "error": str(exc)[:300],
+            })
+            return _crm_slots_unavailable_answer(session)
+
+        matched_slot = next(
+            (candidate for candidate in refreshed_slots if _same_slot_identity(candidate, slot)),
+            None,
+        )
+        if matched_slot is None:
+            session["booking_ready"] = False
+            session["crm_called"] = False
+            session["booking_confirmed"] = False
+            session.pop("selected_slot", None)
+            session["selected_time"] = ""
+            session["last_slots"] = refreshed_slots[:5]
+            session["step"] = "time" if session["last_slots"] else "date"
+            _safe_log(chat_id, "booking_payload_legacy_slot_stale", {
+                "chat_id": chat_id,
+                "date": slot_date,
+                "doctor_login": slot_login,
+                "requested_time": _slot_time(slot),
+                "current_slots_count": len(refreshed_slots),
+            })
+            return _mandatory_step_prompt(session, session["step"])
+
+        slot = matched_slot
+        session["selected_slot"] = matched_slot
+        session["selected_doctor_login"] = _slot_doctor_login(matched_slot)
+        session["selected_doctor_name"] = _slot_doctor_name(matched_slot)
+        session["selected_date"] = _slot_date(matched_slot)
+        session["selected_time"] = _slot_time(matched_slot)
+        session["last_slots"] = [matched_slot]
+        session["legacy_slot_revalidated"] = True
+        _safe_log(chat_id, "booking_payload_legacy_slot_revalidated", {
+            "chat_id": chat_id,
+            "date": _slot_date(matched_slot),
+            "doctor_login": _slot_doctor_login(matched_slot),
+            "time": _slot_time(matched_slot),
+        })
 
     if session.get("contraindications_ok") is True and not session.get("contraindications_verdict"):
         # Backward-compatible migration for existing sessions created before tool gates.
@@ -4928,6 +5426,9 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
 
         return _booking_success_answer(session, booked, slot)
     except crm.CRMResponseError as exc:
+        race_answer = await _recover_booking_slot_race(chat_id, session, slot, exc)
+        if race_answer is not None:
+            return race_answer
         log_payload = {
             "error": str(exc)[:500],
             "booking_payload": booking_payload,
@@ -6277,7 +6778,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         date = session.get("appointment_date") or appt.get("date") or appt.get("appointmentDate") or ""
         time = session.get("appointment_time") or appt.get("timeStart") or appt.get("time") or ""
         doctor = session.get("appointment_doctor_name") or appt.get("doctorName") or "врачу"
-        if _is_cancel(text) or _has_any(_low(text), POST_BOOKING_RESCHEDULE_WORDS) or _has_any(_low(text), POST_BOOKING_TIME_WORDS) or _wants_existing_lookup(text) or _has_any(_low(text), ADDRESS_WORDS) or _low(text).strip() in POST_BOOKING_OK_WORDS:
+        if session.get("reschedule_mode") or _is_cancel(text) or _is_reschedule_request(text) or _has_any(_low(text), POST_BOOKING_TIME_WORDS) or _wants_existing_lookup(text) or _has_any(_low(text), ADDRESS_WORDS) or _low(text).strip() in POST_BOOKING_OK_WORDS:
             booked_answer = await _post_booking_support_answer(chat_id, phone, session, text)
         elif date and time:
             booked_answer = f"Здравствуйте 🌿 Вы уже записаны на {_format_booking_date_human(date, 'ru')} в {time} к врачу {doctor}. Если возникнут вопросы по записи, можете написать сюда."
@@ -6812,6 +7313,20 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return _finalize(chat_id, session, answer)
 
         if step in ("time", "select_slot"):
+            # Polyglot change-of-mind: an explicit new date wins over the old
+            # offered slots. Reuse the normal CRM slot path instead of forcing
+            # the patient to finish a stale choice.
+            changed_date = _parse_date(text)
+            if changed_date:
+                _reset_slot_choice_for_change(session, clear_offered=True)
+                answer = await _show_slots(chat_id, session, changed_date)
+                return _finalize(chat_id, session, answer)
+            if _wants_another_booking_day(text):
+                _reset_slot_choice_for_change(session, clear_offered=True)
+                session["step"] = "date"
+                session["questionnaire_step"] = "date"
+                return _finalize(chat_id, session, _ask_date(session))
+
             slots = session.get("last_slots") or []
             slot = _select_slot(text, slots)
             if not slot:
@@ -6833,6 +7348,38 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             return _finalize(chat_id, session, answer)
 
         if step == "name":
+            # The patient may change their mind after selecting a slot but before
+            # giving a name. Never interpret such a message as a name or book the
+            # stale slot.
+            changed_date = _parse_date(text)
+            if changed_date:
+                _reset_slot_choice_for_change(session, clear_offered=True)
+                session["patient_name"] = ""
+                answer = await _show_slots(chat_id, session, changed_date)
+                return _finalize(chat_id, session, answer)
+            if _wants_another_booking_day(text):
+                _reset_slot_choice_for_change(session, clear_offered=True)
+                session["patient_name"] = ""
+                session["step"] = "date"
+                session["questionnaire_step"] = "date"
+                return _finalize(chat_id, session, _ask_date(session))
+
+            offered = session.get("last_slots") or []
+            replacement_slot = _select_slot(text, offered)
+            current_slot = session.get("selected_slot") if isinstance(session.get("selected_slot"), dict) else None
+            if replacement_slot and (current_slot is None or not _same_slot_identity(replacement_slot, current_slot)):
+                _remember_selected_slot(session, replacement_slot)
+                session["patient_name"] = ""
+                session["step"] = "name"
+                session["questionnaire_step"] = "name"
+                return _finalize(chat_id, session, _ask_name(session))
+            if _wants_another_booking_time(text):
+                _reset_slot_choice_for_change(session, clear_offered=False)
+                session["patient_name"] = ""
+                session["step"] = "time"
+                session["questionnaire_step"] = "time"
+                return _finalize(chat_id, session, _mandatory_step_prompt(session, "time"))
+
             if _is_service_polite_phrase(text):
                 session["patient_name"] = ""
                 return _finalize(chat_id, session, "Подскажите, пожалуйста, Ваше имя для записи.")

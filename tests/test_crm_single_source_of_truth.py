@@ -150,5 +150,5 @@ def test_reschedule_active_appointment_asks_for_new_datetime(monkeypatch: Any) -
 
     assert session["reschedule_mode"] is True
     assert session["original_appointment"]
-    assert "На какой день и время" in answer
+    assert "На какой день" in answer
     assert dialog.FIRST_TOUCH_CLINIC_INFO_RU not in answer

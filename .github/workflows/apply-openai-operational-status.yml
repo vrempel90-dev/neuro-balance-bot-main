@@ -1,0 +1,133 @@
+name: Apply OpenAI operational status fix
+
+# Trigger verified OpenAI operational diagnostics patch.
+on:
+  push:
+    branches:
+      - refactor/polyglot-brain-contract
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  apply-fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      OPENAI_API_KEY: ''
+      CRM_BOT_SECRET: test
+      CRM_BASE_URL: http://127.0.0.1:9
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refactor/polyglot-brain-contract
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Apply safe OpenAI runtime status
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          main = Path('main.py')
+          text = main.read_text(encoding='utf-8')
+
+          marker = '\n@app.get("/health")\ndef health() -> dict[str, Any]:\n'
+          helper = '''\ndef _openai_runtime_status() -> dict[str, Any]:
+    """Non-secret operational OpenAI configuration for health/debug endpoints."""
+    settings = get_settings()
+    api_key_present = bool(str(getattr(settings, "openai_api_key", "") or "").strip())
+    ai_enabled = bool(getattr(settings, "ai_enabled", True))
+    brain_enabled = bool(getattr(settings, "openai_brain_enabled", True))
+    brain_model = str(getattr(settings, "ai_brain_model", "") or getattr(settings, "openai_model", "") or "").strip()
+    blockers: list[str] = []
+    if not api_key_present:
+        blockers.append("OPENAI_API_KEY")
+    if not ai_enabled:
+        blockers.append("AI_ENABLED=false")
+    if not brain_enabled:
+        blockers.append("OPENAI_BRAIN_ENABLED=false")
+    if not brain_model:
+        blockers.append("AI_BRAIN_MODEL_or_OPENAI_MODEL")
+    return {
+        "openai_api_key_present": api_key_present,
+        "ai_enabled": ai_enabled,
+        "openai_brain_enabled": brain_enabled,
+        "ai_brain_model": brain_model,
+        "ai_brain_temperature": float(getattr(settings, "ai_brain_temperature", 0.2) or 0.2),
+        "ai_brain_max_completion_tokens": int(getattr(settings, "ai_brain_max_completion_tokens", 2000) or 2000),
+        "openai_model": str(getattr(settings, "openai_model", "") or ""),
+        "openai_humanize_replies": bool(getattr(settings, "openai_humanize_replies", True)),
+        "monthly_ai_budget_usd": float(getattr(settings, "monthly_ai_budget_usd", 0.0) or 0.0),
+        "monthly_ai_budget_kzt": int(getattr(settings, "monthly_ai_budget_kzt", 0) or 0),
+        "ai_max_classifier_calls_per_day": int(getattr(settings, "ai_max_classifier_calls_per_day", 0) or 0),
+        "brain_config_ready": not blockers,
+        "brain_blockers": blockers,
+        "production_entrypoint": "live_main:app -> main.app",
+    }
+\n'''
+          if 'def _openai_runtime_status()' not in text:
+              if marker not in text:
+                  raise SystemExit('health marker not found')
+              text = text.replace(marker, helper + marker, 1)
+
+          health_start = text.index('@app.get("/health")')
+          health_end = text.index('\n\n@app.get("/debug/time")', health_start)
+          health_block = text[health_start:health_end]
+          if '"openai": _openai_runtime_status(),' not in health_block:
+              target = '    return {\n        "ok": True,\n'
+              if target not in health_block:
+                  raise SystemExit('health return target not found')
+              health_block = health_block.replace(target, target + '        "openai": _openai_runtime_status(),\n', 1)
+              text = text[:health_start] + health_block + text[health_end:]
+
+          main.write_text(text, encoding='utf-8')
+
+          contract = Path('.github/workflows/brain-contract.yml')
+          wt = contract.read_text(encoding='utf-8')
+          marker2 = '      - name: OpenAI runtime telemetry contract\n        run: pytest -q tests/test_openai_runtime_telemetry_contract.py\n'
+          addition = marker2 + '\n      - name: OpenAI operational health contract\n        run: pytest -q tests/test_openai_operational_health_contract.py\n'
+          if 'OpenAI operational health contract' not in wt:
+              if marker2 not in wt:
+                  raise SystemExit('brain contract OpenAI marker not found')
+              contract.write_text(wt.replace(marker2, addition, 1), encoding='utf-8')
+          PY
+
+      - name: Compile
+        run: python -m py_compile main.py live_main.py ai.py ai_budget.py
+
+      - name: Verify OpenAI operational health
+        run: pytest -q tests/test_openai_operational_health_contract.py
+
+      - name: Verify OpenAI telemetry
+        run: pytest -q tests/test_openai_runtime_telemetry_contract.py
+
+      - name: Verify OpenAI budget enforcement
+        run: pytest -q tests/test_ai_budget_enforcement.py
+
+      - name: Commit only after verification
+        run: |
+          rm -f .github/workflows/apply-openai-operational-status.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add main.py .github/workflows/brain-contract.yml .github/workflows/apply-openai-operational-status.yml
+          git diff --cached --check
+          git commit -m "fix: expose safe OpenAI operational health"
+          git push origin HEAD:refactor/polyglot-brain-contract
+
+      - name: Report failure in PR
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment 90 --body "OpenAI operational status fix was not committed because its compile/regression verification failed."

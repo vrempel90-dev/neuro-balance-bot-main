@@ -1,0 +1,114 @@
+name: Neuro Brain Contract
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: brain-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  contract-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      OPENAI_API_KEY: ''
+      CRM_BOT_SECRET: test
+      CRM_BASE_URL: http://127.0.0.1:9
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Compile protected brain modules
+        run: python -m py_compile ai.py ai_budget.py dialog.py main.py bot_tools.py state.py language_guard.py
+
+      - name: OpenAI runtime telemetry contract
+        run: pytest -q tests/test_openai_runtime_telemetry_contract.py
+
+      - name: OpenAI budget accounting contract
+        run: pytest -q tests/test_ai_budget_enforcement.py
+
+      - name: Canonical prompt contract
+        run: pytest -q tests/test_prompt_source_of_truth_contract.py
+
+      - name: AI brain before keyword fallbacks
+        run: pytest -q tests/test_brain_before_keyword_branches.py
+
+      - name: Slot provenance contract
+        run: pytest -q tests/test_polyglot_slot_contract.py
+
+      - name: Booking race recovery contract
+        run: pytest -q tests/test_booking_race_recovery_contract.py
+
+      - name: Mid-booking change-of-mind contract
+        run: pytest -q tests/test_polyglot_change_of_mind_contract.py
+
+      - name: Safe post-booking reschedule contract
+        run: pytest -q tests/test_post_booking_reschedule_contract.py
+
+      - name: Cross-turn anti-loop contract
+        run: pytest -q tests/test_polyglot_anti_loop_contract.py
+
+      - name: Brain language contract
+        run: pytest -q tests/test_brain_language_contract.py
+
+      - name: Bilingual language guard
+        run: pytest -q tests/test_bilingual_language_guard.py
+
+      - name: Explicit RU-KK language switching
+        run: pytest -q tests/test_language_switching.py
+
+      - name: Bilingual hallucination guard
+        run: pytest -q tests/test_bilingual_hallucination_guards.py
+
+      - name: Response language guard
+        run: pytest -q tests/test_response_language_guard.py
+
+      - name: RU-KK multi-turn flow
+        run: pytest -q tests/test_multiturn_bilingual_flow.py
+
+      - name: Relative-patient booking contract
+        run: pytest -q tests/test_booking_for_relative.py
+
+      - name: Contraindications must never go silent
+        run: pytest -q tests/test_contraindications_never_silent.py
+
+      - name: FAQ must not trigger false loop repair
+        run: pytest -q tests/test_faq_not_blocked_by_step_repair.py
+
+      - name: Existing appointment and cancellation routing
+        run: |
+          pytest -q \
+            tests/test_dialog_intent_router.py::test_existing_appointment_lookup_wins_over_booking_flow \
+            tests/test_dialog_intent_router.py::test_cancel_and_negative_visit_use_crm_not_confirmation
+
+      - name: Booking regression contract
+        run: pytest -q tests/test_production_booking_flow.py
+
+      - name: CRM source-of-truth contract
+        run: pytest -q tests/test_crm_single_source_of_truth.py -k 'not test_no_active_appointment_allows_first_touch'
+
+      - name: Webhook idempotency contract
+        run: pytest -q tests/test_webhook_idempotency_and_failures.py
+
+      - name: Working-hours contract
+        run: pytest -q tests/test_working_hours_guard.py

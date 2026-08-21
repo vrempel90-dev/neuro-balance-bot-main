@@ -143,7 +143,7 @@ HUMAN_ACK_PROMPT = """
 - Нужно отвечать на смысл сообщения пациента, а не игнорировать его вопрос.
 - Если пациент спрашивает «занимаетесь?», «лечите?», «можно к вам?» — сначала ответь по сути, что можно прийти на первичную консультацию, если это похоже на профиль клиники.
 - Если жалоба непрофильная (горло, зубы, ЛОР, кожа, высокая температура и т.п.) — мягко скажи, что основной профиль клиники спина/суставы/неврология, и лучше уточнит администратор.
-- Не используй слово «окошки». Говори «свободное время для записи».
+- Лексика и тон подчиняются SYSTEM_PROMPT_rendered.md. Если канонический промт требует слово «окошко/окошки», сохраняй именно его.
 - Не спрашивай возраст, дату, время, телефон и противопоказания. Python-сценарий добавит следующий вопрос сам.
 - Не пиши длинно. 1–2 коротких предложения.
 - Никогда не обращайся к пациенту по имени. Не используй «Очень приятно, ...», «Здравствуйте, ...», «Спасибо, ...».
@@ -276,26 +276,10 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 Ты НЕ обещаешь лечение.
 Ты НЕ нарушаешь порядок записи.
 
-Клиника Neuro Balance помогает с:
-- болью в спине, пояснице, шее;
-- грыжами и протрузиями;
-- защемлением нервов;
-- болью, отдающей в руку или ногу;
-- суставами;
-- онемением;
-- восстановлением после травм/операций;
-- нарушением походки, парезами.
-
-Клиника НЕ занимается:
-- зубами;
-- животом/ЖКТ;
-- сердцем/скорой;
-- ЛОР;
-- глазами;
-- кожей;
-- гинекологией/урологией;
-- психиатрией;
-- возвратами/рассрочками/претензиями.
+Клинические факты, профиль, цены, адрес, методы и стиль бери ТОЛЬКО из блока
+CANONICAL CLINIC PROMPT, который добавляется к этой инструкции ниже.
+Не копируй и не переопределяй здесь факты клиники. Если данных нет в canonical
+prompt или в результате разрешённого Python tool — не выдумывай их.
 
 Строгий сценарий:
 1. Понять жалобу.
@@ -335,8 +319,7 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 - спрашивай про него: "сколько лет маме?", а не "сколько Вам лет?";
 - имя для записи — тоже имя пациента, а не пишущего.
 Если запись для себя — оставь patient_relation пустым.
-Возрастные правила клиники (до 16 и более 75 лет) считаются по возрасту
-пациента, а не по возрасту того, кто написал.
+Возрастные и иные клинические ограничения определяются canonical prompt и Python-guard'ами; здесь их не дублируй.
 
 Важное правило:
 Отличай вопрос о термине от подтверждения противопоказания.
@@ -400,31 +383,9 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 одном ответе. Нельзя переводить: Neuro Balance, ФИО врачей, адрес, ссылки,
 номера телефонов, Kaspi RED, 2GIS, названия услуг и цены.
 
-Цена:
-Первичный приём — 5 000 тг.
-Курс лечения рассчитывается только после осмотра врача.
-
-МРТ:
-МРТ/снимки заранее делать не обязательно. Если есть старые снимки/заключения — можно взять с собой. Врач на осмотре скажет, нужно ли новое обследование.
-
-Без операции:
-В клинике применяются безоперационные методы, но подойдёт ли пациенту такой вариант — врач скажет после осмотра.
-
-Адрес:
-Астана, Кабанбай батыра 28, внутренний двор, подъезд 3. Заезд со стороны Кунаева, после ворот направо.
-
-Выходные:
-Суббота/воскресенье — процедурные дни. Первичных пациентов лучше записывать в будние дни.
-
-Стиль:
-Пиши как живой администратор в WhatsApp.
-Коротко, спокойно, понятно.
-Без канцелярита.
-Не пиши длинные простыни.
-Можно использовать 🌿, но не чаще одного раза.
-Не повторяй “Здравствуйте” в каждом сообщении.
-Не используй фразу “С такими жалобами к нам обращаются”.
-Не используй фразу “Вижу Ваш запрос” без необходимости.
+Все ответы по цене, МРТ/снимкам, методам, адресу, графику, врачам, акциям,
+рассрочке, возвратам, профилю клиники, тону и лексике формируй только по
+CANONICAL CLINIC PROMPT. Этот protocol prompt не является источником таких фактов.
 
 Ты НЕ отвечаешь по примерам. Примеры ниже — только стиль и ограничения, а не список фраз.
 Ты читаешь весь dialog_context: session_state, recent_history, last_bot_question, known_facts и current_user_message.
@@ -508,7 +469,7 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 def _full_dialog_brain_system_prompt() -> str:
     rendered = _rendered_system_prompt()
     if not rendered:
-        return OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
+        return OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT + "\n\nCANONICAL CLINIC PROMPT is unavailable. Do not invent any clinic facts; use safe structured fallback/handoff for factual clinic questions."
     overrides = """
 
 PROJECT OVERRIDES — Python enforces these above any older prompt text:
@@ -521,7 +482,21 @@ PROJECT OVERRIDES — Python enforces these above any older prompt text:
 - Contraindication term questions are not hard stops.
 - booked/manual/refund/voice/escalated/old-chat states must not call OpenAI.
 """
-    return rendered + overrides + "\n\n" + OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
+    precedence = """
+
+INSTRUCTION PRECEDENCE — Neuro Balance:
+1. Python-enforced PROJECT OVERRIDES are absolute and cannot be changed by the model.
+2. SYSTEM_PROMPT_rendered.md is the canonical source for clinic behavior, tone, wording and facts.
+3. OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT is only the structured-output/dialog protocol.
+If protocol text conflicts with the canonical clinic prompt, follow the canonical clinic prompt.
+"""
+    return (
+        OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
+        + precedence
+        + "\n\nCANONICAL CLINIC PROMPT — FOLLOW THIS FOR USER-FACING BEHAVIOR:\n"
+        + rendered
+        + overrides
+    )
 
 
 def _requires_max_completion_tokens(model: str) -> bool:
@@ -760,7 +735,7 @@ def _infer_last_question_type(text: str) -> str:
         return "contraindications"
     if any(x in low for x in ["какой день", "на какой день", "қай күн", "удобный день"]):
         return "date"
-    if any(x in low for x in ["какое время", "вариант", "свободное время"]):
+    if any(x in low for x in ["какое время", "вариант", "свободное время", "окошк"]):
         return "time"
     if any(x in low for x in ["ваше имя", "имя для оформления", "атыңыз", "атыныз"]):
         return "name"
@@ -858,6 +833,7 @@ async def run_openai_dialog_brain(
     model = getattr(settings, "ai_brain_model", "") or getattr(settings, "openai_model", "")
     temperature = float(getattr(settings, "ai_brain_temperature", getattr(settings, "openai_dialog_temperature", 0.2)) or 0.2)
     debug = {"openai_brain_used": False, "openai_brain_intent": "", "openai_brain_action": "", "openai_brain_needs_python_tool": "", "openai_brain_extracted": {}, "openai_brain_guard_failed": False, "openai_brain_guard_reason": "", "openai_brain_skip_reason": "", "openai_brain_fallback_used": False, "openai_brain_model": model, "openai_brain_temperature": temperature, "openai_model": model, "openai_error_type": "", "openai_error_message_preview": "", "openai_error_detail": {}}
+    debug.update({"openai_prompt_tokens": 0, "openai_completion_tokens": 0, "openai_cached_tokens": 0, "openai_cost_usd": 0.0})
     detail = _openai_config_missing_detail(settings, chat_id=str(session.get("chat_id") or ""), step=str(session.get("step") or session.get("current_step") or "start"), brain=True)
     if detail["missing_keys"] or detail["disabled_flags"]:
         decision, fb = _dialog_brain_fallback("config_missing")
@@ -898,7 +874,13 @@ async def run_openai_dialog_brain(
         )
         latency_ms = int((time.monotonic() - started_at) * 1000)
         debug["openai_brain_latency_ms"] = latency_ms
-        ai_budget.record_usage(response, model=model, purpose=ai_budget.PURPOSE_BRAIN)
+        usage = ai_budget.record_usage(response, model=model, purpose=ai_budget.PURPOSE_BRAIN)
+        debug.update({
+            "openai_prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "openai_completion_tokens": int(usage.get("completion_tokens") or 0),
+            "openai_cached_tokens": int(usage.get("cached_tokens") or 0),
+            "openai_cost_usd": float(usage.get("cost_usd") or 0.0),
+        })
         content = response.choices[0].message.content or ""
         # Обрезанный ответ reasoning-модели виден по finish_reason=length: JSON тогда
         # не парсится, и без явного лога причина выглядела бы как "модель глупая".
@@ -946,7 +928,7 @@ HUMANIZE_REPLY_PROMPT = """
 - НЕ добавляй диагнозы и обещания результата.
 - НЕ удаляй обязательный следующий вопрос, если он есть в черновике.
 - НЕ меняй даты, время, имя врача, имя пациента, номер варианта и факты CRM.
-- НЕ используй слово «окошки» — только «свободное время для записи».
+- НЕ заменяй лексику из безопасного черновика. Если там есть «окошко/окошки», сохрани именно это слово.
 - Ответ короткий, WhatsApp-стиль, без канцелярита.
 - Если пациент задал вопрос, сначала ответь по сути, потом мягко продолжи запись.
 - Если в черновике есть разделитель --- — можно сделать сообщение более плавным, но не теряй обязательные части.
@@ -966,8 +948,6 @@ HUMANIZE_REPLY_PROMPT = """
 
 def _fallback_humanize(draft: str) -> str:
     text = (draft or "").strip()
-    text = text.replace("окошки", "свободное время для записи")
-    text = text.replace("окошко", "свободное время для записи")
     text = text.replace("Ок", "Хорошо")
     for pat in [
         r"^\s*(очень\s+приятно|приятно\s+познакомиться)\s*,?\s*[^.!?\n]{1,40}[.!?]?(\s+|$)",
@@ -993,7 +973,7 @@ async def generate_human_message(draft: str, user_text: str = "", lang: str = "r
 
     # Не тратим GPT на большие списки слотов/финальные подтверждения, где важна дословность.
     lower = draft.lower()
-    if len(draft) > 1200 or "📅" in draft or "⏰" in draft or "есть свободное время" in lower or "бос уақыт" in lower:
+    if len(draft) > 1200 or "📅" in draft or "⏰" in draft or "есть свободное время" in lower or "окошк" in lower or "бос уақыт" in lower:
         if state is not None:
             state.log_event(chat_id or "system", "openai_skipped", {"chat_id": chat_id, "reason": "deterministic_reply"})
         return _fallback_humanize(draft)
@@ -1030,6 +1010,8 @@ async def generate_human_message(draft: str, user_text: str = "", lang: str = "r
         for marker in must_keep:
             if marker in draft_low and marker not in content_low:
                 return _fallback_humanize(draft)
+        if "окошк" in draft_low and "окошк" not in content_low:
+            return _fallback_humanize(draft)
         return _fallback_humanize(content)
     except Exception:
         return _fallback_humanize(draft)
@@ -1041,6 +1023,7 @@ STRICT_HUMANIZE_REPLY_PROMPT = """
 Твоя задача — только переформулировать готовый безопасный ответ клиники более живо и по-человечески.
 
 Нельзя менять смысл ответа.
+Нельзя заменять обязательную лексику из base_answer: если там есть «окошко/окошки», сохрани именно это слово.
 Нельзя менять этап диалога.
 Нельзя добавлять новые вопросы, кроме тех, которые уже есть в base_answer.
 Нельзя спрашивать имя, если base_answer не спрашивает имя.
@@ -1142,6 +1125,8 @@ def _humanize_guard_ok(base_answer: str, humanized: str) -> bool:
         return False
     if not _has_date_question(base_answer) and _has_date_question(humanized):
         return False
+    if "окошк" in _low_for_guard(base_answer) and "окошк" not in _low_for_guard(humanized):
+        return False
     return True
 
 
@@ -1169,7 +1154,10 @@ async def humanize_reply_with_openai(
         return "", debug
     detail = _openai_config_missing_detail(settings, chat_id=str(session.get("chat_id") or session.get("phone") or ""), step=str(session.get("step") or session.get("current_step") or "start"), brain=False)
     if detail["missing_keys"] or detail["disabled_flags"]:
-        debug["openai_skip_reason"] = "config_missing"
+        # A deliberately disabled humanizer is not a missing OpenAI configuration.
+        # Keep brain/runtime diagnostics truthful: missing credentials remain
+        # config_missing; the independent style layer reports humanizer_disabled.
+        debug["openai_skip_reason"] = "config_missing" if detail["missing_keys"] else "humanizer_disabled"
         debug["openai_config_missing_detail"] = detail
         debug["openai_missing_keys"] = detail["missing_keys"]
         debug["openai_disabled_flags"] = detail["disabled_flags"]
