@@ -1,0 +1,86 @@
+name: Apply active booking never-silent fix
+
+on:
+  push:
+    branches:
+      - refactor/polyglot-brain-contract
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      OPENAI_API_KEY: ''
+      CRM_BOT_SECRET: test
+      CRM_BASE_URL: http://127.0.0.1:9
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refactor/polyglot-brain-contract
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Apply minimal never-silent patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          dialog = Path('dialog.py')
+          text = dialog.read_text(encoding='utf-8')
+          old = '''        else:\n            session["outbound_duplicate_guard_blocked"] = True\n            _safe_save(chat_id, session)\n            return ""\n\n    # final_no_empty_guard: this must be the last answer mutation before saving/returning.\n'''
+          new = '''        elif str(session.get("step") or "") in {"complaint", "age", "date", "time", "select_slot", "name"} and _is_active_new_ai_request(session):\n            # A genuinely new patient turn in an active booking funnel must never be\n            # silenced merely because the safe answer text matches the previous one.\n            # Webhook/event idempotency is enforced separately in main.py.\n            session["outbound_duplicate_guard_blocked"] = False\n            session["fallback_reason"] = "active_booking_repeat_answer_allowed"\n        else:\n            session["outbound_duplicate_guard_blocked"] = True\n            _safe_save(chat_id, session)\n            return ""\n\n    # final_no_empty_guard: this must be the last answer mutation before saving/returning.\n'''
+          if old not in text:
+              raise SystemExit('duplicate guard target not found')
+          text = text.replace(old, new, 1)
+          dialog.write_text(text, encoding='utf-8')
+
+          router = Path('tests/test_dialog_intent_router.py')
+          rt = router.read_text(encoding='utf-8')
+          old_test = '''    first = answer("pf_duplicate", "в субботу")\n    second = answer("pf_duplicate", "в субботу")\n    assert "процедурные дни" in first\n    assert second == ""\n'''
+          new_test = '''    first = answer("pf_duplicate", "в субботу")\n    second = answer("pf_duplicate", "в субботу")\n    assert "процедурные дни" in first\n    assert "процедурные дни" in second\n    assert state.get_session("pf_duplicate").get("outbound_duplicate_guard_blocked") is not True\n'''
+          if old_test not in rt:
+              raise SystemExit('weekend duplicate regression target not found')
+          router.write_text(rt.replace(old_test, new_test, 1), encoding='utf-8')
+
+          workflow = Path('.github/workflows/brain-contract.yml')
+          wt = workflow.read_text(encoding='utf-8')
+          marker = '''      - name: Cross-turn anti-loop contract\n        run: pytest -q tests/test_polyglot_anti_loop_contract.py\n'''
+          addition = marker + '''\n      - name: Active booking turns never go silent\n        run: pytest -q tests/test_active_booking_never_silent_contract.py\n\n      - name: CodeRabbit booking conversion regression\n        run: pytest -q tests/test_coderabbit_booking_conversion_contract.py\n'''
+          if 'Active booking turns never go silent' not in wt:
+              if marker not in wt:
+                  raise SystemExit('brain contract marker not found')
+              workflow.write_text(wt.replace(marker, addition, 1), encoding='utf-8')
+          PY
+
+      - name: Compile
+        run: python -m py_compile dialog.py
+
+      - name: Verify focused regressions
+        run: |
+          pytest -q \
+            tests/test_active_booking_never_silent_contract.py \
+            tests/test_coderabbit_booking_conversion_contract.py \
+            tests/test_polyglot_anti_loop_contract.py \
+            tests/test_production_booking_flow.py
+
+      - name: Commit only after tests pass
+        run: |
+          rm -f .github/workflows/apply-active-never-silent-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dialog.py tests/test_dialog_intent_router.py .github/workflows/brain-contract.yml .github/workflows/apply-active-never-silent-fix.yml
+          git diff --cached --check
+          git commit -m "fix: keep active booking turns responsive"
+          git push origin HEAD:refactor/polyglot-brain-contract
