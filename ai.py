@@ -4,7 +4,6 @@ import json
 import re
 import time
 from functools import lru_cache
-from pathlib import Path
 from typing import Any
 try:
     from openai import AsyncOpenAI
@@ -25,17 +24,6 @@ try:
 except Exception:  # pragma: no cover - language guard is always available in prod
     analyze_language = None
     response_language_violation = None
-
-
-@lru_cache(maxsize=1)
-def _rendered_system_prompt() -> str:
-    """Load the rendered prompt as the canonical clinic source of truth."""
-    path = Path(__file__).resolve().parent / "SYSTEM_PROMPT_rendered.md"
-    try:
-        return path.read_text(encoding="utf-8")
-    except Exception:
-        return ""
-
 
 @lru_cache(maxsize=1)
 def _openai_client(api_key: str):
@@ -270,6 +258,15 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 
 Ты должен понять смысл и вернуть JSON-решение для Python.
 
+Граница работы:
+- отвечай только в диалоге, который Python подтвердил как нового лида;
+- если воронка нового лида уже началась, продолжай её до подтверждённой CRM-записи
+  либо явной безопасной передачи администратору;
+- не оживляй старые, ручные, завершённые или уже записанные диалоги;
+- не повторяй уже отвеченный вопрос и не возвращайся на пройденный шаг;
+- на каждом ходе продвигай один незавершённый обязательный шаг или отвечай на
+  вопрос клиента и сразу возвращайся к этому шагу.
+
 Ты НЕ выполняешь CRM-запись сам.
 Ты НЕ придумываешь слоты.
 Ты НЕ ставишь диагноз.
@@ -306,6 +303,9 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 6. После выбора слота спросить имя.
 7. Python бронирует запись.
 
+Порядок записи неизменен: жалоба → возраст → противопоказания → дата →
+реальные слоты CRM → выбор времени → имя пациента → CRM-запись.
+
 Нельзя:
 - спрашивать имя до выбора слота;
 - предлагать дату до противопоказаний;
@@ -335,6 +335,9 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 - спрашивай про него: "сколько лет маме?", а не "сколько Вам лет?";
 - имя для записи — тоже имя пациента, а не пишущего.
 Если запись для себя — оставь patient_relation пустым.
+Если клиент просит запись к конкретному врачу, заполни doctor_preference ровно
+тем именем или ФИО, которое написал клиент. Не придумывай ФИО и CRM login:
+Python сопоставит предпочтение с актуальным списком врачей CRM.
 Возрастные правила клиники (до 16 и более 75 лет) считаются по возрасту
 пациента, а не по возрасту того, кто написал.
 
@@ -453,6 +456,7 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
     "slot_choice": null,
     "patient_name": "",
     "patient_relation": "",
+    "doctor_preference": "",
     "faq_type": "",
     "language": "ru",
     "detected_language": "ru | kk | mixed | unknown",
@@ -470,58 +474,136 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
   }
 }
 
-Совместимая старая схема тоже принимается:
-{
-  "intent": "medical_question | faq | complaint | age_answer | contraindications_answer | contraindication_term_question | date_preference | slot_choice | ask_human | booking_name | unknown",
-  "patient_meaning": "что пациент имел в виду",
-  "reply": "живой ответ пациенту",
-  "next_step": "complaint | age | contraindications | date | time | name | booked | escalated | keep_current",
-  "extracted": {
-    "complaint": "",
-    "age": null,
-    "contraindications_clear": null,
-    "contraindication_confirmed": false,
-    "contraindication_term_asked": "",
-    "preferred_date_text": "",
-    "time_preference": "",
-    "slot_choice": null,
-    "patient_name": "",
-    "patient_relation": "",
-    "wants_human": false,
-    "faq_type": "",
-    "language": "ru",
-    "detected_language": "ru | kk | mixed | unknown",
-    "preferred_response_language": "ru | kk",
-    "language_confidence": 0.0
-  },
-  "needs_python_tool": "none | check_slots | book_appointment | refresh_slots | handoff_admin",
-  "safety": {
-    "hard_stop": false,
-    "reason": "",
-    "unsafe_medical_claim": false,
-    "tries_to_book_without_rules": false
-  }
-}
 """.strip()
 
 
 def _full_dialog_brain_system_prompt() -> str:
-    rendered = _rendered_system_prompt()
-    if not rendered:
-        return OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
-    overrides = """
+    """Return the single current prompt used by the dialog brain.
 
-PROJECT OVERRIDES — Python enforces these above any older prompt text:
-- AI works only outside contact-center hours: 20:00–08:00 Astana.
-- Ask name only after a CRM slot was selected.
-- Booking order: complaint → age → contraindications → date → CRM slots → time choice → name → CRM booking.
-- Contraindications are always before slots.
-- CRM is the only source of slots/availability; session.last_slots is the only source of shown slots.
-- selected_slot is the only source of booking payload.
-- Contraindication term questions are not hard stops.
-- booked/manual/refund/voice/escalated/old-chat states must not call OpenAI.
-"""
-    return rendered + overrides + "\n\n" + OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
+    SYSTEM_PROMPT_rendered.md describes a retired rule-based flow and contains
+    rules that contradict relative booking and the current field order. Mixing
+    both prompts made the model receive mutually exclusive instructions.
+    """
+    return OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT
+
+
+def _dialog_brain_response_format() -> dict[str, Any]:
+    """Strict Structured Outputs contract for the GPT dialog decision."""
+
+    nullable_integer = {"type": ["integer", "null"]}
+    nullable_boolean = {"type": ["boolean", "null"]}
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "neuro_balance_dialog_decision",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "understood_context": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "patient_meaning": {"type": "string"},
+                            "is_answer_to_last_question": {"type": "boolean"},
+                            "is_new_question": {"type": "boolean"},
+                            "contains_multiple_entities": {"type": "boolean"},
+                            "should_answer_faq_first": {"type": "boolean"},
+                            "should_return_to_pending_step": {"type": "boolean"},
+                        },
+                        "required": [
+                            "patient_meaning",
+                            "is_answer_to_last_question",
+                            "is_new_question",
+                            "contains_multiple_entities",
+                            "should_answer_faq_first",
+                            "should_return_to_pending_step",
+                        ],
+                    },
+                    "intent": {
+                        "type": "string",
+                        "enum": [
+                            "booking", "complaint", "faq", "age_answer",
+                            "contraindications_answer", "date_preference",
+                            "slot_choice", "name_answer", "ask_human",
+                            "objection", "irrelevant", "unclear",
+                        ],
+                    },
+                    "entities": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "complaint": {"type": "string"},
+                            "age": nullable_integer,
+                            "symptom_duration": {"type": "string"},
+                            "contraindications_clear": nullable_boolean,
+                            "contraindication_confirmed": {"type": "boolean"},
+                            "date_preference": {"type": "string"},
+                            "time_preference": {"type": "string"},
+                            "slot_choice": nullable_integer,
+                            "patient_name": {"type": "string"},
+                            "patient_relation": {"type": "string"},
+                            "doctor_preference": {"type": "string"},
+                            "faq_type": {"type": "string"},
+                            "language": {"type": "string", "enum": ["ru", "kk"]},
+                            "detected_language": {
+                                "type": "string",
+                                "enum": ["ru", "kk", "mixed", "unknown"],
+                            },
+                            "preferred_response_language": {
+                                "type": "string",
+                                "enum": ["ru", "kk"],
+                            },
+                            "language_confidence": {
+                                "type": "number",
+                                "minimum": 0.0,
+                                "maximum": 1.0,
+                            },
+                        },
+                        "required": [
+                            "complaint", "age", "symptom_duration",
+                            "contraindications_clear", "contraindication_confirmed",
+                            "date_preference", "time_preference", "slot_choice",
+                            "patient_name", "patient_relation", "doctor_preference",
+                            "faq_type", "language", "detected_language",
+                            "preferred_response_language", "language_confidence",
+                        ],
+                    },
+                    "next_required_step": {
+                        "type": "string",
+                        "enum": [
+                            "complaint", "age", "contraindications", "date",
+                            "time", "name", "booked", "escalated", "keep_current",
+                        ],
+                    },
+                    "needs_python_tool": {
+                        "type": "string",
+                        "enum": ["none", "check_slots", "handoff_admin"],
+                    },
+                    "reply": {"type": "string"},
+                    "safety": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "hard_stop": {"type": "boolean"},
+                            "unsafe_medical_claim": {"type": "boolean"},
+                            "invented_fact_risk": {"type": "boolean"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": [
+                            "hard_stop", "unsafe_medical_claim",
+                            "invented_fact_risk", "reason",
+                        ],
+                    },
+                },
+                "required": [
+                    "understood_context", "intent", "entities",
+                    "next_required_step", "needs_python_tool", "reply", "safety",
+                ],
+            },
+        },
+    }
 
 
 def _requires_max_completion_tokens(model: str) -> bool:
@@ -561,7 +643,8 @@ def _dialog_brain_fallback(reason: str) -> tuple[dict, dict]:
             "complaint": "", "age": None, "contraindications_clear": None,
             "contraindication_confirmed": False, "contraindication_term_asked": "",
             "contraindication_red_flags": [], "preferred_date_text": "", "time_preference": "", "slot_choice": None,
-            "patient_name": "", "wants_human": False, "faq_type": "", "language": "ru",
+            "patient_name": "", "patient_relation": "", "doctor_preference": "",
+            "wants_human": False, "faq_type": "", "language": "ru",
             "detected_language": "", "preferred_response_language": "", "language_confidence": 0.0,
         },
         "needs_python_tool": "none",
@@ -650,6 +733,7 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
                 "slot_choice": entities.get("slot_choice"),
                 "patient_name": entities.get("patient_name") or "",
                 "patient_relation": entities.get("patient_relation") or "",
+                "doctor_preference": entities.get("doctor_preference") or "",
                 "wants_human": normalized_intent == "ask_human",
                 "faq_type": entities.get("faq_type") or "",
                 "language": entities.get("language") or "ru",
@@ -678,6 +762,7 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
         "contraindication_term_asked", "contraindication_red_flags", "preferred_date_text",
         "time_preference", "slot_choice", "patient_name", "wants_human", "faq_type", "language", "symptom_duration",
         "patient_relation",
+        "doctor_preference",
         "detected_language", "preferred_response_language", "language_confidence",
     }
     allowed_safety = {"hard_stop", "reason", "unsafe_medical_claim", "tries_to_book_without_rules"}
@@ -726,6 +811,7 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
             "slot_choice": extracted.get("slot_choice"),
             "patient_name": str(extracted.get("patient_name") or ""),
             "patient_relation": str(extracted.get("patient_relation") or ""),
+            "doctor_preference": str(extracted.get("doctor_preference") or ""),
             "wants_human": bool(extracted.get("wants_human")),
             "faq_type": str(extracted.get("faq_type") or ""),
             "language": str(extracted.get("language") or "ru"),
@@ -762,7 +848,10 @@ def _infer_last_question_type(text: str) -> str:
         return "date"
     if any(x in low for x in ["какое время", "вариант", "свободное время"]):
         return "time"
-    if any(x in low for x in ["ваше имя", "имя для оформления", "атыңыз", "атыныз"]):
+    if any(x in low for x in [
+        "ваше имя", "имя для оформления", "имя мамы", "имя папы",
+        "имя пациента", "имя родственника", "атыңыз", "атыныз", "пациенттің атын",
+    ]):
         return "name"
     if any(x in low for x in ["что вас беспокоит", "не мазалай"]):
         return "complaint"
@@ -807,6 +896,10 @@ def build_dialog_context(*, user_text: str, session: dict, recent_history: list 
         "last_slots": available_slots if available_slots is not None else session.get("last_slots") or [],
         "selected_slot": session.get("selected_slot") or None,
         "patient_name": session.get("patient_name") or "",
+        "patient_subject": session.get("patient_subject") or "self",
+        "patient_relation": session.get("patient_relation") or "",
+        "selected_doctor_login": session.get("selected_doctor_login") or "",
+        "selected_doctor_name": session.get("selected_doctor_name") or "",
         "manual_takeover": bool(session.get("manual_takeover") or session.get("manual_admin_intervention")),
         "ai_muted": bool(session.get("ai_muted") or session.get("do_not_reply")),
         "last_required_question": session.get("last_required_question") or "",
@@ -838,7 +931,7 @@ def build_dialog_context(*, user_text: str, session: dict, recent_history: list 
         # а не приказ: окончательное решение о языке принимает Python.
         "message_language": message_language,
         "known_facts": {
-            "clinic_prompt_source": "SYSTEM_PROMPT_rendered.md",
+            "clinic_prompt_source": "OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT",
             "allowed_contraindications": clinic_context.get("allowed_contraindications") if isinstance(clinic_context, dict) else [],
             "working_hours_rule": "AI only 20:00-08:00 Astana",
             "booking_order": "complaint -> age -> contraindications -> date -> CRM slots -> time -> name -> booking",
@@ -889,7 +982,7 @@ async def run_openai_dialog_brain(
         response = await client.chat.completions.create(
             model=model,
             temperature=temperature,
-            response_format={"type": "json_object"},
+            response_format=_dialog_brain_response_format(),
             messages=[
                 {"role": "system", "content": _full_dialog_brain_system_prompt()},
                 {"role": "user", "content": json.dumps({"dialog_context": dialog_context}, ensure_ascii=False)},

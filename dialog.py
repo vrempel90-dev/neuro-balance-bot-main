@@ -18,6 +18,7 @@ import crm
 import state
 from ai import run_openai_dialog_brain
 from config import get_settings
+from doctor_router import resolve_doctor_preference
 
 try:
     from phone import sanitize_kz_phone
@@ -49,6 +50,13 @@ OPENAI_BRAIN_ALLOWED_STEPS = {"start", "complaint", "age", "contraindications", 
 OPENAI_BRAIN_ALLOWED_GATE_REASONS = {"new_lead", "new_lead_like_message", "active_conversation_reply", "active_ai_lead"}
 OPENAI_BRAIN_MULTI_ENTITY_STEPS = {"age", "contraindications", "date"}
 OPENAI_BRAIN_ALLOWED_GATES = {"new_lead", "new_lead_like_message", "active_ai_lead", "active_conversation_reply"}
+ACTIVE_AI_BOOKING_STEPS = {
+    "start", "complaint", "age", "contraindications", "date",
+    "preferred_time", "time", "select_slot", "name", "phone",
+}
+STALE_OLD_LEAD_REASONS = {
+    "old_lead_from_crm", "returning_patient_old_lead", "active_booking_old_lead",
+}
 
 FIRST_TOUCH_CLINIC_INFO_RU = """Здравствуйте ☺️
 
@@ -452,6 +460,45 @@ def _post_booking_support_is_active(session: dict[str, Any], chat_id: str) -> bo
     return active
 
 
+def _is_active_ai_booking_flow(session: dict[str, Any]) -> bool:
+    """True only for an unfinished funnel that originally started as a new lead."""
+
+    step = _low(str(session.get("step") or "start"))
+    return bool(
+        session.get("ai_lead_started") is True
+        and session.get("first_touch_info_sent") is True
+        and step in ACTIVE_AI_BOOKING_STEPS
+        and not session.get("booked")
+        and not session.get("booking_confirmed")
+        and not session.get("manual_takeover")
+        and not session.get("manual_admin_intervention")
+        and not session.get("ai_muted")
+        and not session.get("do_not_reply")
+        and not session.get("escalated")
+    )
+
+
+def _has_only_stale_old_lead_mute(session: dict[str, Any]) -> bool:
+    reason = str(session.get("no_reply_reason") or session.get("old_lead_reason") or "")
+    return bool(
+        reason in STALE_OLD_LEAD_REASONS
+        and not session.get("manual_admin_intervention")
+        and not session.get("refund_claim_admin_required")
+        and not session.get("booking_confirmed")
+        and session.get("crm_result") != "failed"
+    )
+
+
+def _clear_stale_old_lead_mute(session: dict[str, Any]) -> None:
+    session["ai_muted"] = False
+    session["manual_takeover"] = False
+    session["no_reply_reason"] = ""
+    session["openai_skip_reason"] = ""
+    session["openai_brain_skip_reason"] = ""
+    session["silent_old_lead"] = False
+    session["old_lead_reason"] = ""
+
+
 def _mute_old_lead(chat_id: str, session: dict[str, Any], reason: str, blocked_reason: str | None = None) -> str:
     session["NEW_LEADS_ONLY"] = _is_new_leads_only_enabled()
     session["silent_old_lead"] = True
@@ -728,11 +775,14 @@ def _repair_forbidden_required_question(chat_id: str, session: dict[str, Any], a
             session["repair_reason"] = f"repeat_required_step_{step}_limit"
             session["step"] = "escalated"
             session["escalated"] = True
+            session["manual_takeover"] = True
+            session["ai_muted"] = True
+            session["handoff_reason"] = "duplicate_answer_loop_guard"
             _safe_log(chat_id, "repeat_required_question_limit_reached", {"blocked_step": step, "answer_preview": answer[:180]})
             return _tr(
                 session,
-                "Чтобы не повторяться и не запутать Вас, передам диалог администратору — он уточнит данные и поможет с записью 🌿",
-                "Қайталамау және шатастырмау үшін диалогты әкімшіге жіберемін — ол деректерді нақтылап, жазылуға көмектеседі 🌿",
+                "Я передала администратору уже собранные данные, чтобы он уточнил этот пункт и завершил запись без повторов 🌿",
+                "Жиналған деректерді әкімшіге жібердім — ол осы тармақты нақтылап, жазуды қайталаусыз аяқтайды 🌿",
             )
         return answer
     next_step = _next_required_step_after_collected_data(session)
@@ -1113,6 +1163,8 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
     reply = str(decision.get("reply") or "")
     step = str(session.get("step") or "start")
     next_step = str(decision.get("next_step") or "")
+    if action == "no_reply" and _is_active_new_ai_request(session):
+        return False, "active_lead_no_reply"
     if session.get("contraindications_ok") is True:
         if next_step == "contraindications" or action == "ask_contraindications" or _answer_contains_contraindications_question(reply):
             return False, "contraindications_already_ok"
@@ -1176,7 +1228,12 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
     _doctor_question_words = ("доктор", "врач", "кто принимает", "какой специалист") + _kkl(
         "дәрігер", "маман", "кім қабылдайды")
     _doctor_reply_words = ("доктор", "врач") + _kkl("дәрігер", "маман")
-    if any(x in _low(user_text) for x in _doctor_question_words) and any(x in low_reply for x in _doctor_reply_words) and not (session.get("last_slots") or []):
+    if (
+        any(x in _low(user_text) for x in _doctor_question_words)
+        and any(x in low_reply for x in _doctor_reply_words)
+        and not (session.get("last_slots") or [])
+        and not extracted.get("doctor_preference")
+    ):
         return False, "doctor_hallucination"
     if not (session.get("last_slots") or []) and (_TIME_PATTERN.search(reply) or any(p in low_reply for p in _FORBIDDEN_EMPTY_SLOT_PHRASES)):
         return False, "slot_hallucination"
@@ -1253,6 +1310,7 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
             _log_llm_repair(chat_id, repair, str(decision.get("reply") or ""))
             return _finalize(chat_id, session, repair.answer)
         return None
+    session["answer_source"] = "openai_dialog_brain"
     action = decision.get("action")
     extracted = decision.get("extracted") or {}
     _apply_brain_language_hint(session, extracted, text)
@@ -1267,6 +1325,20 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         # что и rule-based путь. Дальше _ask_age/_faq_answer уже сами
         # переключаются на "сколько лет маме?" вместо "сколько Вам лет?".
         _apply_patient_relation(session, str(extracted.get("patient_relation") or ""))
+    doctor_preference = str(extracted.get("doctor_preference") or "").strip()
+    if doctor_preference:
+        doctor_resolved = await _apply_crm_doctor_preference(
+            chat_id,
+            session,
+            doctor_preference,
+        )
+        if not doctor_resolved and (
+            decision.get("action") == "show_slots"
+            or decision.get("needs_python_tool") == "check_slots"
+        ):
+            session["step"] = "date"
+            session["questionnaire_step"] = "date"
+            return _finalize(chat_id, session, _doctor_preference_unresolved_answer(session))
     if decision.get("intent"):
         session["last_user_intent"] = str(decision.get("intent") or "")
     if extracted.get("time_preference"):
@@ -2984,6 +3056,8 @@ def _strict_trim_extra(answer: str, session: dict[str, Any]) -> str:
 
     allow_long = any(x in low for x in [
         "ближайшие свободные даты",
+        "есть такие свободные",
+        "таңдалған күнге бос",
         "перед записью нужно подтвердить",
         "перед записью мне нужно уточнить",
         "противопоказан",
@@ -3292,7 +3366,7 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
             "Қазір бос уақыттарды нақтылап, Сізге нұсқаларын жазамын 🌿",
         )
     if session.get("llm_blocked") and not answer and str(session.get("step") or "") == "name" and session.get("selected_time"):
-        answer = f"Пока ещё нет 🌿 Я выбрала время {session.get('selected_time')}, осталось только Ваше имя для записи."
+        answer = _status_answer(session)
     if not answer and _is_active_new_ai_request(session):
         repair = repair_empty_active_reply(session, str(session.get("last_user_text") or ""), "empty_active_reply")
         session["fallback_reason"] = "empty_active_reply"
@@ -3316,16 +3390,17 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
         session["banned_phrase_repaired"] = True
         if str(session.get("step") or "") == "complaint":
             answer = "Расскажите, пожалуйста, что именно Вас беспокоит?"
-        elif str(session.get("step") or "") == "contraindications":
+        elif str(session.get("step") or "") == "contraindications" and not _is_active_new_ai_request(session):
             answer = _ask_contra(session)
         else:
             answer, _, _ = build_safe_answer_for_current_state(session, str(session.get("last_user_text") or ""))
 
-    # duplicate_answer_guard: на одно входящее сообщение — один ответ.
-    # Если новый текст полностью совпадает с последним ответом бота, молчим,
-    # чтобы Wazzup не получал одинаковые сообщения подряд.
+    # duplicate_answer_guard: an active new-lead funnel must never go silent or
+    # loop forever just because the next safe question resembles the previous
+    # one. Allow at most two clarified repeats, then hand off explicitly.
     last_answer = _clean(str(session.get("last_assistant_answer") or session.get("last_bot_answer") or ""))
-    if last_answer and (_low(last_answer) == _low(answer) or _similar_text(last_answer, answer)):
+    duplicate_answer = bool(last_answer and (_low(last_answer) == _low(answer) or _similar_text(last_answer, answer)))
+    if duplicate_answer:
         if _has_any(str(session.get("last_user_text") or ""), ADDRESS_WORDS) and str(session.get("step") or "") in {"complaint", "age", "contraindications", "date", "time", "select_slot", "name"}:
             answer = _address_answer_then_optional_resume(session)
         elif session.get("crm_patient_state") == "RETURNING_PATIENT_NO_ACTIVE_BOOKING":
@@ -3340,10 +3415,37 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
             session["outbound_duplicate_guard_blocked"] = False
             session["fallback_reason"] = "contraindications_never_silent"
             answer = _ask_contra(session)
+        elif _is_active_new_ai_request(session):
+            repeat_count = int(session.get("consecutive_duplicate_answer_count") or 0) + 1
+            session["consecutive_duplicate_answer_count"] = repeat_count
+            session["outbound_duplicate_guard_blocked"] = False
+            if repeat_count >= 3:
+                session["step"] = "escalated"
+                session["manual_takeover"] = True
+                session["ai_muted"] = True
+                session["escalated"] = True
+                session["handoff_reason"] = "duplicate_answer_loop_guard"
+                answer = _tr(
+                    session,
+                    "Чтобы не повторять один и тот же вопрос, передала диалог администратору вместе с уже собранными данными 🌿",
+                    "Бір сұрақты қайталай бермеу үшін жиналған мәліметтермен бірге диалогты әкімшіге жібердім 🌿",
+                )
+            else:
+                safe_answer, _, _ = build_safe_answer_for_current_state(
+                    session,
+                    str(session.get("last_user_text") or ""),
+                )
+                answer = _tr(
+                    session,
+                    "Чтобы продолжить запись, уточню этот пункт ещё раз: ",
+                    "Жазуды жалғастыру үшін осы тармақты тағы бір рет нақтылаймын: ",
+                ) + safe_answer
         else:
             session["outbound_duplicate_guard_blocked"] = True
             _safe_save(chat_id, session)
             return ""
+    else:
+        session["consecutive_duplicate_answer_count"] = 0
 
     # final_no_empty_guard: this must be the last answer mutation before saving/returning.
     if not str(answer or "").strip():
@@ -3516,7 +3618,7 @@ def _classify_bot_question(text: str) -> str:
         return "contraindications"
     if any(x in low for x in ["какой день", "на какой день", "қай күн", "кай кун", "удобный день"]):
         return "date"
-    if any(x in low for x in ["ваше имя", "атыңыз", "атыныз", "имя для оформления"]):
+    if any(x in low for x in ["ваше имя", "имя мамы", "имя папы", "имя пациента", "имя родственника", "атыңыз", "атыныз", "пациенттің атын", "имя для оформления"]):
         return "name"
     if any(x in low for x in ["какое время", "қайсысы ыңғайлы", "кайсысы ынгайлы", "вариант", "окошк"]):
         return "time"
@@ -4555,16 +4657,23 @@ def _ask_date(session: dict[str, Any]) -> str:
 
 
 def _ask_name(session: dict[str, Any]) -> str:
+    booking_for_other = str(session.get("patient_subject") or "self") != "self" or bool(session.get("patient_relation"))
+    if booking_for_other:
+        ru_name_question = f"Подскажите, пожалуйста, имя {_patient_genitive(session)} для записи."
+        kk_name_question = "Жазылу үшін пациенттің атын жазыңызшы."
+    else:
+        ru_name_question = "Подскажите, пожалуйста, Ваше имя для записи."
+        kk_name_question = "Жазылу үшін атыңызды жазыңызшы."
     if session.get("selected_time") and session.get("selected_doctor_name"):
         return _tr(
             session,
-            f"Хорошо, предварительно выбрала {session['selected_time']} к врачу {session['selected_doctor_name']} 🌿 Подскажите, пожалуйста, Ваше имя для записи.",
-            f"Жақсы, {session['selected_time']} уақытына {session['selected_doctor_name']} дәрігеріне алдын ала таңдадым 🌿 Жазылу үшін атыңызды жазыңызшы.",
+            f"Хорошо, предварительно выбрала {session['selected_time']} к врачу {session['selected_doctor_name']} 🌿 {ru_name_question}",
+            f"Жақсы, {session['selected_time']} уақытына {session['selected_doctor_name']} дәрігеріне алдын ала таңдадым 🌿 {kk_name_question}",
         )
     return _tr(
         session,
-        "Хорошо, это окошко можем закрепить за Вами 🌿 Подскажите, пожалуйста, Ваше имя для оформления записи.",
-        "Жақсы, бұл уақытты Сізге бекіте аламыз 🌿 Жазбаны рәсімдеу үшін атыңызды жазыңызшы.",
+        f"Хорошо, это время можем закрепить за пациентом 🌿 {ru_name_question}",
+        f"Жақсы, бұл уақытты пациентке бекіте аламыз 🌿 {kk_name_question}",
     )
 
 
@@ -4598,7 +4707,11 @@ def _booking_success_answer(session: dict[str, Any], booked: dict[str, Any], slo
 
 
 def _booking_failed_answer(session: dict[str, Any]) -> str:
-    return _final_confirmation_text(session)
+    return _tr(
+        session,
+        "Не удалось подтвердить запись в системе. Передала администратору выбранные дату, время и врача — он проверит запись и свяжется с Вами 🌿",
+        "Жүйеде жазбаны растай алмадым. Таңдалған күнді, уақытты және дәрігерді әкімшіге жібердім — ол тексеріп, Сізбен байланысады 🌿",
+    )
 
 
 def _no_slots_text(session: dict[str, Any]) -> str:
@@ -4660,6 +4773,9 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
         if isinstance(data, dict):
             data.setdefault("date", date_iso)
         all_slots = _format_slots(data, max_count=max_slots)
+        selected_login = str(session.get("selected_doctor_login") or "").strip()
+        if selected_login:
+            all_slots = [slot for slot in all_slots if _slot_doctor_login(slot) == selected_login]
         pref_kind = _time_pref_kind(str(session.get("time_preference") or ""))
         slots = _slots_for_time_pref(all_slots, pref_kind) if pref_kind else all_slots
     except Exception as exc:
@@ -4671,6 +4787,17 @@ async def _show_slots(chat_id: str, session: dict[str, Any], date_iso: str) -> s
 
     if not slots:
         raw_has_slots = bool((isinstance(data, dict) and (data.get("availability") or data.get("slots"))))
+        if selected_login and raw_has_slots and not all_slots:
+            session["last_slots"] = []
+            session.pop("selected_slot", None)
+            session.pop("selected_time", None)
+            session["step"] = "date"
+            session["crm_availability_empty"] = True
+            return _tr(
+                session,
+                "У этого врача на выбранный день свободного времени не нашла 🌿 Подскажите другой удобный день — проверю его актуальное расписание.",
+                "Бұл дәрігерде таңдалған күнге бос уақыт жоқ 🌿 Басқа ыңғайлы күнді жазыңызшы — өзекті кестесін тексеремін.",
+            )
         if raw_has_slots and not (locals().get("all_slots") or []):
             session["last_slots"] = []
             session.pop("selected_slot", None)
@@ -4736,6 +4863,9 @@ async def _recover_empty_time_slots(chat_id: str, session: dict[str, Any], text:
         if isinstance(data, dict):
             data.setdefault("date", preferred_date)
         all_slots = _format_slots(data, max_count=max_slots)
+        selected_login = str(session.get("selected_doctor_login") or "").strip()
+        if selected_login:
+            all_slots = [slot for slot in all_slots if _slot_doctor_login(slot) == selected_login]
         pref_kind = _time_pref_kind(str(session.get("time_preference") or ""))
         slots = _slots_for_time_pref(all_slots, pref_kind) if pref_kind else all_slots
     except Exception as exc:
@@ -4777,22 +4907,35 @@ async def _recover_empty_time_slots(chat_id: str, session: dict[str, Any], text:
 
 
 
-async def _refresh_slots_after_book_conflict(chat_id: str, session: dict[str, Any], date_iso: str) -> str:
+async def _refresh_slots_after_book_conflict(
+    chat_id: str,
+    session: dict[str, Any],
+    date_iso: str,
+    conflict_code: str = "slot_conflict",
+) -> str:
     try:
         crm.clear_slots_cache(date_iso)
     except Exception:
         pass
 
-    prefix = _tr(
-        session,
-        "К сожалению, это окошко уже заняли 🌿 Сейчас покажу актуальные свободные варианты.",
-        "Өкінішке қарай, бұл уақытты жаңа ғана алып қойды 🌿 Қазір өзекті бос уақыттарды көрсетемін.",
-    )
+    if conflict_code == "doctor_not_scheduled":
+        prefix = _tr(
+            session,
+            "На это время врач уже недоступен 🌿 Проверяю актуальное расписание этого врача.",
+            "Бұл уақытта дәрігер енді қолжетімсіз 🌿 Осы дәрігердің өзекті кестесін тексеріп жатырмын.",
+        )
+    else:
+        prefix = _tr(
+            session,
+            "К сожалению, это время уже заняли 🌿 Сейчас покажу актуальные свободные варианты.",
+            "Өкінішке қарай, бұл уақытты жаңа ғана алып қойды 🌿 Қазір өзекті бос уақыттарды көрсетемін.",
+        )
     session.pop("selected_slot", None)
     session.pop("selected_time", None)
     session["step"] = "time"
     refreshed = await _show_slots(chat_id, session, date_iso)
-    session["step"] = "time"
+    if session.get("last_slots"):
+        session["step"] = "time"
     return prefix + "\n\n" + refreshed
 
 async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
@@ -4817,6 +4960,10 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
     if not slot:
         session["step"] = "date"
         return _ask_date(session)
+    session["selected_doctor_login"] = _slot_doctor_login(slot)
+    session["selected_doctor_name"] = _slot_doctor_name(slot)
+    session["selected_date"] = _slot_date(slot)
+    session["selected_time"] = _slot_time(slot)
     if _is_reserve_slot(slot) or not (_slot_date(slot) and _slot_time(slot) and _slot_doctor_login(slot) and _slot_doctor_name(slot)):
         session["booking_ready"] = False
         session["crm_called"] = False
@@ -4861,6 +5008,13 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
     bot_tools.mark_tool(session, "book_appointment", gate="passed")
     session["crm_called"] = True
     session["booking_ready"] = True
+    representative_note = ""
+    if str(session.get("patient_subject") or "self") != "self" or session.get("patient_relation"):
+        relation = str(session.get("patient_relation") or "родственник").strip()
+        representative_note = f"; запись оформляет представитель пациента ({relation})"
+        session["booking_contact_role"] = "representative"
+    else:
+        session["booking_contact_role"] = "patient"
     booking_payload = {
         "patient_name": session.get("patient_name") or "Пациент",
         "phone": normalized_phone,
@@ -4873,6 +5027,7 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
             f"возраст: {session.get('age') or ''}; "
             f"противопоказания/ограничения: {session.get('contraindications_raw') or ''}; "
             f"важно для врача: {'да' if session.get('doctor_note_required') else 'нет'}"
+            f"{representative_note}"
         ),
     }
 
@@ -4906,7 +5061,12 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
             verification = await crm.lookup_active_appointments_by_phone(normalized_phone)
             session["crm_verification_result"] = verification
             found = False
-            for a in (verification.get("appointments") or []):
+            verification_candidates = list(verification.get("appointments") or [])
+            for key in ("appointment", "lastAppointment", "activeAppointment"):
+                candidate = verification.get(key)
+                if isinstance(candidate, dict):
+                    verification_candidates.append(candidate)
+            for a in verification_candidates:
                 if str(a.get("id") or a.get("appointmentId") or a.get("bookingId") or "") == str(session.get("appointment_id") or "") or (str(a.get("date") or a.get("appointmentDate") or "")[:10] == str(session.get("appointment_date") or "")[:10] and str(a.get("timeStart") or a.get("time") or "")[:5] == str(session.get("appointment_time") or "")[:5]):
                     found = True
                     _store_appointment_fields(session, a)
@@ -4950,6 +5110,23 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
             "handoff_reason": f"crm_book_{exc.status_code}",
         }
         _safe_log(chat_id, "crm_booking_failed", log_payload)
+
+        if exc.status_code == 409 and exc.code in {"slot_conflict", "doctor_not_scheduled"}:
+            session["booking_confirmed"] = False
+            session["crm_result"] = "conflict"
+            session["booking_conflict_code"] = exc.code
+            session["handoff_reason"] = ""
+            session["manual_takeover"] = False
+            session["ai_muted"] = False
+            session["escalated"] = False
+            date_iso = _slot_date(slot) or str(session.get("preferred_date") or "")
+            if date_iso:
+                return await _refresh_slots_after_book_conflict(
+                    chat_id,
+                    session,
+                    date_iso,
+                    exc.code,
+                )
 
         session["step"] = "escalated"
         session["escalated"] = True
@@ -5766,6 +5943,53 @@ def _apply_doctor_lock(session: dict[str, Any], text: str) -> bool:
         return True
     return False
 
+
+async def _apply_crm_doctor_preference(
+    chat_id: str,
+    session: dict[str, Any],
+    preference: str,
+) -> bool:
+    """Persist an explicit doctor only after resolving it against CRM."""
+
+    preference = (preference or "").strip()
+    if not preference:
+        return True
+    session["doctor_preference"] = preference
+    resolved = await resolve_doctor_preference(chat_id, preference)
+    if not resolved:
+        session["doctor_preference_unresolved"] = preference
+        session["doctor_selection_source"] = "explicit_preference_unresolved"
+        session.pop("selected_doctor_login", None)
+        session.pop("selected_doctor_name", None)
+        session.pop("selected_slot", None)
+        session.pop("selected_time", None)
+        session["last_slots"] = []
+        return False
+
+    login = str(resolved.get("doctor_login") or "").strip()
+    name = str(resolved.get("doctor_name") or "").strip()
+    if not login or not name:
+        return False
+    changed = login != str(session.get("selected_doctor_login") or "")
+    if changed:
+        session.pop("selected_slot", None)
+        session.pop("selected_time", None)
+        session["last_slots"] = []
+    session["selected_doctor_login"] = login
+    session["selected_doctor_name"] = name
+    session["doctor_selection_source"] = "explicit_preference_crm"
+    session["doctor_preference_resolved"] = True
+    session.pop("doctor_preference_unresolved", None)
+    return True
+
+
+def _doctor_preference_unresolved_answer(session: dict[str, Any]) -> str:
+    return _tr(
+        session,
+        "Не нашла этого врача в актуальном списке CRM 🌿 Уточните, пожалуйста, имя или ФИО врача — проверю ещё раз.",
+        "Бұл дәрігерді CRM-дегі өзекті тізімнен таппадым 🌿 Дәрігердің аты-жөнін нақтылап жазыңызшы, қайта тексеремін.",
+    )
+
 def _is_status_request(text: str) -> bool:
     low = _low(text).strip()
     return low in {"?", "??", "???"} or any(p in low for p in (
@@ -5780,6 +6004,8 @@ def _status_answer(session: dict[str, Any]) -> str:
         doctor = session.get("selected_doctor_name") or "врачу клиники"
         return f"Да, Вы записаны: {date} в {time} к {doctor} 🌿"
     if session.get("selected_time") and not session.get("patient_name"):
+        if str(session.get("patient_subject") or "self") != "self" or session.get("patient_relation"):
+            return f"Пока ещё нет 🌿 Я выбрала время {session.get('selected_time')}, осталось только имя {_patient_genitive(session)} для записи."
         return f"Пока ещё нет 🌿 Я выбрала время {session.get('selected_time')}, осталось только Ваше имя для записи."
     if session.get("patient_name"):
         return "Сейчас оформляю запись и подтвержу Вам 🌿"
@@ -5790,6 +6016,8 @@ def _status_answer(session: dict[str, Any]) -> str:
     if session.get("preferred_date"):
         return "Сейчас уточню свободные окошки на этот день 🌿"
     if str(session.get("step") or "") == "name":
+        if str(session.get("patient_subject") or "self") != "self" or session.get("patient_relation"):
+            return f"Пока ещё нет 🌿 Осталось только имя {_patient_genitive(session)} для записи."
         return "Пока ещё нет 🌿 Осталось только Ваше имя для записи."
     return _mandatory_step_prompt(session, str(session.get("step") or "complaint"))
 
@@ -5965,6 +6193,24 @@ def _weekend_primary_block_answer(session: dict[str, Any]) -> str:
 
 def _is_first_touch_due(session: dict[str, Any]) -> bool:
     return session.get("first_touch_info_sent") is not True and int(session.get("conversation_turns_count") or 0) == 0 and not session.get("ai_lead_started")
+
+
+def _prepare_gpt_first_touch(session: dict[str, Any], text: str, lead_source: str = "new_lead") -> None:
+    """Open a CRM-confirmed new-lead session and let GPT lead its first reply."""
+
+    session["first_touch_allowed"] = True
+    session["first_touch_info_sent"] = True
+    session["first_touch_just_started"] = True
+    session["first_touch_intent"] = _classify_patient_intent(text)
+    session["ai_lead_started"] = True
+    session["gate_reason"] = lead_source or "new_lead"
+    session["lead_source"] = lead_source or "new_lead"
+    session["ai_started_at"] = datetime.now(timezone.utc).isoformat()
+    session["answer_source"] = "pending:gpt_first_touch"
+    session["skip_openai"] = False
+    session["skip_humanize"] = True
+    session["skip_fallback_question"] = False
+    session.setdefault("step", "start")
 
 
 def _is_greeting_only(text: str) -> bool:
@@ -6169,6 +6415,9 @@ async def _show_nearest_available_dates(chat_id: str, session: dict[str, Any], d
             time_preference=(session.get("time_preference") or None),
         )
         slots = sanitize_slots(_format_slots(data, max_count=200))
+        selected_login = str(session.get("selected_doctor_login") or "").strip()
+        if selected_login:
+            slots = [slot for slot in slots if _slot_doctor_login(slot) == selected_login]
     except Exception as exc:
         _safe_log(chat_id, "crm_nearest_slots_error", {"error": str(exc)[:500], "days_ahead": days_ahead})
         slots = []
@@ -6206,6 +6455,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session = state.get_session(chat_id)
     if not isinstance(session, dict):
         session = {}
+    was_active_ai_booking_flow = _is_active_ai_booking_flow(session)
 
     session["phone"] = phone or session.get("phone") or ""
     session["NEW_LEADS_ONLY"] = _is_new_leads_only_enabled()
@@ -6220,6 +6470,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session["skip_openai"] = False
     session["skip_humanize"] = False
     session["skip_fallback_question"] = False
+    session["first_touch_just_started"] = False
+    session["active_ai_flow_preserved_from_crm_reclassification"] = False
     session["last_user_text"] = text
     session["state_before_step"] = session.get("step") or "start"
     session["openai_used"] = False
@@ -6255,15 +6507,25 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session["guard_decision"] = {"allowed": False, "no_reply_reason": "crm_lookup_failed", "should_call_openai": False, "should_call_crm": False, "should_send_wazzup": False}
             return _no_reply(chat_id, session, "crm_lookup_failed")
         return _finalize(chat_id, session, "Сейчас уточню Вашу запись у администратора 🌿")
-    if session.get("crm_patient_state") == "NEW_PATIENT":
-        if session.get("no_reply_reason") == "old_lead_from_crm" or session.get("ai_muted") or session.get("manual_takeover"):
-            session["ai_muted"] = False
-            session["manual_takeover"] = False
-            session["no_reply_reason"] = ""
-            session["openai_skip_reason"] = ""
-            session["openai_brain_skip_reason"] = ""
-            session["silent_old_lead"] = False
-            session["old_lead_reason"] = ""
+    if session.get("crm_patient_state") == "NEW_PATIENT" and _has_only_stale_old_lead_mute(session):
+        _clear_stale_old_lead_mute(session)
+
+    # CRM may create a patient/lead record after the first AI message. From the
+    # next turn that same chat then looks "returning", even though it is the
+    # unfinished new-lead funnel we just started. Preserve only that proven
+    # active flow; a genuinely returning lead with no active AI session remains
+    # silent under NEW_LEADS_ONLY.
+    if (
+        session.get("crm_patient_state") == "RETURNING_PATIENT_NO_ACTIVE_BOOKING"
+        and was_active_ai_booking_flow
+    ):
+        session["crm_patient_state_raw"] = "RETURNING_PATIENT_NO_ACTIVE_BOOKING"
+        session["crm_patient_state"] = "ACTIVE_NEW_LEAD_CONTINUATION"
+        session["crm_state_reason"] = (
+            str(session.get("crm_state_reason") or "")
+            + "; unfinished CRM-confirmed new-lead flow preserved"
+        ).strip("; ")
+        session["active_ai_flow_preserved_from_crm_reclassification"] = True
     if _is_new_leads_only_enabled() and session.get("crm_patient_state") in {"RETURNING_PATIENT_NO_ACTIVE_BOOKING", "ACTIVE_BOOKING"} and not _post_booking_support_is_active(session, chat_id):
         state_reason = "active_booking_old_lead" if session.get("crm_patient_state") == "ACTIVE_BOOKING" or appt else ("returning_patient_old_lead" if session.get("crm_patient_state") == "RETURNING_PATIENT_NO_ACTIVE_BOOKING" else "old_lead_from_crm")
         # Public no_reply_reason remains the requested old-lead value for generic returning patients.
@@ -6287,7 +6549,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if session.get("crm_patient_state") == "RETURNING_PATIENT_NO_ACTIVE_BOOKING":
         session["gate_reason"] = "returning_patient_no_active_booking"
         return _finalize(chat_id, session, _returning_patient_answer(session, text))
-    session["first_touch_allowed"] = session.get("crm_patient_state") == "NEW_PATIENT"
+    session["first_touch_allowed"] = session.get("crm_patient_state") in {
+        "NEW_PATIENT", "ACTIVE_NEW_LEAD_CONTINUATION",
+    }
     if (session.get("ai_muted") or session.get("manual_takeover") or session.get("manual_admin_intervention")) and not (session.get("old_chat") or session.get("imported") or session.get("existing_chat")):
         session["ai_muted"] = True
         session["manual_takeover"] = True
@@ -6326,10 +6590,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["gate_reason"] = "post_booking_support"
         return _finalize(chat_id, session, await _post_booking_support_answer(chat_id, phone, session, text))
     if _is_first_touch_due(session):
-        session["gate_reason"] = "new_lead"
-        session["lead_source"] = "new_lead"
-        session["ai_started_at"] = datetime.now(timezone.utc).isoformat()
-        return _finalize(chat_id, session, _first_touch_answer(session, text))
+        _prepare_gpt_first_touch(session, text, "new_lead")
     early_step = str(session.get("step") or "start")
     # Вопрос про адрес: активация лида — это гейт (без ai_lead_started брейн вообще
     # не допускается к сообщению, _openai_brain_skip_reason → not_ai_lead), поэтому
@@ -6426,11 +6687,14 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return ""
 
     if _is_first_touch_due(session):
-        session["lead_source"] = reason
-        session["ai_started_at"] = datetime.now(timezone.utc).isoformat()
-        return _finalize(chat_id, session, _first_touch_answer(session, text))
+        _prepare_gpt_first_touch(session, text, reason)
 
-    if session.get("first_touch_info_sent") is True and _is_clinic_info_repeat_request(text) and not session.get("complaint"):
+    if (
+        session.get("first_touch_info_sent") is True
+        and not session.get("first_touch_just_started")
+        and _is_clinic_info_repeat_request(text)
+        and not session.get("complaint")
+    ):
         return _finalize(chat_id, session, _short_clinic_info_answer(session))
 
     if reason in {"new_lead", "new_lead_like_message", "active_conversation_reply", "active_ai_lead"}:
@@ -6510,19 +6774,6 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if _is_status_request(text):
         return _finalize(chat_id, session, _status_answer(session))
 
-    if _is_available_dates_request(text) and not _parse_date(text):
-        session["available_dates_intent"] = "AVAILABLE_DATES_REQUEST"
-        return _finalize(chat_id, session, await _show_nearest_available_dates(chat_id, session, days_ahead=14))
-
-    if _availability_request(text):
-        if not (session.get("preferred_date") or session.get("selected_date")):
-            session["preferred_date"] = datetime.now(timezone.utc).date().isoformat()
-        return _finalize(
-            chat_id,
-            session,
-            await _show_slots(chat_id, session, session.get("preferred_date") or datetime.now(timezone.utc).date().isoformat()),
-        )
-
     # state_machine_first_guard:
     # После языкового режима сначала уважаем текущее состояние диалога.
     # Intent-router запускается только после обязательных шагов, чтобы не перехватывать
@@ -6559,27 +6810,6 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             session["step"] = "name"
             step = "name"
             return _finalize(chat_id, session, info + " " + _ask_name(session))
-    if step in {"date", "preferred_time"} and session.get("selected_doctor_login") == "zhuma_md" and (_parse_date(text) or _contains_date_time_preference(text)):
-        date_iso = _parse_date(text)
-        if date_iso:
-            if _is_new_patient_consultation(session) and _mentions_weekend_day(text) and _is_weekend_date(date_iso):
-                session["step"] = "date"
-                return _finalize(chat_id, session, _weekend_primary_block_answer(session))
-            if any(p in _low(text) for p in TIME_PREFERENCE_WORDS):
-                session["time_preference"] = next((p for p in TIME_PREFERENCE_WORDS if p in _low(text)), "")
-                session["preferred_date_text"] = text
-            answer = await _show_slots(chat_id, session, date_iso)
-            if _has_any(text, ADDRESS_WORDS):
-                answer = _address_answer(session) + "\n\n" + answer
-            if _has_video_procedure_question(text):
-                answer = _video_procedure_answer(session) + "\n\n" + answer
-            return _finalize(chat_id, session, answer)
-
-    if step in {"date", "preferred_time", "time", "select_slot", "name"}:
-        faq_resume = None if (_has_any(text, ADDRESS_WORDS) and (_parse_date(text) or _contains_date_time_preference(text))) else _faq_answer_then_resume(text, session, step)
-        if faq_resume:
-            return _finalize(chat_id, session, faq_resume)
-        step = session.get("step") or step
     if step in ("time", "select_slot") and session.get("selected_time") and not session.get("patient_name"):
         session["step"] = "name"
         session["questionnaire_step"] = "name"
@@ -6606,7 +6836,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     name_from_text = _extract_name(text)
     if step == "name" and _is_service_polite_phrase(text):
         session["patient_name"] = ""
-        return _finalize(chat_id, session, "Подскажите, пожалуйста, Ваше имя для записи.")
+        return _finalize(chat_id, session, _ask_name(session))
 
     if step == "name" and name_from_text and not session.get("patient_name"):
         session["patient_name"] = name_from_text
@@ -6618,6 +6848,8 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["openai_used"] = True
         session["openai_skip_reason"] = ""
         return brain_answer
+    if session.get("first_touch_just_started"):
+        session["answer_source"] = "python_fallback:first_touch"
 
     # ---- Ветки, перенесённые ПОСЛЕ брейна (Фаза 2) --------------------------
     # Интерпретация смысла сообщения — работа GPT, а не keyword-заготовок.
@@ -6634,6 +6866,59 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         combined_answer = _combined_profile_booking_answer(session, combined_recent_user_text or text)
     if combined_answer:
         return _finalize(chat_id, session, combined_answer)
+
+    if post_brain_step in {"date", "preferred_time"} and session.get("selected_doctor_login") == "zhuma_md" and (_parse_date(text) or _contains_date_time_preference(text)):
+        date_iso = _parse_date(text)
+        if date_iso:
+            if _is_new_patient_consultation(session) and _mentions_weekend_day(text) and _is_weekend_date(date_iso):
+                session["step"] = "date"
+                return _finalize(chat_id, session, _weekend_primary_block_answer(session))
+            if any(p in _low(text) for p in TIME_PREFERENCE_WORDS):
+                session["time_preference"] = next((p for p in TIME_PREFERENCE_WORDS if p in _low(text)), "")
+                session["preferred_date_text"] = text
+            answer = await _show_slots(chat_id, session, date_iso)
+            if _has_any(text, ADDRESS_WORDS):
+                answer = _address_answer(session) + "\n\n" + answer
+            if _has_video_procedure_question(text):
+                answer = _video_procedure_answer(session) + "\n\n" + answer
+            return _finalize(chat_id, session, answer)
+
+    if (
+        post_brain_step in {"date", "preferred_time", "time", "select_slot", "name"}
+        and not _is_available_dates_request(text)
+        and not _availability_request(text)
+    ):
+        faq_resume = None if (
+            _has_any(text, ADDRESS_WORDS)
+            and (_parse_date(text) or _contains_date_time_preference(text))
+        ) else _faq_answer_then_resume(text, session, post_brain_step)
+        if faq_resume:
+            return _finalize(chat_id, session, faq_resume)
+        post_brain_step = str(session.get("step") or post_brain_step)
+
+    # GPT gets the first chance to understand availability requests. These
+    # deterministic branches are only an outage fallback and may call CRM only
+    # after the mandatory complaint/age/contraindications gates are complete.
+    if session.get("contraindications_ok") is True and _is_available_dates_request(text) and not _parse_date(text):
+        session["available_dates_intent"] = "AVAILABLE_DATES_REQUEST"
+        return _finalize(
+            chat_id,
+            session,
+            await _show_nearest_available_dates(chat_id, session, days_ahead=14),
+        )
+
+    if session.get("contraindications_ok") is True and _availability_request(text):
+        if not (session.get("preferred_date") or session.get("selected_date")):
+            session["preferred_date"] = datetime.now(timezone.utc).date().isoformat()
+        return _finalize(
+            chat_id,
+            session,
+            await _show_slots(
+                chat_id,
+                session,
+                session.get("preferred_date") or datetime.now(timezone.utc).date().isoformat(),
+            ),
+        )
 
     if early_address_question or (
         _has_any(text, ADDRESS_WORDS) and not (_parse_date(text) or _contains_date_time_preference(text))

@@ -78,18 +78,20 @@ def test_relative_age_moves_to_gendered_contraindications() -> None:
     assert session["escalated"] is False
 
 
-def test_first_touch_booking_exact_welcome_once() -> None:
+def test_first_touch_booking_starts_gpt_led_funnel_once() -> None:
     chat_id = "first_touch_booking_exact"
     answer = run(dialog.handle_message(chat_id, "77011234567", "хочу записаться"))
     session = state.get_session(chat_id)
 
-    assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+    assert answer
+    assert answer != dialog.FIRST_TOUCH_CLINIC_INFO_RU
     assert session["first_touch_info_sent"] is True
+    assert session["ai_lead_started"] is True
     assert session["step"] == "complaint"
     assert "чем можем помочь: хотите записаться" not in answer.lower()
 
 
-def test_duplicate_outbound_guard_blocks_same_answer() -> None:
+def test_duplicate_outbound_guard_never_silences_active_lead() -> None:
     chat_id = "duplicate_age_question"
     session = {
         "step": "age",
@@ -104,7 +106,8 @@ def test_duplicate_outbound_guard_blocks_same_answer() -> None:
 
     answer = dialog._finalize(chat_id, session, "Подскажите, пожалуйста, сколько Вам лет?")
 
-    assert answer == ""
+    assert answer
+    assert "продолжить запись" in answer.lower()
 
 
 def test_price_faq_while_waiting_relative_age_resumes_age() -> None:

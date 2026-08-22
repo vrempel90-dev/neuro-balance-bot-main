@@ -626,7 +626,8 @@ def test_release_candidate_crm_slots_and_book_fallbacks(monkeypatch: Any) -> Non
     result = answer("rc_book_error", "Виктор")
     session = state.get_session("rc_book_error")
     assert result
-    assert "запись подтверждена" in result.lower()
+    assert "не удалось подтвердить запись" in result.lower()
+    assert "запись подтверждена" not in result.lower()
     assert "CRM" not in result
     assert session["step"] == "escalated"
 
@@ -1183,10 +1184,12 @@ def test_crm_book_409_slot_conflict_refreshes_slots(monkeypatch: Any) -> None:
     result = answer(chat_id, "Алия")
     session = state.get_session(chat_id)
 
-    assert "запись подтверждена" in result.lower()
-    assert calls["slots"] == []
-    assert session["step"] == "escalated"
-    assert session["selected_slot"]["timeStart"] == "10:40"
+    assert "уже заняли" in result.lower()
+    assert "11:20" in result and "12:00" in result
+    assert calls["slots"] == [{"date": "2026-06-22", "doctor_login": "zhuma_md"}]
+    assert session["step"] == "time"
+    assert session.get("selected_slot") is None
+    assert session["booking_conflict_code"] == "slot_conflict"
 
 
 def test_crm_book_409_doctor_not_scheduled_refreshes_slots(monkeypatch: Any) -> None:
@@ -1204,9 +1207,11 @@ def test_crm_book_409_doctor_not_scheduled_refreshes_slots(monkeypatch: Any) -> 
     result = answer(chat_id, "Алия")
     session = state.get_session(chat_id)
 
-    assert "запись подтверждена" in result.lower()
-    assert session["step"] == "escalated"
-    assert session["selected_slot"]["timeStart"] == "10:40"
+    assert "врач уже недоступен" in result.lower()
+    assert "другой удобный день" in result.lower()
+    assert session["step"] == "date"
+    assert session.get("selected_slot") is None
+    assert session["booking_conflict_code"] == "doctor_not_scheduled"
 
 
 def test_crm_book_500_logs_body_and_escalates(monkeypatch: Any) -> None:
@@ -1223,7 +1228,8 @@ def test_crm_book_500_logs_body_and_escalates(monkeypatch: Any) -> None:
     result = answer(chat_id, "Алия")
     session = state.get_session(chat_id)
 
-    assert "запись подтверждена" in result.lower()
+    assert "не удалось подтвердить запись" in result.lower()
+    assert "запись подтверждена" not in result.lower()
     assert session["step"] == "escalated"
     assert session.get("escalated") is True
     assert any(item.get("name") == "escalate_to_human" for item in session.get("tool_history", []))

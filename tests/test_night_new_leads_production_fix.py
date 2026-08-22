@@ -51,7 +51,7 @@ def test_phone_normalization_and_lookup_variants():
     assert crm.phone_lookup_variants("+7 700 898 45 05")[:4] == ["77008984505", "+77008984505", "87008984505", "7008984505"]
 
 
-def test_new_patient_gets_locked_first_touch(monkeypatch):
+def test_new_patient_gets_gpt_first_touch(monkeypatch):
     async def scenario():
         _enable_new_leads_only(monkeypatch)
         async def fake_lookup(phone):
@@ -61,10 +61,11 @@ def test_new_patient_gets_locked_first_touch(monkeypatch):
         state.reset_session(chat_id)
         answer = await dialog.handle_message(chat_id, "87008984505", "Здравствуйте")
         session = state.get_session(chat_id)
-        assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+        assert answer
+        assert "что Вас беспокоит" in answer
         assert session["crm_patient_state"] == "NEW_PATIENT"
         assert session["first_touch_allowed"] is True
-        assert session["answer_source"] == "locked_template:first_touch"
+        assert session["answer_source"] == "python_fallback:first_touch"
 
 
     asyncio.run(scenario())
@@ -169,7 +170,8 @@ def test_crm_new_lead_with_found_true_is_new_patient(monkeypatch):
         session = state.get_session(chat_id)
         assert session["crm_patient_state"] == "NEW_PATIENT"
         assert session["crm_state_reason"] == "isNew=true, patient=null, lead.status=НОВАЯ, no active appointment => NEW_PATIENT"
-        assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+        assert answer
+        assert "что Вас беспокоит" in answer
         assert session.get("no_reply_reason", "") == ""
     asyncio.run(scenario())
 
@@ -184,7 +186,8 @@ def test_crm_new_not_found_is_new_patient(monkeypatch):
         state.reset_session(chat_id)
         answer = await dialog.handle_message(chat_id, "77008984505", "Здравствуйте")
         assert state.get_session(chat_id)["crm_patient_state"] == "NEW_PATIENT"
-        assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+        assert answer
+        assert "что Вас беспокоит" in answer
     asyncio.run(scenario())
 
 
@@ -206,7 +209,8 @@ def test_old_lead_mute_resets_for_new_patient(monkeypatch):
         assert session["manual_takeover"] is False
         assert session.get("no_reply_reason", "") == ""
         assert session.get("openai_skip_reason", "") == ""
-        assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+        assert answer
+        assert "что Вас беспокоит" in answer
     asyncio.run(scenario())
 
 

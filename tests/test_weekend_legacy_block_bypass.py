@@ -155,11 +155,10 @@ def test_first_touch_stops_weekend_before_slot_availability(monkeypatch) -> None
 
     monkeypatch.setattr(dialog, "_lookup_active_appointment", no_active_appointment)
     monkeypatch.setattr(dialog, "_is_first_touch_due", lambda current: True)
-    monkeypatch.setattr(dialog, "_first_touch_answer", lambda current, text: "FIRST_TOUCH_SAFE")
 
     answer = _run(dialog.handle_message("chat-first", VALID_PHONE, WEEKEND_TEXT))
 
-    assert answer == "FIRST_TOUCH_SAFE"
-    assert session["gate_reason"] == "new_lead"
-    assert session["lead_source"] == "new_lead"
+    assert answer
+    assert session["ai_lead_started"] is True
+    assert session["lead_source"] in {"new_lead", "active_conversation_reply"}
     assert session.get("weekend_procedure_day_requested") is None

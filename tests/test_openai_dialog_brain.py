@@ -367,7 +367,8 @@ def test_booking_python_owned_and_crm_error_escalates(monkeypatch: Any) -> None:
     session = state.get_session(chat_id)
     assert called["brain"] == 0 and called["book"] == 1
     assert session["step"] == "escalated"
-    assert "запись подтверждена" in answer.lower()
+    assert "не удалось подтвердить запись" in answer.lower()
+    assert "запись подтверждена" not in answer.lower()
     later = run(handle_message(chat_id, "77011234567", "?"))
     assert later == ""
 

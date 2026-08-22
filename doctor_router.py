@@ -57,7 +57,13 @@ def _doctor_login(item: dict[str, Any]) -> str:
 
 
 def _doctor_name(item: dict[str, Any]) -> str:
-    return str(item.get("doctorName") or item.get("name") or item.get("doctor_name") or "").strip()
+    return str(
+        item.get("doctorName")
+        or item.get("fullName")
+        or item.get("name")
+        or item.get("doctor_name")
+        or ""
+    ).strip()
 
 
 def _doctor_text(item: dict[str, Any]) -> str:
@@ -171,6 +177,124 @@ async def choose_doctor_for_complaint(chat_id: str, complaint: str) -> dict[str,
             "doctor selected by complaint",
             tool_name="get_doctor_info",
             tool_args={"complaint": complaint},
+            tool_result=json.dumps(result, ensure_ascii=False),
+        )
+    except Exception:
+        pass
+    return result
+
+
+_DOCTOR_PREFERENCE_STOP_WORDS = {
+    "врач", "врачу", "врача", "доктор", "доктору", "доктора",
+    "записать", "запишите", "записаться", "прием", "консультация",
+    "к", "ко", "у", "на", "именно", "хочу", "можно", "пожалуйста",
+}
+
+
+def _preference_tokens(text: str) -> list[str]:
+    normalized = re.sub(r"[^a-zа-яәғқңөұүһі0-9_]+", " ", _low(text))
+    return [
+        token
+        for token in normalized.split()
+        if len(token) >= 2 and token not in _DOCTOR_PREFERENCE_STOP_WORDS
+    ]
+
+
+def _name_token_matches(preference_token: str, crm_name_token: str) -> bool:
+    """Match common case endings without guessing outside a CRM name.
+
+    Patients normally write names in the dative/genitive form (for example,
+    ``Кайсару``), while CRM stores the nominative form (``Кайсар``).  A short
+    prefix extension covers those endings and still requires a unique doctor.
+    """
+
+    if preference_token == crm_name_token:
+        return True
+    shorter, longer = sorted((preference_token, crm_name_token), key=len)
+    return len(shorter) >= 4 and len(longer) - len(shorter) <= 3 and longer.startswith(shorter)
+
+
+def _preference_match_score(item: dict[str, Any], preference: str) -> int:
+    """Score an explicit user preference against CRM-owned doctor identity."""
+
+    login = _low(_doctor_login(item)).strip()
+    name = _low(_doctor_name(item)).strip()
+    raw = _low(preference).strip()
+    if not login or not raw:
+        return 0
+    if raw == login or raw.replace(" ", "_") == login:
+        return 100
+
+    pref_tokens = set(_preference_tokens(raw))
+    name_tokens = set(_preference_tokens(name))
+    if not pref_tokens or not name_tokens:
+        return 0
+    matched_tokens = {
+        pref_token
+        for pref_token in pref_tokens
+        if any(_name_token_matches(pref_token, name_token) for name_token in name_tokens)
+    }
+    if matched_tokens == pref_tokens:
+        return 90 + min(len(pref_tokens), 5)
+    if len(matched_tokens) >= 2:
+        return 70 + len(matched_tokens)
+    if len(matched_tokens) == 1 and len(next(iter(matched_tokens))) >= 4:
+        return 50
+    return 0
+
+
+async def resolve_doctor_preference(chat_id: str, preference: str) -> dict[str, str] | None:
+    """Resolve a requested doctor only against the current CRM doctor list.
+
+    A unique, confident match is required. This prevents the GPT reply or a
+    hard-coded Python table from inventing a doctor/login that CRM cannot book.
+    """
+
+    preference = (preference or "").strip()
+    if not preference:
+        return None
+    try:
+        data = await crm.get_doctors()
+    except Exception as exc:
+        try:
+            state.log_bot_action(
+                chat_id,
+                "error",
+                "explicit doctor resolution failed",
+                tool_name="get_doctor_info",
+                tool_args={"preference": preference},
+                tool_result=str(exc)[:1000],
+            )
+        except Exception:
+            pass
+        return None
+
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    for item in _doctor_items(data):
+        if not _doctor_login(item) or not _doctor_name(item):
+            continue
+        score = _preference_match_score(item, preference)
+        if score >= 50:
+            candidates.append((score, item))
+    candidates.sort(key=lambda row: row[0], reverse=True)
+    if not candidates:
+        return None
+    best_score, best_item = candidates[0]
+    if len(candidates) > 1 and candidates[1][0] == best_score:
+        return None
+
+    result = {
+        "doctor_login": _doctor_login(best_item),
+        "doctor_name": _doctor_name(best_item),
+        "score": str(best_score),
+    }
+    try:
+        state.log_bot_action(
+            chat_id,
+            "tool_call",
+            "explicit doctor resolved from CRM",
+            tool_name="get_doctor_info",
+            tool_args={"preference": preference},
             tool_result=json.dumps(result, ensure_ascii=False),
         )
     except Exception:

@@ -13,7 +13,7 @@ Input on stdin is JSON from the live Wazzup production stream for the last few m
 5. Never invent a CRM slot. `session.last_slots` / existing CRM availability logic remains authoritative.
 6. Never claim booking/cancellation/reschedule succeeded unless existing Python/CRM state proves it.
 7. Preserve the booking order and safety gates: complaint -> age -> contraindications -> date -> CRM slots -> time -> name -> booking.
-8. `SYSTEM_PROMPT_rendered.md` remains the canonical behavior source. Python remains authoritative for state transitions, contraindications, slots and booking safety.
+8. `OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT` in `ai.py` is the single canonical GPT behavior source. Python remains authoritative for state transitions, contraindications, real CRM doctors/slots and booking safety.
 9. Preserve RU/KK behavior and language guards.
 10. Do NOT modify any Wazzup, CRM, deployment, scheduling, environment-variable, webhook, Railway, or public API contract.
 11. Do NOT modify `main.py`, `crm.py`, `wazzup.py`, `config.py`, `schedule.py`, Railway files, or workflow files.
