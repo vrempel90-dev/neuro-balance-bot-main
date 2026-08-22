@@ -1170,8 +1170,12 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
             return False, "contraindications_already_ok"
     if action == "show_slots" and tool != "check_slots":
         return False, "slots_without_crm_tool"
+    if action == "show_nearest_dates" and tool != "check_nearest_slots":
+        return False, "nearest_slots_without_crm_tool"
     if tool == "check_slots" and action != "show_slots":
         return False, "crm_tool_action_mismatch"
+    if tool == "check_nearest_slots" and action != "show_nearest_dates":
+        return False, "nearest_crm_tool_action_mismatch"
     if action == "select_slot" and not (session.get("last_slots") or []):
         return False, "select_slot_without_last_slots"
     if next_step == "booked" or tool == "book_appointment":
@@ -1203,6 +1207,12 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
         if session.get("contraindications_ok") is True or extracted.get("contraindications_clear") is True:
             return False, "need_date_after_contraindications_clear"
         return False, "show_slots_without_date"
+    if action == "show_nearest_dates" and (
+        session.get("contraindications_ok") is not True
+        and extracted.get("contraindications_clear") is not True
+        and not _text_confirms_no_contra(session, user_text)
+    ):
+        return False, "nearest_slots_before_contra"
     if action == "show_slots" and (
         step not in OPENAI_BRAIN_MULTI_ENTITY_STEPS
         or session.get("ai_lead_started") is not True
@@ -1237,7 +1247,7 @@ def validate_openai_dialog_decision(decision: dict, session: dict, user_text: st
         return False, "doctor_hallucination"
     if not (session.get("last_slots") or []) and (_TIME_PATTERN.search(reply) or any(p in low_reply for p in _FORBIDDEN_EMPTY_SLOT_PHRASES)):
         return False, "slot_hallucination"
-    if action in {"ask_date", "show_slots"} and session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not _text_confirms_no_contra(session, user_text):
+    if action in {"ask_date", "show_slots", "show_nearest_dates"} and session.get("contraindications_ok") is not True and extracted.get("contraindications_clear") is not True and not _text_confirms_no_contra(session, user_text):
         return False, "offered_date_before_contra"
     if step == "contraindications" and session.get("contraindications_ok") is not True and action not in {"ask_date", "stop_contraindication", "handoff_admin", "fallback_rule_based", "no_reply", "answer_faq_and_continue"}:
         if "противопоказ" not in low_reply and not any(x in low_reply for x in _kkl("қарсы", "көрсетілім")):
@@ -1297,6 +1307,28 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
             _log_llm_repair(chat_id, repair, str(decision.get("reply") or ""))
             return _finalize(chat_id, session, repair.answer)
         return None
+    # An explicit unresolved doctor is a hard routing constraint, not a normal
+    # questionnaire field. Resolve or clarify it before validating/advancing
+    # the model's next step so generic guards cannot move the funnel forward.
+    extracted = decision.get("extracted") or {}
+    doctor_preference = str(extracted.get("doctor_preference") or "").strip()
+    if doctor_preference:
+        doctor_resolved = await _apply_crm_doctor_preference(
+            chat_id,
+            session,
+            doctor_preference,
+        )
+        if not doctor_resolved:
+            return _finalize(chat_id, session, _doctor_preference_unresolved_answer(session))
+    elif session.get("doctor_preference_unresolved"):
+        if _doctor_preference_waived(text):
+            session.pop("doctor_preference_unresolved", None)
+            session.pop("doctor_preference", None)
+            session.pop("doctor_preference_resolved", None)
+            session["doctor_selection_source"] = "explicit_preference_waived"
+        elif decision.get("action") != "handoff_admin":
+            return _finalize(chat_id, session, _doctor_preference_unresolved_answer(session))
+
     _apply_brain_contraindications_clear(session, text, decision)
     ok, guard_reason = validate_openai_dialog_decision(decision, session, text)
     if not ok:
@@ -1312,7 +1344,6 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         return None
     session["answer_source"] = "openai_dialog_brain"
     action = decision.get("action")
-    extracted = decision.get("extracted") or {}
     _apply_brain_language_hint(session, extracted, text)
     if extracted.get("symptom_duration"):
         session["symptom_duration"] = str(extracted.get("symptom_duration") or "")
@@ -1325,20 +1356,6 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         # что и rule-based путь. Дальше _ask_age/_faq_answer уже сами
         # переключаются на "сколько лет маме?" вместо "сколько Вам лет?".
         _apply_patient_relation(session, str(extracted.get("patient_relation") or ""))
-    doctor_preference = str(extracted.get("doctor_preference") or "").strip()
-    if doctor_preference:
-        doctor_resolved = await _apply_crm_doctor_preference(
-            chat_id,
-            session,
-            doctor_preference,
-        )
-        if not doctor_resolved and (
-            decision.get("action") == "show_slots"
-            or decision.get("needs_python_tool") == "check_slots"
-        ):
-            session["step"] = "date"
-            session["questionnaire_step"] = "date"
-            return _finalize(chat_id, session, _doctor_preference_unresolved_answer(session))
     if decision.get("intent"):
         session["last_user_intent"] = str(decision.get("intent") or "")
     if extracted.get("time_preference"):
@@ -1367,6 +1384,19 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         session["step"] = "date"
         session["questionnaire_step"] = "date"
         return _finalize(chat_id, session, reply or _ask_date(session))
+    if action == "show_nearest_dates" or decision.get("needs_python_tool") == "check_nearest_slots":
+        if extracted.get("contraindications_clear") is True or _text_confirms_no_contra(session, text):
+            _accept_no_contraindications(session, text or "нет")
+        if session.get("contraindications_ok") is not True:
+            session["step"] = "contraindications"
+            session["questionnaire_step"] = "contra"
+            return _finalize(chat_id, session, _ask_contra(session))
+        session["available_dates_intent"] = "AVAILABLE_DATES_REQUEST"
+        return _finalize(
+            chat_id,
+            session,
+            await _show_nearest_available_dates(chat_id, session, days_ahead=14),
+        )
     if action == "show_slots" or decision.get("needs_python_tool") == "check_slots":
         if extracted.get("age"):
             try:
@@ -3406,6 +3436,27 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
         elif session.get("crm_patient_state") == "RETURNING_PATIENT_NO_ACTIVE_BOOKING":
             session["outbound_duplicate_guard_blocked"] = True
             answer = _returning_patient_answer(session, str(session.get("last_user_text") or ""))
+        elif session.get("doctor_preference_unresolved"):
+            repeat_count = int(session.get("consecutive_duplicate_answer_count") or 0) + 1
+            session["consecutive_duplicate_answer_count"] = repeat_count
+            session["outbound_duplicate_guard_blocked"] = False
+            if repeat_count >= 3:
+                session["step"] = "escalated"
+                session["manual_takeover"] = True
+                session["ai_muted"] = True
+                session["escalated"] = True
+                session["handoff_reason"] = "doctor_preference_resolution_loop_guard"
+                answer = _tr(
+                    session,
+                    "Не смогла однозначно найти выбранного врача. Передала администратору Ваш запрос и уже собранные данные, чтобы записать именно к нужному специалисту 🌿",
+                    "Таңдалған дәрігерді нақты таба алмадым. Дәл қажетті маманға жазу үшін сұрауыңызды және жиналған деректерді әкімшіге жібердім 🌿",
+                )
+            else:
+                answer = _tr(
+                    session,
+                    "Чтобы не показать время другого врача, уточните, пожалуйста, имя или ФИО выбранного врача. Если подойдёт любой врач — так и напишите 🌿",
+                    "Басқа дәрігердің уақытын көрсетпеу үшін таңдалған дәрігердің аты-жөнін нақтылап жазыңызшы. Кез келген дәрігер жараса — соны жазыңыз 🌿",
+                )
         elif str(session.get("step") or "") == "contraindications":
             # contraindications_never_silent_guard: на этом шаге молчание недопустимо.
             # Прод 17.08.2026 (chat_id 77478875259, WhatsApp, текст): пациент написал
@@ -4971,6 +5022,8 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         session.pop("selected_slot", None)
         session["selected_doctor_login"] = ""
         session["selected_doctor_name"] = ""
+        session["selected_date"] = ""
+        session["selected_time"] = ""
         session["step"] = "time" if session.get("last_slots") else "date"
         _safe_log(chat_id, "booking_payload_blocked_reserve_or_invalid_slot", {"chat_id": chat_id, "step": session.get("step") or "", "doctor_login": _slot_doctor_login(slot), "doctor_name": _slot_doctor_name(slot)})
         return "Сейчас уточню свободное время у администратора, чтобы записать Вас корректно 🌿"
@@ -5066,8 +5119,21 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
                 candidate = verification.get(key)
                 if isinstance(candidate, dict):
                     verification_candidates.append(candidate)
+            expected_id = str(session.get("appointment_id") or "").strip()
             for a in verification_candidates:
-                if str(a.get("id") or a.get("appointmentId") or a.get("bookingId") or "") == str(session.get("appointment_id") or "") or (str(a.get("date") or a.get("appointmentDate") or "")[:10] == str(session.get("appointment_date") or "")[:10] and str(a.get("timeStart") or a.get("time") or "")[:5] == str(session.get("appointment_time") or "")[:5]):
+                candidate_id = str(
+                    a.get("id") or a.get("appointmentId") or a.get("bookingId") or ""
+                ).strip()
+                id_matches = bool(
+                    expected_id and candidate_id and candidate_id == expected_id
+                )
+                date_time_matches = bool(
+                    str(a.get("date") or a.get("appointmentDate") or "")[:10]
+                    == str(session.get("appointment_date") or "")[:10]
+                    and str(a.get("timeStart") or a.get("time") or "")[:5]
+                    == str(session.get("appointment_time") or "")[:5]
+                )
+                if id_matches or date_time_matches:
                     found = True
                     _store_appointment_fields(session, a)
                     break
@@ -5983,6 +6049,67 @@ async def _apply_crm_doctor_preference(
     return True
 
 
+def _doctor_preference_waived(text: str) -> bool:
+    low = _low(text)
+    return any(
+        phrase in low
+        for phrase in (
+            "любой врач", "к любому врачу", "врач неважен", "не важно какой врач",
+            "без разницы какой врач", "кто угодно", "к любому",
+            "кез келген дәрігер", "дәрігер маңызды емес", "бәрібір қай дәрігер",
+        )
+    )
+
+
+def _explicit_human_handoff_requested(text: str) -> bool:
+    low = _low(text)
+    person = any(
+        phrase in low
+        for phrase in (
+            "администратор", "оператор", "живой человек", "позовите человека",
+            "позвать человека", "әкімші", "операторға", "адаммен сөйлес",
+        )
+    )
+    request = any(
+        phrase in low
+        for phrase in (
+            "позов", "соедин", "передай", "хочу", "нужен", "нужна",
+            "шақыр", "қос", "сөйлес",
+        )
+    )
+    return person and request
+
+
+async def _pending_doctor_preference_answer(
+    chat_id: str,
+    session: dict[str, Any],
+    text: str,
+) -> str | None:
+    """Keep an explicit doctor constraint sticky until resolved or waived."""
+
+    pending = str(session.get("doctor_preference_unresolved") or "").strip()
+    if not pending:
+        return None
+    if _doctor_preference_waived(text):
+        session.pop("doctor_preference_unresolved", None)
+        session.pop("doctor_preference", None)
+        session.pop("doctor_preference_resolved", None)
+        session["doctor_selection_source"] = "explicit_preference_waived"
+        return None
+    if _explicit_human_handoff_requested(text):
+        return None
+
+    resolved = await _apply_crm_doctor_preference(chat_id, session, text)
+    if resolved:
+        return None
+
+    # The new message may be a date/age rather than another spelling of the
+    # doctor's name. Preserve the original constraint instead of replacing it.
+    session["doctor_preference"] = pending
+    session["doctor_preference_unresolved"] = pending
+    return _doctor_preference_unresolved_answer(session)
+
+
 def _doctor_preference_unresolved_answer(session: dict[str, Any]) -> str:
     return _tr(
         session,
@@ -6704,6 +6831,14 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["ai_lead_started"] = True
         session["lead_source"] = reason
         session["ai_started_at"] = datetime.now(timezone.utc).isoformat()
+
+    pending_doctor_answer = await _pending_doctor_preference_answer(
+        chat_id,
+        session,
+        text,
+    )
+    if pending_doctor_answer is not None:
+        return _finalize(chat_id, session, pending_doctor_answer)
 
     context = _build_conversation_context(chat_id, session, text)
     _apply_conversation_context(session, context, text)

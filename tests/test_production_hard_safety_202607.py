@@ -87,9 +87,16 @@ def test_new_chat_methods_question_stays_concise_and_continues(monkeypatch):
     chat_id = "hard_new_methods"
     reset(chat_id)
     ans = run(dialog.handle_message(chat_id, "77011234567", "Как лечите?"))
-    assert ans
-    assert "что" in ans.lower() or "подскажите" in ans.lower()
-    assert ans != dialog.FIRST_TOUCH_CLINIC_INFO_RU
+    low = ans.lower()
+    assert any(
+        phrase in low
+        for phrase in (
+            "что вас беспокоит", "что именно вас беспокоит", "что беспокоит",
+            "беспокоит спина", "что именно беспокоит",
+        )
+    ), ans
+    for blocked in ("клиника neuro balance помогает", "мы специализируемся на:", "tiktok", "плазмотерап"):
+        assert blocked not in low
 
 
 def test_new_chat_booking_starts_booking_scenario(monkeypatch):
@@ -117,8 +124,16 @@ def test_new_chat_detail_request_is_gpt_ready_not_locked_presentation(monkeypatc
         chat_id = "hard_new_detail_" + str(abs(hash(text)))
         reset(chat_id)
         ans = run(dialog.handle_message(chat_id, "77011234567", text))
-        assert ans
-        assert ans != dialog.FIRST_TOUCH_CLINIC_INFO_RU
+        low = ans.lower()
+        assert any(
+            phrase in low
+            for phrase in (
+                "что вас беспокоит", "что именно вас беспокоит", "что беспокоит",
+                "беспокоит спина", "что именно беспокоит",
+            )
+        ), ans
+        for blocked in ("клиника neuro balance помогает", "мы специализируемся на:", "tiktok", "плазмотерап"):
+            assert blocked not in low
         assert state.get_session(chat_id)["ai_lead_started"] is True
 
 

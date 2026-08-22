@@ -41,9 +41,19 @@ def test_new_chat_first_touch_starts_gpt_led_funnel(user: str) -> None:
         "python_fallback:first_touch",
         "pending:gpt_first_touch",
     }
-    assert "чем можем помочь" not in answer
-    assert "Не беспокоит" not in answer
-    assert answer != FIRST_TOUCH_CLINIC_INFO_RU
+    low = answer.lower()
+    assert any(
+        phrase in low
+        for phrase in (
+            "что вас беспокоит", "что именно вас беспокоит", "что беспокоит",
+            "беспокоит спина", "не мазалайды", "жазылғыңыз келе ме",
+        )
+    ), answer
+    for blocked in (
+        "чем можем помочь", "не беспокоит", "клиника neuro balance помогает",
+        "мы специализируемся на:", "tiktok", "плазмотерап",
+    ):
+        assert blocked not in low
 
 
 def test_age_to_contraindications_uses_full_locked_template() -> None:

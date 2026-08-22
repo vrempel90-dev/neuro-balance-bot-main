@@ -319,6 +319,77 @@ def test_gpt_doctor_preference_is_resolved_to_real_crm_login(monkeypatch: pytest
     assert "14:00" in answer
 
 
+def test_unresolved_doctor_stops_funnel_before_any_general_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat_id = "audit_unresolved_doctor_blocks_funnel"
+    seed(chat_id, {"step": "complaint"})
+
+    async def fake_doctors() -> dict[str, Any]:
+        return {
+            "doctors": [
+                {
+                    "doctorLogin": "kaisar_k",
+                    "doctorName": "Куанышулы Кайсар Куанышулы",
+                }
+            ]
+        }
+
+    async def fake_brain(**_kwargs: Any):
+        return brain_decision(
+            "ask_age",
+            "Понимаю. Сколько лет пациенту?",
+            next_step="age",
+            extracted={
+                "complaint": "болит спина",
+                "doctor_preference": "Несуществующему врачу",
+            },
+        )
+
+    monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", new_patient_lookup)
+    monkeypatch.setattr(crm, "get_doctors", fake_doctors)
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+
+    answer = run(
+        dialog.handle_message(
+            chat_id,
+            "77011234567",
+            "Хочу к несуществующему врачу, болит спина",
+        )
+    )
+    session = state.get_session(chat_id)
+
+    assert "уточните" in answer.lower()
+    assert session["doctor_preference_unresolved"] == "Несуществующему врачу"
+    assert not session.get("selected_doctor_login")
+    assert not session.get("last_slots")
+
+    slot_calls = {"count": 0}
+
+    async def forbidden_general_slots(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        slot_calls["count"] += 1
+        raise AssertionError("general slots must remain blocked while doctor is unresolved")
+
+    async def date_brain(**_kwargs: Any):
+        return brain_decision(
+            "show_slots",
+            "Проверю свободное время.",
+            next_step="time",
+            extracted={"preferred_date_text": "в понедельник"},
+            tool="check_slots",
+        )
+
+    monkeypatch.setattr(crm, "check_slots", forbidden_general_slots)
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", date_brain)
+
+    repeated = run(dialog.handle_message(chat_id, "77011234567", "Тогда в понедельник"))
+    session = state.get_session(chat_id)
+
+    assert "уточните" in repeated.lower()
+    assert slot_calls["count"] == 0
+    assert session["doctor_preference_unresolved"] == "Несуществующему врачу"
+
+
 def test_relative_patient_name_and_specific_doctor_reach_crm(monkeypatch: pytest.MonkeyPatch) -> None:
     chat_id = "audit_relative_books_patient"
     slot = {
@@ -453,6 +524,61 @@ def test_dialog_brain_uses_one_current_prompt_and_strict_schema(monkeypatch: pyt
     assert debug["openai_brain_used"] is True
     assert captured["response_format"]["type"] == "json_schema"
     assert captured["response_format"]["json_schema"]["strict"] is True
+    tool_enum = captured["response_format"]["json_schema"]["schema"]["properties"][
+        "needs_python_tool"
+    ]["enum"]
+    assert "check_nearest_slots" in tool_enum
+    confidence_schema = captured["response_format"]["json_schema"]["schema"][
+        "properties"
+    ]["entities"]["properties"]["language_confidence"]
+    assert confidence_schema == {"type": "number"}
+
+
+def test_structured_nearest_dates_tool_normalizes_to_controller_action() -> None:
+    raw = {
+        "understood_context": {
+            "patient_meaning": "нужны ближайшие даты",
+            "is_answer_to_last_question": True,
+            "is_new_question": False,
+            "contains_multiple_entities": False,
+            "should_answer_faq_first": False,
+            "should_return_to_pending_step": False,
+        },
+        "intent": "date_preference",
+        "entities": {
+            "complaint": "",
+            "age": None,
+            "symptom_duration": "",
+            "contraindications_clear": None,
+            "contraindication_confirmed": False,
+            "date_preference": "",
+            "time_preference": "",
+            "slot_choice": None,
+            "patient_name": "",
+            "patient_relation": "",
+            "doctor_preference": "",
+            "faq_type": "",
+            "language": "ru",
+            "detected_language": "ru",
+            "preferred_response_language": "ru",
+            "language_confidence": 1.0,
+        },
+        "next_required_step": "time",
+        "needs_python_tool": "check_nearest_slots",
+        "reply": "Покажу ближайшие свободные даты.",
+        "safety": {
+            "hard_stop": False,
+            "unsafe_medical_claim": False,
+            "invented_fact_risk": False,
+            "reason": "",
+        },
+    }
+
+    decision, reason = ai._normalize_dialog_brain_decision(raw)
+
+    assert reason == ""
+    assert decision["action"] == "show_nearest_dates"
+    assert decision["needs_python_tool"] == "check_nearest_slots"
 
 
 def test_availability_request_cannot_skip_required_gates(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -486,6 +612,138 @@ def test_availability_request_cannot_skip_required_gates(monkeypatch: pytest.Mon
     assert crm_calls == {"slots": 0, "nearest": 0}
     assert session["step"] == "age"
     assert "сколько" in answer.lower()
+
+
+def test_gpt_nearest_dates_tool_routes_to_real_crm_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    chat_id = "audit_gpt_nearest_dates_tool"
+    seed(
+        chat_id,
+        {
+            "step": "date",
+            "complaint": "болит спина",
+            "age": 39,
+            "contraindications_ok": True,
+            "contraindications_verdict": "proceed",
+        },
+    )
+    calls: list[dict[str, Any]] = []
+
+    async def fake_nearest(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "slots": [
+                {
+                    "doctorLogin": "kaisar_k",
+                    "doctorName": "Куанышулы Кайсар Куанышулы",
+                    "date": "2099-01-05",
+                    "timeStart": "14:00",
+                }
+            ]
+        }
+
+    async def fake_brain(**_kwargs: Any):
+        return brain_decision(
+            "show_nearest_dates",
+            "Покажу ближайшие свободные даты.",
+            next_step="time",
+            tool="check_nearest_slots",
+        )
+
+    monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", new_patient_lookup)
+    monkeypatch.setattr(crm, "find_nearest_available_slots", fake_nearest)
+    monkeypatch.setattr(dialog, "run_openai_dialog_brain", fake_brain)
+
+    answer = run(dialog.handle_message(chat_id, "77011234567", "Какие ближайшие даты есть?"))
+    session = state.get_session(chat_id)
+
+    assert calls
+    assert "Ближайшие свободные даты" in answer
+    assert "14:00" in answer
+    assert session["step"] == "time"
+
+
+def test_booking_verification_does_not_match_two_empty_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chat_id = "audit_booking_empty_ids_do_not_match"
+    slot = {
+        "doctorLogin": "kaisar_k",
+        "doctorName": "Куанышулы Кайсар Куанышулы",
+        "date": "2099-01-05",
+        "timeStart": "14:00",
+        "doctor_login": "kaisar_k",
+        "doctor_name": "Куанышулы Кайсар Куанышулы",
+        "time": "14:00",
+    }
+    session = {
+        "step": "name",
+        "complaint": "болит спина",
+        "age": 39,
+        "contraindications_ok": True,
+        "contraindications_verdict": "proceed",
+        "contraindications_raw": "нет",
+        "patient_name": "Алия",
+        "selected_slot": slot,
+        "last_slots": [slot],
+    }
+
+    async def fake_book(**kwargs: Any) -> dict[str, Any]:
+        return {"ok": True, **kwargs}  # CRM accepted, but returned no booking ID.
+
+    async def fake_lookup(_phone: str) -> dict[str, Any]:
+        return {
+            "appointments": [],
+            "lastAppointment": {
+                "date": "2098-12-01",
+                "timeStart": "09:00",
+                "doctorLogin": "another_doctor",
+                "doctorName": "Другой врач",
+            },
+        }
+
+    monkeypatch.setattr(crm, "book_appointment", fake_book)
+    monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
+
+    answer = run(dialog._book(chat_id, session, "77011234567"))
+
+    assert "запись подтверждена" in answer.lower()
+    assert session["crm_verification_failed"] is True
+    assert session["booking_visible_in_crm"] is False
+    assert session["manual_takeover"] is True
+    assert session["appointment_date"] == "2099-01-05"
+    assert session["appointment_doctor_login"] == "kaisar_k"
+
+
+def test_invalid_reserve_slot_clears_all_selected_slot_fields() -> None:
+    reserve_slot = {
+        "doctorLogin": "reserve",
+        "doctorName": "Резерв",
+        "date": "2099-01-05",
+        "timeStart": "14:00",
+    }
+    session = {
+        "step": "name",
+        "complaint": "болит спина",
+        "age": 39,
+        "contraindications_ok": True,
+        "patient_name": "Алия",
+        "selected_slot": reserve_slot,
+        "selected_doctor_login": "stale_doctor",
+        "selected_doctor_name": "Старый врач",
+        "selected_date": "2098-12-01",
+        "selected_time": "09:00",
+        "last_slots": [reserve_slot],
+    }
+
+    answer = run(dialog._book("audit_invalid_slot_clears_fields", session, "77011234567"))
+
+    assert "администратора" in answer.lower()
+    assert session.get("selected_slot") is None
+    assert session["selected_doctor_login"] == ""
+    assert session["selected_doctor_name"] == ""
+    assert session["selected_date"] == ""
+    assert session["selected_time"] == ""
+    assert dialog._booking_ready(session, "77011234567") is False
 
 
 def test_active_gpt_no_reply_is_repaired_to_visible_progress(monkeypatch: pytest.MonkeyPatch) -> None:

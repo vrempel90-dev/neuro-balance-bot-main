@@ -238,10 +238,13 @@ DIALOG_BRAIN_NEXT_STEPS = {
 }
 DIALOG_BRAIN_ACTIONS = {
     "ask_complaint", "ask_age", "ask_contraindications", "ask_date", "show_slots",
-    "select_slot", "ask_name", "answer_faq_and_continue", "stop_contraindication",
-    "handoff_admin", "no_reply", "fallback_rule_based",
+    "show_nearest_dates", "select_slot", "ask_name", "answer_faq_and_continue",
+    "stop_contraindication", "handoff_admin", "no_reply", "fallback_rule_based",
 }
-DIALOG_BRAIN_TOOLS = {"none", "check_slots", "book_appointment", "refresh_slots", "handoff_admin", "cancel", "handoff"}
+DIALOG_BRAIN_TOOLS = {
+    "none", "check_slots", "check_nearest_slots", "book_appointment",
+    "refresh_slots", "handoff_admin", "cancel", "handoff",
+}
 
 OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 Ты — живой AI-администратор клиники Neuro Balance в WhatsApp.
@@ -338,6 +341,8 @@ OPENAI_DIALOG_BRAIN_SYSTEM_PROMPT = """
 Если клиент просит запись к конкретному врачу, заполни doctor_preference ровно
 тем именем или ФИО, которое написал клиент. Не придумывай ФИО и CRM login:
 Python сопоставит предпочтение с актуальным списком врачей CRM.
+Если Python не смог однозначно сопоставить имя, не продолжай к общим слотам:
+жди уточнения ФИО либо явного ответа клиента, что подойдёт любой врач.
 Возрастные правила клиники (до 16 и более 75 лет) считаются по возрасту
 пациента, а не по возрасту того, кто написал.
 
@@ -372,6 +377,9 @@ Python сопоставит предпочтение с актуальным с�
 
 "все чисто", "ничего такого нет", "по всем нет", "жоқ", "жок"
 = противопоказаний нет, только если контекст — вопрос противопоказаний.
+
+"какие ближайшие даты есть?", "покажите ближайшие свободные дни"
+= needs_python_tool "check_nearest_slots", только после противопоказаний.
 
 Можно:
 - отвечать на FAQ внутри сценария;
@@ -464,7 +472,7 @@ Python сопоставит предпочтение с актуальным с�
     "language_confidence": 0.0
   },
   "next_required_step": "complaint | age | contraindications | date | time | name | booked | escalated | keep_current",
-  "needs_python_tool": "none | check_slots | book_appointment | handoff_admin",
+  "needs_python_tool": "none | check_slots | check_nearest_slots | handoff_admin",
   "reply": "",
   "safety": {
     "hard_stop": false,
@@ -557,8 +565,6 @@ def _dialog_brain_response_format() -> dict[str, Any]:
                             },
                             "language_confidence": {
                                 "type": "number",
-                                "minimum": 0.0,
-                                "maximum": 1.0,
                             },
                         },
                         "required": [
@@ -579,7 +585,10 @@ def _dialog_brain_response_format() -> dict[str, Any]:
                     },
                     "needs_python_tool": {
                         "type": "string",
-                        "enum": ["none", "check_slots", "handoff_admin"],
+                        "enum": [
+                            "none", "check_slots", "check_nearest_slots",
+                            "handoff_admin",
+                        ],
                     },
                     "reply": {"type": "string"},
                     "safety": {
@@ -675,6 +684,8 @@ def _action_from_structured(intent: str, next_step: str, tool: str, safety: dict
         return "ask_age"
     if intent == "age_answer" or next_step == "contraindications":
         return "ask_contraindications"
+    if tool == "check_nearest_slots":
+        return "show_nearest_dates"
     if tool == "check_slots" or next_step == "time":
         return "show_slots"
     if intent == "date_preference" or next_step == "date":
@@ -781,7 +792,8 @@ def _normalize_dialog_brain_decision(raw: Any) -> tuple[dict, str]:
     if not intent:
         intent = {
             "ask_age": "complaint", "ask_contraindications": "age_answer", "ask_date": "contraindications_answer",
-            "show_slots": "date_preference", "select_slot": "slot_choice", "ask_name": "booking_name",
+            "show_slots": "date_preference", "show_nearest_dates": "date_preference",
+            "select_slot": "slot_choice", "ask_name": "booking_name",
             "answer_faq_and_continue": "faq", "stop_contraindication": "contraindications_answer",
             "handoff_admin": "ask_human", "fallback_rule_based": "unknown", "no_reply": "unknown",
         }.get(action, "unknown")
@@ -900,6 +912,7 @@ def build_dialog_context(*, user_text: str, session: dict, recent_history: list 
         "patient_relation": session.get("patient_relation") or "",
         "selected_doctor_login": session.get("selected_doctor_login") or "",
         "selected_doctor_name": session.get("selected_doctor_name") or "",
+        "doctor_preference_unresolved": session.get("doctor_preference_unresolved") or "",
         "manual_takeover": bool(session.get("manual_takeover") or session.get("manual_admin_intervention")),
         "ai_muted": bool(session.get("ai_muted") or session.get("do_not_reply")),
         "last_required_question": session.get("last_required_question") or "",

@@ -1193,10 +1193,13 @@ def test_crm_book_409_slot_conflict_refreshes_slots(monkeypatch: Any) -> None:
 
 
 def test_crm_book_409_doctor_not_scheduled_refreshes_slots(monkeypatch: Any) -> None:
+    slot_calls: list[dict[str, Any]] = []
+
     async def fake_book_appointment(**kwargs: Any) -> dict[str, Any]:
         raise _crm_response_error(409, {"error": "Врач вне расписания", "code": "doctor_not_scheduled"})
 
     async def fake_check_slots(date: str, doctor_login: str | None = None) -> dict[str, Any]:
+        slot_calls.append({"date": date, "doctor_login": doctor_login})
         return {"availability": [{"doctorLogin": "other", "doctorName": "Другой врач", "date": date, "availableSlots": ["14:00"]}]}
 
     monkeypatch.setattr(crm, "book_appointment", fake_book_appointment)
@@ -1209,6 +1212,7 @@ def test_crm_book_409_doctor_not_scheduled_refreshes_slots(monkeypatch: Any) -> 
 
     assert "врач уже недоступен" in result.lower()
     assert "другой удобный день" in result.lower()
+    assert slot_calls == [{"date": "2026-06-22", "doctor_login": "zhuma_md"}]
     assert session["step"] == "date"
     assert session.get("selected_slot") is None
     assert session["booking_conflict_code"] == "doctor_not_scheduled"
