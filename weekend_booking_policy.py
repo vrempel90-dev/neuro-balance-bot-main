@@ -53,6 +53,12 @@ def _weekend_prefix(session: dict[str, Any], offered_date: str) -> str:
     )
 
 
+def _weekend_handoff_prefix(session: dict[str, Any]) -> str:
+    if str(session.get("language") or "ru") == "kk":
+        return "Сенбі және жексенбі — процедуралық күндер."
+    return "В субботу и воскресенье у нас процедурные дни."
+
+
 async def _show_weekday_slots_for_weekend(
     original: ShowSlots,
     chat_id: str,
@@ -68,16 +74,13 @@ async def _show_weekday_slots_for_weekend(
     if candidate is None:
         return await original(chat_id, session, requested_date_iso)
 
-    # Search only a small deterministic weekday window. Every candidate still
-    # goes through the existing CRM check, reserve-slot filter and doctor guard.
-    # We never invent availability or bypass the canonical booking path.
     last_answer = ""
     for _ in range(5):
         candidate_iso = candidate.isoformat()
         last_answer = await original(chat_id, session, candidate_iso)
 
         if session.get("manual_takeover") or session.get("escalated"):
-            return _weekend_prefix(session, candidate_iso) + "\n\n" + last_answer
+            return _weekend_handoff_prefix(session) + "\n\n" + last_answer
 
         if session.get("last_slots"):
             session["weekend_redirect_date"] = candidate_iso
