@@ -55,7 +55,7 @@ class Settings(BaseSettings):
 
     # App / storage
     public_base_url: str = Field(
-        default="https://neuro-balance-bot-main-production.up.railway.app",
+        default="https://neuro-balance-crm.vercel.app",
         validation_alias=AliasChoices("PUBLIC_BASE_URL", "RAILWAY_PUBLIC_DOMAIN", "public_base_url"),
     )
     deprecated_public_base_urls: str = Field(
@@ -94,7 +94,7 @@ class Settings(BaseSettings):
     bot_silent_outside_hours: bool = Field(default=True, validation_alias=AliasChoices("BOT_SILENT_OUTSIDE_HOURS", "bot_silent_outside_hours"))
     production_log_active_window_only: bool = Field(default=True, validation_alias=AliasChoices("PRODUCTION_LOG_ACTIVE_WINDOW_ONLY", "production_log_active_window_only"))
     message_debounce_seconds: int = Field(default=5, validation_alias=AliasChoices("MESSAGE_DEBOUNCE_SECONDS", "message_debounce_seconds"))
-    timezone_offset_hours: int = Field(default=5, validation_alias=AliasChoices("TIMEZONE_OFFSET_HOURS", "BOT_TIMEZONE_OFFSET", "timezone_offset_hours"))
+    timezone_offset_hours: int = Field(default=5, validation_alias=AliasChoices("TIMEZONE_OFFSET_HOURS", "timezone_offset_hours"))
     daytime_handoff_message: str = Field(
         default="Здравствуйте! Сейчас рабочее время контакт-центра, поэтому Ваше сообщение передано администратору. Он ответит Вам в порядке очереди🌿",
         validation_alias=AliasChoices("DAYTIME_HANDOFF_MESSAGE", "daytime_handoff_message"),
