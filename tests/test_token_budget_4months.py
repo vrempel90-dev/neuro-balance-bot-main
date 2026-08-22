@@ -12,12 +12,16 @@ def test_dialog_brain_keeps_high_quality_model_and_token_headroom() -> None:
 
 
 def test_neurobalance_monthly_budget_slice_is_conservative() -> None:
-    # $5/month leaves ~$10/month of the shared $15 target for KORGAN initially.
-    # Railway may rebalance after real usage telemetry without changing code.
     assert Settings.model_fields["monthly_ai_budget_usd"].default == 5.0
 
 
-def test_budget_and_model_settings_remain_environment_overridable() -> None:
-    fields = Settings.model_fields
-    for name in ("monthly_ai_budget_usd", "ai_humanize_model", "ai_brain_model"):
-        assert fields[name].validation_alias is not None
+def test_budget_and_model_settings_remain_environment_overridable(monkeypatch) -> None:
+    monkeypatch.setenv("MONTHLY_AI_BUDGET_USD", "6.25")
+    monkeypatch.setenv("AI_HUMANIZE_MODEL", "test-humanizer")
+    monkeypatch.setenv("AI_BRAIN_MODEL", "test-brain")
+
+    settings = Settings()
+
+    assert settings.monthly_ai_budget_usd == 6.25
+    assert settings.ai_humanize_model == "test-humanizer"
+    assert settings.ai_brain_model == "test-brain"
