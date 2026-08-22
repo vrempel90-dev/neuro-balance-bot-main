@@ -11,7 +11,12 @@ import ai_budget
 import main as neuro
 import state
 from repair_observer import dispatch_new_lead_turn
+from weekend_booking_policy import install_weekend_booking_policy
+from weekend_legacy_block_bypass import install_weekend_legacy_block_bypass
 
+
+install_weekend_booking_policy()
+install_weekend_legacy_block_bypass()
 
 _original_process_wazzup_message = neuro._process_wazzup_message
 
