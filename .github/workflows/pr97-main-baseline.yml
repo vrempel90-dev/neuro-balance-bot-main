@@ -1,0 +1,30 @@
+name: PR97 Main Baseline
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    container: python:3.11-slim
+    steps:
+      - name: Checkout baseline branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+      - name: Run CRM patient state baseline
+        env:
+          PYTHONPATH: .
+        run: pytest -q tests/test_crm_patient_state_regression.py
+      - name: Run relative booking baseline
+        if: always()
+        env:
+          PYTHONPATH: .
+        run: pytest -q tests/test_production_relative_booking_regression.py
