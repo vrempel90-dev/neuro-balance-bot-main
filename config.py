@@ -25,7 +25,9 @@ class Settings(BaseSettings):
     openai_model: str = Field(default="gpt-4o-mini", validation_alias=AliasChoices("OPENAI_MODEL", "openai_model"))
     ai_brain_model: str = Field(default="gpt-5.4-mini", validation_alias=AliasChoices("AI_BRAIN_MODEL", "ai_brain_model"))
     ai_brain_temperature: float = Field(default=0.2, validation_alias=AliasChoices("AI_BRAIN_TEMPERATURE", "ai_brain_temperature"))
-    ai_humanize_model: str = Field(default="gpt-5.4-mini", validation_alias=AliasChoices("AI_HUMANIZE_MODEL", "ai_humanize_model"))
+    # Humanization is style-only and is guarded against meaning/stage changes in ai.py.
+    # Keep the expensive reasoning model reserved for the dialog brain.
+    ai_humanize_model: str = Field(default="gpt-4o-mini", validation_alias=AliasChoices("AI_HUMANIZE_MODEL", "ai_humanize_model"))
     openai_voice_model: str = Field(default="whisper-1", validation_alias=AliasChoices("OPENAI_VOICE_MODEL", "openai_voice_model"))
     ai_enabled: bool = Field(default=True, validation_alias=AliasChoices("AI_ENABLED", "ai_enabled"))
     bot_auto_reply_enabled: bool = Field(default=True, validation_alias=AliasChoices("BOT_AUTO_REPLY_ENABLED", "bot_auto_reply_enabled"))
@@ -69,9 +71,11 @@ class Settings(BaseSettings):
 
     # AI budget / style
     monthly_ai_budget_kzt: int = Field(default=20000, validation_alias=AliasChoices("MONTHLY_AI_BUDGET_KZT", "monthly_ai_budget_kzt"))
-    # Реальный лимит трат в USD. По умолчанию 17.5 = $70 на 4 месяца работы.
-    # Enforcement живёт в ai_budget.py: 80% — warning в логи, 100% — rule-based fallback.
-    monthly_ai_budget_usd: float = Field(default=17.5, validation_alias=AliasChoices("MONTHLY_AI_BUDGET_USD", "monthly_ai_budget_usd"))
+    # Four-month shared target is ~$60 across NeuroBalance + KORGAN. NeuroBalance
+    # starts with a conservative $5/month slice; Railway can override this without
+    # changing code after real usage data shows the correct split.
+    # Enforcement lives in ai_budget.py: 80% warning, 100% safe rule-based fallback.
+    monthly_ai_budget_usd: float = Field(default=5.0, validation_alias=AliasChoices("MONTHLY_AI_BUDGET_USD", "monthly_ai_budget_usd"))
     ai_max_classifier_calls_per_day: int = Field(default=300, validation_alias=AliasChoices("AI_MAX_CLASSIFIER_CALLS_PER_DAY", "ai_max_classifier_calls_per_day"))
     operator_style_mode: bool = Field(default=True, validation_alias=AliasChoices("OPERATOR_STYLE_MODE", "operator_style_mode"))
     human_dialog_mode: bool = Field(default=True, validation_alias=AliasChoices("HUMAN_DIALOG_MODE", "human_dialog_mode"))
@@ -90,7 +94,7 @@ class Settings(BaseSettings):
     bot_silent_outside_hours: bool = Field(default=True, validation_alias=AliasChoices("BOT_SILENT_OUTSIDE_HOURS", "bot_silent_outside_hours"))
     production_log_active_window_only: bool = Field(default=True, validation_alias=AliasChoices("PRODUCTION_LOG_ACTIVE_WINDOW_ONLY", "production_log_active_window_only"))
     message_debounce_seconds: int = Field(default=5, validation_alias=AliasChoices("MESSAGE_DEBOUNCE_SECONDS", "message_debounce_seconds"))
-    timezone_offset_hours: int = Field(default=5, validation_alias=AliasChoices("TIMEZONE_OFFSET_HOURS", "timezone_offset_hours"))
+    timezone_offset_hours: int = Field(default=5, validation_alias=AliasChoices("TIMEZONE_OFFSET_HOURS", "BOT_TIMEZONE_OFFSET", "timezone_offset_hours"))
     daytime_handoff_message: str = Field(
         default="Здравствуйте! Сейчас рабочее время контакт-центра, поэтому Ваше сообщение передано администратору. Он ответит Вам в порядке очереди🌿",
         validation_alias=AliasChoices("DAYTIME_HANDOFF_MESSAGE", "daytime_handoff_message"),
