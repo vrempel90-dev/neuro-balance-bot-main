@@ -12,9 +12,11 @@ import main as neuro
 import state
 from repair_observer import dispatch_new_lead_turn
 from weekend_booking_policy import install_weekend_booking_policy
+from weekend_named_route_patch import install_named_weekend_route
 
 
 install_weekend_booking_policy()
+install_named_weekend_route()
 
 _original_process_wazzup_message = neuro._process_wazzup_message
 
