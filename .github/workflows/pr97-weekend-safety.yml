@@ -22,14 +22,24 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pytest
-      - name: Run weekend and booking regressions
+      - name: Run weekend safety regressions
         env:
           PYTHONPATH: .
         run: |
-          pytest -q \
-            tests/test_weekend_legacy_block_bypass.py \
-            tests/test_weekend_procedure_day_booking.py \
-            tests/test_production_booking_flow.py \
-            tests/test_new_lead_safety_gate.py \
-            tests/test_crm_patient_state_regression.py \
-            tests/test_production_relative_booking_regression.py
+          pytest -q tests/test_weekend_legacy_block_bypass.py tests/test_weekend_procedure_day_booking.py
+      - name: Run production booking flow in isolation
+        env:
+          PYTHONPATH: .
+        run: pytest -q tests/test_production_booking_flow.py
+      - name: Run new lead safety gate in isolation
+        env:
+          PYTHONPATH: .
+        run: pytest -q tests/test_new_lead_safety_gate.py
+      - name: Run CRM patient state regression in isolation
+        env:
+          PYTHONPATH: .
+        run: pytest -q tests/test_crm_patient_state_regression.py
+      - name: Run relative booking regression in isolation
+        env:
+          PYTHONPATH: .
+        run: pytest -q tests/test_production_relative_booking_regression.py
