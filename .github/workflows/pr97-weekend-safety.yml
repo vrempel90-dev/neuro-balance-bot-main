@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - ci/pr97-weekend-safety
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
