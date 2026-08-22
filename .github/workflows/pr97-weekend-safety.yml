@@ -1,0 +1,26 @@
+name: PR97 Weekend Safety
+
+on:
+  push:
+    branches:
+      - ci/pr97-weekend-safety
+
+permissions:
+  contents: read
+
+jobs:
+  weekend-safety:
+    runs-on: ubuntu-latest
+    container: python:3.11-slim
+    steps:
+      - name: Checkout exact CI branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+      - name: Run weekend booking safety regressions
+        run: |
+          pytest -q \
+            tests/test_weekend_legacy_block_bypass.py \
+            tests/test_weekend_procedure_day_booking.py
