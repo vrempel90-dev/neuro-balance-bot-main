@@ -96,7 +96,9 @@ def test_no_active_appointment_allows_first_touch(monkeypatch: Any) -> None:
     assert session["crm_lookup_called"] is True
     assert session["active_appointment_found"] is False
     assert session["first_touch_allowed"] is True
-    assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+    assert answer
+    assert "что Вас беспокоит" in answer
+    assert answer != dialog.FIRST_TOUCH_CLINIC_INFO_RU
 
 
 def test_lookup_failure_fails_closed(monkeypatch: Any) -> None:

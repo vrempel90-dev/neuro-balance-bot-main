@@ -239,7 +239,8 @@ def test_booking_500_soft_client_text_honest_state(monkeypatch: Any) -> None:
     })
     r = answer("prod_book_500", "Дана")
     s = state.get_session("prod_book_500")
-    assert r == "Дана, запись подтверждена 🌿 С Вами свяжется специалист."
+    assert "не удалось подтвердить запись" in r.lower()
+    assert "запись подтверждена" not in r.lower()
     assert s["manual_takeover"] is True and s["escalated"] is True and s["ai_muted"] is True
     assert s["crm_result"] == "failed"
     assert s["handoff_reason"] == "crm_book_500"

@@ -27,22 +27,33 @@ def run(coro):
 
 
 @pytest.mark.parametrize("user", ["хочу записаться", "Сәлеметсіз", "+"])
-def test_new_chat_first_touch_is_exact_locked_template(user: str) -> None:
+def test_new_chat_first_touch_starts_gpt_led_funnel(user: str) -> None:
     chat_id = f"locked_first_{abs(hash(user))}"
     answer = run(handle_message(chat_id, "77010000000", user))
     session = state.get_session(chat_id)
 
-    assert answer == FIRST_TOUCH_CLINIC_INFO_RU
+    assert answer
     assert session["first_touch_info_sent"] is True
-    assert session["step"] == "complaint"
-    assert session["answer_source"] == "locked_template:first_touch"
-    assert "чем можем помочь" not in answer
-    assert "хотите записаться или уточняете" not in answer
-    assert "Не беспокоит" not in answer
-    assert "Мы специализируемся на:" in answer
-    assert "плазмотерапию" in answer
-    assert "TikTok" in answer
-    assert "Подскажите, пожалуйста, что именно Вас беспокоит?" in answer
+    assert session["ai_lead_started"] is True
+    assert session["step"] in {"start", "complaint", "age"}
+    assert session["answer_source"] in {
+        "openai_dialog_brain",
+        "python_fallback:first_touch",
+        "pending:gpt_first_touch",
+    }
+    low = answer.lower()
+    assert any(
+        phrase in low
+        for phrase in (
+            "что вас беспокоит", "что именно вас беспокоит", "что беспокоит",
+            "беспокоит спина", "не мазалайды", "жазылғыңыз келе ме",
+        )
+    ), answer
+    for blocked in (
+        "чем можем помочь", "не беспокоит", "клиника neuro balance помогает",
+        "мы специализируемся на:", "tiktok", "плазмотерап",
+    ):
+        assert blocked not in low
 
 
 def test_age_to_contraindications_uses_full_locked_template() -> None:

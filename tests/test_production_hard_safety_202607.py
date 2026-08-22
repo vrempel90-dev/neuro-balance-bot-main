@@ -74,12 +74,12 @@ def test_new_chat_pain_starts_clarifying_dialog(monkeypatch):
     chat_id = "hard_new_pain"
     reset(chat_id)
     ans = run(dialog.handle_message(chat_id, "77011234567", "Болит спина"))
-    assert "где именно болит" in ans
-    assert "давно появилась боль" in ans
+    assert "спина" in ans.lower()
+    assert "сколько Вам лет" in ans
     assert "Клиника Neuro Balance помогает" not in ans
 
 
-def test_new_chat_methods_question_sends_requested_full_presentation(monkeypatch):
+def test_new_chat_methods_question_stays_concise_and_continues(monkeypatch):
     monkeypatch.setattr(main, "is_bot_work_time", lambda: True)
     async def fake_lookup(phone):
         return {"found": False, "isNew": True, "hasActiveAppointment": False}
@@ -87,10 +87,16 @@ def test_new_chat_methods_question_sends_requested_full_presentation(monkeypatch
     chat_id = "hard_new_methods"
     reset(chat_id)
     ans = run(dialog.handle_message(chat_id, "77011234567", "Как лечите?"))
-    assert ans == dialog.FIRST_TOUCH_CLINIC_INFO_RU
-    assert "Клиника Neuro Balance помогает" in ans
-    assert "TikTok" in ans
-    assert "Подскажите, пожалуйста, что именно Вас беспокоит?" in ans
+    low = ans.lower()
+    assert any(
+        phrase in low
+        for phrase in (
+            "что вас беспокоит", "что именно вас беспокоит", "что беспокоит",
+            "беспокоит спина", "что именно беспокоит",
+        )
+    ), ans
+    for blocked in ("клиника neuro balance помогает", "мы специализируемся на:", "tiktok", "плазмотерап"):
+        assert blocked not in low
 
 
 def test_new_chat_booking_starts_booking_scenario(monkeypatch):
@@ -109,7 +115,7 @@ def test_new_chat_booking_starts_booking_scenario(monkeypatch):
     assert s["step"] == "complaint"
 
 
-def test_new_chat_detail_request_sends_full_presentation(monkeypatch):
+def test_new_chat_detail_request_is_gpt_ready_not_locked_presentation(monkeypatch):
     monkeypatch.setattr(main, "is_bot_work_time", lambda: True)
     async def fake_lookup(phone):
         return {"found": False, "isNew": True, "hasActiveAppointment": False}
@@ -118,9 +124,17 @@ def test_new_chat_detail_request_sends_full_presentation(monkeypatch):
         chat_id = "hard_new_detail_" + str(abs(hash(text)))
         reset(chat_id)
         ans = run(dialog.handle_message(chat_id, "77011234567", text))
-        assert ans == dialog.FIRST_TOUCH_CLINIC_INFO_RU
-        assert "Клиника Neuro Balance помогает" in ans
-        assert "Подскажите, пожалуйста, что именно Вас беспокоит?" in ans
+        low = ans.lower()
+        assert any(
+            phrase in low
+            for phrase in (
+                "что вас беспокоит", "что именно вас беспокоит", "что беспокоит",
+                "беспокоит спина", "что именно беспокоит",
+            )
+        ), ans
+        for blocked in ("клиника neuro balance помогает", "мы специализируемся на:", "tiktok", "плазмотерап"):
+            assert blocked not in low
+        assert state.get_session(chat_id)["ai_lead_started"] is True
 
 
 def test_new_chat_price_answers_only_price(monkeypatch):

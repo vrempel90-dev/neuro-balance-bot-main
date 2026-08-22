@@ -47,11 +47,16 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 def _new_leads_only_test_default(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
     # Keep legacy dialog/state-machine tests on their historical mode while the
     # dedicated production regression file exercises NEW_LEADS_ONLY=true.
-    enabled = request.node.path.name == "test_crm_patient_state_regression.py"
+    enabled = request.node.path.name in {
+        "test_crm_patient_state_regression.py",
+        "test_gpt_crm_doctor_relative_completion.py",
+    }
     monkeypatch.setenv("NEW_LEADS_ONLY", "true" if enabled else "false")
     try:
         from config import get_settings
         get_settings.cache_clear()
+        import state
+        state.init_db()
     except Exception:
         pass
     yield

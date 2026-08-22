@@ -76,7 +76,9 @@ def test_1_new_patient_allows_first_touch(monkeypatch: Any) -> None:
 
     assert session["crm_patient_state"] == "NEW_PATIENT"
     assert session["first_touch_allowed"] is True
-    assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+    assert answer
+    assert "что Вас беспокоит" in answer
+    assert answer != dialog.FIRST_TOUCH_CLINIC_INFO_RU
 
 
 def test_2_returning_patient_greeting_is_silent(monkeypatch: Any) -> None:

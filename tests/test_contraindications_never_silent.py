@@ -184,8 +184,8 @@ def test_voice_message_still_gets_no_reply() -> None:
     assert dialog._openai_brain_skip_reason(session, "Все равно болеет") == "voice_or_audio"
 
 
-def test_duplicate_guard_still_silences_other_steps() -> None:
-    """Старое поведение duplicate_answer_guard вне contraindications сохранено."""
+def test_duplicate_guard_keeps_active_lead_visible() -> None:
+    """An active new-lead funnel must not become silent on a repeated prompt."""
     chat_id = "contra_dup_guard_other_step"
     state.reset_session(chat_id)
     session = state.get_session(chat_id)
@@ -204,5 +204,6 @@ def test_duplicate_guard_still_silences_other_steps() -> None:
 
     answer = dialog._finalize(chat_id, session, "Как Вас зовут? 🌿")
 
-    assert answer == ""
-    assert state.get_session(chat_id).get("outbound_duplicate_guard_blocked") is True
+    assert answer
+    assert "продолжить запись" in answer.lower()
+    assert state.get_session(chat_id).get("outbound_duplicate_guard_blocked") is False

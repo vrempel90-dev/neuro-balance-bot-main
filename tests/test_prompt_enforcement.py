@@ -26,7 +26,7 @@ def run(coro: Any) -> Any:
     return asyncio.run(coro)
 
 
-def test_rendered_prompt_is_loaded_into_dialog_brain(monkeypatch: Any) -> None:
+def test_single_current_prompt_and_strict_schema_are_used(monkeypatch: Any) -> None:
     captured: dict[str, Any] = {}
 
     class FakeChoice:
@@ -55,8 +55,12 @@ def test_rendered_prompt_is_loaded_into_dialog_brain(monkeypatch: Any) -> None:
     monkeypatch.setattr(ai, "_openai_client", lambda key: FakeClient())
     decision, debug = run(ai.run_openai_dialog_brain(user_text="спина", session={"step": "complaint"}))
     system_prompt = captured["messages"][0]["content"]
-    assert "SYSTEM_PROMPT" in system_prompt or "PROJECT OVERRIDES" in system_prompt
-    assert "20:00–08:00" in system_prompt
+    assert "Порядок записи неизменен" in system_prompt
+    assert "за родственника" in system_prompt
+    assert "PROJECT OVERRIDES" not in system_prompt
+    assert "Запись на третье лицо" not in system_prompt
+    assert captured["response_format"]["type"] == "json_schema"
+    assert captured["response_format"]["json_schema"]["strict"] is True
     assert decision["action"] == "ask_age"
     assert captured["model"] == "gpt-5.4-mini"
     assert captured["temperature"] == 0.2
