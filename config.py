@@ -55,7 +55,7 @@ class Settings(BaseSettings):
 
     # App / storage
     public_base_url: str = Field(
-        default="https://neuro-balance-crm.vercel.app",
+        default="https://neuro-balance-bot-main-production.up.railway.app",
         validation_alias=AliasChoices("PUBLIC_BASE_URL", "RAILWAY_PUBLIC_DOMAIN", "public_base_url"),
     )
     deprecated_public_base_urls: str = Field(
