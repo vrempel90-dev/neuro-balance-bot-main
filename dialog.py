@@ -3347,8 +3347,16 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
         answer = _slot_times_answer(session)
     if not ((session.get("step") == "booked" and session.get("booking_confirmed") is True) or "запись подтверждена" in _low(answer)):
         answer = _remove_name_addressing(answer, session)
+    # A GPT-authored answer is the deliverable, not a draft: _strict_trim_extra
+    # cuts a reply down to two sentences unless it matches an allow-list, which
+    # would silently drop the third sentence of e.g. "Свободно 09:20 и 14:00.
+    # Врач — <имя>. Записываю Вас на 14:00." — the patient would lose the part
+    # that states what actually happened. Fact-safety validation still runs
+    # above (_validate_final_fact_answer); only the shortening is skipped.
+    agent_authored = str(session.get("answer_source") or "") == "gpt_agent"
     if not first_touch_in_progress:
-        answer = _strict_trim_extra(answer, session)
+        if not agent_authored:
+            answer = _strict_trim_extra(answer, session)
         answer = _cleanup_final_wazzup_text(answer)
     # final_contraindications_repair:
     # Последний барьер перед сохранением/возвратом ответа. Он должен перебивать
@@ -3520,6 +3528,14 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     if not str(answer or "").strip():
         session["silent_turn_prevented"] = True
         session["fallback_reason"] = session.get("fallback_reason") or "silent_turn_invariant"
+        # Telling the patient "передаю администратору" without actually handing
+        # the dialog over would be a promise the system does not keep: the bot
+        # would answer again on the next turn and no operator would ever see a
+        # handoff flag. Set the same state _progress_repeated_step_answer does.
+        session["step"] = "escalated"
+        session["escalated"] = True
+        session["manual_takeover"] = True
+        session["handoff_reason"] = session.get("handoff_reason") or "silent_turn_invariant"
         answer = _operator_handoff_text(session)
         _safe_log(
             chat_id,

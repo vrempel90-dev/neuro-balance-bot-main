@@ -271,28 +271,75 @@ def test_crm_error_status_is_never_read_as_success(monkeypatch: pytest.MonkeyPat
 # ---------------------------------------------------------------------------
 
 
+def _agent_ast() -> "ast.Module":
+    """Parse agent.py so assertions look at code, not prose.
+
+    Searching ``inspect.getsource`` also matches docstrings and the system
+    prompt written for the model, so a time example in a tool description or
+    the word "httpx" in a comment would fail these tests without any contract
+    change. Only executable nodes are inspected here.
+    """
+    import ast
+
+    return ast.parse(inspect.getsource(agent))
+
+
+def _agent_call_targets() -> set[str]:
+    import ast
+
+    targets: set[str] = set()
+    for node in ast.walk(_agent_ast()):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            value = node.func.value
+            if isinstance(value, ast.Name):
+                targets.add(f"{value.id}.{node.func.attr}")
+    return targets
+
+
+def _agent_code_string_literals() -> set[str]:
+    """Every string literal that is code, excluding docstrings."""
+    import ast
+
+    tree = _agent_ast()
+    docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = getattr(node, "body", [])
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                if isinstance(body[0].value.value, str):
+                    docstrings.add(id(body[0].value))
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings
+    }
+
+
 def test_agent_tools_call_the_existing_crm_client_only() -> None:
-    source = inspect.getsource(agent)
-    assert "crm.check_slots" in source
-    assert "crm.book_appointment" in source
-    assert "crm.get_doctors" in source
-    # No parallel HTTP layer, no second base URL, no hardcoded availability.
-    assert "httpx." not in source, "the agent must go through crm.py, not raw HTTP"
-    assert "vercel.app" not in source
-    assert "railway.app" not in source
+    targets = _agent_call_targets()
+    assert "crm.check_slots" in targets
+    assert "crm.book_appointment" in targets
+    assert "crm.get_doctors" in targets
+    # No parallel HTTP layer: the agent must go through crm.py.
+    assert not any(t.startswith("httpx.") for t in targets), f"raw HTTP in agent: {sorted(targets)}"
 
 
 def test_agent_has_no_hardcoded_slots_or_doctors() -> None:
     """Availability and doctors must originate from CRM responses only."""
-    source = inspect.getsource(agent)
-    import re
+    import re as _re
 
-    # A bare HH:MM literal in agent.py would be a fabricated slot. The only
-    # allowed time-like literals are the tool-schema examples inside docstrings
-    # for the model, which are explicitly marked below.
-    time_literals = set(re.findall(r"\"(\d{1,2}:\d{2})\"", source))
+    literals = _agent_code_string_literals()
+    # The system prompt lives in a module-level constant, so drop the long
+    # model-facing texts and check the short operational literals.
+    operational = {value for value in literals if len(value) <= 80}
+
+    time_literals = {v for v in operational if _re.fullmatch(r"\d{1,2}:\d{2}", v)}
     assert time_literals <= {"14:00", "0:00"}, f"unexpected hardcoded time literals: {time_literals}"
-    assert "zhuma_md" not in source, "no doctor login may be hardcoded in the agent"
+
+    base_urls = {v for v in operational if "vercel.app" in v or "railway.app" in v}
+    assert not base_urls, f"agent must not carry its own base URL: {base_urls}"
+
+    assert not any("zhuma_md" in v for v in literals), "no doctor login may be hardcoded in the agent"
 
 
 def test_agent_booking_requires_a_crm_offered_slot() -> None:

@@ -827,3 +827,192 @@ def test_wide_search_stops_early_instead_of_hammering_crm(monkeypatch: pytest.Mo
     assert result["ok"] is True
     assert len(stub.check_slots_calls) < 21, "wide search must stop once enough slots are collected"
     assert result["slot_count"] <= agent._MAX_SLOTS_IN_TOOL_RESULT
+
+
+# ---------------------------------------------------------------------------
+# Review findings: facts, age limits, strict CRM success, telemetry privacy
+# ---------------------------------------------------------------------------
+
+
+def test_gpt_collected_facts_are_persisted_for_the_booking_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A brand-new patient must become bookable through the agent alone.
+
+    Without record_patient_facts the complaint/age/contraindication answers
+    existed only as chat history, so booking_gate_status saw an empty session
+    and the age limits had nothing to check.
+    """
+    stub = install_crm(monkeypatch, CRMStub())
+    install_openai(
+        monkeypatch,
+        [
+            assistant_tool_call(
+                "record_patient_facts",
+                {
+                    "complaint": "болит поясница",
+                    "age": 34,
+                    "contraindications_clear": True,
+                    "contraindications_note": "ничего нет",
+                    "patient_name": "Асель",
+                },
+                call_id="f1",
+            ),
+            assistant_tool_call("get_available_slots", {"date_from": DATE}, call_id="s1"),
+            assistant_tool_call(
+                "book_appointment",
+                {"patient_name": "Асель", "doctor_login": DOCTOR_LOGIN, "date": DATE, "time_start": "14:00"},
+                call_id="b1",
+            ),
+            assistant_text(f"Записала на {DATE} в 14:00 🌿"),
+        ],
+    )
+    chat_id = "agent_facts_persisted"
+    state.reset_session(chat_id)
+    session = state.get_session(chat_id)
+    session.update({"ai_lead_started": True, "gate_reason": "active_ai_lead", "phone": PHONE, "step": "complaint"})
+    state.save_session(chat_id, session)
+
+    answer = run_turn(chat_id, f"болит поясница, мне 34, противопоказаний нет, хочу {DATE} в 14:00, я Асель")
+
+    saved = state.get_session(chat_id)
+    assert saved["complaint"] == "болит поясница"
+    assert saved["age"] == 34
+    assert saved["contraindications_ok"] is True
+    assert len(stub.book_calls) == 1
+    assert answer.strip()
+
+
+@pytest.mark.parametrize("age", [12, 81])
+def test_age_outside_clinic_limits_blocks_the_crm_booking(
+    monkeypatch: pytest.MonkeyPatch, age: int
+) -> None:
+    """Clinic age limits are enforced in Python, not only in the prompt."""
+    stub = install_crm(monkeypatch, CRMStub())
+    install_openai(
+        monkeypatch,
+        [
+            assistant_tool_call("get_available_slots", {"date_from": DATE}),
+            assistant_tool_call(
+                "book_appointment",
+                {"patient_name": "Асель", "doctor_login": DOCTOR_LOGIN, "date": DATE, "time_start": "14:00"},
+                call_id="b1",
+            ),
+            assistant_text("Передам администратору."),
+        ],
+    )
+    chat_id = f"agent_age_{age}"
+    ready_session(chat_id, age=age)
+
+    answer = run_turn(chat_id, f"запишите на {DATE} в 14:00")
+
+    assert stub.book_calls == [], f"age {age} is outside clinic limits and must never reach the CRM"
+    assert answer.strip()
+
+
+def test_booking_without_a_recorded_age_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = install_crm(monkeypatch, CRMStub())
+    install_openai(
+        monkeypatch,
+        [
+            assistant_tool_call("get_available_slots", {"date_from": DATE}),
+            assistant_tool_call(
+                "book_appointment",
+                {"patient_name": "Асель", "doctor_login": DOCTOR_LOGIN, "date": DATE, "time_start": "14:00"},
+                call_id="b1",
+            ),
+            assistant_text("Подскажите, пожалуйста, возраст пациента."),
+        ],
+    )
+    chat_id = "agent_missing_age"
+    ready_session(chat_id, age=0)
+
+    answer = run_turn(chat_id, f"запишите на {DATE} в 14:00")
+
+    assert stub.book_calls == [], "an unknown age must not reach the CRM booking endpoint"
+    assert answer.strip()
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ({"ok": True, "id": 1}, True),
+        ({"success": True}, True),
+        ({"id": 42}, True),
+        ({"appointmentId": "a-1"}, True),
+        ({}, False),
+        ({"message": "queued"}, False),
+        ({"ok": False}, False),
+        ({"success": False, "id": 5}, False),
+        ({"error": "slot_taken"}, False),
+        ({"status": "failed"}, False),
+        (None, False),
+        ("ok", False),
+    ],
+)
+def test_crm_success_needs_positive_confirmation(response: Any, expected: bool) -> None:
+    """An unconfirmed response must never be read as a created appointment."""
+    assert agent._crm_booking_succeeded(response) is expected
+
+
+def test_unconfirmed_crm_response_is_not_a_booking(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = install_crm(monkeypatch, CRMStub(book_response={"message": "queued"}))
+    install_openai(
+        monkeypatch,
+        [
+            assistant_tool_call("get_available_slots", {"date_from": DATE}),
+            assistant_tool_call(
+                "book_appointment",
+                {"patient_name": "Асель", "doctor_login": DOCTOR_LOGIN, "date": DATE, "time_start": "14:00"},
+                call_id="b1",
+            ),
+            assistant_text("Уточню статус записи у администратора."),
+        ],
+    )
+    chat_id = "agent_unconfirmed"
+    ready_session(chat_id)
+
+    answer = run_turn(chat_id, f"{DATE} 14:00, Асель")
+
+    assert len(stub.book_calls) == 1
+    assert state.get_session(chat_id).get("booking_confirmed") is not True
+    assert "записан" not in answer.lower()
+
+
+def test_telemetry_never_records_free_text_from_the_model() -> None:
+    """Escalation reasons and names are patient data; only shape is logged."""
+    safe = agent._safe_args(
+        {
+            "patient_name": "Гульнара Сериковна",
+            "patient_relation": "мама",
+            "complaint": "болит поясница",
+            "reason": "пациентка просит перезвонить на 87011234567",
+            "date_from": "2026-09-01",
+            "days_ahead": 3,
+        }
+    )
+
+    assert safe["patient_name"] is True
+    assert safe["patient_relation"] is True
+    assert safe["complaint"] is True
+    assert safe["reason"] is True
+    # Structured values stay — they are what makes the telemetry useful.
+    assert safe["date_from"] == "2026-09-01"
+    assert safe["days_ahead"] == 3
+
+
+def test_escalation_reason_is_reduced_to_a_category() -> None:
+    assert agent._escalation_category("пациент просит живого оператора") == "human_requested"
+    assert agent._escalation_category("сомнение по противопоказаниям") == "medical_doubt"
+    assert agent._escalation_category("хочет возврат денег") == "refund_or_claim"
+    assert agent._escalation_category("нечто необычное") == "other"
+
+
+def test_relative_dates_use_the_clinic_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bot works across UTC midnight, so 'today' must be Astana's."""
+    import schedule
+
+    context = agent.build_agent_context(session={}, phone=PHONE)
+
+    assert context["today"] == schedule.astana_now().date().isoformat()
+    assert context["tomorrow"] > context["today"]

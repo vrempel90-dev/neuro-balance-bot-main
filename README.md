@@ -6,7 +6,7 @@ Production-бот Neuro Balance с отдельным OpenAI Dialog Brain и ж�
 
 GPT ведёт разговор, Python исполняет, CRM — единственный источник истины.
 
-```
+```text
 Wazzup inbound -> main.py (webhook, dedup, гейты)
                -> dialog.handle_message
                -> agent.py  ── GPT-first tool loop ──┐

@@ -90,6 +90,12 @@ _SLOT_CONFLICT_MARKERS = (
     "недоступ",
 )
 
+# Clinic age limits. These are a hard medical rule, so they are enforced in
+# Python before any CRM booking — the model is told about them too, but an
+# instruction is not a guarantee.
+MIN_PATIENT_AGE = 16
+MAX_PATIENT_AGE = 75
+
 _MAX_SLOTS_IN_TOOL_RESULT = 12
 _MAX_DAYS_AHEAD = 21
 
@@ -329,6 +335,40 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "record_patient_facts",
+            "description": (
+                "Сохранить факты, которые сообщил пациент: жалобу, возраст, "
+                "отсутствие противопоказаний, имя, за кого запись. Вызывай сразу, "
+                "как только пациент их назвал — до записи. Без сохранённых жалобы, "
+                "возраста и подтверждённого отсутствия противопоказаний "
+                "book_appointment будет отклонён."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "complaint": {"type": "string", "description": "Жалоба ПАЦИЕНТА своими словами."},
+                    "age": {"type": "integer", "description": "Возраст ПАЦИЕНТА полными годами."},
+                    "contraindications_clear": {
+                        "type": "boolean",
+                        "description": "true только если пациент явно подтвердил, что противопоказаний из чек-листа нет.",
+                    },
+                    "contraindications_note": {
+                        "type": "string",
+                        "description": "Дословно то, что пациент сказал про противопоказания.",
+                    },
+                    "patient_name": {"type": "string", "description": "Имя ПАЦИЕНТА."},
+                    "patient_relation": {
+                        "type": "string",
+                        "description": "Кем пациент приходится отправителю (мама, сын, муж...). Пусто, если пациент — сам отправитель.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_clinic_info",
             "description": "Получить утверждённый клиникой текст по теме (цена, адрес, график, МРТ, методы, рассрочка и т.п.).",
             "parameters": {
@@ -444,9 +484,24 @@ def agent_system_prompt() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _clinic_today() -> date_cls:
+    """Today in the clinic's timezone, not the Railway host's.
+
+    The bot works the 20:00-08:00 Astana window, which straddles UTC midnight,
+    so a host-local date would hand the model yesterday's "today" for part of
+    every shift — and "сегодня"/"завтра" would resolve to the wrong CRM date.
+    """
+    try:
+        from schedule import astana_now
+
+        return astana_now().date()
+    except Exception:
+        return datetime.now().date()
+
+
 def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls | None = None) -> dict[str, Any]:
     """Compact, structured facts so GPT never re-asks what it already knows."""
-    today = today or datetime.now().date()
+    today = today or _clinic_today()
     facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
     offered = session.get("crm_offered_slots") if isinstance(session.get("crm_offered_slots"), dict) else {}
     return {
@@ -660,19 +715,26 @@ async def _tool_get_available_slots(
 
 
 def _crm_booking_succeeded(response: Any) -> bool:
-    """A booking counts as real only when the CRM response confirms it."""
+    """A booking counts as real only when the CRM response *confirms* it.
+
+    Positive confirmation is required: an explicit success flag, or an
+    appointment identifier. Anything else — an empty ``{}``, an informational
+    ``{"message": "queued"}``, a non-dict — is treated as "not booked".
+    Assuming success in the absence of evidence is exactly how a patient ends
+    up with a confirmation for an appointment the CRM never created.
+    """
     if not isinstance(response, dict):
+        return False
+    if str(response.get("error") or "").strip():
+        return False
+    if str(response.get("status") or "").strip().lower() in {
+        "error", "failed", "rejected", "cancelled", "canceled",
+    }:
         return False
     for key in ("ok", "success", "booked", "created"):
         if key in response:
-            if response.get(key) is False:
-                return False
-    if str(response.get("error") or "").strip():
-        return False
-    status = str(response.get("status") or "").strip().lower()
-    if status in {"error", "failed", "rejected", "cancelled", "canceled"}:
-        return False
-    return True
+            return response.get(key) is True
+    return any(str(response.get(key) or "").strip() for key in ("id", "appointmentId", "bookingId"))
 
 
 def _looks_like_slot_conflict(text: str) -> bool:
@@ -697,7 +759,7 @@ async def _tool_book_appointment(
             "date": date,
             "time_start": time_start,
             "has_patient_name": bool(patient_name),
-            "patient_relation": relation,
+            "booking_for_relative": bool(relation),
         },
     )
 
@@ -775,6 +837,30 @@ async def _tool_book_appointment(
         bot_tools.record_chief_complaint(session, str(session.get("complaint") or ""), is_in_profile=True)
     if session.get("contraindications_ok") is True and not session.get("contraindications_verdict"):
         bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, str(session.get("contraindications_raw") or "нет"))
+    age_block = _age_block_reason(session.get("age"))
+    if age_block:
+        _log(chat_id, "agent_booking_blocked_by_age", {"reason": age_block})
+        return {
+            "ok": False,
+            "booking_success": False,
+            "error": f"age_{age_block}",
+            "message": (
+                f"Возраст пациента вне правил клиники ({MIN_PATIENT_AGE}–{MAX_PATIENT_AGE} лет). "
+                "Запись невозможна — вызови escalate_to_operator и объясни это пациенту."
+            ),
+        }
+    if not session.get("age"):
+        _log(chat_id, "agent_booking_blocked_missing_age", {})
+        return {
+            "ok": False,
+            "booking_success": False,
+            "error": "missing_age",
+            "message": (
+                "Возраст пациента не сохранён. Спроси его и сохрани через "
+                "record_patient_facts — без возраста запись невозможна."
+            ),
+        }
+
     gate_ok, gate_reason = bot_tools.booking_gate_status(session)
     if not gate_ok:
         _log(chat_id, "agent_booking_blocked_by_gate", {"gate_reason": gate_reason})
@@ -948,6 +1034,100 @@ def _booking_notes(session: dict[str, Any], relation: str) -> str:
     return "; ".join(parts)
 
 
+def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+    """Persist what the patient told GPT into the structured session state.
+
+    Without this the GPT-first path had the complaint/age/contraindication
+    answers only as chat history, so ``booking_gate_status`` saw an empty
+    session and the deterministic age limits had nothing to check. Facts that
+    gate a booking must live in state, not only in the transcript.
+    """
+    stored: list[str] = []
+
+    complaint = str(args.get("complaint") or "").strip()
+    if complaint:
+        session["complaint"] = complaint
+        bot_tools.record_chief_complaint(session, complaint, is_in_profile=True)
+        stored.append("complaint")
+
+    age_value = args.get("age")
+    age: int | None = None
+    if age_value is not None:
+        try:
+            age = int(age_value)
+        except (TypeError, ValueError):
+            age = None
+    if age is not None and 0 < age < 130:
+        session["age"] = age
+        stored.append("age")
+
+    note = str(args.get("contraindications_note") or "").strip()
+    if args.get("contraindications_clear") is True:
+        session["contraindications_raw"] = note or str(session.get("contraindications_raw") or "нет")
+        bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, session["contraindications_raw"])
+        stored.append("contraindications_clear")
+    elif args.get("contraindications_clear") is False:
+        session["contraindications_ok"] = False
+        session["contraindications_verdict"] = "need_details"
+        if note:
+            session["contraindications_raw"] = note
+        stored.append("contraindications_present")
+
+    patient_name = str(args.get("patient_name") or "").strip()
+    if patient_name:
+        session["patient_name"] = patient_name
+        stored.append("patient_name")
+
+    relation = str(args.get("patient_relation") or "").strip()
+    if relation:
+        session["patient_relation"] = relation
+        stored.append("patient_relation")
+
+    facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
+    for key in ("complaint", "age", "patient_name", "patient_relation"):
+        if session.get(key):
+            facts[key] = session.get(key)
+    session["known_user_facts"] = facts
+
+    # Report the age verdict back so the model can escalate instead of trying
+    # to book a patient the clinic cannot treat.
+    age_block = _age_block_reason(session.get("age"))
+
+    _log(
+        chat_id,
+        "agent_facts_recorded",
+        {"stored": stored, "has_age": session.get("age") is not None, "age_block": age_block},
+    )
+
+    return {
+        "ok": True,
+        "stored": stored,
+        "booking_gate": dict(zip(("allowed", "reason"), bot_tools.booking_gate_status(session))),
+        "age_outside_clinic_limits": bool(age_block),
+        "message": (
+            f"Возраст пациента вне правил клиники ({MIN_PATIENT_AGE}–{MAX_PATIENT_AGE} лет). "
+            "Записывать нельзя — вызови escalate_to_operator."
+            if age_block
+            else "Факты сохранены."
+        ),
+    }
+
+
+def _age_block_reason(age: Any) -> str:
+    """Deterministic clinic age rule, applied regardless of what GPT decided."""
+    try:
+        value = int(age)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    if value < MIN_PATIENT_AGE:
+        return "under_min_age"
+    if value > MAX_PATIENT_AGE:
+        return "over_max_age"
+    return ""
+
+
 def _tool_get_clinic_info(chat_id: str, session: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     topic = str(args.get("topic") or "").strip()
     text = bot_tools.get_clinic_info(session, topic)
@@ -957,11 +1137,36 @@ def _tool_get_clinic_info(chat_id: str, session: dict[str, Any], args: dict[str,
     return {"ok": True, "topic": topic, "text": text}
 
 
+_ESCALATION_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("human_requested", ("оператор", "администратор", "человек", "живой", "operator", "human")),
+    ("medical_doubt", ("противопоказ", "врач", "медицин", "диагноз", "снимок", "мрт")),
+    ("refund_or_claim", ("возврат", "жалоб", "претенз", "рассрочк", "деньг")),
+    ("booking_failed", ("crm", "запис", "слот", "ошибк", "booking")),
+    ("age_limit", ("возраст", "лет", "age")),
+)
+
+
+def _escalation_category(reason: str) -> str:
+    """Map a free-text escalation reason onto a fixed, log-safe category."""
+    low = str(reason or "").lower()
+    for category, markers in _ESCALATION_CATEGORIES:
+        if any(marker in low for marker in markers):
+            return category
+    return "other"
+
+
 def _tool_escalate(chat_id: str, session: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     reason = str(args.get("reason") or "operator_requested").strip()
     bot_tools.escalate_to_human(session, reason)
     session["manual_takeover"] = True
-    _log(chat_id, "agent_escalated_to_operator", {"reason": reason[:200]})
+    # The reason is model-written text derived from the patient's message and
+    # may contain personal data, so telemetry records a coarse category and the
+    # length instead of the text itself.
+    _log(
+        chat_id,
+        "agent_escalated_to_operator",
+        {"category": _escalation_category(reason), "reason_length": len(reason)},
+    )
     return {
         "ok": True,
         "escalated": True,
@@ -980,6 +1185,8 @@ async def execute_tool(
         return await _tool_get_available_slots(chat_id, session, args)
     if name == "book_appointment":
         return await _tool_book_appointment(chat_id, session, phone, args)
+    if name == "record_patient_facts":
+        return _tool_record_patient_facts(chat_id, session, args)
     if name == "get_clinic_info":
         return _tool_get_clinic_info(chat_id, session, args)
     if name == "escalate_to_operator":
@@ -1234,14 +1441,33 @@ async def run_agent_turn(
     return result
 
 
+# Tool arguments that carry free text written by (or about) the patient. They
+# are never logged verbatim: only whether they were present.
+_FREE_TEXT_TOOL_ARGS = {
+    "patient_name",
+    "patient_relation",
+    "complaint",
+    "contraindications_note",
+    "reason",
+}
+
+
 def _safe_args(args: dict[str, Any]) -> dict[str, Any]:
-    """Tool arguments for telemetry with personal data kept out of logs."""
-    safe = {}
+    """Tool arguments for telemetry with personal data kept out of logs.
+
+    Everything the model writes originates from a patient message, so any free
+    text field may contain a name, a complaint or other personal data. Those
+    are reduced to a presence flag; structured values (dates, logins, counts)
+    are safe to keep because they are what makes the telemetry useful.
+    """
+    safe: dict[str, Any] = {}
     for key, value in args.items():
-        if key in {"patient_name"}:
+        if key in _FREE_TEXT_TOOL_ARGS:
             safe[key] = bool(value)
-        else:
+        elif isinstance(value, (str, int, float, bool)) or value is None:
             safe[key] = value
+        else:
+            safe[key] = type(value).__name__
     return safe
 
 
