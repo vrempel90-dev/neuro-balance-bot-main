@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import agent
 import bot_tools
 import crm
 import state
@@ -1431,6 +1432,77 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         session["escalated"] = True
         return _finalize(chat_id, session, reply or _crm_fallback_answer(session))
     return None
+
+
+async def _try_gpt_first_agent(chat_id: str, phone: str, session: dict[str, Any], text: str) -> str | None:
+    """Run the turn as a GPT-driven tool loop; ``None`` = fall back to Python.
+
+    This is the GPT-first entry point. The agent owns understanding, phrasing
+    and step selection; every fact it states about doctors, dates, times or a
+    created booking comes from a real CRM call made inside ``agent.py``.
+
+    Returning ``None`` hands the turn to the legacy deterministic funnel and is
+    reserved for *technical* unavailability (missing OpenAI key, AI disabled,
+    budget exhausted, transport error) — never for "Python disagrees with what
+    GPT understood".
+    """
+    try:
+        result = await agent.run_agent_turn(
+            chat_id=chat_id,
+            phone=phone,
+            session=session,
+            user_text=text,
+            recent_history=_recent_history_for_brain(chat_id, session),
+        )
+    except Exception as exc:  # agent must never break the production pipeline
+        _safe_log(chat_id, "agent_unexpected_error", {"chat_id": chat_id, "error_type": type(exc).__name__, "error": str(exc)[:300]})
+        session["agent_used"] = False
+        session["agent_skip_reason"] = "agent_exception"
+        return None
+
+    session["agent_used"] = bool(result.used)
+    session["agent_skip_reason"] = result.skip_reason
+    session["agent_outcome"] = result.outcome
+    session["agent_tool_calls"] = [call["tool"] for call in result.tool_calls]
+    session["agent_iterations"] = result.iterations
+
+    if not result.used:
+        _safe_log(
+            chat_id,
+            "agent_fallback_to_python",
+            {"chat_id": chat_id, "reason": result.skip_reason, "step": session.get("step") or "start"},
+        )
+        return None
+
+    # The agent already performed any CRM work for this turn. Mark the OpenAI
+    # debug fields the rest of the pipeline reports on.
+    session["openai_used"] = True
+    session["openai_brain_used"] = True
+    session["openai_skip_reason"] = ""
+    session["openai_brain_skip_reason"] = ""
+    session["answer_source"] = "gpt_agent"
+    # The agent writes its own text; the humanizer must not rewrite it.
+    session["skip_humanize"] = True
+
+    if result.booked:
+        booking = result.booking or {}
+        session["booking_confirmed"] = True
+        session["created_by_ai"] = True
+        session["post_booking_support_active"] = True
+        session["post_booking_support_until"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        _safe_log(
+            chat_id,
+            "agent_booking_confirmed",
+            {
+                "chat_id": chat_id,
+                "appointment_id": booking.get("appointment_id") or "",
+                "doctor_login": booking.get("doctor_login") or "",
+                "date": booking.get("date") or "",
+                "time_start": booking.get("time_start") or "",
+            },
+        )
+
+    return _finalize(chat_id, session, result.reply)
 
 
 def _multi_entity_safe_date_text(text: str) -> str:
@@ -6675,6 +6747,28 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     current_step = session.get("step") or "start"
     if (current_step in ("done", "booked") or session.get("booked")) and _is_thanks_or_ok(text):
         return _no_reply(chat_id, session, "thanks/done")
+
+    # ============================================================
+    # GPT-FIRST AGENT LOOP — the primary conversational path.
+    # ============================================================
+    # Everything above this point is technical admission control: CRM patient
+    # state, first touch, manual takeover, refunds, booked-session silence.
+    # Everything below is the legacy deterministic funnel.
+    #
+    # From here on GPT owns the conversation. It understands the message, picks
+    # the next dialog step and calls real CRM tools (availability, doctors,
+    # booking) through agent.py. Python no longer decides what the patient
+    # meant — it executes tools, validates CRM responses and enforces
+    # idempotency.
+    #
+    # The legacy funnel below is kept as the *technical* fallback: it runs only
+    # when the agent cannot run at all (no OpenAI key, AI disabled, budget
+    # exhausted, transport error). That keeps a production OpenAI outage from
+    # stopping bookings, without letting Python act as a second conversational
+    # brain while GPT is available.
+    agent_answer = await _try_gpt_first_agent(chat_id, phone, session, text)
+    if agent_answer is not None:
+        return agent_answer
 
     # explicit_language_switch_guard:
     # Если клиент просит отвечать на другом языке — переключаем язык и подтверждаем.

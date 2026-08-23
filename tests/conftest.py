@@ -49,14 +49,47 @@ def _new_leads_only_test_default(monkeypatch: pytest.MonkeyPatch, request: pytes
     # dedicated production regression file exercises NEW_LEADS_ONLY=true.
     enabled = request.node.path.name == "test_crm_patient_state_regression.py"
     monkeypatch.setenv("NEW_LEADS_ONLY", "true" if enabled else "false")
+    _reload_settings()
+    yield
+    _reload_settings()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_openai_calls(monkeypatch: pytest.MonkeyPatch):
+    """The suite must never reach the real OpenAI API.
+
+    ``OPENAI_API_KEY`` is empty by default so the GPT-first agent loop skips
+    itself and tests exercise the deterministic path. Tests that do cover the
+    agent loop set the key themselves via monkeypatch *and* stub the client,
+    so they never open a socket either. Without this guard one module setting
+    the key at import time would silently send every other module's turns to
+    the network — hanging the suite and burning budget.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    _reload_settings()
+    yield
+    _reload_settings()
+
+
+def _reload_settings() -> None:
+    """Drop the cached Settings and make sure the active SQLite file has tables.
+
+    Test modules each point ``SQLITE_PATH`` at their own temp file at import
+    time, while ``get_settings`` is an ``lru_cache``. Clearing that cache can
+    therefore switch ``state`` onto a database whose ``init_db()`` ran against
+    a different path, which surfaces as "no such table: sessions". Re-running
+    the idempotent ``init_db()`` after every cache clear keeps the schema and
+    the active path in sync no matter which subset of tests is executed.
+    """
     try:
         from config import get_settings
+
         get_settings.cache_clear()
     except Exception:
-        pass
-    yield
+        return
     try:
-        from config import get_settings
-        get_settings.cache_clear()
+        import state
+
+        state.init_db()
     except Exception:
         pass
