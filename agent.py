@@ -66,6 +66,9 @@ MAX_TOOL_ITERATIONS = 4
 # an unbounded dict would grow the persisted session on every availability call.
 _MAX_OFFERED_SLOTS = 60
 
+# Cap on tool calls executed from a single model response (see the loop below).
+_MAX_TOOL_CALLS_PER_ROUND = 3
+
 # Terminal outcomes of a booking conversation. Silence is deliberately not one.
 OUTCOME_CONTINUE = "continue"
 OUTCOME_SUCCESS = "success"
@@ -567,6 +570,9 @@ async def _tool_get_available_slots(
     except Exception:
         days_ahead = 1
     days_ahead = max(1, min(days_ahead, _MAX_DAYS_AHEAD))
+    # Each day is one sequential CRM request; stop early once there is clearly
+    # enough to offer, so a wide search cannot outlive the webhook turn.
+    enough_slots = _MAX_SLOTS_IN_TOOL_RESULT
 
     doctor_login = str(args.get("doctor_login") or "").strip() or None
     time_preference = str(args.get("time_preference") or "").strip()
@@ -586,6 +592,8 @@ async def _tool_get_available_slots(
             )
             break
         collected.extend(_normalize_crm_slots(data, fallback_date=day))
+        if len(collected) >= enough_slots:
+            break
 
     if http_error and not collected:
         return {
@@ -595,6 +603,7 @@ async def _tool_get_available_slots(
             "slots": [],
         }
 
+    partial = bool(http_error and collected)
     filtered = _filter_by_time_preference(collected, time_preference) if time_preference else collected
     dropped_by_preference = bool(time_preference and collected and not filtered)
     slots = (filtered or collected)[:_MAX_SLOTS_IN_TOOL_RESULT]
@@ -641,6 +650,7 @@ async def _tool_get_available_slots(
         "slots": slots,
         "doctors": doctors,
         "time_preference_had_no_slots": dropped_by_preference,
+        "crm_partially_unavailable": partial,
         "note": (
             "Показывай пациенту только эти варианты. Другие даты/время называть нельзя."
             if slots
@@ -698,8 +708,15 @@ async def _tool_book_appointment(
         return {"ok": False, "booking_success": False, "error": "missing_slot_fields",
                 "message": "Нужны doctor_login, date и time_start ровно из результата get_available_slots."}
 
+    normalized_phone = crm.normalize_phone(phone or session.get("phone") or "")
+    if not normalized_phone:
+        return {"ok": False, "booking_success": False, "error": "missing_phone",
+                "message": "Нет номера телефона пациента для записи."}
+
     # --- idempotency: one confirmed booking per (doctor, date, time, phone) ---
-    idempotency_key = _slot_key(date, time_start, doctor_login) + "|" + crm.normalize_phone(phone)
+    # The phone is validated first: an empty one would make this key collide
+    # across conversations.
+    idempotency_key = _slot_key(date, time_start, doctor_login) + "|" + normalized_phone
     if session.get("booking_confirmed") and session.get("booking_idempotency_key") == idempotency_key:
         _log(chat_id, "agent_booking_duplicate_prevented", {"doctor_login": doctor_login, "date": date, "time_start": time_start})
         return {
@@ -771,11 +788,6 @@ async def _tool_book_appointment(
                 "contra_refuse": "У пациента есть противопоказание — запись невозможна, нужна эскалация.",
             }.get(gate_reason, "Обязательные шаги записи не пройдены."),
         }
-
-    normalized_phone = crm.normalize_phone(phone or session.get("phone") or "")
-    if not normalized_phone:
-        return {"ok": False, "booking_success": False, "error": "missing_phone",
-                "message": "Нет номера телефона пациента для записи."}
 
     if relation:
         session["patient_relation"] = relation
@@ -1057,6 +1069,9 @@ async def run_agent_turn(
     messages.append({"role": "user", "content": str(user_text)[:2000]})
 
     result = AgentResult(used=True)
+    # Per-turn state: a stale value from a previous turn would misclassify this
+    # turn's outcome (e.g. as NO_SLOTS when no availability call happened).
+    session.pop("crm_availability_empty", None)
     _log(
         chat_id,
         "agent_turn_started",
@@ -1070,7 +1085,8 @@ async def run_agent_turn(
         return AgentResult(used=False, skip_reason="openai_client_error", error=str(exc)[:200])
 
     iterations = 0
-    while iterations <= MAX_TOOL_ITERATIONS:
+    rounds = 0
+    while True:
         try:
             response = await client.chat.completions.create(
                 model=model,
@@ -1106,16 +1122,27 @@ async def run_agent_turn(
             result.iterations = iterations
             break
 
-        if iterations >= MAX_TOOL_ITERATIONS:
+        if rounds >= MAX_TOOL_ITERATIONS:
             _log(
                 chat_id,
                 "agent_tool_iteration_limit",
-                {"iterations": iterations, "tool_calls": [tc.function.name for tc in tool_calls]},
+                {"iterations": iterations, "rounds": rounds, "tool_calls": [tc.function.name for tc in tool_calls]},
             )
             result.reply = content
             result.iterations = iterations
             result.error = "tool_iteration_limit"
             break
+
+        rounds += 1
+        # The budget counts round-trips, but a single response may still carry
+        # several tool calls. Cap them too, otherwise one confused response
+        # could execute an unbounded number of CRM requests inside one round.
+        # Every call still gets a tool message: the OpenAI protocol requires a
+        # reply for each tool_call_id in the assistant message.
+        executable = tool_calls[:_MAX_TOOL_CALLS_PER_ROUND]
+        refused = tool_calls[_MAX_TOOL_CALLS_PER_ROUND:]
+        if refused:
+            _log(chat_id, "agent_tool_calls_truncated", {"requested": len(tool_calls), "executed": len(executable)})
 
         messages.append(
             {
@@ -1132,7 +1159,20 @@ async def run_agent_turn(
             }
         )
 
-        for call in tool_calls:
+        for call in refused:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(
+                        {"ok": False, "error": "too_many_tool_calls",
+                         "message": "Слишком много инструментов за один раз. Вызови их по одному."},
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+
+        for call in executable:
             iterations += 1
             name = call.function.name
             try:

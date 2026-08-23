@@ -735,3 +735,95 @@ def test_escalation_tool_delivers_a_message(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert answer.strip(), "escalation is a terminal state that must still answer the patient"
     assert state.get_session(chat_id)["agent_outcome"] == agent.OUTCOME_OPERATOR_ESCALATION
+
+
+# ---------------------------------------------------------------------------
+# Hardening found during self-review
+# ---------------------------------------------------------------------------
+
+
+def test_one_response_with_many_tool_calls_cannot_bypass_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single response carrying N tool calls must not run N CRM requests.
+
+    The budget counts round-trips, so a per-round cap is also needed: without
+    it one confused response could execute an unbounded number of CRM calls
+    inside a single "iteration".
+    """
+    stub = install_crm(monkeypatch, CRMStub())
+    many = agent._MAX_TOOL_CALLS_PER_ROUND + 5
+    message = assistant_tool_call("get_available_slots", {"date_from": DATE}, call_id="c0")
+    message.tool_calls = [
+        __import__("fake_openai").FakeToolCall(f"c{i}", "get_available_slots", {"date_from": DATE})
+        for i in range(many)
+    ]
+    install_openai(monkeypatch, [message, assistant_text("Свободно 09:20, 14:00 и 15:40.")])
+    chat_id = "agent_many_calls"
+    ready_session(chat_id)
+
+    answer = run_turn(chat_id, "когда свободно?")
+
+    assert len(stub.check_slots_calls) <= agent._MAX_TOOL_CALLS_PER_ROUND
+    assert answer.strip()
+
+
+def test_stale_no_slots_state_does_not_leak_into_the_next_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_crm(monkeypatch, CRMStub())
+    install_openai(monkeypatch, [assistant_text("Здравствуйте 🌿 Чем могу помочь?")])
+    chat_id = "agent_stale_outcome"
+    ready_session(chat_id, crm_availability_empty=True)
+
+    run_turn(chat_id, "здравствуйте")
+
+    session = state.get_session(chat_id)
+    assert session["agent_outcome"] != agent.OUTCOME_NO_SLOTS, (
+        "a previous turn's empty-availability flag must not classify this turn"
+    )
+
+
+def test_booking_without_a_phone_is_refused_before_crm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty phone would also make the idempotency key collide."""
+    stub = install_crm(monkeypatch, CRMStub())
+    session: dict[str, Any] = {
+        "complaint": "спина",
+        "complaint_gate": "COMPLAINT_OK",
+        "contraindications_ok": True,
+        "contraindications_verdict": "proceed",
+    }
+    agent._remember_offered_slots(
+        session,
+        [{"doctor_login": DOCTOR_LOGIN, "doctor_name": DOCTOR_NAME, "date": DATE, "time_start": "14:00"}],
+    )
+    session["crm_known_doctors"] = {DOCTOR_LOGIN: DOCTOR_NAME}
+
+    result = asyncio.run(
+        agent._tool_book_appointment(
+            "agent_no_phone",
+            session,
+            "",
+            {"patient_name": "Асель", "doctor_login": DOCTOR_LOGIN, "date": DATE, "time_start": "14:00"},
+        )
+    )
+
+    assert result["booking_success"] is False
+    assert result["error"] == "missing_phone"
+    assert stub.book_calls == []
+
+
+def test_wide_search_stops_early_instead_of_hammering_crm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 21-day search is 21 sequential CRM calls; it must stop once it has enough."""
+    stub = install_crm(monkeypatch, CRMStub())
+    session: dict[str, Any] = {}
+
+    result = asyncio.run(
+        agent._tool_get_available_slots(
+            "agent_wide", session, {"date_from": DATE, "days_ahead": 21}
+        )
+    )
+
+    assert result["ok"] is True
+    assert len(stub.check_slots_calls) < 21, "wide search must stop once enough slots are collected"
+    assert result["slot_count"] <= agent._MAX_SLOTS_IN_TOOL_RESULT
