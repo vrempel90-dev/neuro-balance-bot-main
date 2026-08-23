@@ -5204,15 +5204,29 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
 
     try:
         booked = await crm.book_appointment(**booking_payload)
+        booking_confirmed = agent._crm_booking_succeeded(booked)
+        explicitly_rejected = agent._crm_booking_explicitly_rejected(booked)
         # Only a confirmed booking closes the claim. Anything the CRM did not
         # confirm keeps it `uncertain`, because that answer is not proof the
         # appointment was never written.
         agent._settle_booking_claim(
             chat_id,
             booking_claim_key,
-            rejected=False,
-            confirmed=agent._crm_booking_succeeded(booked),
+            rejected=explicitly_rejected,
+            confirmed=booking_confirmed,
         )
+        if not booking_confirmed:
+            booking_uncertain = not explicitly_rejected
+            session["booking_confirmed"] = False
+            session["booking_uncertain"] = booking_uncertain
+            session["crm_result"] = "uncertain" if booking_uncertain else "failed"
+            session["manual_takeover"] = True
+            session["ai_muted"] = True
+            session["handoff_reason"] = "crm_booking_unconfirmed"
+            bot_tools.escalate_to_human(session, session["handoff_reason"])
+            return _operator_handoff_text(session)
+
+        session.pop("booking_uncertain", None)
         session["booked"] = True
         session["appointment"] = booked
         session["step"] = "booked"
