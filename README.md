@@ -57,7 +57,7 @@ Wazzup inbound -> main.py (webhook, dedup, гейты)
 - `agent_booking_claim_settle_error`
 - `agent_booking_crm_called`
 - `agent_booking_crm_error`
-- `agent_booking_crm_rejected`
+- `agent_booking_crm_rejected` — поле `explicit_rejection` различает «CRM назвала отказ» (слот можно занимать снова) и «CRM ответила, но не подтвердила» (claim остаётся `uncertain`, повторный POST запрещён)
 - `agent_booking_crm_success`
 - `agent_booking_duplicate_prevented`
 - `agent_booking_rejected_unknown_doctor`

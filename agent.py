@@ -799,6 +799,34 @@ def _crm_booking_succeeded(response: Any) -> bool:
     )
 
 
+def _crm_booking_explicitly_rejected(response: Any) -> bool:
+    """True only when the CRM's own answer says it created nothing.
+
+    Deliberately not the negation of ``_crm_booking_succeeded``. "No proof of
+    success" and "proof of failure" are different states: a bare ``200 {}`` or
+    an informational ``{"message": "queued"}`` could still mean the appointment
+    was written and the body was truncated, proxied or malformed on the way
+    back. Only an answer that names the failure may free the slot claim —
+    everything else stays ``uncertain``, because releasing it would let a
+    retry POST the same slot again and double-book the patient.
+    """
+    if not isinstance(response, dict):
+        return False
+    if str(response.get("error") or "").strip():
+        return True
+    if str(response.get("status") or "").strip().lower() in {
+        "error", "failed", "rejected", "cancelled", "canceled",
+    }:
+        return True
+    crm_keys = response.get(crm.CRM_RESPONSE_KEYS_FIELD)
+    confirmed_by_crm = set(crm_keys) if isinstance(crm_keys, list) else set(response)
+    return any(
+        response.get(key) is False
+        for key in ("ok", "success", "booked", "created")
+        if key in confirmed_by_crm
+    )
+
+
 def _looks_like_slot_conflict(text: str) -> bool:
     low = str(text or "").lower()
     return any(marker in low for marker in _SLOT_CONFLICT_MARKERS)
@@ -1049,11 +1077,32 @@ async def _tool_book_appointment(
 
     if not _crm_booking_succeeded(response):
         conflict = _looks_like_slot_conflict(json.dumps(response, ensure_ascii=False) if isinstance(response, dict) else str(response))
-        _log(chat_id, "agent_booking_crm_rejected", {"slot_conflict": conflict})
+        explicitly_rejected = _crm_booking_explicitly_rejected(response)
+        _log(
+            chat_id,
+            "agent_booking_crm_rejected",
+            {"slot_conflict": conflict, "explicit_rejection": explicitly_rejected},
+        )
         session["crm_result"] = "failed"
         session["booking_confirmed"] = False
-        # The CRM answered and did not confirm: nothing was created.
-        _settle_booking_claim(chat_id, idempotency_key, rejected=True)
+        # A 2xx the CRM did not confirm is NOT proof that it created nothing:
+        # the body may have been truncated, proxied or malformed after the
+        # appointment was already written. Only an answer that names the
+        # failure frees the claim; anything ambiguous keeps it, so a retry
+        # cannot POST the same slot a second time.
+        _settle_booking_claim(chat_id, idempotency_key, rejected=explicitly_rejected)
+        if not explicitly_rejected:
+            session["booking_uncertain"] = True
+            return {
+                "ok": False,
+                "booking_success": False,
+                "error": "crm_unconfirmed",
+                "message": (
+                    "CRM ответила, но не подтвердила запись. Возможно, запись всё же создана, "
+                    "поэтому бронировать этот слот повторно нельзя. Не говори пациенту, что он "
+                    "записан — скажи, что администратор уточнит статус, и вызови escalate_to_operator."
+                ),
+            }
         return {
             "ok": False,
             "booking_success": False,
@@ -1662,7 +1711,7 @@ def _classify_outcome(result: AgentResult, session: dict[str, Any]) -> str:
     booking = result.booking or {}
     if booking.get("error") == "slot_conflict":
         return OUTCOME_SLOT_CONFLICT
-    if booking.get("error") in {"crm_unavailable", "crm_error", "crm_rejected"}:
+    if booking.get("error") in {"crm_unavailable", "crm_error", "crm_rejected", "crm_unconfirmed"}:
         return OUTCOME_TECHNICAL_ERROR
     if session.get("crm_availability_empty") is True:
         return OUTCOME_NO_SLOTS

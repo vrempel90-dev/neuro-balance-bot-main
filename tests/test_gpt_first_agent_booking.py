@@ -1241,6 +1241,130 @@ def test_claim_is_released_only_on_an_unambiguous_rejection(monkeypatch: pytest.
     assert _state.claim_booking("rejected-key", "chat") is True, "a rejected slot may be claimed again"
 
 
+def _claim_key(date: str, time_start: str, doctor_login: str, phone: str) -> str:
+    return agent._slot_key(date, time_start, doctor_login) + "|" + crm.normalize_phone(phone)
+
+
+def test_unconfirmed_crm_answer_keeps_the_claim_and_blocks_a_second_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 2xx without confirmation is not proof that the CRM created nothing.
+
+    The body may have been truncated, proxied or malformed *after* the
+    appointment was written. Releasing the claim on that basis would let the
+    next message POST the same slot again and give the patient two
+    appointments. So the claim stays ``uncertain`` and the second attempt is
+    refused — while the patient still gets an answer, never silence.
+    """
+    import state as _state
+
+    stub = install_crm(monkeypatch, CRMStub(book_response={"message": "queued"}))
+    install_openai(
+        monkeypatch,
+        [
+            assistant_tool_call("get_available_slots", {"date_from": DATE}),
+            assistant_tool_call(
+                "book_appointment",
+                {"patient_name": "Асель", "doctor_login": DOCTOR_LOGIN, "date": DATE, "time_start": "14:00"},
+                call_id="b1",
+            ),
+            assistant_text("Уточню статус записи у администратора и вернусь 🌿"),
+        ],
+    )
+    chat_id = "agent_unconfirmed_claim"
+    ready_session(chat_id)
+
+    first = run_turn(chat_id, f"запишите на {DATE} в 14:00")
+
+    assert len(stub.book_calls) == 1
+    assert state.get_session(chat_id).get("booking_confirmed") is not True
+    assert first.strip(), "an unconfirmed booking must still answer the patient"
+    claim_key = _claim_key(DATE, "14:00", DOCTOR_LOGIN, PHONE)
+    assert _state.booking_claim_status(claim_key) == "uncertain", (
+        "an unconfirmed CRM answer must leave the slot claimed, not free"
+    )
+
+    # A second inbound message tries the very same slot again.
+    install_openai(
+        monkeypatch,
+        [
+            assistant_tool_call(
+                "book_appointment",
+                {"patient_name": "Асель", "doctor_login": DOCTOR_LOGIN, "date": DATE, "time_start": "14:00"},
+                call_id="b2",
+            ),
+            assistant_text("Передаю администратору, он подтвердит запись 🌿"),
+        ],
+    )
+
+    second = run_turn(chat_id, "так я записана?")
+
+    assert len(stub.book_calls) == 1, "the ambiguous first POST must not be repeated"
+    assert state.get_session(chat_id).get("booking_confirmed") is not True
+    assert second.strip()
+
+
+def test_explicit_crm_rejection_frees_the_slot_for_another_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mirror case: when the CRM says no, a retry must stay possible.
+
+    Keeping the claim after an unambiguous rejection would permanently block a
+    slot the CRM never wrote, so the two cases have to be told apart rather
+    than lumped into "not confirmed".
+    """
+    import state as _state
+
+    stub = install_crm(
+        monkeypatch, CRMStub(book_response={"ok": False, "error": "validation failed"})
+    )
+    install_openai(
+        monkeypatch,
+        [
+            assistant_tool_call("get_available_slots", {"date_from": DATE}),
+            assistant_tool_call(
+                "book_appointment",
+                {"patient_name": "Асель", "doctor_login": DOCTOR_LOGIN, "date": DATE, "time_start": "14:00"},
+                call_id="b1",
+            ),
+            assistant_text("Не получилось записать, подберём другое время 🌿"),
+        ],
+    )
+    chat_id = "agent_explicit_rejection"
+    ready_session(chat_id)
+
+    answer = run_turn(chat_id, f"запишите на {DATE} в 14:00")
+
+    assert len(stub.book_calls) == 1
+    assert state.get_session(chat_id).get("booking_confirmed") is not True
+    assert answer.strip()
+    claim_key = _claim_key(DATE, "14:00", DOCTOR_LOGIN, PHONE)
+    assert _state.booking_claim_status(claim_key) == "", (
+        "an explicit CRM rejection creates nothing, so the slot must be claimable again"
+    )
+
+
+@pytest.mark.parametrize(
+    ("response", "explicit"),
+    [
+        ({}, False),
+        ({"message": "queued"}, False),
+        ({"status": "Обрабатывается"}, False),
+        ("not a dict", False),
+        ({"ok": False}, True),
+        ({"error": "slot taken"}, True),
+        ({"status": "rejected"}, True),
+        ({"success": False}, True),
+    ],
+)
+def test_only_a_named_failure_counts_as_an_explicit_rejection(
+    response: Any, explicit: bool
+) -> None:
+    assert agent._crm_booking_explicitly_rejected(response) is explicit
+    # Nothing in this table is ever a confirmed booking.
+    assert agent._crm_booking_succeeded(response) is False
+
+
 def test_budget_is_rechecked_before_every_model_call(monkeypatch: pytest.MonkeyPatch) -> None:
     """One turn can make several calls; the cap must apply to all of them."""
     install_crm(monkeypatch, CRMStub())
