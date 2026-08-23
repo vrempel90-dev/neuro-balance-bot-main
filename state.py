@@ -187,6 +187,13 @@ def init_db() -> None:
                 chat_id TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS booking_claims (
+                claim_key TEXT PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS ai_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 day TEXT NOT NULL,
@@ -448,6 +455,75 @@ def mark_processed_message(message_key: str, chat_id: str) -> None:
             "INSERT OR IGNORE INTO processed_messages(message_key, chat_id, created_at) VALUES (?, ?, ?)",
             (message_key, chat_id, now_iso()),
         )
+
+
+_BOOKING_CLAIMS_DDL = """
+CREATE TABLE IF NOT EXISTS booking_claims (
+    claim_key TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
+
+def claim_booking(claim_key: str, chat_id: str) -> bool:
+    """Atomically reserve one appointment slot before calling the CRM.
+
+    ``claim_message`` only de-duplicates a *repeated delivery of the same
+    message*. Two different messages in the same chat, arriving close together,
+    are handled concurrently: both read ``booking_confirmed=False`` from their
+    own copy of the session and both would POST to the CRM, creating two
+    appointments for one patient. Session state cannot close that window
+    because it is read and written as separate operations.
+
+    A PRIMARY KEY insert is atomic in SQLite, so exactly one caller wins the
+    claim for a given (phone, doctor, date, time).
+
+    Returns True when this caller may proceed to the CRM.
+    """
+    if not claim_key:
+        return True
+    init_db()
+    with _connect() as conn:
+        conn.execute(_BOOKING_CLAIMS_DDL)
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO booking_claims(claim_key, chat_id, status, created_at) VALUES (?, ?, ?, ?)",
+            (claim_key, chat_id, "pending", now_iso()),
+        )
+        return cur.rowcount == 1
+
+
+def release_booking_claim(claim_key: str) -> None:
+    """Release a claim after an *unambiguous* CRM rejection.
+
+    Never call this for a timeout or a connection error: the CRM may have
+    created the appointment anyway, and releasing the claim would let a retry
+    book the same patient twice.
+    """
+    if not claim_key:
+        return
+    with _connect() as conn:
+        conn.execute(_BOOKING_CLAIMS_DDL)
+        conn.execute("DELETE FROM booking_claims WHERE claim_key=?", (claim_key,))
+
+
+def mark_booking_claim(claim_key: str, status: str) -> None:
+    """Record the outcome of a claim (confirmed / uncertain)."""
+    if not claim_key:
+        return
+    with _connect() as conn:
+        conn.execute(_BOOKING_CLAIMS_DDL)
+        conn.execute("UPDATE booking_claims SET status=? WHERE claim_key=?", (str(status), claim_key))
+
+
+def booking_claim_status(claim_key: str) -> str:
+    if not claim_key:
+        return ""
+    with _connect() as conn:
+        conn.execute(_BOOKING_CLAIMS_DDL)
+        row = conn.execute("SELECT status FROM booking_claims WHERE claim_key=?", (claim_key,)).fetchone()
+    return str(row["status"]) if row else ""
 
 
 def append_pending_message(chat_id: str, batch_id: str, content: str) -> None:

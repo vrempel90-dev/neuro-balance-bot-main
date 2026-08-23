@@ -29,6 +29,10 @@ class CRMResponseError(CRMError):
 
 logger = logging.getLogger(__name__)
 
+# Name of the field book_appointment adds listing the keys the CRM actually
+# returned, so a caller can tell a real confirmation from a defaulted one.
+CRM_RESPONSE_KEYS_FIELD = "_crm_response_keys"
+
 
 @lru_cache(maxsize=1)
 def _client() -> httpx.AsyncClient:
@@ -371,6 +375,15 @@ async def book_appointment(
     clear_slots_cache(date)
 
     data = response.json()
+    # Record which keys the CRM itself returned, BEFORE the convenience
+    # defaults below are applied. Without this a bare `200 {}` becomes
+    # {"ok": True, "status": "Записан"} and is indistinguishable from a real
+    # confirmation — a caller would tell the patient they are booked for an
+    # appointment the CRM may never have created. The defaults are kept for
+    # backwards compatibility with existing callers; this field lets a caller
+    # that cares ask what was actually confirmed.
+    data[CRM_RESPONSE_KEYS_FIELD] = sorted(str(k) for k in data) if isinstance(data, dict) else []
+
     data.setdefault("ok", True)
     data.setdefault("status", "Записан")
     data.setdefault("date", date)

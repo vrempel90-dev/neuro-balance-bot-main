@@ -1059,3 +1059,181 @@ def test_relative_dates_use_the_clinic_timezone(monkeypatch: pytest.MonkeyPatch)
     assert context["today"] == "2031-03-07", "relative dates must come from the clinic clock"
     assert context["tomorrow"] == "2031-03-08"
     assert context["today"] != _dt.datetime.now().date().isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Third review round: false confirmation, concurrency, budget, search bounds
+# ---------------------------------------------------------------------------
+
+
+def test_empty_crm_200_is_not_a_confirmed_booking(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bare ``200 {}`` must never be reported as a created appointment.
+
+    crm.book_appointment applies convenience defaults (ok=True,
+    status="Записан") to any 2xx body, so an empty CRM response used to look
+    exactly like a real confirmation.
+    """
+    import httpx as _httpx
+
+    class _EmptyOk:
+        async def handle_async_request(self, request: "_httpx.Request") -> "_httpx.Response":
+            await request.aread()
+            return _httpx.Response(200, json={}, request=request)
+
+    monkeypatch.setattr(crm, "_client", lambda: _httpx.AsyncClient(transport=_EmptyOk()))
+
+    response = asyncio.run(
+        crm.book_appointment(
+            patient_name="Асель",
+            phone=PHONE,
+            doctor_login=DOCTOR_LOGIN,
+            date=DATE,
+            time_start="14:00",
+        )
+    )
+
+    assert response["ok"] is True, "the legacy default is still applied for existing callers"
+    assert response[crm.CRM_RESPONSE_KEYS_FIELD] == [], "no key actually came from the CRM"
+    assert agent._crm_booking_succeeded(response) is False, (
+        "a defaulted ok=True must not be read as a CRM confirmation"
+    )
+
+
+def test_crm_confirmation_is_accepted_when_really_returned(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx as _httpx
+
+    class _RealOk:
+        async def handle_async_request(self, request: "_httpx.Request") -> "_httpx.Response":
+            await request.aread()
+            return _httpx.Response(200, json={"ok": True, "id": 4242}, request=request)
+
+    monkeypatch.setattr(crm, "_client", lambda: _httpx.AsyncClient(transport=_RealOk()))
+
+    response = asyncio.run(
+        crm.book_appointment(
+            patient_name="Асель",
+            phone=PHONE,
+            doctor_login=DOCTOR_LOGIN,
+            date=DATE,
+            time_start="14:00",
+        )
+    )
+
+    assert set(response[crm.CRM_RESPONSE_KEYS_FIELD]) >= {"ok", "id"}
+    assert agent._crm_booking_succeeded(response) is True
+
+
+def test_concurrent_turns_create_only_one_booking(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two different messages in one chat must not create two appointments.
+
+    claim_message only de-duplicates a repeated delivery of the *same* message.
+    Two distinct messages are handled concurrently, and both would read
+    booking_confirmed=False from their own copy of the session.
+    """
+    stub = install_crm(monkeypatch, CRMStub())
+    started = asyncio.Event()
+
+    async def slow_book(**kwargs: Any) -> dict[str, Any]:
+        stub.book_calls.append(kwargs)
+        started.set()
+        await asyncio.sleep(0.05)  # widen the window between check and write
+        return {"ok": True, "id": 9001, crm.CRM_RESPONSE_KEYS_FIELD: ["ok", "id"]}
+
+    monkeypatch.setattr(crm, "book_appointment", slow_book)
+
+    def _session() -> dict[str, Any]:
+        session: dict[str, Any] = {
+            "complaint": "спина",
+            "complaint_gate": "COMPLAINT_OK",
+            "age": 40,
+            "contraindications_ok": True,
+            "contraindications_verdict": "proceed",
+            "crm_known_doctors": {DOCTOR_LOGIN: DOCTOR_NAME},
+        }
+        agent._remember_offered_slots(
+            session,
+            [{"doctor_login": DOCTOR_LOGIN, "doctor_name": DOCTOR_NAME, "date": DATE, "time_start": "14:00"}],
+        )
+        return session
+
+    args = {"patient_name": "Асель", "doctor_login": DOCTOR_LOGIN, "date": DATE, "time_start": "14:00"}
+
+    async def both() -> list[dict[str, Any]]:
+        # Separate session objects: exactly what two concurrent webhook
+        # handlers get, since each loads its own copy from SQLite.
+        return await asyncio.gather(
+            agent._tool_book_appointment("concurrent", _session(), PHONE, dict(args)),
+            agent._tool_book_appointment("concurrent", _session(), PHONE, dict(args)),
+        )
+
+    results = asyncio.run(both())
+
+    assert len(stub.book_calls) == 1, "concurrent turns must produce exactly one CRM booking"
+    assert sum(1 for r in results if r.get("booking_success")) == 1
+    refused = [r for r in results if not r.get("booking_success")]
+    assert refused and refused[0]["error"] == "booking_already_in_progress"
+
+
+def test_claim_is_released_only_on_an_unambiguous_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A timeout keeps the claim: the CRM may have booked anyway."""
+    import state as _state
+
+    _state.claim_booking("timeout-key", "chat")
+    agent._settle_booking_claim("chat", "timeout-key", rejected=False)
+    assert _state.booking_claim_status("timeout-key") == "uncertain"
+    assert _state.claim_booking("timeout-key", "chat") is False, "an uncertain claim must not be reusable"
+
+    _state.claim_booking("rejected-key", "chat")
+    agent._settle_booking_claim("chat", "rejected-key", rejected=True)
+    assert _state.claim_booking("rejected-key", "chat") is True, "a rejected slot may be claimed again"
+
+
+def test_budget_is_rechecked_before_every_model_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One turn can make several calls; the cap must apply to all of them."""
+    install_crm(monkeypatch, CRMStub())
+    client = install_openai(
+        monkeypatch,
+        [
+            assistant_tool_call("get_available_slots", {"date_from": DATE}),
+            assistant_text("Свободно 09:20, 14:00 и 15:40."),
+        ],
+    )
+
+    calls = {"n": 0}
+
+    def budget(purpose: str) -> tuple[bool, str]:
+        calls["n"] += 1
+        # Call 1 is agent_skip_reason's admission check, call 2 is the first
+        # round-trip. From the second round-trip on, the budget is exhausted.
+        allowed = calls["n"] <= 2
+        return (allowed, "" if allowed else "monthly_budget_exceeded")
+
+    monkeypatch.setattr(agent.ai_budget, "check_allowed", budget)
+    chat_id = "agent_budget_midturn"
+    ready_session(chat_id)
+
+    answer = run_turn(chat_id, f"что свободно {DATE}?")
+
+    assert len(client.calls) == 1, "the loop must stop once the budget is exhausted"
+    assert answer.strip(), "an exhausted budget must still answer the patient"
+
+
+def test_all_empty_period_is_bounded_by_request_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty CRM never triggers the "enough slots" early exit."""
+    stub = CRMStub()
+
+    async def empty(date: str, doctor_login: str | None = None) -> dict[str, Any]:
+        stub.check_slots_calls.append({"date": date, "doctor_login": doctor_login})
+        return {"ok": True, "date": date, "availability": []}
+
+    install_crm(monkeypatch, stub)
+    monkeypatch.setattr(crm, "check_slots", empty)
+
+    result = asyncio.run(
+        agent._tool_get_available_slots("agent_empty_wide", {}, {"date_from": DATE, "days_ahead": 21})
+    )
+
+    assert result["slot_count"] == 0
+    assert len(stub.check_slots_calls) <= agent._MAX_AVAILABILITY_REQUESTS, (
+        "an all-empty search must still be bounded by the request ceiling"
+    )

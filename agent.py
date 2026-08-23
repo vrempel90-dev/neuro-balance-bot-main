@@ -99,6 +99,11 @@ MAX_PATIENT_AGE = 75
 _MAX_SLOTS_IN_TOOL_RESULT = 12
 _MAX_DAYS_AHEAD = 21
 
+# Hard ceiling on sequential CRM day-requests per availability tool call. With
+# a 12s CRM timeout each, an unbounded search would outlive the webhook turn —
+# and an all-empty period never triggers the "enough slots" early exit.
+_MAX_AVAILABILITY_REQUESTS = 7
+
 
 class AgentUnavailable(Exception):
     """Raised when the agent loop cannot run at all (config/budget/transport)."""
@@ -634,8 +639,11 @@ async def _tool_get_available_slots(
     except Exception:
         days_ahead = 1
     days_ahead = max(1, min(days_ahead, _MAX_DAYS_AHEAD))
-    # Each day is one sequential CRM request; stop early once there is clearly
-    # enough to offer, so a wide search cannot outlive the webhook turn.
+    # Each day is one sequential CRM request inside a single webhook turn, so
+    # the search is bounded twice: by the number of requests (which also caps
+    # the all-days-empty case, where an early exit on "enough slots" never
+    # fires) and by having collected enough to offer.
+    days_ahead = min(days_ahead, _MAX_AVAILABILITY_REQUESTS)
     enough_slots = _MAX_SLOTS_IN_TOOL_RESULT
 
     doctor_login = str(args.get("doctor_login") or "").strip() or None
@@ -740,10 +748,26 @@ def _crm_booking_succeeded(response: Any) -> bool:
         "error", "failed", "rejected", "cancelled", "canceled",
     }:
         return False
+
+    # crm.book_appointment applies convenience defaults (ok=True,
+    # status="Записан") to any HTTP 2xx body, so a bare `200 {}` would look
+    # confirmed. Only keys the CRM itself returned count as evidence.
+    crm_keys = response.get(crm.CRM_RESPONSE_KEYS_FIELD)
+    if isinstance(crm_keys, list):
+        confirmed_by_crm = set(crm_keys)
+    else:
+        # Response did not come through crm.book_appointment (a stub, or a
+        # direct call): every key present is treated as genuinely returned.
+        confirmed_by_crm = set(response)
+
     for key in ("ok", "success", "booked", "created"):
-        if key in response:
+        if key in confirmed_by_crm:
             return response.get(key) is True
-    return any(str(response.get(key) or "").strip() for key in ("id", "appointmentId", "bookingId"))
+    return any(
+        str(response.get(key) or "").strip()
+        for key in ("id", "appointmentId", "bookingId")
+        if key in confirmed_by_crm
+    )
 
 
 def _looks_like_slot_conflict(text: str) -> bool:
@@ -898,6 +922,30 @@ async def _tool_book_appointment(
         "notes": _booking_notes(session, relation),
     }
 
+    # --- atomic cross-request claim: exactly one CRM POST per slot ----------
+    # The session check above only sees this request's copy of the session.
+    # Two different messages in the same chat are handled concurrently, so both
+    # could pass it and both would POST. A PRIMARY KEY insert is atomic and
+    # closes that window across requests (and across processes).
+    claim_acquired = True
+    if state is not None:
+        try:
+            claim_acquired = state.claim_booking(idempotency_key, str(chat_id or ""))
+        except Exception as exc:  # a claim-store failure must not book twice
+            _log(chat_id, "agent_booking_claim_error", {"error_type": type(exc).__name__})
+            claim_acquired = False
+    if not claim_acquired:
+        _log(chat_id, "agent_booking_duplicate_prevented", {"reason": "concurrent_claim"})
+        return {
+            "ok": False,
+            "booking_success": False,
+            "error": "booking_already_in_progress",
+            "message": (
+                "Эта запись уже создаётся или создана в параллельном обращении. "
+                "Не создавай вторую и не подтверждай, пока не будет результата."
+            ),
+        }
+
     bot_tools.mark_tool(session, "book_appointment", gate="passed")
     session["crm_called"] = True
     _log(
@@ -928,6 +976,10 @@ async def _tool_book_appointment(
         )
         session["crm_result"] = "failed"
         session["booking_confirmed"] = False
+        # A 4xx is an unambiguous rejection: nothing was created, so the slot
+        # may be claimed again. A 5xx is not — the CRM may have created the
+        # appointment before failing to answer.
+        _settle_booking_claim(chat_id, idempotency_key, rejected=exc.status_code < 500)
         try:
             crm.clear_slots_cache(payload["date"])
         except Exception:
@@ -952,6 +1004,10 @@ async def _tool_book_appointment(
         )
         session["crm_result"] = "failed"
         session["booking_confirmed"] = False
+        # Timeout / connection error: the CRM may have created the appointment
+        # anyway, so the claim is deliberately NOT released — a retry must not
+        # be able to book the same patient twice.
+        _settle_booking_claim(chat_id, idempotency_key, rejected=False)
         return {
             "ok": False,
             "booking_success": False,
@@ -967,6 +1023,8 @@ async def _tool_book_appointment(
         _log(chat_id, "agent_booking_crm_rejected", {"slot_conflict": conflict})
         session["crm_result"] = "failed"
         session["booking_confirmed"] = False
+        # The CRM answered and did not confirm: nothing was created.
+        _settle_booking_claim(chat_id, idempotency_key, rejected=True)
         return {
             "ok": False,
             "booking_success": False,
@@ -1006,6 +1064,7 @@ async def _tool_book_appointment(
     session["crm_result"] = "success"
     session["created_by_ai"] = True
     session["booking_confirmed_at"] = datetime.now().isoformat()
+    _settle_booking_claim(chat_id, idempotency_key, rejected=False, confirmed=True)
 
     _log(
         chat_id,
@@ -1030,6 +1089,26 @@ async def _tool_book_appointment(
         "patient_name": patient_name,
         "message": "CRM подтвердила запись. Теперь можно сообщить пациенту врача, дату и время.",
     }
+
+
+def _settle_booking_claim(chat_id: str, claim_key: str, *, rejected: bool, confirmed: bool = False) -> None:
+    """Close out a booking claim after the CRM answered (or failed to).
+
+    ``rejected`` means the CRM unambiguously created nothing, so the slot is
+    free to be claimed again. Anything uncertain (timeout, 5xx, transport
+    error) keeps the claim, because a retry could otherwise double-book.
+    """
+    if state is None or not claim_key:
+        return
+    try:
+        if confirmed:
+            state.mark_booking_claim(claim_key, "confirmed")
+        elif rejected:
+            state.release_booking_claim(claim_key)
+        else:
+            state.mark_booking_claim(claim_key, "uncertain")
+    except Exception as exc:
+        _log(chat_id, "agent_booking_claim_settle_error", {"error_type": type(exc).__name__})
 
 
 def _booking_notes(session: dict[str, Any], relation: str) -> str:
@@ -1332,6 +1411,17 @@ async def run_agent_turn(
     iterations = 0
     rounds = 0
     while True:
+        # The budget is re-checked before every round-trip, not only before the
+        # first: one turn can make several calls, and the clinic runs on a fixed
+        # monthly cap. Tools already executed (possibly a real booking) must
+        # still be reported, so this stops the loop rather than discarding it.
+        allowed, budget_block = ai_budget.check_allowed(ai_budget.PURPOSE_BRAIN)
+        if not allowed:
+            _log(chat_id, "agent_budget_exhausted_mid_turn", {"reason": budget_block, "rounds": rounds})
+            if result.tool_calls:
+                return _finish_after_openai_failure(chat_id, session, result)
+            return AgentResult(used=False, skip_reason=budget_block or "ai_budget_blocked")
+
         try:
             response = await client.chat.completions.create(
                 model=model,

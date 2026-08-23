@@ -103,3 +103,56 @@ def _reload_settings() -> None:
 # an external service. Tests that must assert against the real client check the
 # module source instead of the runtime attribute (see
 # test_production_readiness.py).
+
+
+@pytest.fixture(autouse=True)
+def _clear_booking_claims():
+    """Start every test with an empty booking-claim store.
+
+    Booking claims are deliberately durable in production — that is what stops
+    two concurrent messages from creating two appointments. Tests reuse the
+    same slot repeatedly, so without this the second test in a file would be
+    refused with "booking already in progress".
+    """
+    def _clear() -> None:
+        try:
+            import state
+
+            with state._connect() as conn:
+                conn.execute(state._BOOKING_CLAIMS_DDL)
+                conn.execute("DELETE FROM booking_claims")
+        except Exception:
+            pass
+
+    _clear()
+    yield
+    _clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_crm_http(monkeypatch: pytest.MonkeyPatch):
+    """The suite must never reach the real CRM over the network.
+
+    Most tests stub ``crm.check_slots`` / ``crm.book_appointment`` directly, but
+    a few older ones exercise code paths that also call ``patient_lookup``
+    without stubbing it. Those requests used to be absorbed by an offline fake
+    another module had leaked onto ``crm``; once that is not the case they hit
+    the production CRM host, which is slow, flaky and depends on an external
+    service being up.
+
+    Failing fast keeps the observable behaviour identical (the calling code
+    already handles a CRM connection error) without opening a socket. Tests that
+    want their own transport simply override ``crm._client`` themselves.
+    """
+    import httpx
+
+    class _RefuseTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError(
+                "outbound CRM HTTP is disabled in tests; stub the crm function you need",
+                request=request,
+            )
+
+    client = httpx.AsyncClient(transport=_RefuseTransport())
+    monkeypatch.setattr("crm._client", lambda: client, raising=False)
+    yield
