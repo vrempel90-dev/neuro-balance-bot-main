@@ -3721,11 +3721,21 @@ def _progress_repeated_step_answer(chat_id: str, session: dict[str, Any], repeat
     if step in {"time", "select_slot"} and session.get("last_slots"):
         times = [_slot_time(slot) for slot in session.get("last_slots") or [] if isinstance(slot, dict) and _slot_time(slot)]
         joined = _join_times(times)
+        # No slot may ever be invented. last_slots can be non-empty while no
+        # entry carries a recognisable time (malformed CRM payload, legacy
+        # session), and a placeholder example like "например, 14:00" would then
+        # read to the patient as a real free slot.
+        if not times:
+            return _tr(
+                session,
+                "Сейчас уточню свободное время и напишу Вам актуальные варианты 🌿",
+                "Қазір бос уақытты нақтылап, өзекті нұсқаларды жазамын 🌿",
+            )
         if attempts == 1:
             return _tr(
                 session,
-                f"Уточню, чтобы записать без ошибки: свободны {joined}. Напишите, пожалуйста, время цифрами — например, {times[0] if times else '14:00'}.",
-                f"Қателеспеу үшін нақтылайын: {joined} бос. Уақытты сандармен жазыңызшы — мысалы, {times[0] if times else '14:00'}.",
+                f"Уточню, чтобы записать без ошибки: свободны {joined}. Напишите, пожалуйста, время цифрами — например, {times[0]}.",
+                f"Қателеспеу үшін нақтылайын: {joined} бос. Уақытты сандармен жазыңызшы — мысалы, {times[0]}.",
             )
         return _tr(
             session,

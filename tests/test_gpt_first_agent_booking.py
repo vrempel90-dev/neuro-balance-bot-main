@@ -883,7 +883,35 @@ def test_gpt_collected_facts_are_persisted_for_the_booking_gate(
     assert answer.strip()
 
 
-@pytest.mark.parametrize("age", [12, 81])
+def test_age_boundaries_are_inclusive() -> None:
+    """Pin the exact comparison: 16 and 75 are allowed, 15 and 76 are not."""
+    assert agent._age_block_reason(agent.MIN_PATIENT_AGE) == ""
+    assert agent._age_block_reason(agent.MAX_PATIENT_AGE) == ""
+    assert agent._age_block_reason(agent.MIN_PATIENT_AGE - 1) == "under_min_age"
+    assert agent._age_block_reason(agent.MAX_PATIENT_AGE + 1) == "over_max_age"
+    # Unknown / unusable values are not a block on their own — the separate
+    # "missing age" check refuses those, with a different message.
+    assert agent._age_block_reason(None) == ""
+    assert agent._age_block_reason(0) == ""
+    assert agent._age_block_reason("сорок") == ""
+
+
+def test_rejected_age_is_reported_back_to_the_model() -> None:
+    """Silently dropping an unusable age would leave the model misinformed."""
+    session: dict[str, Any] = {}
+
+    result = agent._tool_record_patient_facts("agent_bad_age", session, {"age": 500})
+
+    assert result["age_rejected"] == "out_of_plausible_range"
+    assert result["age_known"] is False
+    assert "age" not in result["stored"]
+    assert "Переспроси возраст" in result["message"]
+
+    text_result = agent._tool_record_patient_facts("agent_bad_age", session, {"age": "сорок"})
+    assert text_result["age_rejected"] == "not_a_number"
+
+
+@pytest.mark.parametrize("age", [12, 15, 76, 81])
 def test_age_outside_clinic_limits_blocks_the_crm_booking(
     monkeypatch: pytest.MonkeyPatch, age: int
 ) -> None:
@@ -940,6 +968,11 @@ def test_booking_without_a_recorded_age_is_refused(monkeypatch: pytest.MonkeyPat
         ({"success": True}, True),
         ({"id": 42}, True),
         ({"appointmentId": "a-1"}, True),
+        # A CRM may return "created" as a timestamp rather than a flag; that is
+        # not a confirmation on its own, but an id alongside it is.
+        ({"created": "2026-09-01T10:00:00Z"}, False),
+        ({"created": "2026-09-01T10:00:00Z", "id": 7}, False),
+        ({"booked": "yes"}, False),
         ({}, False),
         ({"message": "queued"}, False),
         ({"ok": False}, False),
@@ -1009,10 +1042,20 @@ def test_escalation_reason_is_reduced_to_a_category() -> None:
 
 
 def test_relative_dates_use_the_clinic_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The bot works across UTC midnight, so 'today' must be Astana's."""
+    """The bot works across UTC midnight, so 'today' must be Astana's.
+
+    Comparing against ``astana_now()`` alone would also pass on a host that
+    happens to share the clinic's timezone, so the clinic clock is moved to a
+    date the host clock cannot produce.
+    """
+    import datetime as _dt
     import schedule
+
+    fixed = _dt.datetime(2031, 3, 7, 1, 30, tzinfo=_dt.timezone(_dt.timedelta(hours=5)))
+    monkeypatch.setattr(schedule, "astana_now", lambda: fixed)
 
     context = agent.build_agent_context(session={}, phone=PHONE)
 
-    assert context["today"] == schedule.astana_now().date().isoformat()
-    assert context["tomorrow"] > context["today"]
+    assert context["today"] == "2031-03-07", "relative dates must come from the clinic clock"
+    assert context["tomorrow"] == "2031-03-08"
+    assert context["today"] != _dt.datetime.now().date().isoformat()

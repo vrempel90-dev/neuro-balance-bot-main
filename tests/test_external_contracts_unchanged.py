@@ -14,6 +14,7 @@ It asserts contracts, not behaviour:
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import json
@@ -271,7 +272,7 @@ def test_crm_error_status_is_never_read_as_success(monkeypatch: pytest.MonkeyPat
 # ---------------------------------------------------------------------------
 
 
-def _agent_ast() -> "ast.Module":
+def _agent_ast() -> ast.Module:
     """Parse agent.py so assertions look at code, not prose.
 
     Searching ``inspect.getsource`` also matches docstrings and the system
@@ -285,8 +286,6 @@ def _agent_ast() -> "ast.Module":
 
 
 def _agent_call_targets() -> set[str]:
-    import ast
-
     targets: set[str] = set()
     for node in ast.walk(_agent_ast()):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
@@ -298,8 +297,6 @@ def _agent_call_targets() -> set[str]:
 
 def _agent_code_string_literals() -> set[str]:
     """Every string literal that is code, excluding docstrings."""
-    import ast
-
     tree = _agent_ast()
     docstrings: set[int] = set()
     for node in ast.walk(tree):
@@ -320,8 +317,18 @@ def test_agent_tools_call_the_existing_crm_client_only() -> None:
     assert "crm.check_slots" in targets
     assert "crm.book_appointment" in targets
     assert "crm.get_doctors" in targets
-    # No parallel HTTP layer: the agent must go through crm.py.
+    # No parallel HTTP layer: the agent must go through crm.py. Checking call
+    # targets alone is not enough — `from httpx import AsyncClient` would make
+    # the target a bare name — so the imports are checked too.
     assert not any(t.startswith("httpx.") for t in targets), f"raw HTTP in agent: {sorted(targets)}"
+    imported: set[str] = set()
+    for node in ast.walk(_agent_ast()):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert "httpx" not in imported, "the agent must not import an HTTP client directly"
+    assert "requests" not in imported and "aiohttp" not in imported
 
 
 def test_agent_has_no_hardcoded_slots_or_doctors() -> None:
