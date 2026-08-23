@@ -5173,8 +5173,46 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         ),
     }
 
+    # The same durable claim the GPT-first tool takes, keyed identically, so a
+    # claim held by either path blocks the other. Without it two messages that
+    # both reach this fallback concurrently each issue their own CRM POST and
+    # the patient ends up with two appointments.
+    booking_claim_key = (
+        agent._slot_key(
+            str(booking_payload["date"] or ""),
+            str(booking_payload["time_start"] or ""),
+            str(booking_payload["doctor_login"] or ""),
+        )
+        + "|"
+        + normalized_phone
+    )
+    try:
+        claim_acquired = state.claim_booking(booking_claim_key, str(chat_id or ""))
+    except Exception as exc:  # a claim-store failure must never book twice
+        _safe_log(chat_id, "booking_claim_error", {"error_type": type(exc).__name__})
+        claim_acquired = False
+    if not claim_acquired:
+        _safe_log(chat_id, "booking_duplicate_prevented", {"reason": "claim_held"})
+        session["step"] = "escalated"
+        session["escalated"] = True
+        session["manual_takeover"] = True
+        session["crm_result"] = "pending"
+        session["booking_confirmed"] = False
+        session["handoff_reason"] = session.get("handoff_reason") or "booking_already_in_progress"
+        bot_tools.escalate_to_human(session, session["handoff_reason"])
+        return _operator_handoff_text(session)
+
     try:
         booked = await crm.book_appointment(**booking_payload)
+        # Only a confirmed booking closes the claim. Anything the CRM did not
+        # confirm keeps it `uncertain`, because that answer is not proof the
+        # appointment was never written.
+        agent._settle_booking_claim(
+            chat_id,
+            booking_claim_key,
+            rejected=False,
+            confirmed=agent._crm_booking_succeeded(booked),
+        )
         session["booked"] = True
         session["appointment"] = booked
         session["step"] = "booked"
@@ -5247,6 +5285,10 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
             "handoff_reason": f"crm_book_{exc.status_code}",
         }
         _safe_log(chat_id, "crm_booking_failed", log_payload)
+
+        # A 4xx means the CRM refused and created nothing, so the slot may be
+        # claimed again. A 5xx may have created it before failing to answer.
+        agent._settle_booking_claim(chat_id, booking_claim_key, rejected=exc.status_code < 500)
 
         session["step"] = "escalated"
         session["escalated"] = True

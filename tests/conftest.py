@@ -115,14 +115,14 @@ def _clear_booking_claims():
     refused with "booking already in progress".
     """
     def _clear() -> None:
-        try:
-            import state
+        # Deliberately unguarded: a swallowed failure here would leave a durable
+        # claim behind and the *next* test would be refused with "booking
+        # already in progress" — a confusing failure far from its cause.
+        import state
 
-            with state._connect() as conn:
-                conn.execute(state._BOOKING_CLAIMS_DDL)
-                conn.execute("DELETE FROM booking_claims")
-        except Exception:
-            pass
+        with state._connect() as conn:
+            conn.execute(state._BOOKING_CLAIMS_DDL)
+            conn.execute("DELETE FROM booking_claims")
 
     _clear()
     yield

@@ -374,7 +374,27 @@ async def book_appointment(
 
     clear_slots_cache(date)
 
-    data = response.json()
+    try:
+        data = response.json()
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        # A 2xx whose body is not a JSON object (a list, a scalar, null, or not
+        # JSON at all). There is nothing here to read a confirmation out of, and
+        # the convenience defaults below would turn it into a fabricated
+        # "Записан". Note what is deliberately absent from the returned dict:
+        # no ``error`` key and no failure ``status``, because this answer does
+        # NOT prove the CRM created nothing — it may have written the
+        # appointment and mangled the response. Callers must treat it as
+        # unconfirmed and keep the slot claimed, not as a rejection.
+        logger.warning("CRM book returned a non-object body (%s)", type(data).__name__)
+        return {
+            "ok": False,
+            "malformed_response": True,
+            "message": "CRM вернула ответ, который невозможно разобрать.",
+            CRM_RESPONSE_KEYS_FIELD: [],
+        }
+
     # Record which keys the CRM itself returned, BEFORE the convenience
     # defaults below are applied. Without this a bare `200 {}` becomes
     # {"ok": True, "status": "Записан"} and is indistinguishable from a real
@@ -382,7 +402,7 @@ async def book_appointment(
     # appointment the CRM may never have created. The defaults are kept for
     # backwards compatibility with existing callers; this field lets a caller
     # that cares ask what was actually confirmed.
-    data[CRM_RESPONSE_KEYS_FIELD] = sorted(str(k) for k in data) if isinstance(data, dict) else []
+    data[CRM_RESPONSE_KEYS_FIELD] = sorted(str(k) for k in data)
 
     data.setdefault("ok", True)
     data.setdefault("status", "Записан")

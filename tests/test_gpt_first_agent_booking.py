@@ -17,6 +17,7 @@ contract (``availability[].availableSlots``, ``POST /api/bot/book`` fields).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -764,7 +765,10 @@ def test_one_response_with_many_tool_calls_cannot_bypass_the_budget(
 
     answer = run_turn(chat_id, "когда свободно?")
 
-    assert len(stub.check_slots_calls) <= agent._MAX_TOOL_CALLS_PER_ROUND
+    assert len(stub.check_slots_calls) == agent._MAX_TOOL_CALLS_PER_ROUND, (
+        "exactly the first N calls of the round run: a mere upper bound would "
+        "also pass if the loop stopped executing tools altogether"
+    )
     assert answer.strip()
 
 
@@ -1365,6 +1369,145 @@ def test_only_a_named_failure_counts_as_an_explicit_rejection(
     assert agent._crm_booking_succeeded(response) is False
 
 
+@pytest.mark.parametrize(
+    ("body", "content_type"),
+    [
+        ([{"id": 1}], "application/json"),
+        ("\"booked\"", "application/json"),
+        ("42", "application/json"),
+        ("null", "application/json"),
+        ("<html>gateway</html>", "text/html"),
+    ],
+)
+def test_a_non_object_crm_body_is_unconfirmed_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch, body: Any, content_type: str
+) -> None:
+    """A 2xx whose body is not a JSON object must not blow up — or confirm.
+
+    The convenience defaults would otherwise stamp ``ok=True, status="Записан"``
+    onto a gateway error page. And it must not look like a *rejection* either:
+    the CRM may have written the appointment and mangled the answer, so the
+    slot claim has to survive.
+    """
+    import httpx as _httpx
+
+    payload = json.dumps(body) if content_type == "application/json" and not isinstance(body, str) else body
+
+    class _Weird:
+        async def handle_async_request(self, request: _httpx.Request) -> _httpx.Response:
+            await request.aread()
+            return _httpx.Response(
+                200, content=payload.encode("utf-8"),
+                headers={"content-type": content_type}, request=request,
+            )
+
+    monkeypatch.setattr(crm, "_client", lambda: _httpx.AsyncClient(transport=_Weird()))
+
+    response = asyncio.run(
+        crm.book_appointment(
+            patient_name="Асель", phone=PHONE, doctor_login=DOCTOR_LOGIN, date=DATE, time_start="14:00"
+        )
+    )
+
+    assert isinstance(response, dict), "the client must always hand callers a dict"
+    assert response["ok"] is False
+    assert response.get("status") != "Записан", "a body we cannot read is never a confirmation"
+    assert agent._crm_booking_succeeded(response) is False
+    assert agent._crm_booking_explicitly_rejected(response) is False, (
+        "an unreadable answer is not proof the CRM created nothing — the claim must hold"
+    )
+
+
+def test_an_object_crm_body_still_gets_the_legacy_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The hardening must not change the normal, documented response path."""
+    import httpx as _httpx
+
+    class _Ok:
+        async def handle_async_request(self, request: _httpx.Request) -> _httpx.Response:
+            await request.aread()
+            return _httpx.Response(200, json={"id": 77}, request=request)
+
+    monkeypatch.setattr(crm, "_client", lambda: _httpx.AsyncClient(transport=_Ok()))
+
+    response = asyncio.run(
+        crm.book_appointment(
+            patient_name="Асель", phone=PHONE, doctor_login=DOCTOR_LOGIN, date=DATE, time_start="14:00"
+        )
+    )
+
+    assert response["ok"] is True and response["status"] == "Записан"
+    assert response[crm.CRM_RESPONSE_KEYS_FIELD] == ["id"]
+    assert agent._crm_booking_succeeded(response) is True
+
+
+def _legacy_booking_session() -> dict[str, Any]:
+    slot = {
+        "doctor_login": DOCTOR_LOGIN,
+        "doctor_name": DOCTOR_NAME,
+        "date": DATE,
+        "time": "14:00",
+    }
+    return {
+        "phone": PHONE,
+        "patient_name": "Асель",
+        "complaint": "болит поясница",
+        "complaint_gate": "COMPLAINT_OK",
+        "age": 34,
+        "contraindications_ok": True,
+        "contraindications_verdict": "proceed",
+        "contraindications_raw": "нет",
+        "preferred_date": DATE,
+        "selected_date": DATE,
+        "selected_time": "14:00",
+        "selected_doctor_login": DOCTOR_LOGIN,
+        "selected_doctor_name": DOCTOR_NAME,
+        "selected_slot": dict(slot),
+        "last_slots": [dict(slot)],
+        "step": "name",
+    }
+
+
+def test_legacy_fallback_path_respects_a_claim_held_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Python fallback must not be a second, unprotected way to book.
+
+    It runs when OpenAI is unavailable, and two messages can reach it
+    concurrently just as they can reach the agent. Before this it called
+    ``crm.book_appointment`` directly, so a claim already held for the slot did
+    not stop it — the patient got two appointments.
+    """
+    import state as _state
+
+    stub = install_crm(monkeypatch, CRMStub())
+    claim_key = _claim_key(DATE, "14:00", DOCTOR_LOGIN, PHONE)
+    assert _state.claim_booking(claim_key, "concurrent_turn") is True
+
+    session = _legacy_booking_session()
+    answer = asyncio.run(dialog._book("legacy_claim_held", session, PHONE))
+
+    assert stub.book_calls == [], "the fallback must not POST a slot already claimed"
+    assert session.get("booking_confirmed") is not True
+    assert answer.strip(), "and it must still answer the patient, never go silent"
+
+
+def test_legacy_fallback_booking_confirms_the_claim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A booking made through the fallback also blocks a later duplicate."""
+    import state as _state
+
+    stub = install_crm(monkeypatch, CRMStub())
+    session = _legacy_booking_session()
+
+    asyncio.run(dialog._book("legacy_claim_ok", session, PHONE))
+
+    assert len(stub.book_calls) == 1
+    claim_key = _claim_key(DATE, "14:00", DOCTOR_LOGIN, PHONE)
+    assert _state.booking_claim_status(claim_key) == "confirmed"
+    assert _state.claim_booking(claim_key, "later_turn") is False, (
+        "a confirmed booking must not be claimable again from either path"
+    )
+
+
 def test_budget_is_rechecked_before_every_model_call(monkeypatch: pytest.MonkeyPatch) -> None:
     """One turn can make several calls; the cap must apply to all of them."""
     install_crm(monkeypatch, CRMStub())
@@ -1411,6 +1554,8 @@ def test_all_empty_period_is_bounded_by_request_count(monkeypatch: pytest.Monkey
     )
 
     assert result["slot_count"] == 0
-    assert len(stub.check_slots_calls) <= agent._MAX_AVAILABILITY_REQUESTS, (
-        "an all-empty search must still be bounded by the request ceiling"
+    assert len(stub.check_slots_calls) == agent._MAX_AVAILABILITY_REQUESTS, (
+        "an all-empty 21-day search must walk right up to the request ceiling "
+        "and stop there — an upper bound alone would also accept a search that "
+        "gave up on the first empty day"
     )
