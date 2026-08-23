@@ -911,6 +911,60 @@ def test_rejected_age_is_reported_back_to_the_model() -> None:
     assert text_result["age_rejected"] == "not_a_number"
 
 
+def test_rejected_age_clears_the_previously_stored_one() -> None:
+    """A contradicted age must not survive as state the medical gate trusts.
+
+    The realistic shape of this: a 40-year-old writes "запиши маму, ей
+    восемьдесят". ``record_patient_facts`` cannot parse "восемьдесят", and if
+    the son's 40 stays in the session then ``age_known`` remains true and the
+    deterministic gate happily clears a booking for a patient the clinic does
+    not treat.
+    """
+    session: dict[str, Any] = {"age": 40, "known_user_facts": {"age": 40, "complaint": "спина"}}
+
+    result = agent._tool_record_patient_facts("agent_stale_age", session, {"age": "восемьдесят"})
+
+    assert result["age_rejected"] == "not_a_number"
+    assert result["age_known"] is False, "a rejected age must not leave the model believing age is known"
+    assert not session.get("age"), "the previous patient's age must be dropped"
+    assert "age" not in session["known_user_facts"], "the GPT context must stop reporting the stale age"
+    # The unrelated fact stays: only the contradicted one is dropped.
+    assert session["known_user_facts"]["complaint"] == "спина"
+
+    out_of_range = agent._tool_record_patient_facts("agent_stale_age", {"age": 40}, {"age": 500})
+    assert out_of_range["age_known"] is False
+
+
+def test_stale_age_cannot_pass_the_gate_after_a_rejected_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same defect, proven through the real loop: the CRM must not be reached."""
+    stub = install_crm(monkeypatch, CRMStub())
+    install_openai(
+        monkeypatch,
+        [
+            assistant_tool_call(
+                "record_patient_facts",
+                {"patient_name": "Гульнара", "patient_relation": "мама", "age": "восемьдесят"},
+                call_id="f1",
+            ),
+            assistant_tool_call("get_available_slots", {"date_from": DATE}, call_id="s1"),
+            assistant_tool_call(
+                "book_appointment",
+                {"patient_name": "Гульнара", "doctor_login": DOCTOR_LOGIN, "date": DATE, "time_start": "14:00"},
+                call_id="b1",
+            ),
+            assistant_text("Подскажите, пожалуйста, сколько полных лет маме?"),
+        ],
+    )
+    chat_id = "agent_stale_age_flow"
+    ready_session(chat_id, age=40)
+
+    answer = run_turn(chat_id, "запиши маму, ей восемьдесят, на 14:00")
+
+    assert stub.book_calls == [], "an unparsable age must not be silently replaced by the sender's age"
+    assert not state.get_session(chat_id).get("age")
+    assert answer.strip()
+
+
 @pytest.mark.parametrize("age", [12, 15, 76, 81])
 def test_age_outside_clinic_limits_blocks_the_crm_booking(
     monkeypatch: pytest.MonkeyPatch, age: int
@@ -1044,9 +1098,9 @@ def test_escalation_reason_is_reduced_to_a_category() -> None:
 def test_relative_dates_use_the_clinic_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
     """The bot works across UTC midnight, so 'today' must be Astana's.
 
-    Comparing against ``astana_now()`` alone would also pass on a host that
-    happens to share the clinic's timezone, so the clinic clock is moved to a
-    date the host clock cannot produce.
+    The clinic clock is pinned to a fixed far-future date rather than compared
+    with the host clock: asserting the two merely *differ* would turn into a
+    false failure on the one day the host happens to sit on the same date.
     """
     import datetime as _dt
     import schedule
@@ -1058,7 +1112,6 @@ def test_relative_dates_use_the_clinic_timezone(monkeypatch: pytest.MonkeyPatch)
 
     assert context["today"] == "2031-03-07", "relative dates must come from the clinic clock"
     assert context["tomorrow"] == "2031-03-08"
-    assert context["today"] != _dt.datetime.now().date().isoformat()
 
 
 # ---------------------------------------------------------------------------

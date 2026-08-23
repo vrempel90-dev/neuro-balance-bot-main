@@ -514,6 +514,31 @@ def _clinic_today() -> date_cls:
         return datetime.now().date()
 
 
+_MAX_CONTEXT_TEXT = {
+    "complaint": 400,
+    "patient_name": 80,
+    "patient_relation": 60,
+    "relation": 60,
+    "time_preference": 80,
+}
+_MAX_CONTEXT_TEXT_DEFAULT = 200
+
+
+def _clip(value: Any, field: str) -> str:
+    """Bound a free-text field before it is serialised into the GPT context.
+
+    Everything here originates in patient messages, so its length is not ours
+    to trust: a pasted medical history would be re-sent on every round-trip of
+    every turn, inflating cost and eventually crowding out the conversation
+    itself.
+    """
+    text = str(value or "").strip()
+    limit = _MAX_CONTEXT_TEXT.get(field, _MAX_CONTEXT_TEXT_DEFAULT)
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
 def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls | None = None) -> dict[str, Any]:
     """Compact, structured facts so GPT never re-asks what it already knows."""
     today = today or _clinic_today()
@@ -527,23 +552,27 @@ def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls 
         "sender": {"phone_masked": _mask_phone(phone or session.get("phone"))},
         "patient": {
             "booking_for_self": not bool(session.get("patient_relation")),
-            "relation": session.get("patient_relation") or "",
-            "patient_name": session.get("patient_name") or "",
+            "relation": _clip(session.get("patient_relation"), "relation"),
+            "patient_name": _clip(session.get("patient_name"), "patient_name"),
             "age": session.get("age"),
-            "complaint": session.get("complaint") or "",
+            "complaint": _clip(session.get("complaint"), "complaint"),
         },
         "booking_state": {
             "step": session.get("step") or "start",
             "contraindications_confirmed_clear": session.get("contraindications_ok") is True,
             "preferred_date": session.get("preferred_date") or "",
-            "time_preference": session.get("time_preference") or "",
+            "time_preference": _clip(session.get("time_preference"), "time_preference"),
             "selected_doctor_login": session.get("selected_doctor_login") or "",
             "selected_date": session.get("selected_date") or "",
             "selected_time": session.get("selected_time") or "",
             "already_booked": bool(session.get("booking_confirmed")),
             "crm_slots_offered_count": len(offered),
         },
-        "known_facts": {k: v for k, v in facts.items() if v not in (None, "", [], {})},
+        "known_facts": {
+            key: (_clip(value, str(key)) if isinstance(value, str) else value)
+            for key, value in facts.items()
+            if value not in (None, "", [], {})
+        },
     }
 
 
@@ -1153,6 +1182,12 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
             stored.append("age")
         else:
             age_rejected = "out_of_plausible_range"
+    if age_rejected:
+        # Drop whatever age was stored before. Keeping it would report
+        # ``age_known: true`` for a value the patient just contradicted, and the
+        # deterministic medical gate would then clear a booking on the previous
+        # patient's age — the exact case of "запиши маму" after the son gave 40.
+        session.pop("age", None)
 
     note = str(args.get("contraindications_note") or "").strip()
     if args.get("contraindications_clear") is True:
@@ -1180,6 +1215,11 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
     for key in ("complaint", "age", "patient_name", "patient_relation"):
         if session.get(key):
             facts[key] = session.get(key)
+    if age_rejected:
+        # The context sent to GPT is built from these facts, so a stale entry
+        # here would keep telling the model the age is already known and it
+        # would never re-ask.
+        facts.pop("age", None)
     session["known_user_facts"] = facts
 
     # Report the age verdict back so the model can escalate instead of trying
