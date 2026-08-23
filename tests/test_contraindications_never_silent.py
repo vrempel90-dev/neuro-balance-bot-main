@@ -184,8 +184,15 @@ def test_voice_message_still_gets_no_reply() -> None:
     assert dialog._openai_brain_skip_reason(session, "Все равно болеет") == "voice_or_audio"
 
 
-def test_duplicate_guard_still_silences_other_steps() -> None:
-    """Старое поведение duplicate_answer_guard вне contraindications сохранено."""
+def test_duplicate_guard_progresses_other_steps_instead_of_silence() -> None:
+    """duplicate_answer_guard вне contraindications больше не молчит.
+
+    Раньше здесь проверялось ``answer == ""``. Это и есть production
+    CRITICAL SILENT TURN BUG: активный booking turn (ai_lead_started=True,
+    step=name) заканчивался без единого исходящего сообщения. Требование
+    «не повторять один и тот же текст» сохранено — изменился только способ:
+    вместо молчания шаг продвигается вперёд.
+    """
     chat_id = "contra_dup_guard_other_step"
     state.reset_session(chat_id)
     session = state.get_session(chat_id)
@@ -204,5 +211,8 @@ def test_duplicate_guard_still_silences_other_steps() -> None:
 
     answer = dialog._finalize(chat_id, session, "Как Вас зовут? 🌿")
 
-    assert answer == ""
-    assert state.get_session(chat_id).get("outbound_duplicate_guard_blocked") is True
+    assert answer.strip(), "active booking turn must never end without an outbound answer"
+    assert answer.strip() != "Как Вас зовут? 🌿", "bot repeated the identical question"
+    saved = state.get_session(chat_id)
+    assert saved.get("outbound_duplicate_guard_blocked") is not True
+    assert saved.get("silent_turn_prevented") is True

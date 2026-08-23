@@ -705,6 +705,46 @@ def _next_required_step_after_collected_data(session: dict[str, Any]) -> str:
     return "book"
 
 
+def _turn_must_answer(session: dict[str, Any]) -> bool:
+    """Whether this turn is obliged to produce an outbound message.
+
+    ``_finalize`` is only ever called when the controller decided to answer —
+    deliberate silence goes through ``_no_reply`` with an explicit reason. So
+    the only states allowed to end quietly here are the ones where a human has
+    taken over or the booking is already closed and the patient just said
+    "спасибо".
+
+    Note this is deliberately *wider* than ``_is_active_new_ai_request``: an
+    escalated turn must still deliver its handoff notice, and that is exactly
+    the case the production silent-turn bug fell into.
+    """
+    if session.get("manual_takeover") or session.get("manual_admin_intervention") or session.get("ai_muted"):
+        return False
+    if session.get("refund_claim_admin_required") or session.get("gate_reason") == "refund_claim_admin_required":
+        return False
+    if session.get("old_chat_ai_disabled") or session.get("gate_reason") == "old_chat_ai_disabled":
+        return False
+    if session.get("booked") or str(session.get("step") or "") in {"booked", "done", "confirmed", "appointment_confirmed"}:
+        return False
+    if session.get("last_ignored_message_type") in {"voice", "audio"} or session.get("voice_ignored"):
+        return False
+    return True
+
+
+def _operator_handoff_text(session: dict[str, Any]) -> str:
+    """Single wording used whenever Python hands the dialog to a human.
+
+    Escalation is a legitimate terminal state — but only when the patient is
+    actually told about it. Keeping one canonical, non-banned wording makes it
+    impossible for a later "repair" layer to swallow the notice.
+    """
+    return _tr(
+        session,
+        "Передаю Ваш диалог администратору — он уточнит детали и поможет с записью 🌿",
+        "Диалогыңызды әкімшіге жіберемін — ол мәліметтерді нақтылап, жазылуға көмектеседі 🌿",
+    )
+
+
 def _repair_forbidden_required_question(chat_id: str, session: dict[str, Any], answer: str) -> str:
     if session.get("available_dates_answer_shown") and "ближайшие свободные даты" in _low(answer):
         return answer
@@ -728,12 +768,15 @@ def _repair_forbidden_required_question(chat_id: str, session: dict[str, Any], a
             session["repair_reason"] = f"repeat_required_step_{step}_limit"
             session["step"] = "escalated"
             session["escalated"] = True
+            session["handoff_reason"] = f"repeat_required_step_{step}_limit"
             _safe_log(chat_id, "repeat_required_question_limit_reached", {"blocked_step": step, "answer_preview": answer[:180]})
-            return _tr(
-                session,
-                "Чтобы не повторяться и не запутать Вас, передам диалог администратору — он уточнит данные и поможет с записью 🌿",
-                "Қайталамау және шатастырмау үшін диалогты әкімшіге жіберемін — ол деректерді нақтылап, жазылуға көмектеседі 🌿",
-            )
+            # NB: this text must not be a BANNED_FINAL_PHRASE. It used to be —
+            # the escalation notice generated here was itself on the banned
+            # list, so the banned-phrase repair below replaced it with a step
+            # prompt, the duplicate guard saw that repeat and returned "".
+            # Result in production: Python escalated to an operator and told
+            # the patient nothing at all.
+            return _operator_handoff_text(session)
         return answer
     next_step = _next_required_step_after_collected_data(session)
     session["llm_blocked"] = True
@@ -3314,7 +3357,13 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     session["banned_phrase_detected"] = _has_banned_final_phrase(answer)
     if session["banned_phrase_detected"]:
         session["banned_phrase_repaired"] = True
-        if str(session.get("step") or "") == "complaint":
+        if session.get("escalated") or str(session.get("step") or "") == "escalated":
+            # The dialog is already handed to a human. Replacing that notice
+            # with a funnel prompt is how the handoff used to become silent:
+            # the prompt duplicated the previous answer and was swallowed by
+            # the duplicate guard. An escalated turn must deliver the handoff.
+            answer = _operator_handoff_text(session)
+        elif str(session.get("step") or "") == "complaint":
             answer = "Расскажите, пожалуйста, что именно Вас беспокоит?"
         elif str(session.get("step") or "") == "contraindications":
             answer = _ask_contra(session)
@@ -3340,8 +3389,24 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
             session["outbound_duplicate_guard_blocked"] = False
             session["fallback_reason"] = "contraindications_never_silent"
             answer = _ask_contra(session)
+        elif _turn_must_answer(session):
+            # silent_turn_guard — ROOT CAUSE FIX.
+            # This branch used to `return ""`, and it did so BEFORE
+            # final_no_empty_guard, so no recovery below could run. In
+            # production that turned "клиент выбрал дату/время" into total
+            # silence: the keyword branch answered with a verbatim repeat of the
+            # step prompt, the duplicate guard swallowed it, and the handler
+            # returned with outbound_count = 0.
+            #
+            # A repeat is still wrong — but the fix is to move the conversation
+            # forward, not to abandon the patient mid-booking.
+            session["outbound_duplicate_guard_blocked"] = False
+            session["silent_turn_prevented"] = True
+            session["fallback_reason"] = "duplicate_answer_progressed"
+            answer = _progress_repeated_step_answer(chat_id, session, answer)
         else:
             session["outbound_duplicate_guard_blocked"] = True
+            session["no_reply_reason"] = session.get("no_reply_reason") or "duplicate_answer_suppressed"
             _safe_save(chat_id, session)
             return ""
 
@@ -3356,6 +3421,26 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
         else:
             answer, _, _ = build_safe_answer_for_current_state(session, str(session.get("last_user_text") or ""))
             session["fallback_reason"] = "final_no_empty_step_fallback"
+
+    # SILENT TURN INVARIANT (last line of defence).
+    # `_finalize` is only reached when the controller decided to answer, so an
+    # empty string here is always a bug — that is precisely how the production
+    # "бот замолкает" case escaped every earlier repair. Deliberate silence must
+    # go through `_no_reply`, which records an explicit reason.
+    if not str(answer or "").strip():
+        session["silent_turn_prevented"] = True
+        session["fallback_reason"] = session.get("fallback_reason") or "silent_turn_invariant"
+        answer = _operator_handoff_text(session)
+        _safe_log(
+            chat_id,
+            "silent_turn_prevented",
+            {
+                "chat_id": chat_id,
+                "from_step": before_step,
+                "step": session.get("step") or "",
+                "reason": session.get("fallback_reason") or "",
+            },
+        )
 
     session["state_before_step"] = before_step
     session["state_after_step"] = session.get("step") or ""
@@ -3481,6 +3566,102 @@ def _remember_required_question(session: dict[str, Any], answer: str) -> None:
             important.append(f"{key}={facts[key]}")
     if important:
         session["dialog_summary"] = "; ".join(important)[-1200:]
+
+
+def _progress_repeated_step_answer(chat_id: str, session: dict[str, Any], repeated: str) -> str:
+    """Anti-loop: move the turn forward instead of repeating or going silent.
+
+    Root cause of the production "бот замолкает" bug: when a keyword branch did
+    not understand a conversational phrase ("мне удобно в обед", "можно в начале
+    недели", "да"), it answered with a verbatim repeat of the step prompt. The
+    duplicate guard then saw the repeat and returned "" — the patient got
+    nothing in the middle of a booking.
+
+    Repeating and going silent are both wrong. This escalates instead:
+
+    * 1st repeat — same required step, but reworded and more concrete;
+    * 2nd repeat — widen the options (other days) or hand over to an operator.
+
+    It is a small, state-driven ladder, not a new keyword dialog: the ladder
+    depends only on the step and the repeat counter.
+    """
+    step = str(session.get("step") or "start")
+    if session.get("escalated") or step == "escalated":
+        # Already handed to a human — deliver that, never a funnel prompt.
+        session["silent_turn_prevented"] = True
+        return _operator_handoff_text(session)
+    counter_key = f"repeat_prompt_count::{step}"
+    attempts = int(session.get(counter_key) or 0) + 1
+    session[counter_key] = attempts
+    session["last_repeat_step"] = step
+    session["last_repeat_attempts"] = attempts
+    _safe_log(chat_id, "repeated_step_prompt_progressed", {"chat_id": chat_id, "step": step, "attempt": attempts})
+
+    if attempts >= 3:
+        # Third identical answer in a row means the deterministic path cannot
+        # understand this patient. A human must take over — but the patient is
+        # still told what is happening.
+        session["step"] = "escalated"
+        session["escalated"] = True
+        session["manual_takeover"] = True
+        session["handoff_reason"] = f"repeated_step_prompt_{step}"
+        _safe_log(chat_id, "repeated_step_prompt_escalated", {"chat_id": chat_id, "step": step, "attempt": attempts})
+        return _tr(
+            session,
+            "Чтобы не путать Вас, передам диалог администратору — он подберёт удобное время и всё оформит 🌿",
+            "Сізді шатастырмау үшін диалогты әкімшіге жіберемін — ол ыңғайлы уақыт таңдап, рәсімдейді 🌿",
+        )
+
+    if step in {"time", "select_slot"} and session.get("last_slots"):
+        times = [_slot_time(slot) for slot in session.get("last_slots") or [] if isinstance(slot, dict) and _slot_time(slot)]
+        joined = _join_times(times)
+        if attempts == 1:
+            return _tr(
+                session,
+                f"Уточню, чтобы записать без ошибки: свободны {joined}. Напишите, пожалуйста, время цифрами — например, {times[0] if times else '14:00'}.",
+                f"Қателеспеу үшін нақтылайын: {joined} бос. Уақытты сандармен жазыңызшы — мысалы, {times[0] if times else '14:00'}.",
+            )
+        return _tr(
+            session,
+            f"На этот день свободны только {joined}. Если ни одно не подходит — напишите другой день, посмотрю свободные окошки там 🌿",
+            f"Бұл күні тек {joined} бос. Егер ыңғайлы болмаса — басқа күнді жазыңыз, сол күнге қараймын 🌿",
+        )
+
+    if step in {"date", "preferred_time"}:
+        if attempts == 1:
+            return _tr(
+                session,
+                "Подскажите, пожалуйста, конкретный день — например «завтра» или «в среду». Тогда сразу покажу свободное время.",
+                "Нақты күнді жазыңызшы — мысалы «ертең» немесе «сәрсенбіде». Сонда бос уақыттарды бірден көрсетемін.",
+            )
+        return _tr(
+            session,
+            "Могу посмотреть ближайшие свободные дни и прислать варианты — так будет быстрее. Написать их?",
+            "Ең жақын бос күндерді қарап, нұсқаларын жіберейін бе? Солай жылдамырақ болады.",
+        )
+
+    if step == "name":
+        return _tr(
+            session,
+            "Для записи нужно имя пациента — напишите, пожалуйста, как записать (имя и фамилию).",
+            "Жазылу үшін пациенттің аты керек — атыңыз бен тегіңізді жазыңызшы.",
+        )
+
+    if step == "age":
+        return _tr(
+            session,
+            "Напишите, пожалуйста, возраст пациента числом — например «45». Это нужно для безопасности процедуры.",
+            "Пациенттің жасын санмен жазыңызшы — мысалы «45». Бұл процедураның қауіпсіздігі үшін қажет.",
+        )
+
+    if step == "complaint":
+        return _tr(
+            session,
+            "Опишите, пожалуйста, что беспокоит: где болит и как давно. Тогда подскажу, поможем ли мы.",
+            "Не мазалайтынын жазыңызшы: қай жері ауырады және қашаннан бері. Сонда көмектесе алатынымызды айтамын.",
+        )
+
+    return _clarify_intent_answer(session)
 
 
 def _no_reply(chat_id: str, session: dict[str, Any], reason: str = "") -> str:
