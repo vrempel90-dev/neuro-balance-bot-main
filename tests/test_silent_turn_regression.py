@@ -184,3 +184,61 @@ def test_silent_turn_regression_marks_reason_when_intentionally_quiet() -> None:
 
     assert answer == ""
     assert state.get_session(chat_id)["no_reply_reason"] == "thanks/done"
+
+
+def test_short_ok_after_a_faq_inside_an_open_booking_is_answered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production case: slots shown → price question → "ок" → silence.
+
+    ``thanks_after_info_guard`` imitates a human admin who simply does not
+    reply to "спасибо" after an address/price answer. That is reasonable when
+    nothing is pending — but the price text contains "приём"/"5 000", so
+    ``_last_answer_was_info`` was true even while the patient was looking at
+    real CRM slots, and a plain "ок" ended the booking in silence.
+    """
+    _patch_crm(monkeypatch)
+    chat_id = "silent_turn_thanks_info"
+    _reset(chat_id, {"first_touch_info_sent": True})
+
+    messages = ["Болит поясница", "34", "нет", "давайте завтра", "а сколько стоит?", "ок"]
+    answers = asyncio.run(_run_turns(chat_id, messages))
+
+    session = state.get_session(chat_id)
+    assert str(answers[-1] or "").strip(), (
+        "a short confirmation inside an open booking must never be answered with silence; "
+        f"no_reply_reason={session.get('no_reply_reason')!r}"
+    )
+
+
+def test_polite_silence_still_applies_outside_a_booking(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard must keep working where it was actually intended.
+
+    With nothing pending, "спасибо" after an info answer stays unanswered —
+    the bot should not restart a funnel just to have the last word.
+    """
+    _patch_crm(monkeypatch)
+    chat_id = "silent_turn_polite_ok"
+    _reset(
+        chat_id,
+        {
+            "step": "start",
+            "first_touch_info_sent": True,
+            "last_assistant_answer": "Мы находимся по адресу Кабанбай батыра 28 🌿",
+            "last_bot_answer": "Мы находимся по адресу Кабанбай батыра 28 🌿",
+        },
+    )
+
+    answer = asyncio.run(_say(chat_id, "спасибо"))
+
+    assert answer == ""
+    assert state.get_session(chat_id)["no_reply_reason"] == "thanks/info"
+
+
+def test_has_unfinished_booking_classification() -> None:
+    assert dialog._has_unfinished_booking({"step": "time", "last_slots": [{"time": "14:00"}]}) is True
+    assert dialog._has_unfinished_booking({"step": "name", "selected_time": "14:00"}) is True
+    assert dialog._has_unfinished_booking({"step": "date"}) is True
+    assert dialog._has_unfinished_booking({"step": "start"}) is False
+    assert dialog._has_unfinished_booking({"step": "booked", "booked": True}) is False
+    assert dialog._has_unfinished_booking({"step": "time", "booking_confirmed": True}) is False

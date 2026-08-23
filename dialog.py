@@ -706,6 +706,24 @@ def _next_required_step_after_collected_data(session: dict[str, Any]) -> str:
     return "book"
 
 
+def _has_unfinished_booking(session: dict[str, Any]) -> bool:
+    """True while the patient is mid-booking and still owed a next step.
+
+    Used to stop "polite silence" guards from firing inside an open booking:
+    a patient who has already been shown real CRM slots must never be left
+    without an answer, whatever short phrase they send next.
+    """
+    if session.get("booked") or session.get("booking_confirmed"):
+        return False
+    if str(session.get("step") or "") in {"booked", "done", "escalated", "stopped"}:
+        return False
+    if session.get("last_slots") and not session.get("selected_time"):
+        return True
+    if session.get("selected_slot") or session.get("selected_time"):
+        return True
+    return str(session.get("step") or "") in {"age", "contraindications", "date", "preferred_time", "time", "select_slot", "name"}
+
+
 def _turn_must_answer(session: dict[str, Any]) -> bool:
     """Whether this turn is obliged to produce an outbound message.
 
@@ -6738,7 +6756,19 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # справку, и _last_answer_was_info ложно срабатывает на слове "приём" внутри
     # locked-шаблона противопоказаний ("приём не проводится"). Молчать в ответ на
     # собственный вопрос нельзя — переспрашиваем.
-    if _is_thanks_or_ok(text) and _last_answer_was_info(session) and str(session.get("step") or "") != "contraindications":
+    #
+    # Second exception — an unfinished booking. Production case: the patient is
+    # already looking at real CRM slots, asks "а сколько стоит?", gets the price
+    # (which contains "приём"/"5 000", so _last_answer_was_info is true), replies
+    # "ок" — and the bot went silent in the middle of the booking. Silence is
+    # only a sane imitation of a human admin when there is nothing pending; with
+    # an open booking it just abandons the patient.
+    if (
+        _is_thanks_or_ok(text)
+        and _last_answer_was_info(session)
+        and str(session.get("step") or "") != "contraindications"
+        and not _has_unfinished_booking(session)
+    ):
         return _no_reply(chat_id, session, "thanks/info")
 
     # no_duplicate_after_booking_guard:
