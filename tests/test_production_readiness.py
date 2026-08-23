@@ -156,3 +156,35 @@ def test_webhook_configuration_needs_no_change() -> None:
     assert settings.public_base_url == "https://neuro-balance-bot-main-production.up.railway.app"
     expected_callback = f"{settings.public_base_url}/webhook/wazzup"
     assert expected_callback.startswith("https://neuro-balance-bot-main-production.up.railway.app")
+
+
+def test_readme_telemetry_list_matches_the_code() -> None:
+    """Documented events must exist, so the list stays useful for diagnosis.
+
+    A README that lists an event name the code never emits (or omits the ones
+    that explain a refused booking) is worse than no list at all when someone
+    is debugging a production incident at 2am.
+    """
+    import re
+
+    agent_source = inspect.getsource(agent)
+    emitted = set(re.findall(r'_log\(\s*chat_id,\s*"([a-z_]+)"', agent_source))
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    section = readme.split("## Телеметрия booking flow", 1)[1].split("## Railway variables", 1)[0]
+    documented = set(re.findall(r"`(agent_[a-z_]+)`", section))
+
+    assert documented, "the telemetry section must list the agent events"
+    assert not documented - emitted, f"README documents events the code never emits: {documented - emitted}"
+    # The events that explain a refused or duplicated booking are the ones an
+    # operator actually needs; they must not silently drop out of the docs.
+    required = {
+        "agent_booking_crm_success",
+        "agent_booking_crm_error",
+        "agent_booking_blocked_by_age",
+        "agent_booking_blocked_by_gate",
+        "agent_booking_duplicate_prevented",
+        "agent_booking_rejected_unknown_slot",
+        "agent_booking_rejected_unknown_doctor",
+        "agent_facts_recorded",
+    }
+    assert required <= documented, f"undocumented booking-diagnostics events: {required - documented}"
