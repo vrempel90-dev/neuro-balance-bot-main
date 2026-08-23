@@ -89,7 +89,15 @@ def test_first_touch_booking_exact_welcome_once() -> None:
     assert "чем можем помочь: хотите записаться" not in answer.lower()
 
 
-def test_duplicate_outbound_guard_blocks_same_answer() -> None:
+def test_duplicate_outbound_guard_does_not_repeat_and_does_not_go_silent() -> None:
+    """The duplicate guard must stop the repeat — not the conversation.
+
+    This test used to assert ``answer == ""``. That behaviour is the production
+    CRITICAL SILENT TURN BUG: an active booking turn ended with no outbound at
+    all, so a patient mid-funnel was simply abandoned. The original intent —
+    never send the same message twice in a row — is preserved below; only the
+    way it is enforced changed, from silence to moving the step forward.
+    """
     chat_id = "duplicate_age_question"
     session = {
         "step": "age",
@@ -104,7 +112,9 @@ def test_duplicate_outbound_guard_blocks_same_answer() -> None:
 
     answer = dialog._finalize(chat_id, session, "Подскажите, пожалуйста, сколько Вам лет?")
 
-    assert answer == ""
+    assert answer.strip(), "active booking turn must never end without an outbound answer"
+    assert answer.strip() != "Подскажите, пожалуйста, сколько Вам лет?", "bot repeated the identical question"
+    assert session.get("silent_turn_prevented") is True
 
 
 def test_price_faq_while_waiting_relative_age_resumes_age() -> None:

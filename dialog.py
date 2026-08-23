@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import agent
 import bot_tools
 import crm
 import state
@@ -705,6 +706,64 @@ def _next_required_step_after_collected_data(session: dict[str, Any]) -> str:
     return "book"
 
 
+def _has_unfinished_booking(session: dict[str, Any]) -> bool:
+    """True while the patient is mid-booking and still owed a next step.
+
+    Used to stop "polite silence" guards from firing inside an open booking:
+    a patient who has already been shown real CRM slots must never be left
+    without an answer, whatever short phrase they send next.
+    """
+    if session.get("booked") or session.get("booking_confirmed"):
+        return False
+    if str(session.get("step") or "") in {"booked", "done", "escalated", "stopped"}:
+        return False
+    if session.get("last_slots") and not session.get("selected_time"):
+        return True
+    if session.get("selected_slot") or session.get("selected_time"):
+        return True
+    return str(session.get("step") or "") in {"age", "contraindications", "date", "preferred_time", "time", "select_slot", "name"}
+
+
+def _turn_must_answer(session: dict[str, Any]) -> bool:
+    """Whether this turn is obliged to produce an outbound message.
+
+    ``_finalize`` is only ever called when the controller decided to answer —
+    deliberate silence goes through ``_no_reply`` with an explicit reason. So
+    the only states allowed to end quietly here are the ones where a human has
+    taken over or the booking is already closed and the patient just said
+    "спасибо".
+
+    Note this is deliberately *wider* than ``_is_active_new_ai_request``: an
+    escalated turn must still deliver its handoff notice, and that is exactly
+    the case the production silent-turn bug fell into.
+    """
+    if session.get("manual_takeover") or session.get("manual_admin_intervention") or session.get("ai_muted"):
+        return False
+    if session.get("refund_claim_admin_required") or session.get("gate_reason") == "refund_claim_admin_required":
+        return False
+    if session.get("old_chat_ai_disabled") or session.get("gate_reason") == "old_chat_ai_disabled":
+        return False
+    if session.get("booked") or str(session.get("step") or "") in {"booked", "done", "confirmed", "appointment_confirmed"}:
+        return False
+    if session.get("last_ignored_message_type") in {"voice", "audio"} or session.get("voice_ignored"):
+        return False
+    return True
+
+
+def _operator_handoff_text(session: dict[str, Any]) -> str:
+    """Single wording used whenever Python hands the dialog to a human.
+
+    Escalation is a legitimate terminal state — but only when the patient is
+    actually told about it. Keeping one canonical, non-banned wording makes it
+    impossible for a later "repair" layer to swallow the notice.
+    """
+    return _tr(
+        session,
+        "Передаю Ваш диалог администратору — он уточнит детали и поможет с записью 🌿",
+        "Диалогыңызды әкімшіге жіберемін — ол мәліметтерді нақтылап, жазылуға көмектеседі 🌿",
+    )
+
+
 def _repair_forbidden_required_question(chat_id: str, session: dict[str, Any], answer: str) -> str:
     if session.get("available_dates_answer_shown") and "ближайшие свободные даты" in _low(answer):
         return answer
@@ -728,12 +787,15 @@ def _repair_forbidden_required_question(chat_id: str, session: dict[str, Any], a
             session["repair_reason"] = f"repeat_required_step_{step}_limit"
             session["step"] = "escalated"
             session["escalated"] = True
+            session["handoff_reason"] = f"repeat_required_step_{step}_limit"
             _safe_log(chat_id, "repeat_required_question_limit_reached", {"blocked_step": step, "answer_preview": answer[:180]})
-            return _tr(
-                session,
-                "Чтобы не повторяться и не запутать Вас, передам диалог администратору — он уточнит данные и поможет с записью 🌿",
-                "Қайталамау және шатастырмау үшін диалогты әкімшіге жіберемін — ол деректерді нақтылап, жазылуға көмектеседі 🌿",
-            )
+            # NB: this text must not be a BANNED_FINAL_PHRASE. It used to be —
+            # the escalation notice generated here was itself on the banned
+            # list, so the banned-phrase repair below replaced it with a step
+            # prompt, the duplicate guard saw that repeat and returned "".
+            # Result in production: Python escalated to an operator and told
+            # the patient nothing at all.
+            return _operator_handoff_text(session)
         return answer
     next_step = _next_required_step_after_collected_data(session)
     session["llm_blocked"] = True
@@ -1388,6 +1450,77 @@ async def _try_openai_dialog_brain(chat_id: str, phone: str, session: dict[str, 
         session["escalated"] = True
         return _finalize(chat_id, session, reply or _crm_fallback_answer(session))
     return None
+
+
+async def _try_gpt_first_agent(chat_id: str, phone: str, session: dict[str, Any], text: str) -> str | None:
+    """Run the turn as a GPT-driven tool loop; ``None`` = fall back to Python.
+
+    This is the GPT-first entry point. The agent owns understanding, phrasing
+    and step selection; every fact it states about doctors, dates, times or a
+    created booking comes from a real CRM call made inside ``agent.py``.
+
+    Returning ``None`` hands the turn to the legacy deterministic funnel and is
+    reserved for *technical* unavailability (missing OpenAI key, AI disabled,
+    budget exhausted, transport error) — never for "Python disagrees with what
+    GPT understood".
+    """
+    try:
+        result = await agent.run_agent_turn(
+            chat_id=chat_id,
+            phone=phone,
+            session=session,
+            user_text=text,
+            recent_history=_recent_history_for_brain(chat_id, session),
+        )
+    except Exception as exc:  # agent must never break the production pipeline
+        _safe_log(chat_id, "agent_unexpected_error", {"chat_id": chat_id, "error_type": type(exc).__name__, "error": str(exc)[:300]})
+        session["agent_used"] = False
+        session["agent_skip_reason"] = "agent_exception"
+        return None
+
+    session["agent_used"] = bool(result.used)
+    session["agent_skip_reason"] = result.skip_reason
+    session["agent_outcome"] = result.outcome
+    session["agent_tool_calls"] = [call["tool"] for call in result.tool_calls]
+    session["agent_iterations"] = result.iterations
+
+    if not result.used:
+        _safe_log(
+            chat_id,
+            "agent_fallback_to_python",
+            {"chat_id": chat_id, "reason": result.skip_reason, "step": session.get("step") or "start"},
+        )
+        return None
+
+    # The agent already performed any CRM work for this turn. Mark the OpenAI
+    # debug fields the rest of the pipeline reports on.
+    session["openai_used"] = True
+    session["openai_brain_used"] = True
+    session["openai_skip_reason"] = ""
+    session["openai_brain_skip_reason"] = ""
+    session["answer_source"] = "gpt_agent"
+    # The agent writes its own text; the humanizer must not rewrite it.
+    session["skip_humanize"] = True
+
+    if result.booked:
+        booking = result.booking or {}
+        session["booking_confirmed"] = True
+        session["created_by_ai"] = True
+        session["post_booking_support_active"] = True
+        session["post_booking_support_until"] = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        _safe_log(
+            chat_id,
+            "agent_booking_confirmed",
+            {
+                "chat_id": chat_id,
+                "appointment_id": booking.get("appointment_id") or "",
+                "doctor_login": booking.get("doctor_login") or "",
+                "date": booking.get("date") or "",
+                "time_start": booking.get("time_start") or "",
+            },
+        )
+
+    return _finalize(chat_id, session, result.reply)
 
 
 def _multi_entity_safe_date_text(text: str) -> str:
@@ -3214,8 +3347,16 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
         answer = _slot_times_answer(session)
     if not ((session.get("step") == "booked" and session.get("booking_confirmed") is True) or "запись подтверждена" in _low(answer)):
         answer = _remove_name_addressing(answer, session)
+    # A GPT-authored answer is the deliverable, not a draft: _strict_trim_extra
+    # cuts a reply down to two sentences unless it matches an allow-list, which
+    # would silently drop the third sentence of e.g. "Свободно 09:20 и 14:00.
+    # Врач — <имя>. Записываю Вас на 14:00." — the patient would lose the part
+    # that states what actually happened. Fact-safety validation still runs
+    # above (_validate_final_fact_answer); only the shortening is skipped.
+    agent_authored = str(session.get("answer_source") or "") == "gpt_agent"
     if not first_touch_in_progress:
-        answer = _strict_trim_extra(answer, session)
+        if not agent_authored:
+            answer = _strict_trim_extra(answer, session)
         answer = _cleanup_final_wazzup_text(answer)
     # final_contraindications_repair:
     # Последний барьер перед сохранением/возвратом ответа. Он должен перебивать
@@ -3314,7 +3455,13 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
     session["banned_phrase_detected"] = _has_banned_final_phrase(answer)
     if session["banned_phrase_detected"]:
         session["banned_phrase_repaired"] = True
-        if str(session.get("step") or "") == "complaint":
+        if session.get("escalated") or str(session.get("step") or "") == "escalated":
+            # The dialog is already handed to a human. Replacing that notice
+            # with a funnel prompt is how the handoff used to become silent:
+            # the prompt duplicated the previous answer and was swallowed by
+            # the duplicate guard. An escalated turn must deliver the handoff.
+            answer = _operator_handoff_text(session)
+        elif str(session.get("step") or "") == "complaint":
             answer = "Расскажите, пожалуйста, что именно Вас беспокоит?"
         elif str(session.get("step") or "") == "contraindications":
             answer = _ask_contra(session)
@@ -3340,8 +3487,24 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
             session["outbound_duplicate_guard_blocked"] = False
             session["fallback_reason"] = "contraindications_never_silent"
             answer = _ask_contra(session)
+        elif _turn_must_answer(session):
+            # silent_turn_guard — ROOT CAUSE FIX.
+            # This branch used to `return ""`, and it did so BEFORE
+            # final_no_empty_guard, so no recovery below could run. In
+            # production that turned "клиент выбрал дату/время" into total
+            # silence: the keyword branch answered with a verbatim repeat of the
+            # step prompt, the duplicate guard swallowed it, and the handler
+            # returned with outbound_count = 0.
+            #
+            # A repeat is still wrong — but the fix is to move the conversation
+            # forward, not to abandon the patient mid-booking.
+            session["outbound_duplicate_guard_blocked"] = False
+            session["silent_turn_prevented"] = True
+            session["fallback_reason"] = "duplicate_answer_progressed"
+            answer = _progress_repeated_step_answer(chat_id, session, answer)
         else:
             session["outbound_duplicate_guard_blocked"] = True
+            session["no_reply_reason"] = session.get("no_reply_reason") or "duplicate_answer_suppressed"
             _safe_save(chat_id, session)
             return ""
 
@@ -3356,6 +3519,34 @@ def _finalize(chat_id: str, session: dict[str, Any], answer: str) -> str:
         else:
             answer, _, _ = build_safe_answer_for_current_state(session, str(session.get("last_user_text") or ""))
             session["fallback_reason"] = "final_no_empty_step_fallback"
+
+    # SILENT TURN INVARIANT (last line of defence).
+    # `_finalize` is only reached when the controller decided to answer, so an
+    # empty string here is always a bug — that is precisely how the production
+    # "бот замолкает" case escaped every earlier repair. Deliberate silence must
+    # go through `_no_reply`, which records an explicit reason.
+    if not str(answer or "").strip():
+        session["silent_turn_prevented"] = True
+        session["fallback_reason"] = session.get("fallback_reason") or "silent_turn_invariant"
+        # Telling the patient "передаю администратору" without actually handing
+        # the dialog over would be a promise the system does not keep: the bot
+        # would answer again on the next turn and no operator would ever see a
+        # handoff flag. Set the same state _progress_repeated_step_answer does.
+        session["step"] = "escalated"
+        session["escalated"] = True
+        session["manual_takeover"] = True
+        session["handoff_reason"] = session.get("handoff_reason") or "silent_turn_invariant"
+        answer = _operator_handoff_text(session)
+        _safe_log(
+            chat_id,
+            "silent_turn_prevented",
+            {
+                "chat_id": chat_id,
+                "from_step": before_step,
+                "step": session.get("step") or "",
+                "reason": session.get("fallback_reason") or "",
+            },
+        )
 
     session["state_before_step"] = before_step
     session["state_after_step"] = session.get("step") or ""
@@ -3481,6 +3672,112 @@ def _remember_required_question(session: dict[str, Any], answer: str) -> None:
             important.append(f"{key}={facts[key]}")
     if important:
         session["dialog_summary"] = "; ".join(important)[-1200:]
+
+
+def _progress_repeated_step_answer(chat_id: str, session: dict[str, Any], repeated: str) -> str:
+    """Anti-loop: move the turn forward instead of repeating or going silent.
+
+    Root cause of the production "бот замолкает" bug: when a keyword branch did
+    not understand a conversational phrase ("мне удобно в обед", "можно в начале
+    недели", "да"), it answered with a verbatim repeat of the step prompt. The
+    duplicate guard then saw the repeat and returned "" — the patient got
+    nothing in the middle of a booking.
+
+    Repeating and going silent are both wrong. This escalates instead:
+
+    * 1st repeat — same required step, but reworded and more concrete;
+    * 2nd repeat — widen the options (other days) or hand over to an operator.
+
+    It is a small, state-driven ladder, not a new keyword dialog: the ladder
+    depends only on the step and the repeat counter.
+    """
+    step = str(session.get("step") or "start")
+    if session.get("escalated") or step == "escalated":
+        # Already handed to a human — deliver that, never a funnel prompt.
+        session["silent_turn_prevented"] = True
+        return _operator_handoff_text(session)
+    counter_key = f"repeat_prompt_count::{step}"
+    attempts = int(session.get(counter_key) or 0) + 1
+    session[counter_key] = attempts
+    session["last_repeat_step"] = step
+    session["last_repeat_attempts"] = attempts
+    _safe_log(chat_id, "repeated_step_prompt_progressed", {"chat_id": chat_id, "step": step, "attempt": attempts})
+
+    if attempts >= 3:
+        # Third identical answer in a row means the deterministic path cannot
+        # understand this patient. A human must take over — but the patient is
+        # still told what is happening.
+        session["step"] = "escalated"
+        session["escalated"] = True
+        session["manual_takeover"] = True
+        session["handoff_reason"] = f"repeated_step_prompt_{step}"
+        _safe_log(chat_id, "repeated_step_prompt_escalated", {"chat_id": chat_id, "step": step, "attempt": attempts})
+        return _tr(
+            session,
+            "Чтобы не путать Вас, передам диалог администратору — он подберёт удобное время и всё оформит 🌿",
+            "Сізді шатастырмау үшін диалогты әкімшіге жіберемін — ол ыңғайлы уақыт таңдап, рәсімдейді 🌿",
+        )
+
+    if step in {"time", "select_slot"} and session.get("last_slots"):
+        times = [_slot_time(slot) for slot in session.get("last_slots") or [] if isinstance(slot, dict) and _slot_time(slot)]
+        joined = _join_times(times)
+        # No slot may ever be invented. last_slots can be non-empty while no
+        # entry carries a recognisable time (malformed CRM payload, legacy
+        # session), and a placeholder example like "например, 14:00" would then
+        # read to the patient as a real free slot.
+        if not times:
+            return _tr(
+                session,
+                "Сейчас уточню свободное время и напишу Вам актуальные варианты 🌿",
+                "Қазір бос уақытты нақтылап, өзекті нұсқаларды жазамын 🌿",
+            )
+        if attempts == 1:
+            return _tr(
+                session,
+                f"Уточню, чтобы записать без ошибки: свободны {joined}. Напишите, пожалуйста, время цифрами — например, {times[0]}.",
+                f"Қателеспеу үшін нақтылайын: {joined} бос. Уақытты сандармен жазыңызшы — мысалы, {times[0]}.",
+            )
+        return _tr(
+            session,
+            f"На этот день свободны только {joined}. Если ни одно не подходит — напишите другой день, посмотрю свободные окошки там 🌿",
+            f"Бұл күні тек {joined} бос. Егер ыңғайлы болмаса — басқа күнді жазыңыз, сол күнге қараймын 🌿",
+        )
+
+    if step in {"date", "preferred_time"}:
+        if attempts == 1:
+            return _tr(
+                session,
+                "Подскажите, пожалуйста, конкретный день — например «завтра» или «в среду». Тогда сразу покажу свободное время.",
+                "Нақты күнді жазыңызшы — мысалы «ертең» немесе «сәрсенбіде». Сонда бос уақыттарды бірден көрсетемін.",
+            )
+        return _tr(
+            session,
+            "Могу посмотреть ближайшие свободные дни и прислать варианты — так будет быстрее. Написать их?",
+            "Ең жақын бос күндерді қарап, нұсқаларын жіберейін бе? Солай жылдамырақ болады.",
+        )
+
+    if step == "name":
+        return _tr(
+            session,
+            "Для записи нужно имя пациента — напишите, пожалуйста, как записать (имя и фамилию).",
+            "Жазылу үшін пациенттің аты керек — атыңыз бен тегіңізді жазыңызшы.",
+        )
+
+    if step == "age":
+        return _tr(
+            session,
+            "Напишите, пожалуйста, возраст пациента числом — например «45». Это нужно для безопасности процедуры.",
+            "Пациенттің жасын санмен жазыңызшы — мысалы «45». Бұл процедураның қауіпсіздігі үшін қажет.",
+        )
+
+    if step == "complaint":
+        return _tr(
+            session,
+            "Опишите, пожалуйста, что беспокоит: где болит и как давно. Тогда подскажу, поможем ли мы.",
+            "Не мазалайтынын жазыңызшы: қай жері ауырады және қашаннан бері. Сонда көмектесе алатынымызды айтамын.",
+        )
+
+    return _clarify_intent_answer(session)
 
 
 def _no_reply(chat_id: str, session: dict[str, Any], reason: str = "") -> str:
@@ -4876,8 +5173,46 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
         ),
     }
 
+    # The same durable claim the GPT-first tool takes, keyed identically, so a
+    # claim held by either path blocks the other. Without it two messages that
+    # both reach this fallback concurrently each issue their own CRM POST and
+    # the patient ends up with two appointments.
+    booking_claim_key = (
+        agent._slot_key(
+            str(booking_payload["date"] or ""),
+            str(booking_payload["time_start"] or ""),
+            str(booking_payload["doctor_login"] or ""),
+        )
+        + "|"
+        + normalized_phone
+    )
+    try:
+        claim_acquired = state.claim_booking(booking_claim_key, str(chat_id or ""))
+    except Exception as exc:  # a claim-store failure must never book twice
+        _safe_log(chat_id, "booking_claim_error", {"error_type": type(exc).__name__})
+        claim_acquired = False
+    if not claim_acquired:
+        _safe_log(chat_id, "booking_duplicate_prevented", {"reason": "claim_held"})
+        session["step"] = "escalated"
+        session["escalated"] = True
+        session["manual_takeover"] = True
+        session["crm_result"] = "pending"
+        session["booking_confirmed"] = False
+        session["handoff_reason"] = session.get("handoff_reason") or "booking_already_in_progress"
+        bot_tools.escalate_to_human(session, session["handoff_reason"])
+        return _operator_handoff_text(session)
+
     try:
         booked = await crm.book_appointment(**booking_payload)
+        # Only a confirmed booking closes the claim. Anything the CRM did not
+        # confirm keeps it `uncertain`, because that answer is not proof the
+        # appointment was never written.
+        agent._settle_booking_claim(
+            chat_id,
+            booking_claim_key,
+            rejected=False,
+            confirmed=agent._crm_booking_succeeded(booked),
+        )
         session["booked"] = True
         session["appointment"] = booked
         session["step"] = "booked"
@@ -4950,6 +5285,10 @@ async def _book(chat_id: str, session: dict[str, Any], phone: str) -> str:
             "handoff_reason": f"crm_book_{exc.status_code}",
         }
         _safe_log(chat_id, "crm_booking_failed", log_payload)
+
+        # A 4xx means the CRM refused and created nothing, so the slot may be
+        # claimed again. A 5xx may have created it before failing to answer.
+        agent._settle_booking_claim(chat_id, booking_claim_key, rejected=exc.status_code < 500)
 
         session["step"] = "escalated"
         session["escalated"] = True
@@ -6485,7 +6824,19 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     # справку, и _last_answer_was_info ложно срабатывает на слове "приём" внутри
     # locked-шаблона противопоказаний ("приём не проводится"). Молчать в ответ на
     # собственный вопрос нельзя — переспрашиваем.
-    if _is_thanks_or_ok(text) and _last_answer_was_info(session) and str(session.get("step") or "") != "contraindications":
+    #
+    # Second exception — an unfinished booking. Production case: the patient is
+    # already looking at real CRM slots, asks "а сколько стоит?", gets the price
+    # (which contains "приём"/"5 000", so _last_answer_was_info is true), replies
+    # "ок" — and the bot went silent in the middle of the booking. Silence is
+    # only a sane imitation of a human admin when there is nothing pending; with
+    # an open booking it just abandons the patient.
+    if (
+        _is_thanks_or_ok(text)
+        and _last_answer_was_info(session)
+        and str(session.get("step") or "") != "contraindications"
+        and not _has_unfinished_booking(session)
+    ):
         return _no_reply(chat_id, session, "thanks/info")
 
     # no_duplicate_after_booking_guard:
@@ -6494,6 +6845,28 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     current_step = session.get("step") or "start"
     if (current_step in ("done", "booked") or session.get("booked")) and _is_thanks_or_ok(text):
         return _no_reply(chat_id, session, "thanks/done")
+
+    # ============================================================
+    # GPT-FIRST AGENT LOOP — the primary conversational path.
+    # ============================================================
+    # Everything above this point is technical admission control: CRM patient
+    # state, first touch, manual takeover, refunds, booked-session silence.
+    # Everything below is the legacy deterministic funnel.
+    #
+    # From here on GPT owns the conversation. It understands the message, picks
+    # the next dialog step and calls real CRM tools (availability, doctors,
+    # booking) through agent.py. Python no longer decides what the patient
+    # meant — it executes tools, validates CRM responses and enforces
+    # idempotency.
+    #
+    # The legacy funnel below is kept as the *technical* fallback: it runs only
+    # when the agent cannot run at all (no OpenAI key, AI disabled, budget
+    # exhausted, transport error). That keeps a production OpenAI outage from
+    # stopping bookings, without letting Python act as a second conversational
+    # brain while GPT is available.
+    agent_answer = await _try_gpt_first_agent(chat_id, phone, session, text)
+    if agent_answer is not None:
+        return agent_answer
 
     # explicit_language_switch_guard:
     # Если клиент просит отвечать на другом языке — переключаем язык и подтверждаем.
