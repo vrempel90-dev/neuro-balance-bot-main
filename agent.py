@@ -52,7 +52,19 @@ except Exception:  # pragma: no cover - state is always importable in production
 # One inbound turn may drive at most this many tool executions. Beyond that the
 # loop stops, records telemetry and still answers the patient — an exhausted
 # budget must never become a silent turn.
-MAX_TOOL_ITERATIONS = 6
+#
+# Kept deliberately small: each iteration is another OpenAI round-trip carrying
+# the full clinic system prompt, and the clinic runs on a fixed monthly AI
+# budget (MONTHLY_AI_BUDGET_USD, enforced in ai_budget). A normal booking turn
+# needs one or two tool calls; four leaves headroom for "check availability →
+# book → re-check after a conflict" without letting a confused model burn the
+# month's budget on one conversation.
+MAX_TOOL_ITERATIONS = 4
+
+# Upper bound on the per-conversation registry of CRM-offered slots. It only
+# has to cover what was shown recently enough for the patient to pick from, and
+# an unbounded dict would grow the persisted session on every availability call.
+_MAX_OFFERED_SLOTS = 60
 
 # Terminal outcomes of a booking conversation. Silence is deliberately not one.
 OUTCOME_CONTINUE = "continue"
@@ -198,7 +210,14 @@ def _remember_offered_slots(session: dict[str, Any], slots: list[dict[str, str]]
     if not isinstance(registry, dict):
         registry = {}
     for slot in slots:
-        registry[_slot_key(slot["date"], slot["time_start"], slot["doctor_login"])] = dict(slot)
+        key = _slot_key(slot["date"], slot["time_start"], slot["doctor_login"])
+        registry.pop(key, None)  # re-inserting keeps the newest offers last
+        registry[key] = dict(slot)
+    if len(registry) > _MAX_OFFERED_SLOTS:
+        # Drop the oldest offers; dicts preserve insertion order, so the slots
+        # the patient was shown most recently are the ones that survive.
+        for stale_key in list(registry)[: len(registry) - _MAX_OFFERED_SLOTS]:
+            registry.pop(stale_key, None)
     session["crm_offered_slots"] = registry
 
 

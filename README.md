@@ -4,10 +4,57 @@ Production-бот Neuro Balance с отдельным OpenAI Dialog Brain и ж�
 
 ## Архитектура
 
-- OpenAI Dialog Brain (`AI_BRAIN_MODEL`, production: `gpt-5.4-mini`) — понимает клиента, язык, жалобу и намерение и предлагает следующий безопасный шаг диалога.
+GPT ведёт разговор, Python исполняет, CRM — единственный источник истины.
+
+```
+Wazzup inbound -> main.py (webhook, dedup, гейты)
+               -> dialog.handle_message
+               -> agent.py  ── GPT-first tool loop ──┐
+                                                     │
+     user -> GPT -> tool_call -> реальный CRM -> tool_result -> GPT -> ответ
+                                                     │
+               -> legacy state machine (только когда GPT недоступен)
+```
+
+- **agent.py (`AI_BRAIN_MODEL`, production: `gpt-5.4-mini`)** — главный
+  разговорный слой. GPT понимает сообщение, выбирает следующий шаг диалога и
+  сам вызывает инструменты. Все факты о врачах, датах, времени и записи
+  приходят из реальных ответов CRM.
+- **Инструменты GPT** — тонкие мосты к существующему `crm.py`, контракт CRM не
+  менялся: `get_available_slots` → `GET /api/bot/check-slots`, `get_doctors` →
+  `GET /api/bot/doctors`, `book_appointment` → `POST /api/bot/book`,
+  `get_clinic_info` (утверждённые тексты), `escalate_to_operator`.
+- **Python** — исполнительный слой: Wazzup webhook, режим 20:00–08:00,
+  дедупликация, валидация CRM-ответов, идемпотентность записи, таймауты,
+  телеметрия, безопасность.
+- **Детерминированные гарантии остаются в Python:** записать можно только слот,
+  который CRM реально предложила в этом диалоге; `doctorLogin` обязан быть из
+  CRM; медицинские гейты (жалоба, противопоказания, возраст) блокируют запись;
+  `booking_success` выставляется только после подтверждения CRM; повторный
+  booking-вызов не создаёт вторую запись; `MAX_TOOL_ITERATIONS` ограничивает
+  цикл.
+- **Legacy state machine в `dialog.py`** — технический fallback. Работает
+  только когда агент не может запуститься (нет `OPENAI_API_KEY`, `AI_ENABLED`
+  или `OPENAI_BRAIN_ENABLED` выключены, исчерпан AI-бюджет, ошибка транспорта).
+  Сбой OpenAI не останавливает запись пациентов.
+- **Инвариант «не молчать»:** каждый принятый активный inbound turn
+  заканчивается ответом пациенту, эскалацией с сообщением или корректной
+  технической ошибкой. Намеренное молчание возможно только через `_no_reply` с
+  явной причиной.
 - `OPENAI_MODEL` (`gpt-4o-mini`) — используется для вспомогательной OpenAI/humanize-логики.
-- Python — источник истины для Wazzup, режима 20:00–08:00, state machine, противопоказаний, CRM-слотов, записи, переноса, отмены и safety guards.
 - Railway production запускает `live_main:app`. `live_main.py` делегирует обычную обработку в `main.py`; Claude observer запускается только после завершённого Wazzup-turn и не управляет ответом GPT/CRM пациенту.
+
+## Телеметрия booking flow
+
+Диагностика GPT-first пути видна в событиях `state.log_event` (без секретов и
+без полных персональных данных — телефон маскируется):
+
+`agent_turn_started`, `agent_tool_requested`, `agent_crm_availability_result`
+(`doctor_count`, `slot_count`), `agent_booking_tool_requested`,
+`agent_booking_crm_called`, `agent_booking_crm_success` / `agent_booking_crm_error`,
+`agent_booking_duplicate_prevented`, `agent_booking_rejected_unknown_slot`,
+`agent_booking_rejected_unknown_doctor`, `agent_tool_iteration_limit`,
+`agent_silent_turn_prevented`, `agent_turn_finished`, `agent_fallback_to_python`.
 
 ## Railway variables
 
