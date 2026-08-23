@@ -93,3 +93,13 @@ def _reload_settings() -> None:
         state.init_db()
     except Exception:
         pass
+
+
+# NB: deliberately no fixture that restores the ``crm`` module between tests.
+# Two legacy runners (run_golden.py, run_dialog_tests.py) install offline fakes
+# straight onto ``crm``, and several older tests rely on those fakes still
+# being in place. Restoring the real functions makes those tests attempt live
+# HTTP calls to the CRM, which doubles the suite runtime and makes it depend on
+# an external service. Tests that must assert against the real client check the
+# module source instead of the runtime attribute (see
+# test_production_readiness.py).
