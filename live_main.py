@@ -10,6 +10,7 @@ import ai as openai_runtime
 import ai_budget
 import main as neuro
 import state
+from agent_prompt_policy import install_agent_prompt_policy
 from booking_confirmation_guard import enforce_confirmed_booking_only
 from repair_observer import dispatch_new_lead_turn
 from returning_patient_policy import install_returning_patient_policy
@@ -20,6 +21,7 @@ from weekend_legacy_block_bypass import install_weekend_legacy_block_bypass
 install_weekend_booking_policy()
 install_weekend_legacy_block_bypass()
 install_returning_patient_policy()
+install_agent_prompt_policy()
 
 # Final patient-facing fail-closed guard. main.py imported enforce_prompt_only as
 # a module-global function, so patch that exact runtime binding used by
