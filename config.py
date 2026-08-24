@@ -21,23 +21,28 @@ class Settings(BaseSettings):
     )
 
     # OpenAI / AI
+    # Main conversational agent: balanced GPT-5.6 tier for reliable tool use.
+    # Cheap helper/humanize path: GPT-5.6 Luna.
     openai_api_key: str = Field(default="", validation_alias=AliasChoices("OPENAI_API_KEY", "openai_api_key"))
-    openai_model: str = Field(default="gpt-4o-mini", validation_alias=AliasChoices("OPENAI_MODEL", "openai_model"))
-    ai_brain_model: str = Field(default="gpt-5.4-mini", validation_alias=AliasChoices("AI_BRAIN_MODEL", "ai_brain_model"))
+    openai_model: str = Field(default="gpt-5.6-luna", validation_alias=AliasChoices("OPENAI_MODEL", "openai_model"))
+    ai_brain_model: str = Field(default="gpt-5.6-terra", validation_alias=AliasChoices("AI_BRAIN_MODEL", "ai_brain_model"))
     ai_brain_temperature: float = Field(default=0.2, validation_alias=AliasChoices("AI_BRAIN_TEMPERATURE", "ai_brain_temperature"))
-    ai_humanize_model: str = Field(default="gpt-5.4-mini", validation_alias=AliasChoices("AI_HUMANIZE_MODEL", "ai_humanize_model"))
+    ai_humanize_model: str = Field(default="gpt-5.6-luna", validation_alias=AliasChoices("AI_HUMANIZE_MODEL", "ai_humanize_model"))
     openai_voice_model: str = Field(default="whisper-1", validation_alias=AliasChoices("OPENAI_VOICE_MODEL", "openai_voice_model"))
     ai_enabled: bool = Field(default=True, validation_alias=AliasChoices("AI_ENABLED", "ai_enabled"))
     bot_auto_reply_enabled: bool = Field(default=True, validation_alias=AliasChoices("BOT_AUTO_REPLY_ENABLED", "bot_auto_reply_enabled"))
     bot_activated_at: str = Field(default="2026-07-02T00:00:00+05:00", validation_alias=AliasChoices("BOT_ACTIVATED_AT", "bot_activated_at"))
-    new_leads_only: bool = Field(default=True, validation_alias=AliasChoices("NEW_LEADS_ONLY", "new_leads_only"))
+    # False means an existing CRM patient without an active booking may still
+    # continue a new booking conversation. Active bookings/manual takeover keep
+    # their own hard guards and are not reopened by this switch.
+    new_leads_only: bool = Field(default=False, validation_alias=AliasChoices("NEW_LEADS_ONLY", "new_leads_only"))
     openai_humanize_replies: bool = Field(default=True, validation_alias=AliasChoices("OPENAI_HUMANIZE_REPLIES", "openai_humanize_replies"))
     openai_brain_enabled: bool = Field(default=True, validation_alias=AliasChoices("OPENAI_BRAIN_ENABLED", "openai_brain_enabled"))
     openai_dialog_temperature: float = Field(default=0.2, validation_alias=AliasChoices("OPENAI_DIALOG_TEMPERATURE", "openai_dialog_temperature"))
     openai_humanize_temperature: float = Field(default=0.3, validation_alias=AliasChoices("OPENAI_HUMANIZE_TEMPERATURE", "openai_humanize_temperature"))
     openai_max_tokens: int = Field(default=700, validation_alias=AliasChoices("OPENAI_MAX_TOKENS", "openai_max_tokens"))
     # Потолок ответа брейна для gpt-5.x: в max_completion_tokens входят и токены
-    # рассуждения, поэтому 700 может уйти на reasoning и обрезать JSON.
+    # рассуждения, поэтому 700 может уйти на reasoning и обрезать JSON/tool call.
     ai_brain_max_completion_tokens: int = Field(default=2000, validation_alias=AliasChoices("AI_BRAIN_MAX_COMPLETION_TOKENS", "ai_brain_max_completion_tokens"))
 
     # Wazzup
