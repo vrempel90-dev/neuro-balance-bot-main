@@ -30,16 +30,21 @@ except Exception:  # pragma: no cover - state недоступен только 
 
 
 # Цены OpenAI в USD за 1M токенов.
-# ВАЖНО: проверять на https://openai.com/api/pricing при смене модели.
-# Проверено 17.08.2026: gpt-5.4-mini дороже gpt-4o-mini в 5x по input и 7.5x по output.
+# Проверено 24.08.2026 по официальному OpenAI API pricing/model pages.
+# Для Sol используем консервативный стандартный тариф как верхнюю границу;
+# это безопаснее для budget guard, даже если действует временная промо-цена.
 MODEL_PRICING_USD_PER_1M: dict[str, dict[str, float]] = {
+    "gpt-5.6-sol": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.6": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+    "gpt-5.6-terra": {"input": 2.00, "cached_input": 0.20, "output": 12.00},
+    "gpt-5.6-luna": {"input": 0.20, "cached_input": 0.02, "output": 1.20},
     "gpt-5.4-mini": {"input": 0.75, "cached_input": 0.075, "output": 4.50},
     "gpt-4o-mini": {"input": 0.15, "cached_input": 0.075, "output": 0.60},
 }
 
-# Неизвестная модель считается по самому дорогому известному тарифу:
+# Неизвестная модель считается по дорогой верхней границе:
 # лучше переоценить расход и притормозить, чем незаметно уйти за бюджет.
-_FALLBACK_PRICING = {"input": 0.75, "cached_input": 0.075, "output": 4.50}
+_FALLBACK_PRICING = {"input": 5.00, "cached_input": 0.50, "output": 30.00}
 
 # Роли вызовов — совпадают с purpose в логах openai_called.
 PURPOSE_BRAIN = "dialog_brain"
@@ -52,8 +57,9 @@ def _normalize_model(model: str) -> str:
     name = str(model or "").strip().lower()
     if name in MODEL_PRICING_USD_PER_1M:
         return name
-    # gpt-4o-mini-2024-07-18 → gpt-4o-mini
-    for known in MODEL_PRICING_USD_PER_1M:
+    # Версии/снапшоты моделей нормализуем к базовому имени.
+    # Сначала проверяем более длинные имена, чтобы gpt-5.6-terra не попал в gpt-5.6.
+    for known in sorted(MODEL_PRICING_USD_PER_1M, key=len, reverse=True):
         if name.startswith(known):
             return known
     return name
