@@ -10,13 +10,28 @@ import ai as openai_runtime
 import ai_budget
 import main as neuro
 import state
+from booking_confirmation_guard import enforce_confirmed_booking_only
 from repair_observer import dispatch_new_lead_turn
+from returning_patient_policy import install_returning_patient_policy
 from weekend_booking_policy import install_weekend_booking_policy
 from weekend_legacy_block_bypass import install_weekend_legacy_block_bypass
 
 
 install_weekend_booking_policy()
 install_weekend_legacy_block_bypass()
+install_returning_patient_policy()
+
+# Final patient-facing fail-closed guard. main.py imported enforce_prompt_only as
+# a module-global function, so patch that exact runtime binding used by
+# _guard_answer rather than only replacing strict_prompt_guard.enforce_prompt_only.
+_base_prompt_guard = neuro.enforce_prompt_only
+
+
+def _confirmed_booking_prompt_guard(answer: str, session: dict[str, Any] | None = None) -> str:
+    return enforce_confirmed_booking_only(answer, session, _base_prompt_guard)
+
+
+neuro.enforce_prompt_only = _confirmed_booking_prompt_guard
 
 _original_process_wazzup_message = neuro._process_wazzup_message
 
