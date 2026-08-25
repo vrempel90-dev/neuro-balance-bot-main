@@ -128,6 +128,10 @@ class AgentResult:
     escalate: bool = False
     booking: dict[str, Any] | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    # Everything the CRM actually returned this turn. The caller validates the
+    # model's text against these facts before it reaches the patient, so a date
+    # or a doctor that no tool returned can be blocked instead of delivered.
+    tool_results: list[dict[str, Any]] = field(default_factory=list)
     iterations: int = 0
     error: str = ""
 
@@ -2335,6 +2339,7 @@ async def run_agent_turn(
                 }
 
             result.tool_calls.append({"tool": name, "ok": bool(tool_result.get("ok")), "args": _safe_args(args)})
+            result.tool_results.append(tool_result)
             if name == "book_appointment":
                 result.booking = tool_result
             if name == "escalate_to_operator" and tool_result.get("escalated"):

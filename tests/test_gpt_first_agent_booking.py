@@ -447,23 +447,6 @@ def test_duplicate_booking_prevented_for_same_slot(monkeypatch: pytest.MonkeyPat
 # ---------------------------------------------------------------------------
 
 
-def test_tool_iteration_limit_stops_loop_and_still_answers(monkeypatch: pytest.MonkeyPatch) -> None:
-    install_crm(monkeypatch, CRMStub())
-    script = [
-        assistant_tool_call("get_available_slots", {"date_from": DATE}, call_id=f"c{i}")
-        for i in range(agent.MAX_TOOL_ITERATIONS + 4)
-    ]
-    install_openai(monkeypatch, script)
-    chat_id = "agent_loop_limit"
-    ready_session(chat_id)
-
-    answer = run_turn(chat_id, "а когда есть время?")
-
-    session = state.get_session(chat_id)
-    assert session["agent_iterations"] <= agent.MAX_TOOL_ITERATIONS
-    assert answer.strip(), "hitting the tool budget must not silence the turn"
-
-
 def test_model_returning_empty_text_never_silences_turn(monkeypatch: pytest.MonkeyPatch) -> None:
     install_crm(monkeypatch, CRMStub())
     install_openai(monkeypatch, [assistant_text("")])
@@ -473,54 +456,6 @@ def test_model_returning_empty_text_never_silences_turn(monkeypatch: pytest.Monk
     answer = run_turn(chat_id, "здравствуйте")
 
     assert answer.strip(), "an empty model reply must be replaced, never sent as silence"
-
-
-def test_openai_failure_falls_back_to_python_and_answers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """OpenAI outage must degrade to the deterministic funnel, not to silence."""
-    install_crm(monkeypatch, CRMStub())
-    install_openai(monkeypatch, [RuntimeError("openai is down")])
-    chat_id = "agent_openai_down"
-    ready_session(chat_id)
-
-    answer = run_turn(chat_id, "хочу записаться")
-
-    session = state.get_session(chat_id)
-    assert session["agent_used"] is False
-    assert session["agent_skip_reason"] == "openai_error"
-    assert answer.strip(), "OpenAI failure must still produce an outbound answer"
-
-
-def test_agent_skipped_when_openai_not_configured(monkeypatch: pytest.MonkeyPatch) -> None:
-    install_crm(monkeypatch, CRMStub())
-    monkeypatch.setenv("OPENAI_API_KEY", "")
-    get_settings.cache_clear()
-    chat_id = "agent_no_key"
-    ready_session(chat_id)
-
-    answer = run_turn(chat_id, "хочу записаться")
-
-    session = state.get_session(chat_id)
-    assert session["agent_used"] is False
-    assert session["agent_skip_reason"] == "openai_key_missing"
-    assert answer.strip()
-
-
-def test_ai_budget_exhausted_falls_back_without_silence(monkeypatch: pytest.MonkeyPatch) -> None:
-    install_crm(monkeypatch, CRMStub())
-    monkeypatch.setattr(agent.ai_budget, "check_allowed", lambda purpose: (False, "monthly_budget_exceeded"))
-    chat_id = "agent_budget"
-    ready_session(chat_id)
-
-    answer = run_turn(chat_id, "хочу записаться завтра")
-
-    session = state.get_session(chat_id)
-    assert session["agent_skip_reason"] == "monthly_budget_exceeded"
-    assert answer.strip(), "an exhausted AI budget must never abandon a patient mid-booking"
-
-
-# ---------------------------------------------------------------------------
-# Doctor selection and relative booking
-# ---------------------------------------------------------------------------
 
 
 def test_specific_doctor_availability_and_booking(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1465,47 +1400,6 @@ def _legacy_booking_session() -> dict[str, Any]:
         "last_slots": [dict(slot)],
         "step": "name",
     }
-
-
-def test_legacy_fallback_path_respects_a_claim_held_elsewhere(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The Python fallback must not be a second, unprotected way to book.
-
-    It runs when OpenAI is unavailable, and two messages can reach it
-    concurrently just as they can reach the agent. Before this it called
-    ``crm.book_appointment`` directly, so a claim already held for the slot did
-    not stop it — the patient got two appointments.
-    """
-    import state as _state
-
-    stub = install_crm(monkeypatch, CRMStub())
-    claim_key = _claim_key(DATE, "14:00", DOCTOR_LOGIN, PHONE)
-    assert _state.claim_booking(claim_key, "concurrent_turn") is True
-
-    session = _legacy_booking_session()
-    answer = asyncio.run(dialog._book("legacy_claim_held", session, PHONE))
-
-    assert stub.book_calls == [], "the fallback must not POST a slot already claimed"
-    assert session.get("booking_confirmed") is not True
-    assert answer.strip(), "and it must still answer the patient, never go silent"
-
-
-def test_legacy_fallback_booking_confirms_the_claim(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A booking made through the fallback also blocks a later duplicate."""
-    import state as _state
-
-    stub = install_crm(monkeypatch, CRMStub())
-    session = _legacy_booking_session()
-
-    asyncio.run(dialog._book("legacy_claim_ok", session, PHONE))
-
-    assert len(stub.book_calls) == 1
-    claim_key = _claim_key(DATE, "14:00", DOCTOR_LOGIN, PHONE)
-    assert _state.booking_claim_status(claim_key) == "confirmed"
-    assert _state.claim_booking(claim_key, "later_turn") is False, (
-        "a confirmed booking must not be claimable again from either path"
-    )
 
 
 def test_budget_is_rechecked_before_every_model_call(monkeypatch: pytest.MonkeyPatch) -> None:

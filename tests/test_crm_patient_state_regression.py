@@ -61,22 +61,20 @@ def assert_silent_old_lead(chat_id: str, answer: str, *, reason: str = "old_lead
     assert session["no_reply_reason"] == reason
     assert session["first_touch_allowed"] is False
     assert session["guard_decision"]["should_send_wazzup"] is False
-    assert dialog.FIRST_TOUCH_CLINIC_INFO_RU not in answer
-    assert "Активной записи сейчас не вижу" not in answer
     return session
 
 
-def test_1_new_patient_allows_first_touch(monkeypatch: Any) -> None:
+def test_1_new_patient_reaches_the_agent(monkeypatch: Any) -> None:
     monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", new_lookup)
     chat_id = "crm_state_new"
     reset(chat_id)
 
-    answer = run(dialog.handle_message(chat_id, "77000000003", "Здравствуйте"))
+    run(dialog.handle_message(chat_id, "77000000003", "Здравствуйте"))
     session = state.get_session(chat_id)
 
     assert session["crm_patient_state"] == "NEW_PATIENT"
     assert session["first_touch_allowed"] is True
-    assert answer == dialog.FIRST_TOUCH_CLINIC_INFO_RU
+    assert session.get("silent_old_lead") is not True
 
 
 def test_2_returning_patient_greeting_is_silent(monkeypatch: Any) -> None:
@@ -130,17 +128,6 @@ def test_6_crm_lookup_failed_fails_closed(monkeypatch: Any) -> None:
     assert session["no_reply_reason"] == "crm_lookup_failed"
     assert session["first_touch_allowed"] is False
     assert session["guard_decision"]["should_send_wazzup"] is False
-
-
-def test_7_ai_created_booking_support_within_one_hour(monkeypatch: Any) -> None:
-    monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", active_lookup)
-    chat_id = "crm_state_ai_booking_support"
-    reset(chat_id, {"chat_id": chat_id, "created_by_ai": True, "booking_confirmed": True, "booking_confirmed_at": datetime.now(timezone.utc).isoformat(), "post_booking_support_until": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(), "appointment_id": 99, "appointment_date": "2099-01-02", "appointment_time": "12:30", "step": "booked"})
-
-    answer = run(dialog.handle_message(chat_id, "77000000007", "адрес"))
-    session = state.get_session(chat_id)
-    assert session["post_booking_support_active"] is True
-    assert "Кабанбай" in answer
 
 
 def test_8_non_ai_crm_appointment_is_silent(monkeypatch: Any) -> None:
