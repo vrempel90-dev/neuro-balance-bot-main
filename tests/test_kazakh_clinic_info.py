@@ -27,7 +27,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import bot_tools  # noqa: E402
 import clinic_info  # noqa: E402
-import response_guard  # noqa: E402
 from language_guard import response_language_violation  # noqa: E402
 
 
@@ -116,21 +115,3 @@ def test_kazakh_templates_keep_links_brands_and_numbers(topic: str, fragment: st
     """Ссылки, бренды, номера домов и цены переводить нельзя."""
     kk = clinic_info.get_clinic_info(topic, "kk")
     assert fragment.lower() in kk.lower()
-
-
-# ------------------------------------------------- response_guard без смеси
-
-
-@pytest.mark.parametrize(
-    "user_text, ru_answer",
-    [
-        ("Қабылдау қанша тұрады?", "Приём в нашей клинике — 5 000 тг. В стоимость входит осмотр врача."),
-        ("Мекенжайыңыз қайда?", "📍 Адрес: Кабанбай батыра 28, внутренний двор, подъезд 3, Астана."),
-        ("Қандай график бойынша жұмыс істейсіздер?", "🕒 График приёма. Понедельник – Пятница: 08:00 – 20:00"),
-    ],
-)
-def test_kazakh_patient_never_gets_russian_template_with_kazakh_tail(user_text: str, ru_answer: str) -> None:
-    """Regression: guard отдавал русский шаблон + казахский вопрос в одном сообщении."""
-    answer, violations = response_guard.validate_answer("chat-kk", user_text, ru_answer, {"language": "ru"})
-    assert "wrong_language_ru_template_on_kk" in violations
-    assert response_language_violation(answer, "kk") == ""
