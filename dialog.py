@@ -31,9 +31,9 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import admission
 import agent
 import crm
 import state
@@ -100,14 +100,6 @@ RED_FLAG_HISTORY_MARKERS = (
     "кейин", "болган", "калпына",
 )
 
-CRM_ACTIVE_STATUSES = {
-    "active", "scheduled", "confirmed", "booked", "new_booking",
-    "активна", "активный", "запланирован", "подтвержден", "подтверждён",
-    "записан", "записана", "подтвердил", "подтвердила", "подтвердил_заранее",
-    "ожидает",
-}
-CRM_NEW_LEAD_STATUSES = {"", "новая", "new"}
-
 # Технические причины, по которым агент не отработал, но пациент всё равно
 # должен получить ответ: ключа нет, бюджет исчерпан, сеть упала.
 # Всё остальное — молчание: за диалогом уже следит человек.
@@ -115,13 +107,22 @@ SILENT_SKIP_REASONS = {"empty_text", "manual_takeover", "old_chat_ai_disabled"}
 
 # no_reply_reason / first_touch_blocked_reason по состоянию лида. Значения —
 # существующий контракт логов, дашборда и repair_service, поэтому не меняются.
+# Значения crm_patient_state в сессии — существующий контракт отладочной
+# выдачи main.py, поэтому имена состояний admission.py переводятся в них.
+_CRM_PATIENT_STATE = {
+    admission.NEW: "NEW_PATIENT",
+    admission.RETURNING: "RETURNING_PATIENT_NO_ACTIVE_BOOKING",
+    admission.ACTIVE_BOOKING: "ACTIVE_BOOKING",
+    admission.CRM_UNAVAILABLE: "CRM_UNAVAILABLE",
+}
+
 _ADMISSION_MUTE_REASONS = {"old_lead_from_crm", "active_booking_old_lead", "crm_lookup_failed",
                            "returning_patient_old_lead"}
 
 _LEAD_SILENCE_REASONS = {
-    "RETURNING_PATIENT_NO_ACTIVE_BOOKING": ("old_lead_from_crm", "returning_patient_old_lead"),
-    "ACTIVE_BOOKING": ("active_booking_old_lead", "active_booking_old_lead"),
-    "CRM_UNAVAILABLE": ("crm_lookup_failed", "crm_lookup_failed"),
+    admission.RETURNING: ("old_lead_from_crm", "returning_patient_old_lead"),
+    admission.ACTIVE_BOOKING: ("active_booking_old_lead", "active_booking_old_lead"),
+    admission.CRM_UNAVAILABLE: ("crm_lookup_failed", "crm_lookup_failed"),
 }
 
 LANGUAGE_SWITCH_CONFIDENCE = 0.6
@@ -313,84 +314,36 @@ def _detect_lang(text: str, session: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _crm_raw(lookup: dict[str, Any] | None) -> dict[str, Any]:
-    if not isinstance(lookup, dict):
-        return {}
-    raw = lookup.get("raw")
-    return raw if isinstance(raw, dict) else lookup
+async def _classify_lead(chat_id: str, phone: str, session: dict[str, Any]) -> admission.Admission:
+    """Спрашивает CRM про пациента и отдаёт классификацию admission.py.
 
-
-def _crm_appt_is_active(appt: dict[str, Any] | None) -> bool:
-    if not isinstance(appt, dict) or not appt:
-        return False
-    status = _low(str(appt.get("status") or appt.get("appointmentStatus") or ""))
-    date_s = str(appt.get("date") or appt.get("appointmentDate") or "")[:10]
-    if status and not any(s in status for s in CRM_ACTIVE_STATUSES):
-        return False
-    if date_s:
-        try:
-            future_or_today = datetime.fromisoformat(date_s).date() >= (datetime.now(timezone.utc) + timedelta(hours=5)).date()
-            return future_or_today if not status else (future_or_today and any(s in status for s in CRM_ACTIVE_STATUSES))
-        except Exception:
-            pass
-    return any(s in status for s in CRM_ACTIVE_STATUSES)
-
-
-def _set_crm_patient_state(session: dict[str, Any], lookup: dict[str, Any] | None, appt: dict[str, Any] | None) -> str:
-    """Единственная классификация пациента: NEW_PATIENT / RETURNING / ACTIVE_BOOKING."""
-    raw = _crm_raw(lookup)
-    patient = raw.get("patient") if isinstance(raw.get("patient"), dict) else None
-    lead = raw.get("lead") if isinstance(raw.get("lead"), dict) else None
-    last = raw.get("lastAppointment") if isinstance(raw.get("lastAppointment"), dict) else None
-    lead_status = _low(str((lead or {}).get("status") or ""))
-    is_new = raw.get("isNew") is True
-    has_active = raw.get("hasActiveAppointment") is True
-
-    session["crm_patient_found"] = bool(raw.get("found")) if "found" in raw else bool(patient or lead or last)
-    session["crm_patient_is_new"] = bool(raw.get("isNew")) if "isNew" in raw else not bool(patient or lead or last or appt)
-    session["crm_patient_name"] = (patient or {}).get("name") or raw.get("patientName") or ""
-
-    if appt or has_active or _crm_appt_is_active(last) or raw.get("activeAppointment"):
-        state_value = "ACTIVE_BOOKING"
-    elif (
-        (is_new or (raw.get("isNew") is not False and raw.get("found") is not True))
-        and not patient
-        and not last
-        and ((lead and lead_status in CRM_NEW_LEAD_STATUSES) or not lead)
-    ):
-        state_value = "NEW_PATIENT"
-    else:
-        state_value = "RETURNING_PATIENT_NO_ACTIVE_BOOKING"
-    session["crm_patient_state"] = state_value
-    return state_value
-
-
-async def _classify_lead(chat_id: str, phone: str, session: dict[str, Any]) -> str:
-    """Спрашивает CRM про пациента и возвращает его состояние.
-
-    ``CRM_UNAVAILABLE`` — отдельное состояние, а не «наверное новый»: молчать
-    из-за недоступной CRM безопаснее, чем начать анкету пациенту, который уже
-    записан.
+    Сам запрос живёт здесь (ход диалога — место для ввода-вывода), а решение
+    «новый / вернувшийся / записан / CRM молчит» принимает чистая функция,
+    которую можно проверить тестом на каждый пограничный ответ CRM.
     """
     normalized = crm.normalize_phone(phone or session.get("phone") or "")
     session["phone_normalized"] = normalized
     session["crm_lookup_called"] = True
     session["crm_lookup_error"] = ""
+    lookup: dict[str, Any] | None
     try:
         lookup = await crm.lookup_active_appointments_by_phone(normalized)
     except Exception as exc:
         session["crm_lookup_error"] = type(exc).__name__
-        session["crm_patient_state"] = "CRM_UNAVAILABLE"
         _safe_log(chat_id, "crm_lookup_failed", {"chat_id": chat_id, "error_type": type(exc).__name__})
-        return "CRM_UNAVAILABLE"
+        lookup = None
 
-    appointments = [a for a in list((lookup or {}).get("appointments") or []) if _crm_appt_is_active(a)]
-    appt = appointments[0] if appointments else None
-    if appt is None and _crm_appt_is_active((lookup or {}).get("appointment")):
-        appt = (lookup or {}).get("appointment")
-    session["active_appointment_found"] = bool(appt)
-    session["active_appointment_count"] = len(appointments)
-    return _set_crm_patient_state(session, lookup, appt)
+    verdict = admission.classify(normalized, lookup)
+    session["crm_patient_state"] = _CRM_PATIENT_STATE[verdict.state]
+    session["crm_state_reason"] = verdict.reason
+    session["active_appointment_found"] = verdict.appointment is not None
+    session["active_appointment_count"] = len([
+        a for a in (lookup or {}).get("appointments") or [] if isinstance(a, dict)
+    ]) if verdict.state == admission.ACTIVE_BOOKING else 0
+    session["crm_patient_is_new"] = verdict.state == admission.NEW
+    session["crm_patient_found"] = verdict.state in {admission.RETURNING, admission.ACTIVE_BOOKING}
+    _safe_log(chat_id, "lead_admission", {"chat_id": chat_id, "state": verdict.state, "reason": verdict.reason})
+    return verdict
 
 
 async def _notify_admin_once(chat_id: str, session: dict[str, Any], phone: str, reason: str) -> None:
@@ -593,7 +546,7 @@ async def _mute_lead(chat_id: str, session: dict[str, Any], phone: str, lead_sta
     session["old_lead_reason"] = blocked
     session["ai_muted"] = True
     # CRM молчит — мы не знаем, кто пишет. Дальше говорит человек, а не бот.
-    session["manual_takeover"] = lead_state == "CRM_UNAVAILABLE" or bool(session.get("manual_takeover"))
+    session["manual_takeover"] = lead_state == admission.CRM_UNAVAILABLE or bool(session.get("manual_takeover"))
     session["first_touch_allowed"] = False
     session["first_touch_blocked_reason"] = blocked
     await _notify_admin_once(chat_id, session, phone, blocked)
@@ -693,10 +646,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if _human_took_over(session):
         return _no_reply(chat_id, session, "manual_takeover")
 
-    lead_state = await _classify_lead(chat_id, phone, session)
-    if lead_state != "NEW_PATIENT":
+    verdict = await _classify_lead(chat_id, phone, session)
+    if not verdict.bot_may_reply:
         # Не новый лид (или CRM молчит и мы не знаем, кто это) — fail-closed.
-        return await _mute_lead(chat_id, session, phone, lead_state)
+        return await _mute_lead(chat_id, session, phone, verdict.state)
 
     if _admission_muted(session):
         _clear_admission_mute(session)

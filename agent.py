@@ -112,6 +112,13 @@ _MAX_DAYS_AHEAD = 21
 # and an all-empty period never triggers the "enough slots" early exit.
 _MAX_AVAILABILITY_REQUESTS = 7
 
+# Суббота и воскресенье в клинике — процедурные дни: консультации в эти дни не
+# ведутся. Раньше это правило жило в weekend_booking_policy.py, который
+# монкипатчил приватную функцию dialog.py на импорте и приклеивал объяснение
+# текстом перед ответом бота. Правило про даты и должно жить там, где даты
+# берутся, — в инструменте доступности; объяснение пишет модель.
+_PROCEDURE_WEEKEND_DAYS = {5, 6}
+
 
 class AgentUnavailable(Exception):
     """Raised when the agent loop cannot run at all (config/budget/transport)."""
@@ -895,10 +902,24 @@ async def _tool_get_available_slots(
     doctor_login = str(args.get("doctor_login") or "").strip() or None
     time_preference = str(args.get("time_preference") or "").strip()
 
+    requested_start = start
+    weekend_requested = start.weekday() in _PROCEDURE_WEEKEND_DAYS
+    while start.weekday() in _PROCEDURE_WEEKEND_DAYS:
+        start += timedelta(days=1)
+
     collected: list[dict[str, str]] = []
     http_error = ""
-    for offset in range(days_ahead):
-        day = (start + timedelta(days=offset)).isoformat()
+    # days_ahead считается в РАБОЧИХ днях: суббота и воскресенье пропускаются,
+    # а не тратят один из немногих разрешённых запросов к CRM.
+    requested_days = 0
+    day_date = start
+    while requested_days < days_ahead:
+        if day_date.weekday() in _PROCEDURE_WEEKEND_DAYS:
+            day_date += timedelta(days=1)
+            continue
+        day = day_date.isoformat()
+        day_date += timedelta(days=1)
+        requested_days += 1
         try:
             data = await crm.check_slots(day, doctor_login=doctor_login)
         except Exception as exc:
@@ -951,6 +972,8 @@ async def _tool_get_available_slots(
         "agent_crm_availability_result",
         {
             "date_from": start.isoformat(),
+            "requested_date_from": requested_start.isoformat(),
+            "weekend_procedure_day_requested": weekend_requested,
             "days_ahead": days_ahead,
             "doctor_login": doctor_login or "",
             "doctor_count": len(doctors),
@@ -959,9 +982,23 @@ async def _tool_get_available_slots(
         },
     )
 
+    note = (
+        "Показывай пациенту только эти варианты. Другие даты/время называть нельзя."
+        if slots
+        else "CRM не вернула свободных окошек на этот период. Предложи другой период или эскалацию."
+    )
+    if weekend_requested:
+        note = (
+            "Пациент просил субботу или воскресенье — это процедурные дни, консультаций в "
+            "них нет. Скажи об этом своими словами и предложи окошки ближайшего рабочего "
+            "дня. " + note
+        )
+
     return {
         "ok": True,
         "date_from": start.isoformat(),
+        "requested_date_from": requested_start.isoformat(),
+        "weekend_procedure_day_requested": weekend_requested,
         "days_ahead": days_ahead,
         "requested_doctor_login": doctor_login or "",
         "slot_count": len(slots),
@@ -969,11 +1006,7 @@ async def _tool_get_available_slots(
         "doctors": doctors,
         "time_preference_had_no_slots": dropped_by_preference,
         "crm_partially_unavailable": partial,
-        "note": (
-            "Показывай пациенту только эти варианты. Другие даты/время называть нельзя."
-            if slots
-            else "CRM не вернула свободных окошек на этот период. Предложи другой период или эскалацию."
-        ),
+        "note": note,
     }
 
 

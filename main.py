@@ -671,9 +671,9 @@ def _guard_answer(chat_id: str, answer: str) -> str:
     """
     session = _get_session_safe(chat_id)
     if str(session.get("answer_source") or "") in {"gpt_agent", "python_template"}:
-        # Текст агента — это результат, а не черновик: dialog._finalize либо
-        # пропустил его, либо заблокировал целиком. Подрезка и переписывание
-        # здесь и превращали ответы в повтор пройденного вопроса воронки.
+        # Текст агента — это результат, а не черновик: финальная проверка в
+        # dialog.py либо пропустила его, либо заблокировала целиком. Подрезка и
+        # переписывание здесь превращали ответы в повтор пройденного вопроса.
         return (answer or "").strip()
     guarded = enforce_prompt_only(answer or "", session)
     return _guard_answer_language(chat_id, guarded, session)
