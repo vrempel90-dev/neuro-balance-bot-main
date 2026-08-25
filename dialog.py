@@ -685,6 +685,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
             result.skip_reason, human_owns=False,
         )
 
+    if result.escalate:
+        # Агент позвал администратора — значит его нужно реально позвать, а не
+        # только сказать об этом пациенту.
+        await _notify_admin_once(chat_id, session, phone, "agent_escalation")
     session["openai_used"] = True
     session["openai_brain_used"] = True
     session["answer_source"] = "gpt_agent"

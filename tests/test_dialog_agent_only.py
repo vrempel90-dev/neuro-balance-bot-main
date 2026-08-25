@@ -385,3 +385,28 @@ def test_phone_crm_cannot_use_is_never_answered(monkeypatch: pytest.MonkeyPatch)
     assert turn(chat_id, "Здравствуйте", phone="12345") == ""
     assert not stub.lookup_calls
     assert state.get_session(chat_id)["no_reply_reason"] == "invalid_phone_for_crm_lookup"
+
+
+def test_identical_answer_is_sent_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Два одновременных сообщения дают один и тот же ответ — уходит один.
+
+    Пациент может дослать второе сообщение, пока бот думает над первым: оба
+    хода обрабатываются параллельно и оба возвращают одинаковое подтверждение.
+    Дубль режется на отправке, а не подменой текста в диалоге.
+    """
+    sent: list[str] = []
+
+    async def fake_send_text(**kwargs: Any) -> dict[str, Any]:
+        sent.append(str(kwargs.get("text") or ""))
+        return {"ok": True, "status_code": 200}
+
+    monkeypatch.setattr(main, "send_text", fake_send_text)
+    chat_id = "dialog_duplicate_send"
+    fresh_chat(chat_id)
+
+    answer = "Записала 🌿 8 сентября в 09:20."
+    for _ in range(2):
+        asyncio.run(main._send_answer_parts(chat_id=chat_id, answer=answer, chat_type="whatsapp", channel_id=None, phone=PHONE))
+
+    assert sent == [answer]
+    assert state.get_session(chat_id)["outgoing_duplicate_guard_blocked"] is True
