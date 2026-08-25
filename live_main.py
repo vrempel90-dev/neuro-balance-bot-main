@@ -12,6 +12,7 @@ import main as neuro
 import state
 from agent_prompt_policy import install_agent_prompt_policy
 from booking_confirmation_guard import enforce_confirmed_booking_only
+from new_leads_only_policy import install_new_leads_only_policy
 from repair_observer import dispatch_new_lead_turn
 from weekend_booking_policy import install_weekend_booking_policy
 from weekend_legacy_block_bypass import install_weekend_legacy_block_bypass
@@ -19,6 +20,7 @@ from weekend_legacy_block_bypass import install_weekend_legacy_block_bypass
 
 install_weekend_booking_policy()
 install_weekend_legacy_block_bypass()
+install_new_leads_only_policy()
 install_agent_prompt_policy()
 
 # Final patient-facing fail-closed guard. main.py imported enforce_prompt_only as
