@@ -539,6 +539,37 @@ def _requires_max_completion_tokens(model: str) -> bool:
     return str(model or "").strip().lower().startswith("gpt-5")
 
 
+# Семейства gpt-5.5+ идут с reasoning_effort=medium по умолчанию, а
+# /v1/chat/completions не умеет reasoning вместе с function tools.
+_REASONING_TOOL_CONFLICT_PREFIXES = ("gpt-5.5", "gpt-5.6", "gpt-5.7", "gpt-5.8", "gpt-5.9")
+
+
+def _tools_require_reasoning_off(model: str) -> bool:
+    """Модель отвергает function tools, пока не выключено рассуждение.
+
+    Ответ API дословно (прод 26.08.2026, chat_id 77053425538):
+      "Function tools with reasoning_effort are not supported for gpt-5.6-terra
+       in /v1/chat/completions. To use function tools, use /v1/responses or set
+       reasoning_effort to none."
+
+    Ключевое: у этих моделей reasoning_effort по умолчанию не выключен, поэтому
+    400 прилетал даже без передачи параметра — то есть КАЖДЫЙ ход агента падал
+    на первом же вызове OpenAI, и ни один пациент не доходил до записи.
+    """
+    return str(model or "").strip().lower().startswith(_REASONING_TOOL_CONFLICT_PREFIXES)
+
+
+def brain_tool_call_kwargs(model: str) -> dict[str, Any]:
+    """Параметры, без которых вызов с инструментами не примут.
+
+    Отдельная функция, а не константа в agent.py: имя модели приходит из
+    конфигурации, и правило зависит только от него.
+    """
+    if _tools_require_reasoning_off(model):
+        return {"reasoning_effort": "none"}
+    return {}
+
+
 def _brain_token_limit_kwargs(model: str) -> dict[str, int]:
     """Потолок ответа брейна с учётом имени параметра для конкретной модели."""
     settings = get_settings()

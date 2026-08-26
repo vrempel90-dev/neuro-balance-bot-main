@@ -2271,6 +2271,7 @@ async def run_agent_turn(
                 tools=TOOL_SCHEMAS,
                 tool_choice="auto",
                 **ai._brain_token_limit_kwargs(model),
+                **ai.brain_tool_call_kwargs(model),
             )
         except Exception as exc:
             _log(

@@ -410,3 +410,68 @@ def test_identical_answer_is_sent_once(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert sent == [answer]
     assert state.get_session(chat_id)["outgoing_duplicate_guard_blocked"] is True
+
+
+# ---------------------------------------------------------------------------
+# Совместимость вызова с моделью
+# ---------------------------------------------------------------------------
+
+
+def test_tool_calls_disable_reasoning_where_the_api_demands_it() -> None:
+    """gpt-5.5+ отвергает function tools, пока рассуждение не выключено.
+
+    Прод 26.08.2026: AI_BRAIN_MODEL=gpt-5.6-terra, и КАЖДЫЙ ход агента падал с
+    400 «Function tools with reasoning_effort are not supported ... set
+    reasoning_effort to none» — пациент вместо диалога получал передачу
+    администратору. Параметр не передавался вовсе: у этих моделей рассуждение
+    включено по умолчанию.
+    """
+    for model in ("gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6", "gpt-5.5"):
+        assert ai.brain_tool_call_kwargs(model) == {"reasoning_effort": "none"}, model
+    # Модели без этого конфликта параметр не принимают — передавать нельзя.
+    for model in ("gpt-5.4-mini", "gpt-4o-mini", ""):
+        assert ai.brain_tool_call_kwargs(model) == {}, model
+
+
+def test_agent_sends_the_model_compatibility_kwargs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Проверка на реальном вызове, а не только на хелпере."""
+    monkeypatch.setenv("AI_BRAIN_MODEL", "gpt-5.6-terra")
+    get_settings.cache_clear()
+    install_crm(monkeypatch, CRMStub())
+    client = install_openai(monkeypatch, [assistant_text("Здравствуйте 🌿")])
+    chat_id = "dialog_model_kwargs"
+    fresh_chat(chat_id)
+
+    turn(chat_id, "здравствуйте")
+
+    assert client.calls, "модель должна быть вызвана"
+    call = client.calls[0]
+    assert call["model"] == "gpt-5.6-terra"
+    assert call["reasoning_effort"] == "none"
+    assert call["tools"], "инструменты передаются в том же вызове"
+
+
+def test_crm_lookup_debug_survives_for_incident_analysis(monkeypatch: pytest.MonkeyPatch) -> None:
+    """В отладке видно не только вывод admission, но и что ответила CRM."""
+    install_crm(
+        monkeypatch,
+        CRMStub(lookup={
+            "ok": True, "found": True, "isNew": True, "patient": None,
+            "lead": {"id": 44934, "status": "НОВАЯ"}, "lastAppointment": None,
+            "hasActiveAppointment": False, "appointment": None, "appointments": [],
+        }),
+    )
+    install_openai(monkeypatch, [assistant_text("Здравствуйте 🌿 Что беспокоит?")])
+    chat_id = "dialog_crm_debug"
+    fresh_chat(chat_id)
+
+    turn(chat_id, "хочу записаться")
+
+    session = state.get_session(chat_id)
+    assert session["crm_patient_state"] == "NEW_PATIENT"
+    assert session["raw_crm_found"] is True
+    assert session["raw_crm_isNew"] is True
+    assert session["raw_crm_has_lead"] is True
+    assert session["raw_crm_lead_status"] == "НОВАЯ"
+    assert session["raw_crm_has_patient"] is False
+    assert session["raw_crm_hasActiveAppointment"] is False
