@@ -134,10 +134,33 @@ def test_agent_availability_and_booking_reach_the_crm_functions(monkeypatch: pyt
 
 
 def test_dialog_routes_through_the_gpt_first_agent() -> None:
-    """The GPT-first path is wired into the production entry point."""
+    """The GPT-first path is wired into the production entry point.
+
+    The agent loop is now called from ``handle_message`` itself: the wrapper it
+    used to sit behind existed to decide when the deterministic funnel took the
+    turn instead, and that funnel is gone.
+    """
     source = inspect.getsource(dialog.handle_message)
-    assert "_try_gpt_first_agent" in source, "handle_message must call the agent loop"
-    assert inspect.iscoroutinefunction(dialog._try_gpt_first_agent)
+    assert "agent.run_agent_turn" in source, "handle_message must call the agent loop"
+    assert inspect.iscoroutinefunction(dialog.handle_message)
+
+
+def test_dialog_has_no_second_conversational_engine() -> None:
+    """Python may block a turn and hand it to a human — never re-answer it.
+
+    The looping bug was Python owning a parallel funnel: ``handle_message``
+    picked steps by keyword and ``_finalize`` overwrote the model's answer with
+    the previous step prompt. Both are gone, and this keeps them gone.
+    """
+    handle = inspect.getsource(dialog.handle_message)
+    assert len(handle.splitlines()) <= 80, "handle_message must stay a router, not a funnel"
+
+    finalize = inspect.getsource(dialog._finalize)
+    for blocked in ("run_openai_dialog_brain", "_ask_", "_repair_"):
+        assert blocked not in finalize
+    # _finalize may only pass the answer through, or replace it with one of the
+    # two Python-owned handoff texts.
+    assert finalize.count("_handoff(") == 3
 
 
 def test_agent_is_skipped_only_for_technical_reasons() -> None:

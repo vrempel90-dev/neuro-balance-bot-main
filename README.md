@@ -7,41 +7,57 @@ Production-бот Neuro Balance с отдельным OpenAI Dialog Brain и ж�
 GPT ведёт разговор, Python исполняет, CRM — единственный источник истины.
 
 ```text
-Wazzup inbound -> main.py (webhook, dedup, гейты)
-               -> dialog.handle_message
-               -> agent.py  ── GPT-first tool loop ──┐
-                                                     │
+Wazzup inbound -> main.py (webhook, дедуп, ночной режим, отправка)
+               -> dialog.handle_message  ── очистка текста
+                                          ── допуск лида (admission.py)
+                                          ── agent.run_agent_turn
+                                          ── финальная проверка ответа
+
      user -> GPT -> tool_call -> реальный CRM -> tool_result -> GPT -> ответ
-                                                     │
-               -> legacy state machine (только когда GPT недоступен)
 ```
 
-- **agent.py (`AI_BRAIN_MODEL`, production: `gpt-5.4-mini`)** — главный
-  разговорный слой. GPT понимает сообщение, выбирает следующий шаг диалога и
-  сам вызывает инструменты. Все факты о врачах, датах, времени и записи
-  приходят из реальных ответов CRM.
+- **agent.py (`AI_BRAIN_MODEL`)** — единственный разговорный слой. GPT понимает
+  сообщение, выбирает следующий шаг диалога и сам вызывает инструменты. Все
+  факты о врачах, датах, времени и записи приходят из реальных ответов CRM.
 - **Инструменты GPT** — тонкие мосты к существующему `crm.py`, контракт CRM не
   менялся: `get_available_slots` → `GET /api/bot/check-slots`, `get_doctors` →
   `GET /api/bot/doctors`, `book_appointment` → `POST /api/bot/book`,
-  `get_clinic_info` (утверждённые тексты), `escalate_to_operator`.
-- **Python** — исполнительный слой: Wazzup webhook, режим 20:00–08:00,
-  дедупликация, валидация CRM-ответов, идемпотентность записи, таймауты,
-  телеметрия, безопасность.
+  `find_my_appointment` → `GET /api/bot/patient-lookup`,
+  `reschedule_appointment` → `POST /api/bot/appointment/reschedule`,
+  `cancel_appointment` → `POST /api/bot/appointment/cancel`,
+  `get_clinic_info` (утверждённые тексты), `record_patient_facts`,
+  `escalate_to_operator`.
+- **admission.py** — единственное место, где решается, разговаривает ли бот с
+  этим номером: `NEW` → работает агент; `RETURNING`, `ACTIVE_BOOKING`,
+  `CRM_UNAVAILABLE` → бот молчит, администратор получает уведомление. Это
+  чистая функция от ответа CRM, без ввода-вывода и побочных эффектов.
+- **dialog.py** — 700 строк вместо 7940: очистка текста, допуск лида, ход
+  агента, отправка. Второй детерминированной воронки диалога больше нет — это
+  она дублировала агента и возвращала пациента к уже пройденному вопросу.
+- **Финальная проверка ответа (`dialog._finalize`)** умеет ровно три вещи и ни
+  одна не переписывает текст агента: красный флаг в сообщении пациента →
+  шаблон «103» и администратор; пустой ответ → администратор; дата, время или
+  врач, которых не было ни в одном `tool_result` этого диалога → блок и
+  администратор.
 - **Детерминированные гарантии остаются в Python:** записать можно только слот,
   который CRM реально предложила в этом диалоге; `doctorLogin` обязан быть из
   CRM; медицинские гейты (жалоба, противопоказания, возраст) блокируют запись;
-  `booking_success` выставляется только после подтверждения CRM; повторный
+  `booking_success` выставляется только после подтверждения CRM; перенести и
+  отменить можно только запись, которую CRM вернула в этом диалоге; повторный
   booking-вызов не создаёт вторую запись; `MAX_TOOL_ITERATIONS` ограничивает
   цикл.
-- **Legacy state machine в `dialog.py`** — технический fallback. Работает
-  только когда агент не может запуститься (нет `OPENAI_API_KEY`, `AI_ENABLED`
-  или `OPENAI_BRAIN_ENABLED` выключены, исчерпан AI-бюджет, ошибка транспорта).
-  Сбой OpenAI не останавливает запись пациентов.
+- **Суббота и воскресенье — процедурные дни:** поиск свободного времени их
+  пропускает, а `days_ahead` считается в рабочих днях. Правило живёт в
+  обработчике `get_available_slots`, объяснение пациенту пишет модель.
+- **Технически недоступный агент** (нет `OPENAI_API_KEY`, выключен `AI_ENABLED`
+  или `OPENAI_BRAIN_ENABLED`, исчерпан AI-бюджет, ошибка транспорта) — это
+  «Секунду, подключаю администратора» плюс реальная эскалация, один раз на
+  диалог. Второй воронки, в которую можно было бы деградировать, нет.
 - **Инвариант «не молчать»:** каждый принятый активный inbound turn
-  заканчивается ответом пациенту, эскалацией с сообщением или корректной
-  технической ошибкой. Намеренное молчание возможно только через `_no_reply` с
-  явной причиной.
-- `OPENAI_MODEL` (`gpt-4o-mini`) — используется для вспомогательной OpenAI/humanize-логики.
+  заканчивается ответом пациенту или эскалацией с сообщением. Намеренное
+  молчание возможно только через `_no_reply` с явной причиной (не новый лид,
+  оператор в чате, недоступная CRM, сообщение без текста).
+- `OPENAI_MODEL` — используется для вспомогательной OpenAI/humanize-логики.
 - Railway production запускает `live_main:app`. `live_main.py` делегирует обычную обработку в `main.py`; Claude observer запускается только после завершённого Wazzup-turn и не управляет ответом GPT/CRM пациенту.
 
 ## Телеметрия booking flow
@@ -64,7 +80,17 @@ Wazzup inbound -> main.py (webhook, dedup, гейты)
 - `agent_booking_rejected_unknown_slot`
 - `agent_booking_tool_requested`
 - `agent_budget_exhausted_mid_turn`
+- `agent_cancel_crm_called`
+- `agent_cancel_crm_error`
+- `agent_cancel_crm_rejected`
+- `agent_cancel_crm_success`
+- `agent_cancel_duplicate_prevented`
+- `agent_cancel_rejected_unknown_appointment`
+- `agent_cancel_tool_requested`
 - `agent_clinic_info`
+- `agent_appointment_lookup_foreign_phone`
+- `agent_crm_appointment_lookup_error`
+- `agent_crm_appointment_lookup_result`
 - `agent_crm_availability_error`
 - `agent_crm_availability_result`
 - `agent_crm_doctors_error`
@@ -73,6 +99,13 @@ Wazzup inbound -> main.py (webhook, dedup, гейты)
 - `agent_facts_recorded`
 - `agent_openai_client_error`
 - `agent_openai_error`
+- `agent_reschedule_crm_called`
+- `agent_reschedule_crm_error`
+- `agent_reschedule_crm_rejected`
+- `agent_reschedule_crm_success`
+- `agent_reschedule_duplicate_prevented`
+- `agent_reschedule_rejected_unknown_appointment`
+- `agent_reschedule_rejected_unknown_slot`
 - `agent_silent_turn_prevented`
 - `agent_skipped`
 - `agent_tool_calls_truncated`
@@ -82,8 +115,12 @@ Wazzup inbound -> main.py (webhook, dedup, гейты)
 - `agent_turn_finished`
 - `agent_turn_started`
 
-Плюс `silent_turn_prevented` в `dialog.py` — срабатывание инварианта «принятый
-активный turn не может закончиться молчанием».
+Плюс события хода диалога в `dialog.py`: `lead_admission` (кем CRM считает
+номер и почему), `no_reply` (осознанное молчание с причиной),
+`handoff_to_operator` (ответ «подключаю администратора» и его причина),
+`admin_notified` / `admin_notify_failed`, `red_flag_detected` и
+`unverified_fact_blocked` (ответ агента не ушёл пациенту, потому что называл
+факт, которого не было ни в одном `tool_result`).
 
 ## Railway variables
 
@@ -176,8 +213,12 @@ uvicorn main:app --host 0.0.0.0 --port $PORT
 - Бот днём молчит и не мешает КЦ.
 - На профильные жалобы сначала отвечает по смыслу, потом ведёт к записи.
 - На непрофильные жалобы не записывает автоматически, передаёт оператору.
-- Не выдумывает врачей/слоты/записи — только через CRM tools.
-- Ошибка или лимит OpenAI деградирует в Python fallback, но причина должна быть видна в защищённой диагностике.
+- Не выдумывает врачей/слоты/записи — только через CRM tools; ответ с датой,
+  временем или врачом не из `tool_result` пациенту не уходит.
+- Разговаривает только с новыми лидами: вернувшийся пациент и пациент с
+  действующей записью — работа администратора.
+- Ошибка или лимит OpenAI — это «подключаю администратора» и эскалация;
+  причина видна в защищённой диагностике.
 
 ## Важное по CRM API
 

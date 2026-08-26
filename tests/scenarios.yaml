@@ -1,0 +1,489 @@
+# Двадцать живых диалогов — критерий готовности бота.
+#
+# Каждый блок — один диалог, реплика за репликой. `user` — сообщение пациента,
+# `model` — что делает агент на этом ходе: вызывает инструмент (`tool`/`args`),
+# отвечает текстом (`text`) или падает (`error`). Инструменты выполняются
+# по-настоящему: то же `agent.run_agent_turn`, те же гейты, фейковая только CRM
+# и сама модель.
+#
+# Модель здесь местами ведёт себя ПЛОХО намеренно — выдумывает время,
+# объявляет запись, которой нет, повторяет вопрос. Это и проверяется: Python
+# обязан такой ход заблокировать и позвать администратора.
+#
+# Проверки (а) исход, (б) вопрос не повторяется два хода подряд, (в) все даты,
+# время и врачи из tool_result — общие для всех сценариев и живут в
+# test_scenarios.py.
+
+scenarios:
+  # 1 -----------------------------------------------------------------------
+  - name: "01_new_lead_books_a_slot"
+    description: "Новый лид: жалоба → врач → слоты → выбор → имя → запись создана"
+    crm:
+      lookup: new
+      slots: {"2026-09-08": ["09:20", "14:00", "15:40"]}
+      book: ok
+    turns:
+      - user: "Здравствуйте, болит поясница, хочу записаться"
+        model:
+          - tool: record_patient_facts
+            args: {complaint: "болит поясница"}
+          - text: "Здравствуйте 🌿 Понимаю Вас. Подскажите, пожалуйста, сколько Вам полных лет?"
+      - user: "34"
+        model:
+          - tool: record_patient_facts
+            args: {age: 34}
+          - text: "Спасибо. Нет ли у Вас кардиостимулятора, беременности, онкологии, эпилепсии или металла в зоне лечения?"
+      - user: "нет, ничего такого"
+        model:
+          - tool: record_patient_facts
+            args: {contraindications_clear: true, contraindications_note: "нет, ничего такого"}
+          - text: "Хорошо. На какой день Вам удобно прийти?"
+      - user: "во вторник, 8 сентября"
+        model:
+          - tool: get_available_slots
+            args: {date_from: "2026-09-08", days_ahead: 1}
+          - text: "На 8 сентября свободно 09:20, 14:00 и 15:40. Какое время удобнее?"
+      - user: "давайте в 14:00"
+        model:
+          - text: "Отлично. Подскажите, пожалуйста, имя пациента для записи?"
+      - user: "Асель"
+        model:
+          - tool: book_appointment
+            args: {patient_name: "Асель", doctor_login: "zhuma_md", date: "2026-09-08", time_start: "14:00"}
+          - text: "Записала Вас 🌿 8 сентября в 14:00, врач Жумабек Мади Мухтарович."
+    expect:
+      outcome: booked
+      crm_book_calls: 1
+      answer_contains: ["14:00"]
+
+  # 2 -----------------------------------------------------------------------
+  - name: "02_price_question_in_the_middle"
+    description: "Тот же путь, но в середине вопрос про цену, затем возврат к записи"
+    crm:
+      lookup: new
+      slots: {"2026-09-08": ["09:20", "14:00"]}
+      book: ok
+    turns:
+      - user: "болит шея, хочу записаться, мне 41, противопоказаний нет"
+        model:
+          - tool: record_patient_facts
+            args: {complaint: "болит шея", age: 41, contraindications_clear: true, contraindications_note: "противопоказаний нет"}
+          - text: "Поняла Вас 🌿 На какой день удобно прийти?"
+      - user: "а сколько стоит приём?"
+        model:
+          - tool: get_clinic_info
+            args: {topic: "price_first_visit"}
+          - text: "Первичный приём — 5 000 тг. Так на какой день Вас записать?"
+      - user: "на 8 сентября"
+        model:
+          - tool: get_available_slots
+            args: {date_from: "2026-09-08"}
+          - text: "Свободно 09:20 и 14:00 🌿 Какое время подойдёт?"
+      - user: "09:20, меня зовут Дана"
+        model:
+          - tool: book_appointment
+            args: {patient_name: "Дана", doctor_login: "zhuma_md", date: "2026-09-08", time_start: "09:20"}
+          - text: "Готово 🌿 Ждём Вас 8 сентября в 09:20."
+    expect:
+      outcome: booked
+      crm_book_calls: 1
+
+  # 3 -----------------------------------------------------------------------
+  - name: "03_changes_mind_asks_another_day"
+    description: "Передумал на этапе слотов, просит другой день"
+    crm:
+      lookup: new
+      slots: {"2026-09-08": ["09:20", "14:00"], "2026-09-09": ["11:00"]}
+    turns:
+      - user: "хочу записаться, болит колено, 52 года, противопоказаний нет"
+        model:
+          - tool: record_patient_facts
+            args: {complaint: "болит колено", age: 52, contraindications_clear: true, contraindications_note: "нет"}
+          - text: "Поняла 🌿 На какой день Вас записать?"
+      - user: "на 8 сентября"
+        model:
+          - tool: get_available_slots
+            args: {date_from: "2026-09-08"}
+          - text: "На 8 сентября свободно 09:20 и 14:00. Что выберем?"
+      - user: "нет, лучше на следующий день"
+        model:
+          - tool: get_available_slots
+            args: {date_from: "2026-09-09"}
+          - text: "На 9 сентября есть 11:00. Записать Вас на это время?"
+    expect:
+      outcome: answered
+      answer_contains: ["11:00"]
+      no_booking: true
+
+  # 4 -----------------------------------------------------------------------
+  - name: "04_one_word_answers_three_turns"
+    description: "Пациент отвечает односложно три хода подряд — бот не повторяет один вопрос"
+    crm:
+      lookup: new
+      slots: {}
+    turns:
+      - user: "да"
+        model:
+          - text: "Здравствуйте 🌿 Подскажите, что именно Вас беспокоит?"
+      - user: "а"
+        model:
+          - text: "Опишите, пожалуйста, одним словом: что болит — спина, шея или сустав?"
+      - user: "ну"
+        model:
+          - text: "Хорошо, спрошу иначе: где именно Вы чувствуете боль?"
+    expect:
+      outcome: answered
+
+  # 5 -----------------------------------------------------------------------
+  - name: "05_same_message_twice"
+    description: "Пациент пишет одно и то же сообщение дважды"
+    crm:
+      lookup: new
+      slots: {"2026-09-08": ["10:00"]}
+    turns:
+      - user: "хочу записаться"
+        model:
+          - text: "Конечно 🌿 Подскажите, что Вас беспокоит и сколько Вам лет?"
+      - user: "хочу записаться"
+        model:
+          - text: "Уже помогаю с записью — осталось узнать жалобу и возраст, напишите, пожалуйста."
+    expect:
+      outcome: answered
+
+  # 6 -----------------------------------------------------------------------
+  - name: "06_reschedule_existing_appointment"
+    description: "Просит перенести существующую запись"
+    mode: agent
+    crm:
+      lookup: active
+      slots: {"2026-09-10": ["11:00", "16:00"]}
+      appointments:
+        - {id: 5501, date: "2026-09-08", timeStart: "09:20", doctorLogin: "zhuma_md", doctorName: "Жумабек Мади Мухтарович", status: "Записан"}
+    turns:
+      - user: "здравствуйте, хочу перенести запись"
+        model:
+          - tool: find_my_appointment
+            args: {}
+          - text: "Ваша запись 8 сентября в 09:20, врач Жумабек Мади Мухтарович. На какой день перенести?"
+      - user: "на 10 сентября"
+        model:
+          - tool: get_available_slots
+            args: {date_from: "2026-09-10", doctor_login: "zhuma_md"}
+          - text: "На 10 сентября свободно 11:00 и 16:00. Какое время удобнее?"
+      - user: "в 16:00"
+        model:
+          - tool: reschedule_appointment
+            args: {appointment_id: "5501", new_date: "2026-09-10", new_time: "16:00"}
+          - text: "Перенесла 🌿 Теперь 10 сентября в 16:00."
+    expect:
+      outcome: answered
+      crm_calls: ["reschedule"]
+      answer_contains: ["16:00"]
+
+  # 7 -----------------------------------------------------------------------
+  - name: "07_cancel_existing_appointment"
+    description: "Просит отменить запись"
+    mode: agent
+    crm:
+      lookup: active
+      appointments:
+        - {id: 5502, date: "2026-09-08", timeStart: "09:20", doctorLogin: "zhuma_md", doctorName: "Жумабек Мади Мухтарович", status: "Записан"}
+    turns:
+      - user: "не смогу прийти, отмените запись пожалуйста"
+        model:
+          - tool: find_my_appointment
+            args: {}
+          - text: "Вижу запись 8 сентября в 09:20. Отменить её?"
+      - user: "да, отменяйте"
+        model:
+          - tool: cancel_appointment
+            args: {appointment_id: "5502", reason: "пациент не сможет прийти"}
+          - text: "Отменила 🌿 Если понадобится, подберём новое время."
+    expect:
+      outcome: answered
+      crm_calls: ["cancel"]
+
+  # 8 -----------------------------------------------------------------------
+  - name: "08_question_outside_clinic_info"
+    description: "Спрашивает то, чего нет в clinic_info — бот не выдумывает"
+    crm:
+      lookup: new
+    turns:
+      - user: "а вы делаете УЗИ сосудов шеи?"
+        model:
+          - tool: get_clinic_info
+            args: {topic: "методы"}
+          - tool: escalate_to_operator
+            args: {reason: "вопрос про услугу вне утверждённого списка"}
+          - text: "Уточню это у администратора и вернусь к Вам с точным ответом 🌿"
+    expect:
+      outcome: escalated
+      crm_calls: ["escalate"]
+
+  # 9 -----------------------------------------------------------------------
+  - name: "09_red_flag_in_the_middle_of_booking"
+    description: "Red flag (боль в груди) посреди записи — 103 и администратор"
+    crm:
+      lookup: new
+      slots: {"2026-09-08": ["09:20"]}
+    turns:
+      - user: "болит спина, хочу записаться"
+        model:
+          - tool: record_patient_facts
+            args: {complaint: "болит спина"}
+          - text: "Поняла 🌿 Сколько Вам полных лет?"
+      - user: "и ещё сильная боль в груди, тяжело дышать"
+        model:
+          - text: "Сколько Вам лет?"
+    expect:
+      outcome: escalated
+      answer_is_emergency: true
+      no_booking: true
+
+  # 10 ----------------------------------------------------------------------
+  - name: "10_returning_patient_is_silent"
+    description: "Returning-пациент — бот обязан молчать"
+    crm:
+      lookup: returning
+    turns:
+      - user: "здравствуйте, хочу записаться"
+        model:
+          - text: "Этот текст не должен уйти пациенту"
+    expect:
+      outcome: silent
+      no_crm_calls: ["check_slots", "book"]
+
+  # 11 ----------------------------------------------------------------------
+  - name: "11_phone_in_8_format"
+    description: "Пациент пишет с номера в формате 8XXX — это тот же номер"
+    phone: "87011234567"
+    crm:
+      lookup: new
+      slots: {"2026-09-08": ["09:20"]}
+      book: ok
+    turns:
+      - user: "болит спина, 30 лет, противопоказаний нет, хочу на 8 сентября"
+        model:
+          - tool: record_patient_facts
+            args: {complaint: "болит спина", age: 30, contraindications_clear: true, contraindications_note: "нет"}
+          - tool: get_available_slots
+            args: {date_from: "2026-09-08"}
+          - text: "Свободно 09:20 🌿 Записать Вас на это время? И подскажите имя пациента."
+      - user: "да, Ержан"
+        model:
+          - tool: book_appointment
+            args: {patient_name: "Ержан", doctor_login: "zhuma_md", date: "2026-09-08", time_start: "09:20"}
+          - text: "Записала 🌿 8 сентября в 09:20."
+    expect:
+      outcome: booked
+      crm_book_calls: 1
+
+  # 12 ----------------------------------------------------------------------
+  - name: "12_asks_for_a_time_that_was_never_offered"
+    description: "Просит время, которого нет в выданных слотах — записи не будет"
+    crm:
+      lookup: new
+      slots: {"2026-09-08": ["09:20", "14:00"]}
+    turns:
+      - user: "хочу записаться, болит спина, 35, противопоказаний нет, на 8 сентября"
+        model:
+          - tool: record_patient_facts
+            args: {complaint: "болит спина", age: 35, contraindications_clear: true, contraindications_note: "нет"}
+          - tool: get_available_slots
+            args: {date_from: "2026-09-08"}
+          - text: "На 8 сентября свободно 09:20 и 14:00. Какое время удобно?"
+      - user: "а можно в 19:30? меня зовут Айгуль"
+        model:
+          - tool: book_appointment
+            args: {patient_name: "Айгуль", doctor_login: "zhuma_md", date: "2026-09-08", time_start: "19:30"}
+          - text: "На 19:30 окошек нет, свободны 09:20 и 14:00 🌿 Какое выберем?"
+    expect:
+      outcome: answered
+      no_booking: true
+      crm_book_calls: 0
+
+  # 13 ----------------------------------------------------------------------
+  - name: "13_patient_writes_in_kazakh"
+    description: "Отвечает не по-русски — язык диалога переключается на казахский"
+    language: kk
+    crm:
+      lookup: new
+      slots: {"2026-09-08": ["10:40"]}
+    turns:
+      - user: "Сәлеметсіз бе, арқам ауырады, жазылғым келеді"
+        model:
+          - tool: record_patient_facts
+            args: {complaint: "арқасы ауырады"}
+          - text: "Сәлеметсіз бе 🌿 Жасыңыз нешеде?"
+      - user: "45 жаста"
+        model:
+          - tool: record_patient_facts
+            args: {age: 45}
+          - text: "Рахмет. Қарсы көрсетілімдер жоқ па?"
+    expect:
+      outcome: answered
+
+  # 14 ----------------------------------------------------------------------
+  - name: "14_booking_for_a_relative"
+    description: "Записывается не на себя, а на родственника"
+    crm:
+      lookup: new
+      slots: {"2026-09-08": ["12:00"]}
+      book: ok
+    turns:
+      - user: "хочу записать маму, у неё болит колено, ей 67, противопоказаний нет"
+        model:
+          - tool: record_patient_facts
+            args: {complaint: "болит колено", age: 67, contraindications_clear: true, contraindications_note: "нет", patient_name: "Гульнара", patient_relation: "мама"}
+          - text: "Поняла, записываем маму 🌿 На какой день удобно?"
+      - user: "8 сентября"
+        model:
+          - tool: get_available_slots
+            args: {date_from: "2026-09-08"}
+          - text: "Свободно 12:00. Записываю маму на это время?"
+      - user: "да"
+        model:
+          - tool: book_appointment
+            args: {patient_name: "Гульнара", doctor_login: "zhuma_md", date: "2026-09-08", time_start: "12:00", patient_relation: "мама"}
+          - text: "Готово 🌿 Мама записана на 8 сентября, 12:00."
+    expect:
+      outcome: booked
+      crm_book_calls: 1
+
+  # 15 ----------------------------------------------------------------------
+  - name: "15_crm_fails_on_book_appointment"
+    description: "CRM отвечает ошибкой на book_appointment — подтверждения быть не может"
+    crm:
+      lookup: new
+      slots: {"2026-09-08": ["09:20"]}
+      book: error
+    turns:
+      - user: "болит спина, 33, противопоказаний нет, хочу на 8 сентября"
+        model:
+          - tool: record_patient_facts
+            args: {complaint: "болит спина", age: 33, contraindications_clear: true, contraindications_note: "нет"}
+          - tool: get_available_slots
+            args: {date_from: "2026-09-08"}
+          - text: "Свободно 09:20 🌿 Подскажите имя пациента, и я оформлю запись."
+      - user: "Марат"
+        model:
+          - tool: book_appointment
+            args: {patient_name: "Марат", doctor_login: "zhuma_md", date: "2026-09-08", time_start: "09:20"}
+          - tool: escalate_to_operator
+            args: {reason: "CRM не приняла запись"}
+          - text: "Не получилось оформить запись автоматически — передаю администратору, он свяжется с Вами 🌿"
+    expect:
+      outcome: escalated
+      no_booking: true
+      answer_not_contains: ["Вы записаны", "запись подтверждена"]
+
+  # 16 ----------------------------------------------------------------------
+  - name: "16_ai_budget_runs_out_mid_dialog"
+    description: "Бюджет ai_budget исчерпан посреди диалога — администратор, а не молчание"
+    budget_exhausted_from_turn: 2
+    crm:
+      lookup: new
+      slots: {"2026-09-08": ["09:20"]}
+    turns:
+      - user: "здравствуйте, болит спина"
+        model:
+          - text: "Здравствуйте 🌿 Сколько Вам полных лет?"
+      - user: "38"
+        model: []
+    expect:
+      outcome: escalated
+      answer_is_handoff: true
+      no_booking: true
+
+  # 17 ----------------------------------------------------------------------
+  - name: "17_operator_takes_over"
+    description: "Оператор перехватил диалог вручную — бот молчит"
+    crm:
+      lookup: new
+    turns:
+      - user: "здравствуйте"
+        model:
+          - text: "Здравствуйте 🌿 Что Вас беспокоит?"
+      - user: "а можно человека?"
+        session: {manual_admin_intervention: true}
+        model:
+          - text: "Этот текст не должен уйти пациенту"
+    expect:
+      outcome: silent
+
+  # 18 ----------------------------------------------------------------------
+  - name: "18_voice_message_without_text"
+    description: "Пациент прислал голосовое / вложение — без текста бот не выдумывает ответ"
+    crm:
+      lookup: new
+    turns:
+      - user: ""
+        model:
+          - text: "Этот текст не должен уйти пациенту"
+    expect:
+      outcome: silent
+      no_crm_calls: ["lookup", "check_slots", "book"]
+
+  # 19 ----------------------------------------------------------------------
+  - name: "19_agreed_on_a_slot_but_gave_no_name"
+    description: "Согласился на слот, но не дал имя — записи нет, вопрос не повторяется"
+    crm:
+      lookup: new
+      slots: {"2026-09-08": ["09:20", "14:00"]}
+    turns:
+      - user: "болит спина, 29, противопоказаний нет, на 8 сентября"
+        model:
+          - tool: record_patient_facts
+            args: {complaint: "болит спина", age: 29, contraindications_clear: true, contraindications_note: "нет"}
+          - tool: get_available_slots
+            args: {date_from: "2026-09-08"}
+          - text: "Свободно 09:20 и 14:00 🌿 Какое время удобнее?"
+      - user: "14:00 подходит"
+        model:
+          - text: "Отлично. На чьё имя оформляем запись?"
+      - user: "ага"
+        model:
+          - tool: book_appointment
+            args: {doctor_login: "zhuma_md", date: "2026-09-08", time_start: "14:00"}
+          - text: "Мне нужно имя пациента, чтобы оформить запись — как записать?"
+    expect:
+      outcome: answered
+      no_booking: true
+      crm_book_calls: 0
+
+  # 20 ----------------------------------------------------------------------
+  - name: "20_two_messages_while_the_bot_is_thinking"
+    description: "Двойное сообщение подряд, пока бот ещё думает — одна запись, а не две"
+    crm:
+      lookup: new
+      slots: {"2026-09-08": ["09:20"]}
+      book: ok
+    session:
+      complaint: "болит спина"
+      complaint_gate: "COMPLAINT_OK"
+      profile_status: "profile"
+      age: 40
+      contraindications_ok: true
+      contraindications_verdict: "proceed"
+      contraindications_raw: "нет"
+      crm_offered_slots:
+        "2026-09-08|09:20|zhuma_md":
+          doctor_login: "zhuma_md"
+          doctor_name: "Жумабек Мади Мухтарович"
+          date: "2026-09-08"
+          time_start: "09:20"
+    turns:
+      - user: "записывайте на 09:20, меня зовут Алия"
+        model:
+          - tool: book_appointment
+            args: {patient_name: "Алия", doctor_login: "zhuma_md", date: "2026-09-08", time_start: "09:20"}
+          - text: "Записала 🌿 8 сентября в 09:20."
+      - user: "записывайте на 09:20, меня зовут Алия"
+        concurrent_with_previous: true
+        model:
+          - tool: book_appointment
+            args: {patient_name: "Алия", doctor_login: "zhuma_md", date: "2026-09-08", time_start: "09:20"}
+          - text: "Записала 🌿 8 сентября в 09:20."
+    expect:
+      outcome: booked
+      crm_book_calls: 1

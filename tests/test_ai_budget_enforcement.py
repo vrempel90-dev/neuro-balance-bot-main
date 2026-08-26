@@ -88,8 +88,13 @@ def test_cached_tokens_are_billed_at_reduced_rate() -> None:
 def test_unknown_model_uses_conservative_pricing() -> None:
     """Неизвестная модель считается по дорогому тарифу — чтобы не занизить расход."""
     unknown = ai_budget.estimate_cost_usd("some-future-model", prompt_tokens=1_000_000)
-    expensive = ai_budget.estimate_cost_usd("gpt-5.4-mini", prompt_tokens=1_000_000)
-    assert unknown == pytest.approx(expensive)
+    # Дорогая верхняя граница — самая дорогая известная модель, а не первая
+    # попавшаяся: тариф gpt-5.4-mini в прайсе устарел ещё до перехода на 5.6.
+    most_expensive = max(
+        ai_budget.estimate_cost_usd(model, prompt_tokens=1_000_000)
+        for model in ai_budget.MODEL_PRICING_USD_PER_1M
+    )
+    assert unknown == pytest.approx(most_expensive)
 
 
 def test_model_name_with_date_suffix_is_normalized() -> None:

@@ -17,7 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File, Q
 import state
 import crm
 from config import get_settings
-from dialog import FIRST_TOUCH_CLINIC_INFO_RU, handle_message
+from dialog import handle_message
 from guards import GuardDecision, should_auto_reply
 from ai import humanize_reply_with_openai
 from schedule import astana_now, is_bot_work_time, is_test_window_time, next_work_bounds, time_gate_status
@@ -670,7 +670,10 @@ def _guard_answer(chat_id: str, answer: str) -> str:
     - ограничивает длинные ответы вне разрешённых шаблонов.
     """
     session = _get_session_safe(chat_id)
-    if str(session.get("answer_source") or "").startswith("locked_template") or (answer or "").strip() == FIRST_TOUCH_CLINIC_INFO_RU:
+    if str(session.get("answer_source") or "") in {"gpt_agent", "python_template"}:
+        # Текст агента — это результат, а не черновик: финальная проверка в
+        # dialog.py либо пропустила его, либо заблокировала целиком. Подрезка и
+        # переписывание здесь превращали ответы в повтор пройденного вопроса.
         return (answer or "").strip()
     guarded = enforce_prompt_only(answer or "", session)
     return _guard_answer_language(chat_id, guarded, session)
@@ -1050,7 +1053,7 @@ async def _send_answer_parts(
         return
     sess = _get_session_safe(chat_id)
     last_sent = str(sess.get("last_sent_answer") or "")
-    if last_sent and (last_sent.strip() == safe_text or (FIRST_TOUCH_CLINIC_INFO_RU in last_sent and safe_text == FIRST_TOUCH_CLINIC_INFO_RU)):
+    if last_sent and last_sent.strip() == safe_text:
         sess["wazzup_send_called"] = False
         sess["outgoing_duplicate_guard_blocked"] = True
         state.save_session(chat_id, sess)

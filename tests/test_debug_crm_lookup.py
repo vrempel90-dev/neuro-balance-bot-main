@@ -66,8 +66,9 @@ def test_debug_chat_booked_client_blocks_first_touch(monkeypatch):
     data = response.json()
 
     assert response.status_code == 200
-    assert dialog.FIRST_TOUCH_CLINIC_INFO_RU not in data["answer"]
-    assert "Вы уже записаны" in data["answer"]
+    # Пациент с активной записью — не новый лид: бот молчит, а отладочная
+    # выдача по-прежнему показывает, что CRM спросили и что она ответила.
+    assert data["answer"] == ""
     assert data["crm_lookup_called"] is True
     assert data["active_appointment_found"] is True
     assert data["first_touch_allowed"] is False
@@ -86,8 +87,8 @@ def test_debug_chat_crm_failure_fails_closed(monkeypatch):
     data = response.json()
 
     assert response.status_code == 200
-    assert dialog.FIRST_TOUCH_CLINIC_INFO_RU not in data["answer"]
-    assert data["answer"] == "Сейчас уточню Вашу запись у администратора 🌿"
+    # CRM недоступна — fail-closed: бот молчит, диалог у администратора.
+    assert data["answer"] == ""
     assert data["session"]["manual_takeover"] is True
     assert data["first_touch_allowed"] is False
     assert data["first_touch_blocked_reason"] == "crm_lookup_failed"

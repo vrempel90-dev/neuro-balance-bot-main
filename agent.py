@@ -21,6 +21,9 @@ keeps every deterministic guarantee:
 * slots and doctors can only come from a real CRM response (``crm.py``);
 * ``book_appointment`` refuses any slot the CRM did not offer in this dialog;
 * ``booking_success`` is set only after the CRM booking call returns success;
+* ``reschedule_appointment`` and ``cancel_appointment`` accept only an
+  appointment the CRM returned in this dialog, and a reschedule only moves it
+  into a slot the CRM offered in this dialog;
 * booking is idempotent — one confirmed booking per (doctor, date, time, phone);
 * the loop is bounded by ``MAX_TOOL_ITERATIONS`` and never returns silence.
 
@@ -66,6 +69,11 @@ MAX_TOOL_ITERATIONS = 4
 # an unbounded dict would grow the persisted session on every availability call.
 _MAX_OFFERED_SLOTS = 60
 
+# Upper bound on the per-conversation registry of the patient's real CRM
+# appointments. A patient has one or two; the cap only stops a malformed CRM
+# answer from growing the persisted session.
+_MAX_ACTIVE_APPOINTMENTS = 10
+
 # Cap on tool calls executed from a single model response (see the loop below).
 _MAX_TOOL_CALLS_PER_ROUND = 3
 
@@ -104,6 +112,13 @@ _MAX_DAYS_AHEAD = 21
 # and an all-empty period never triggers the "enough slots" early exit.
 _MAX_AVAILABILITY_REQUESTS = 7
 
+# Суббота и воскресенье в клинике — процедурные дни: консультации в эти дни не
+# ведутся. Раньше это правило жило в weekend_booking_policy.py, который
+# монкипатчил приватную функцию dialog.py на импорте и приклеивал объяснение
+# текстом перед ответом бота. Правило про даты и должно жить там, где даты
+# берутся, — в инструменте доступности; объяснение пишет модель.
+_PROCEDURE_WEEKEND_DAYS = {5, 6}
+
 
 class AgentUnavailable(Exception):
     """Raised when the agent loop cannot run at all (config/budget/transport)."""
@@ -120,6 +135,10 @@ class AgentResult:
     escalate: bool = False
     booking: dict[str, Any] | None = None
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    # Everything the CRM actually returned this turn. The caller validates the
+    # model's text against these facts before it reaches the patient, so a date
+    # or a doctor that no tool returned can be blocked instead of delivered.
+    tool_results: list[dict[str, Any]] = field(default_factory=list)
     iterations: int = 0
     error: str = ""
 
@@ -253,6 +272,100 @@ def _known_doctors_from_offers(session: dict[str, Any]) -> dict[str, str]:
     return doctors
 
 
+def _offered_slot_at(
+    session: dict[str, Any], date: str, time_start: str, doctor_login: str = ""
+) -> dict[str, str] | None:
+    """A CRM-offered slot at this date/time for the appointment's own doctor.
+
+    ``reschedule_appointment`` carries no doctor: the CRM moves the existing
+    appointment and keeps the doctor it was created with. So a free window that
+    belongs to a *different* doctor is not a slot this patient can be moved
+    into, and the lookup is doctor-specific whenever the appointment record
+    names one. Only an appointment the CRM returned without a doctor falls back
+    to matching by date and time alone.
+    """
+    login = str(doctor_login or "").strip()
+    if login:
+        return _offered_slot(session, date, time_start, login)
+    registry = session.get("crm_offered_slots")
+    if not isinstance(registry, dict):
+        return None
+    for slot in reversed(list(registry.values())):  # newest offer wins
+        if not isinstance(slot, dict):
+            continue
+        if str(slot.get("date") or "")[:10] == str(date)[:10] and str(slot.get("time_start") or "")[:5] == str(time_start)[:5]:
+            return dict(slot)
+    return None
+
+
+def _normalize_crm_appointments(data: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Read the patient's active appointments out of a real CRM lookup.
+
+    ``crm.lookup_active_appointments_by_phone`` already drops cancelled and
+    past appointments, so this only reshapes what it returned into the single
+    flat shape the agent works with — filtering it a second time here would
+    make agent.py a competing source of truth about what is active.
+    """
+    if not isinstance(data, dict):
+        return []
+    items = data.get("appointments")
+    if not isinstance(items, list):
+        items = []
+    if not items and isinstance(data.get("appointment"), dict):
+        items = [data["appointment"]]
+
+    appointments: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        appointment_id = str(
+            item.get("id")
+            or item.get("appointmentId")
+            or item.get("appointment_id")
+            or item.get("recordId")
+            or item.get("record_id")
+            or item.get("bookingId")
+            or ""
+        ).strip()
+        if not appointment_id or appointment_id in seen:
+            continue
+        seen.add(appointment_id)
+        appointments.append(
+            {
+                "appointment_id": appointment_id,
+                "date": str(item.get("date") or item.get("appointmentDate") or item.get("appointment_date") or "")[:10],
+                "time_start": str(item.get("timeStart") or item.get("time_start") or item.get("time") or "")[:5],
+                "doctor_login": str(item.get("doctorLogin") or item.get("doctor_login") or "").strip(),
+                "doctor_name": str(item.get("doctorName") or item.get("doctor_name") or "").strip(),
+                "status": str(item.get("status") or item.get("appointmentStatus") or "").strip(),
+            }
+        )
+    return appointments
+
+
+def _remember_active_appointments(session: dict[str, Any], appointments: list[dict[str, str]]) -> None:
+    """Record the appointments the CRM really returned in this conversation.
+
+    ``reschedule_appointment`` and ``cancel_appointment`` accept only an
+    ``appointment_id`` from this registry, so neither GPT nor a stale session
+    can move or cancel an appointment the CRM never confirmed exists. A fresh
+    lookup *replaces* the registry: it is the CRM's current answer about this
+    patient, and an id that has disappeared from it must stop being actionable.
+    """
+    session["crm_active_appointments"] = {
+        appointment["appointment_id"]: dict(appointment) for appointment in appointments
+    }
+
+
+def _known_appointment(session: dict[str, Any], appointment_id: str) -> dict[str, str] | None:
+    registry = session.get("crm_active_appointments")
+    if not isinstance(registry, dict):
+        return None
+    appointment = registry.get(str(appointment_id).strip())
+    return dict(appointment) if isinstance(appointment, dict) else None
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas exposed to GPT
 # ---------------------------------------------------------------------------
@@ -333,6 +446,96 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["patient_name", "doctor_login", "date", "time_start"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_my_appointment",
+            "description": (
+                "Найти действующую запись пациента в CRM. Вызывай первым, когда речь про "
+                "уже существующую запись: перенести, отменить, уточнить дату или время. "
+                "Только этот инструмент даёт appointment_id, без которого перенос и отмена "
+                "невозможны. Дату, время и врача существующей записи называй пациенту "
+                "ТОЛЬКО из результата этого инструмента."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phone": {
+                        "type": "string",
+                        "description": (
+                            "Обычно не передавай: поиск идёт по номеру, с которого пишет "
+                            "пациент. Записи по чужому номеру бот не показывает."
+                        ),
+                    }
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reschedule_appointment",
+            "description": (
+                "Перенести существующую запись на другое время в CRM. Порядок обязателен: "
+                "find_my_appointment → get_available_slots на нужный день → пациент выбрал "
+                "конкретное окошко из выданных → reschedule_appointment. appointment_id "
+                "бери только из find_my_appointment, new_date и new_time — только из "
+                "get_available_slots. Пока инструмент не вернул reschedule_success=true, "
+                "НЕ говори пациенту, что запись перенесена."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "appointment_id": {
+                        "type": "string",
+                        "description": "appointment_id ровно как вернул find_my_appointment.",
+                    },
+                    "new_date": {
+                        "type": "string",
+                        "description": "Дата выбранного слота YYYY-MM-DD, ровно как вернул get_available_slots.",
+                    },
+                    "new_time": {
+                        "type": "string",
+                        "description": "Время выбранного слота HH:MM, ровно как вернул get_available_slots.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Короткая причина переноса словами пациента. Необязательно.",
+                    },
+                },
+                "required": ["appointment_id", "new_date", "new_time"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_appointment",
+            "description": (
+                "Отменить существующую запись в CRM. Сначала find_my_appointment: "
+                "appointment_id бери только оттуда. Вызывай, только когда пациент явно "
+                "просит отменить запись или говорит, что не придёт. Пока инструмент не "
+                "вернул cancel_success=true, НЕ говори пациенту, что запись отменена."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "appointment_id": {
+                        "type": "string",
+                        "description": "appointment_id ровно как вернул find_my_appointment.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Короткая причина отмены словами пациента.",
+                    },
+                },
+                "required": ["appointment_id", "reason"],
                 "additionalProperties": False,
             },
         },
@@ -430,6 +633,9 @@ AGENT_OVERRIDES = """
 - get_doctors — реальные врачи клиники;
 - get_available_slots — реальные свободные даты и время;
 - book_appointment — реальная запись в CRM;
+- find_my_appointment — действующая запись пациента в CRM;
+- reschedule_appointment — реальный перенос существующей записи;
+- cancel_appointment — реальная отмена существующей записи;
 - get_clinic_info — утверждённые тексты клиники;
 - escalate_to_operator — передать администратору.
 
@@ -469,6 +675,24 @@ AGENT_OVERRIDES = """
 «я не себе»). Тогда жалоба, возраст, противопоказания и имя относятся к
 ПАЦИЕНТУ, а не к отправителю. В book_appointment передавай имя пациента и
 заполняй patient_relation.
+
+ПЕРЕНОС И ОТМЕНА СУЩЕСТВУЮЩЕЙ ЗАПИСИ:
+Если пациент пишет про уже существующую запись («перенесите», «отмените»,
+«не смогу прийти», «когда я записан»), это НЕ новая анкета: жалобу, возраст и
+противопоказания заново не спрашивай.
+1. НАЙТИ ЗАПИСЬ. Всегда начинай с find_my_appointment. Дату, время, врача и
+   appointment_id бери только из его результата.
+2. ПЕРЕНЕСТИ. После find_my_appointment вызови get_available_slots на нужный
+   день (с doctor_login врача из записи), предложи пациенту только реальные
+   окошки и дождись, пока он выберет конкретное. Затем reschedule_appointment
+   с appointment_id из find_my_appointment и датой/временем выбранного слота.
+   Пока reschedule_success не true — нельзя писать, что запись перенесена.
+3. ОТМЕНИТЬ. cancel_appointment с appointment_id из find_my_appointment и
+   короткой причиной словами пациента. Пока cancel_success не true — нельзя
+   писать, что запись отменена.
+Если find_my_appointment не нашёл активной записи — спокойно скажи об этом и
+вызови escalate_to_operator. Придумывать запись, её дату, время или
+appointment_id запрещено.
 
 ЧЕГО НЕЛЬЗЯ ДЕЛАТЬ:
 - переспрашивать то, что пациент уже сказал (смотри known_facts и историю);
@@ -678,10 +902,24 @@ async def _tool_get_available_slots(
     doctor_login = str(args.get("doctor_login") or "").strip() or None
     time_preference = str(args.get("time_preference") or "").strip()
 
+    requested_start = start
+    weekend_requested = start.weekday() in _PROCEDURE_WEEKEND_DAYS
+    while start.weekday() in _PROCEDURE_WEEKEND_DAYS:
+        start += timedelta(days=1)
+
     collected: list[dict[str, str]] = []
     http_error = ""
-    for offset in range(days_ahead):
-        day = (start + timedelta(days=offset)).isoformat()
+    # days_ahead считается в РАБОЧИХ днях: суббота и воскресенье пропускаются,
+    # а не тратят один из немногих разрешённых запросов к CRM.
+    requested_days = 0
+    day_date = start
+    while requested_days < days_ahead:
+        if day_date.weekday() in _PROCEDURE_WEEKEND_DAYS:
+            day_date += timedelta(days=1)
+            continue
+        day = day_date.isoformat()
+        day_date += timedelta(days=1)
+        requested_days += 1
         try:
             data = await crm.check_slots(day, doctor_login=doctor_login)
         except Exception as exc:
@@ -734,6 +972,8 @@ async def _tool_get_available_slots(
         "agent_crm_availability_result",
         {
             "date_from": start.isoformat(),
+            "requested_date_from": requested_start.isoformat(),
+            "weekend_procedure_day_requested": weekend_requested,
             "days_ahead": days_ahead,
             "doctor_login": doctor_login or "",
             "doctor_count": len(doctors),
@@ -742,9 +982,23 @@ async def _tool_get_available_slots(
         },
     )
 
+    note = (
+        "Показывай пациенту только эти варианты. Другие даты/время называть нельзя."
+        if slots
+        else "CRM не вернула свободных окошек на этот период. Предложи другой период или эскалацию."
+    )
+    if weekend_requested:
+        note = (
+            "Пациент просил субботу или воскресенье — это процедурные дни, консультаций в "
+            "них нет. Скажи об этом своими словами и предложи окошки ближайшего рабочего "
+            "дня. " + note
+        )
+
     return {
         "ok": True,
         "date_from": start.isoformat(),
+        "requested_date_from": requested_start.isoformat(),
+        "weekend_procedure_day_requested": weekend_requested,
         "days_ahead": days_ahead,
         "requested_doctor_login": doctor_login or "",
         "slot_count": len(slots),
@@ -752,11 +1006,7 @@ async def _tool_get_available_slots(
         "doctors": doctors,
         "time_preference_had_no_slots": dropped_by_preference,
         "crm_partially_unavailable": partial,
-        "note": (
-            "Показывай пациенту только эти варианты. Другие даты/время называть нельзя."
-            if slots
-            else "CRM не вернула свободных окошек на этот период. Предложи другой период или эскалацию."
-        ),
+        "note": note,
     }
 
 
@@ -1200,6 +1450,502 @@ def _booking_notes(session: dict[str, Any], relation: str) -> str:
     return "; ".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Existing appointments: find → reschedule / cancel
+# ---------------------------------------------------------------------------
+
+
+_CRM_ACTION_FAILURE_STATUSES = {"error", "failed", "rejected", "declined"}
+
+
+def _crm_action_confirmed(response: Any, *success_flags: str) -> bool:
+    """Did the CRM confirm a reschedule/cancel of an appointment that exists?
+
+    Deliberately less paranoid than ``_crm_booking_succeeded``: a booking that
+    is reported but never created leaves the patient with an appointment the
+    clinic does not have, so it demands positive proof. Here the appointment
+    already exists, ``crm.py`` raises on every non-2xx, and the reschedule and
+    cancel helpers do not report which keys came from the CRM
+    (``CRM_RESPONSE_KEYS_FIELD`` is set by ``book_appointment`` only) — so the
+    honest rule is: a 2xx answer counts, unless its body names the failure.
+    """
+    if not isinstance(response, dict):
+        return False
+    if str(response.get("error") or "").strip():
+        return False
+    if str(response.get("status") or "").strip().lower() in _CRM_ACTION_FAILURE_STATUSES:
+        return False
+    return not any(response.get(flag) is False for flag in success_flags)
+
+
+async def _tool_find_my_appointment(
+    chat_id: str, session: dict[str, Any], phone: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    sender_phone = crm.normalize_phone(phone or session.get("phone") or "")
+    if not sender_phone:
+        return {
+            "ok": False,
+            "found": False,
+            "error": "missing_phone",
+            "appointments": [],
+            "message": "Нет номера пациента, поиск записи невозможен. Вызови escalate_to_operator.",
+        }
+
+    # The lookup is scoped to the number the patient is writing from, exactly
+    # like book_appointment ignores any model-supplied phone. A number the
+    # model passes through would let one patient read another patient's
+    # appointments out of the CRM.
+    requested = crm.normalize_phone(args.get("phone") or "")
+    if requested and requested != sender_phone:
+        _log(chat_id, "agent_appointment_lookup_foreign_phone", {"phone_masked": _mask_phone(requested)})
+        return {
+            "ok": False,
+            "found": False,
+            "error": "foreign_phone",
+            "appointments": [],
+            "message": (
+                "Записи показываются только по номеру, с которого пишет пациент. "
+                "Если запись оформлена на другой номер — вызови escalate_to_operator."
+            ),
+        }
+
+    try:
+        data = await crm.lookup_active_appointments_by_phone(sender_phone)
+    except Exception as exc:
+        # Only the error *type*: a lookup failure message can quote the request
+        # URL, and that carries the patient's phone number as a query param.
+        _log(chat_id, "agent_crm_appointment_lookup_error", {"error_type": type(exc).__name__})
+        return {
+            "ok": False,
+            "found": False,
+            "error": "crm_unavailable",
+            "appointments": [],
+            "message": (
+                "CRM не ответила, проверить запись не удалось. Данные придумывать нельзя — "
+                "скажи, что уточнит администратор, и вызови escalate_to_operator."
+            ),
+        }
+
+    appointments = _normalize_crm_appointments(data)[:_MAX_ACTIVE_APPOINTMENTS]
+    _remember_active_appointments(session, appointments)
+    bot_tools.mark_tool(session, "find_my_appointment", found=bool(appointments), count=len(appointments))
+    _log(
+        chat_id,
+        "agent_crm_appointment_lookup_result",
+        {"phone_masked": _mask_phone(sender_phone), "appointment_count": len(appointments)},
+    )
+
+    if not appointments:
+        return {
+            "ok": True,
+            "found": False,
+            "appointment_count": 0,
+            "appointments": [],
+            "message": (
+                "В CRM нет активной записи на этот номер. Выдумывать запись, дату или время "
+                "нельзя: скажи об этом пациенту и вызови escalate_to_operator."
+            ),
+        }
+
+    return {
+        "ok": True,
+        "found": True,
+        "appointment_count": len(appointments),
+        "appointments": appointments,
+        "appointment": appointments[0],
+        "message": (
+            "Это реальные записи из CRM. Называй пациенту только эти дату, время и врача. "
+            "Для переноса или отмены используй appointment_id отсюда."
+        ),
+    }
+
+
+async def _tool_reschedule_appointment(
+    chat_id: str, session: dict[str, Any], phone: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    appointment_id = str(args.get("appointment_id") or "").strip()
+    new_date = str(args.get("new_date") or "").strip()[:10]
+    new_time = str(args.get("new_time") or "").strip()[:5]
+    reason = str(args.get("reason") or "").strip()
+
+    _log(
+        chat_id,
+        "agent_reschedule_tool_requested",
+        {"has_appointment_id": bool(appointment_id), "new_date": new_date, "new_time": new_time},
+    )
+
+    if not appointment_id:
+        return {
+            "ok": False,
+            "reschedule_success": False,
+            "error": "missing_appointment_id",
+            "message": "Сначала вызови find_my_appointment и возьми appointment_id из его результата.",
+        }
+    if not (new_date and new_time):
+        return {
+            "ok": False,
+            "reschedule_success": False,
+            "error": "missing_new_slot",
+            "message": "Нужны new_date и new_time ровно из результата get_available_slots.",
+        }
+
+    # --- the appointment must be one the CRM returned in this conversation ---
+    appointment = _known_appointment(session, appointment_id)
+    if appointment is None:
+        _log(chat_id, "agent_reschedule_rejected_unknown_appointment", {})
+        return {
+            "ok": False,
+            "reschedule_success": False,
+            "error": "appointment_not_found",
+            "message": (
+                "Такую запись CRM в этом диалоге не возвращала. Вызови find_my_appointment; "
+                "если активной записи нет — вызови escalate_to_operator и не выдумывай данные."
+            ),
+        }
+
+    # --- the new slot must come from a real CRM availability call ------------
+    slot = _offered_slot_at(session, new_date, new_time, appointment.get("doctor_login") or "")
+    if slot is None:
+        _log(
+            chat_id,
+            "agent_reschedule_rejected_unknown_slot",
+            {"new_date": new_date, "new_time": new_time, "doctor_login": appointment.get("doctor_login") or ""},
+        )
+        other_doctor = _offered_slot_at(session, new_date, new_time)
+        return {
+            "ok": False,
+            "reschedule_success": False,
+            "error": "slot_not_offered_by_crm",
+            "message": (
+                "Это окошко свободно у другого врача, а перенос сохраняет врача записи. "
+                "Вызови get_available_slots с doctor_login врача пациента и предложи его окошки."
+                if other_doctor is not None
+                else "Такого свободного окошка CRM в этом диалоге не предлагала. Вызови "
+                "get_available_slots и дай пациенту выбрать из реальных вариантов."
+            ),
+        }
+
+    normalized_phone = crm.normalize_phone(phone or session.get("phone") or "")
+    if not normalized_phone:
+        return {
+            "ok": False,
+            "reschedule_success": False,
+            "error": "missing_phone",
+            "message": "Нет номера телефона пациента для переноса записи.",
+        }
+
+    # --- one CRM move per (appointment, target slot) --------------------------
+    done = session.get("reschedule_confirmed")
+    if (
+        isinstance(done, dict)
+        and done.get("appointment_id") == appointment_id
+        and done.get("date") == slot["date"]
+        and done.get("time_start") == slot["time_start"]
+    ):
+        _log(chat_id, "agent_reschedule_duplicate_prevented", {"appointment_id": appointment_id})
+        return {
+            "ok": True,
+            "reschedule_success": True,
+            "already_rescheduled": True,
+            "appointment_id": appointment_id,
+            "date": slot["date"],
+            "time_start": slot["time_start"],
+            "doctor_login": slot["doctor_login"],
+            "doctor_name": slot["doctor_name"],
+            "message": "Перенос уже выполнен ранее в этом диалоге, повторный перенос не делался.",
+        }
+
+    bot_tools.mark_tool(session, "reschedule_appointment", gate="passed")
+    session["crm_called"] = True
+    _log(
+        chat_id,
+        "agent_reschedule_crm_called",
+        {
+            "appointment_id": appointment_id,
+            "date": slot["date"],
+            "time_start": slot["time_start"],
+            "phone_masked": _mask_phone(normalized_phone),
+        },
+    )
+
+    started = time.monotonic()
+    try:
+        response = await crm.reschedule_appointment(
+            phone=normalized_phone,
+            new_date=slot["date"],
+            new_time_start=slot["time_start"],
+            appointment_id=appointment_id,
+            reason=reason or "перенос по просьбе пациента",
+        )
+    except crm.CRMResponseError as exc:
+        conflict = exc.status_code == 409 or _looks_like_slot_conflict(exc.code or exc.response_text)
+        _log(
+            chat_id,
+            "agent_reschedule_crm_error",
+            {
+                "status_code": exc.status_code,
+                "code": exc.code,
+                "slot_conflict": conflict,
+                "latency_ms": int((time.monotonic() - started) * 1000),
+            },
+        )
+        try:
+            crm.clear_slots_cache(slot["date"])
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "reschedule_success": False,
+            "error": "slot_conflict" if conflict else "crm_error",
+            "status_code": exc.status_code,
+            "message": (
+                "Это окошко только что заняли. Запись осталась на прежнем времени. Вызови "
+                "get_available_slots заново и предложи реальные альтернативы."
+                if conflict
+                else "CRM отклонила перенос. Запись осталась на прежнем времени — не говори, "
+                "что перенесли; предложи другое время или вызови escalate_to_operator."
+            ),
+        }
+    except Exception as exc:
+        _log(
+            chat_id,
+            "agent_reschedule_crm_error",
+            {"error_type": type(exc).__name__, "latency_ms": int((time.monotonic() - started) * 1000)},
+        )
+        return {
+            "ok": False,
+            "reschedule_success": False,
+            "error": "crm_unavailable",
+            "message": (
+                "CRM не ответила, перенос НЕ выполнен. Не говори пациенту, что запись перенесена — "
+                "скажи, что уточнит администратор, и вызови escalate_to_operator."
+            ),
+        }
+
+    if not _crm_action_confirmed(response, "ok", "success", "rescheduled"):
+        _log(chat_id, "agent_reschedule_crm_rejected", {"appointment_id": appointment_id})
+        return {
+            "ok": False,
+            "reschedule_success": False,
+            "error": "crm_rejected",
+            "message": (
+                "CRM не подтвердила перенос. Запись осталась на прежнем времени — не говори "
+                "пациенту, что она перенесена; предложи другое время или эскалацию."
+            ),
+        }
+
+    # --- confirmed by CRM ---
+    moved = dict(appointment)
+    moved.update({"date": slot["date"], "time_start": slot["time_start"]})
+    if appointment.get("doctor_login"):
+        # The slot was matched for this appointment's own doctor (see
+        # _offered_slot_at), so the slot's doctor is this patient's doctor.
+        moved["doctor_login"] = slot["doctor_login"]
+        moved["doctor_name"] = slot["doctor_name"] or appointment.get("doctor_name") or ""
+    # An appointment the CRM returned without a doctor keeps its own (possibly
+    # empty) doctor fields: the reschedule endpoint takes no doctor, so naming
+    # the one who happened to own the free window would be an invented fact.
+    registry = session.get("crm_active_appointments")
+    if isinstance(registry, dict):
+        registry[appointment_id] = moved
+    session["reschedule_confirmed"] = {
+        "appointment_id": appointment_id,
+        "date": slot["date"],
+        "time_start": slot["time_start"],
+    }
+    session["appointment_id"] = appointment_id
+    session["appointment_date"] = moved["date"]
+    session["appointment_time"] = moved["time_start"]
+    session["appointment_doctor_login"] = moved["doctor_login"]
+    session["appointment_doctor_name"] = moved["doctor_name"]
+    session["appointment_status"] = "rescheduled"
+    session["selected_slot"] = dict(slot)
+    session["selected_date"] = moved["date"]
+    session["selected_time"] = moved["time_start"]
+    session["selected_doctor_login"] = moved["doctor_login"]
+    session["selected_doctor_name"] = moved["doctor_name"]
+    session["crm_result"] = "rescheduled"
+
+    _log(
+        chat_id,
+        "agent_reschedule_crm_success",
+        {
+            "appointment_id": appointment_id,
+            "date": moved["date"],
+            "time_start": moved["time_start"],
+            "doctor_login": moved["doctor_login"],
+            "latency_ms": int((time.monotonic() - started) * 1000),
+        },
+    )
+
+    return {
+        "ok": True,
+        "reschedule_success": True,
+        "appointment_id": appointment_id,
+        "date": moved["date"],
+        "time_start": moved["time_start"],
+        "doctor_login": moved["doctor_login"],
+        "doctor_name": moved["doctor_name"],
+        "previous_date": appointment.get("date", ""),
+        "previous_time_start": appointment.get("time_start", ""),
+        "message": "CRM подтвердила перенос. Теперь можно назвать пациенту новые дату и время.",
+    }
+
+
+async def _tool_cancel_appointment(
+    chat_id: str, session: dict[str, Any], phone: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    appointment_id = str(args.get("appointment_id") or "").strip()
+    reason = str(args.get("reason") or "").strip()
+
+    _log(chat_id, "agent_cancel_tool_requested", {"has_appointment_id": bool(appointment_id)})
+
+    if not appointment_id:
+        return {
+            "ok": False,
+            "cancel_success": False,
+            "error": "missing_appointment_id",
+            "message": "Сначала вызови find_my_appointment и возьми appointment_id из его результата.",
+        }
+
+    if session.get("cancelled_appointment_id") == appointment_id:
+        _log(chat_id, "agent_cancel_duplicate_prevented", {"appointment_id": appointment_id})
+        return {
+            "ok": True,
+            "cancel_success": True,
+            "already_cancelled": True,
+            "appointment_id": appointment_id,
+            "message": "Запись уже отменена ранее в этом диалоге, повторная отмена не выполнялась.",
+        }
+
+    appointment = _known_appointment(session, appointment_id)
+    if appointment is None:
+        _log(chat_id, "agent_cancel_rejected_unknown_appointment", {})
+        return {
+            "ok": False,
+            "cancel_success": False,
+            "error": "appointment_not_found",
+            "message": (
+                "Такую запись CRM в этом диалоге не возвращала. Вызови find_my_appointment; "
+                "если активной записи нет — вызови escalate_to_operator и не выдумывай данные."
+            ),
+        }
+
+    normalized_phone = crm.normalize_phone(phone or session.get("phone") or "")
+    if not normalized_phone:
+        return {
+            "ok": False,
+            "cancel_success": False,
+            "error": "missing_phone",
+            "message": "Нет номера телефона пациента для отмены записи.",
+        }
+
+    bot_tools.mark_tool(session, "cancel_appointment", gate="passed")
+    session["crm_called"] = True
+    _log(
+        chat_id,
+        "agent_cancel_crm_called",
+        {"appointment_id": appointment_id, "phone_masked": _mask_phone(normalized_phone)},
+    )
+
+    started = time.monotonic()
+    try:
+        response = await crm.cancel_appointment(
+            phone=normalized_phone,
+            appointment_id=appointment_id,
+            reason=reason or "отмена по просьбе пациента",
+        )
+    except crm.CRMResponseError as exc:
+        _log(
+            chat_id,
+            "agent_cancel_crm_error",
+            {"status_code": exc.status_code, "code": exc.code, "latency_ms": int((time.monotonic() - started) * 1000)},
+        )
+        return {
+            "ok": False,
+            "cancel_success": False,
+            "error": "crm_error",
+            "status_code": exc.status_code,
+            "message": (
+                "CRM отклонила отмену. Запись всё ещё активна — не говори, что она отменена; "
+                "вызови escalate_to_operator."
+            ),
+        }
+    except Exception as exc:
+        _log(
+            chat_id,
+            "agent_cancel_crm_error",
+            {"error_type": type(exc).__name__, "latency_ms": int((time.monotonic() - started) * 1000)},
+        )
+        return {
+            "ok": False,
+            "cancel_success": False,
+            "error": "crm_unavailable",
+            "message": (
+                "CRM не ответила, отмена НЕ выполнена. Не говори пациенту, что запись отменена — "
+                "скажи, что уточнит администратор, и вызови escalate_to_operator."
+            ),
+        }
+
+    if not _crm_action_confirmed(response, "ok", "success", "cancelled"):
+        _log(chat_id, "agent_cancel_crm_rejected", {"appointment_id": appointment_id})
+        return {
+            "ok": False,
+            "cancel_success": False,
+            "error": "crm_rejected",
+            "message": (
+                "CRM не подтвердила отмену. Запись всё ещё активна — не говори, что она "
+                "отменена; вызови escalate_to_operator."
+            ),
+        }
+
+    # --- confirmed by CRM ---
+    registry = session.get("crm_active_appointments")
+    if isinstance(registry, dict):
+        registry.pop(appointment_id, None)
+    session["cancelled_appointment_id"] = appointment_id
+    session["appointment_status"] = "cancelled"
+    session["crm_result"] = "cancelled"
+    session["booked"] = False
+    session["booking_confirmed"] = False
+    if str(session.get("appointment_id") or "") == appointment_id:
+        # This dialog created the appointment that was just cancelled: its slot
+        # is free again, so the durable claim that stops a second POST for it
+        # has to go with it — otherwise a patient who cancels could never
+        # re-book the same time from this chat. A claim is released only for
+        # the appointment it belongs to; cancelling another one leaves it.
+        claim_key = str(session.pop("booking_idempotency_key", "") or "")
+        if claim_key:
+            _settle_booking_claim(chat_id, claim_key, rejected=True)
+        for stale in ("appointment_date", "appointment_time", "appointment_doctor_login",
+                      "appointment_doctor_name", "selected_slot", "selected_date", "selected_time"):
+            session.pop(stale, None)
+
+    _log(
+        chat_id,
+        "agent_cancel_crm_success",
+        {
+            "appointment_id": appointment_id,
+            "date": appointment.get("date", ""),
+            "time_start": appointment.get("time_start", ""),
+            "latency_ms": int((time.monotonic() - started) * 1000),
+        },
+    )
+
+    return {
+        "ok": True,
+        "cancel_success": True,
+        "appointment_id": appointment_id,
+        "date": appointment.get("date", ""),
+        "time_start": appointment.get("time_start", ""),
+        "doctor_name": appointment.get("doctor_name", ""),
+        "message": (
+            "CRM подтвердила отмену. Сообщи пациенту, что запись отменена, и предложи "
+            "подобрать новое время, если он захочет."
+        ),
+    }
+
+
 def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     """Persist what the patient told GPT into the structured session state.
 
@@ -1385,6 +2131,12 @@ async def execute_tool(
         return await _tool_get_available_slots(chat_id, session, args)
     if name == "book_appointment":
         return await _tool_book_appointment(chat_id, session, phone, args)
+    if name == "find_my_appointment":
+        return await _tool_find_my_appointment(chat_id, session, phone, args)
+    if name == "reschedule_appointment":
+        return await _tool_reschedule_appointment(chat_id, session, phone, args)
+    if name == "cancel_appointment":
+        return await _tool_cancel_appointment(chat_id, session, phone, args)
     if name == "record_patient_facts":
         return _tool_record_patient_facts(chat_id, session, args)
     if name == "get_clinic_info":
@@ -1620,6 +2372,7 @@ async def run_agent_turn(
                 }
 
             result.tool_calls.append({"tool": name, "ok": bool(tool_result.get("ok")), "args": _safe_args(args)})
+            result.tool_results.append(tool_result)
             if name == "book_appointment":
                 result.booking = tool_result
             if name == "escalate_to_operator" and tool_result.get("escalated"):
@@ -1666,6 +2419,7 @@ async def run_agent_turn(
 # an age is known and whether it falls outside the clinic's limits, which is
 # what diagnostics actually need.
 _REDACTED_TOOL_ARGS = {
+    "phone",
     "patient_name",
     "patient_relation",
     "complaint",

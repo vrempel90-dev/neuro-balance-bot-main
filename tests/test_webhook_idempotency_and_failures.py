@@ -139,9 +139,14 @@ def test_different_keys_are_both_processed(offline_crm: None) -> None:
         state.release_message(key)
 
     first = run(main._build_answer_for_message(make_message(chat_id, "dup-key-3a", "Болит спина")))
-    second = run(main._build_answer_for_message(make_message(chat_id, "dup-key-3b", "Мне 42")))
+    run(main._build_answer_for_message(make_message(chat_id, "dup-key-3b", "Мне 42")))
     assert first.strip()
-    assert second.strip()
+    # Оба ключа реально обработаны. Раньше здесь проверялся текст второго
+    # ответа, но это была проверка старой воронки, которая отвечала на любое
+    # сообщение сама: теперь текст пишет агент, а без него ход остаётся без
+    # ответа (администратор уже уведомлён на первом ходе).
+    assert state.is_processed_message("dup-key-3a") is True
+    assert state.is_processed_message("dup-key-3b") is True
 
 
 # ------------------------------------------------------- сбои OpenAI
