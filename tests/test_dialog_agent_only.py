@@ -475,3 +475,41 @@ def test_crm_lookup_debug_survives_for_incident_analysis(monkeypatch: pytest.Mon
     assert session["raw_crm_lead_status"] == "НОВАЯ"
     assert session["raw_crm_has_patient"] is False
     assert session["raw_crm_hasActiveAppointment"] is False
+
+
+def test_debug_says_gpt_ran_when_the_agent_wrote_the_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ответ агента не переписывается — но в диагностике GPT обязан числиться вызванным.
+
+    Прод 26.08.2026: живой ход агента писался как openai_used=false,
+    skip_reason=locked_template, потому что «не переписывать текст» и «модель не
+    вызывалась» попали в одну ветку. По такому логу решают, работает GPT или нет.
+    """
+    install_crm(monkeypatch, CRMStub())
+    install_openai(monkeypatch, [assistant_text("Здравствуйте 🌿 Что беспокоит?")])
+    chat_id = "dialog_debug_openai_used"
+    fresh_chat(chat_id)
+
+    answer = turn(chat_id, "здравствуйте")
+    asyncio.run(main._maybe_humanize_answer(chat_id, "здравствуйте", answer))
+
+    session = state.get_session(chat_id)
+    assert session["openai_used"] is True
+    assert session["openai_skip_reason"] == ""
+    assert session["humanize_skipped_because_brain_valid"] is True
+
+
+def test_debug_marks_python_templates_as_not_gpt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """А вот «подключаю администратора» пишет Python — и это должно быть видно."""
+    install_crm(monkeypatch, CRMStub())
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    get_settings.cache_clear()
+    chat_id = "dialog_debug_python_template"
+    fresh_chat(chat_id)
+
+    answer = turn(chat_id, "хочу записаться")
+    asyncio.run(main._maybe_humanize_answer(chat_id, "хочу записаться", answer))
+
+    assert answer == dialog.OPERATOR_HANDOFF_RU
+    session = state.get_session(chat_id)
+    assert session["openai_used"] is False
+    assert session["openai_skip_reason"] == "python_template"

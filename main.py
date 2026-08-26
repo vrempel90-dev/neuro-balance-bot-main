@@ -436,20 +436,31 @@ async def _maybe_humanize_answer(chat_id: str, user_text: str, base_answer: str,
     session = _get_session_safe(chat_id)
     session["chat_id"] = chat_id
     if session.get("skip_humanize") or str(session.get("answer_source") or "").startswith("locked_template"):
+        # Текст агента не переписывается — но это не значит, что GPT не работал.
+        # Раньше эта ветка помечала ЛЮБОЙ такой ответ как openai_used=false с
+        # причиной locked_template, и в диагностике живой ход агента выглядел
+        # так, будто модель не вызывалась вовсе.
+        agent_authored = str(session.get("answer_source") or "") == "gpt_agent"
+        reason = "agent_authored" if agent_authored else "python_template"
         debug = {
-            "openai_used": False,
-            "openai_model": getattr(get_settings(), "openai_model", ""),
-            "openai_skip_reason": "locked_template",
+            "openai_used": agent_authored,
+            "openai_model": (
+                session.get("openai_brain_model") or getattr(get_settings(), "ai_brain_model", "")
+                if agent_authored
+                else getattr(get_settings(), "openai_model", "")
+            ),
+            "openai_skip_reason": "" if agent_authored else reason,
             "openai_guard_failed": False,
             "base_answer_preview": _preview(base_answer, 160),
             "final_answer_preview": _preview(base_answer, 160),
             "humanize_fallback_used": False,
         }
-        session["humanize_skipped_because_locked_template"] = True
+        session["humanize_skipped_because_locked_template"] = not agent_authored
+        session["humanize_skipped_because_brain_valid"] = agent_authored
         session["humanize_fallback_used"] = False
         _set_openai_debug(session, debug, base_answer, base_answer)
         state.save_session(chat_id, session)
-        state.log_event(chat_id, "humanize_skipped", {"chat_id": chat_id, "reason": "locked_template", "step": session.get("step") or session.get("current_step") or ""})
+        state.log_event(chat_id, "humanize_skipped", {"chat_id": chat_id, "reason": reason, "step": session.get("step") or session.get("current_step") or ""})
         return base_answer
     if session.get("openai_brain_used") and (base_answer or "").strip():
         session["humanize_skipped_because_brain_valid"] = True
