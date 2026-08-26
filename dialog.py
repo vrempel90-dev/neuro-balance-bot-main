@@ -314,6 +314,25 @@ def _detect_lang(text: str, session: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _store_crm_lookup_debug(session: dict[str, Any], lookup: dict[str, Any] | None) -> None:
+    """Сырой ответ CRM в отладочную выдачу main.py.
+
+    Классификацию делает admission.py, но при разборе инцидента «почему бот
+    решил, что это старый лид» нужно видеть, что именно ответила CRM, а не
+    только вывод.
+    """
+    raw = lookup.get("raw") if isinstance(lookup, dict) and isinstance(lookup.get("raw"), dict) else lookup
+    raw = raw if isinstance(raw, dict) else {}
+    lead = raw.get("lead") if isinstance(raw.get("lead"), dict) else None
+    session["raw_crm_found"] = raw.get("found")
+    session["raw_crm_isNew"] = raw.get("isNew")
+    session["raw_crm_has_patient"] = isinstance(raw.get("patient"), dict)
+    session["raw_crm_has_lead"] = bool(lead)
+    session["raw_crm_lead_status"] = str((lead or {}).get("status") or "")
+    session["raw_crm_has_lastAppointment"] = isinstance(raw.get("lastAppointment"), dict)
+    session["raw_crm_hasActiveAppointment"] = raw.get("hasActiveAppointment") is True
+
+
 async def _classify_lead(chat_id: str, phone: str, session: dict[str, Any]) -> admission.Admission:
     """Спрашивает CRM про пациента и отдаёт классификацию admission.py.
 
@@ -336,6 +355,7 @@ async def _classify_lead(chat_id: str, phone: str, session: dict[str, Any]) -> a
     verdict = admission.classify(normalized, lookup)
     session["crm_patient_state"] = _CRM_PATIENT_STATE[verdict.state]
     session["crm_state_reason"] = verdict.reason
+    _store_crm_lookup_debug(session, lookup)
     session["active_appointment_found"] = verdict.appointment is not None
     session["active_appointment_count"] = len([
         a for a in (lookup or {}).get("appointments") or [] if isinstance(a, dict)
@@ -621,8 +641,10 @@ def _start_turn(chat_id: str, session: dict[str, Any], phone: str, text: str) ->
     session["openai_brain_used"] = False
     session["openai_skip_reason"] = ""
     session["openai_brain_skip_reason"] = ""
-    for key in ("crm_lookup_called", "crm_lookup_error", "crm_patient_state",
-                "active_appointment_found", "active_appointment_count", "final_answer_preview"):
+    for key in ("crm_lookup_called", "crm_lookup_error", "crm_patient_state", "crm_state_reason",
+                "active_appointment_found", "active_appointment_count", "final_answer_preview",
+                "raw_crm_found", "raw_crm_isNew", "raw_crm_has_patient", "raw_crm_has_lead",
+                "raw_crm_lead_status", "raw_crm_has_lastAppointment", "raw_crm_hasActiveAppointment"):
         session.pop(key, None)
 
 

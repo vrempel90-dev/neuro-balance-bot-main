@@ -226,10 +226,34 @@ def test_crm_outage_is_silent(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_admission_is_the_only_place_that_classifies_a_lead() -> None:
-    """dialog.py больше не содержит собственной классификации пациента."""
+    """Решение принимает admission.classify, а не второй разбор ответа CRM.
+
+    Проверяется именно функция хода: сырой ответ CRM dialog.py по-прежнему
+    раскладывает в отладочную выдачу (``_store_crm_lookup_debug``), но ни одно
+    поле оттуда не должно влиять на вердикт.
+    """
     import inspect
 
-    source = inspect.getsource(dialog)
+    source = inspect.getsource(dialog._classify_lead)
     assert "admission.classify" in source
-    for gone in ("RETURNING_PATIENT_NO_ACTIVE_BOOKING\" if", "hasActiveAppointment", "CRM_NEW_LEAD_STATUSES"):
-        assert gone not in source
+    # Поля сырого ответа CRM в ходе диалога не разбираются: их читает
+    # admission.classify (решение) и _store_crm_lookup_debug (диагностика).
+    for gone in ("hasActiveAppointment", "isNew", "lastAppointment", '"patient"', '"lead"'):
+        assert gone not in source, f"разбор ответа CRM не должен жить в dialog._classify_lead: {gone}"
+
+
+@pytest.mark.parametrize(
+    "lookup, expected",
+    [
+        (new_patient_lookup(), "NEW_PATIENT"),
+        (new_patient_lookup(found=True, isNew=False, patient={"name": "Алия"}), "RETURNING_PATIENT_NO_ACTIVE_BOOKING"),
+        (new_patient_lookup(found=True, isNew=False, hasActiveAppointment=True), "ACTIVE_BOOKING"),
+        (RuntimeError("crm down"), "CRM_UNAVAILABLE"),
+    ],
+)
+def test_dialog_verdict_always_matches_admission(monkeypatch: pytest.MonkeyPatch, lookup: Any, expected: str) -> None:
+    """Ход диалога не имеет собственного мнения о пациенте."""
+    chat_id = f"admission_match_{expected}"
+    _turn(chat_id, "Здравствуйте", monkeypatch, lookup)
+
+    assert state.get_session(chat_id)["crm_patient_state"] == expected
