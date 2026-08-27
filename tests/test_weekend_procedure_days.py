@@ -30,6 +30,8 @@ import state
 state.init_db()
 
 DOCTOR_LOGIN = "zhuma_md"
+OTHER_LOGIN = "aibek_md"
+OTHER_NAME = "Айбек Серикович"
 DOCTOR_NAME = "Жумабек Мади Мухтарович"
 SATURDAY = "2026-09-05"
 SUNDAY = "2026-09-06"
@@ -44,14 +46,16 @@ class SlotsStub:
 
     async def check_slots(self, date: str, doctor_login: str | None = None) -> dict[str, Any]:
         self.calls.append(date)
-        return {
-            "ok": True,
-            "date": date,
-            "availability": [
-                {"doctorLogin": DOCTOR_LOGIN, "doctorName": DOCTOR_NAME, "date": date,
-                 "availableSlots": list(self.times.get(date, []))}
-            ],
-        }
+        by_doctor = self.times.get(date, [])
+        if not isinstance(by_doctor, dict):
+            by_doctor = {DOCTOR_LOGIN: list(by_doctor)}
+        availability = [
+            {"doctorLogin": login, "doctorName": DOCTOR_NAME if login == DOCTOR_LOGIN else OTHER_NAME,
+             "date": date, "availableSlots": list(times)}
+            for login, times in by_doctor.items()
+            if not doctor_login or login == doctor_login
+        ]
+        return {"ok": True, "date": date, "availability": availability}
 
 
 def run_tool(monkeypatch: pytest.MonkeyPatch, stub: SlotsStub, args: dict[str, Any]) -> dict[str, Any]:
@@ -99,3 +103,49 @@ def test_a_multi_day_search_never_spends_a_request_on_a_weekend(monkeypatch: pyt
     run_tool(monkeypatch, stub, {"date_from": "2026-09-03", "days_ahead": 4})
 
     assert stub.calls == ["2026-09-03", "2026-09-04", MONDAY, TUESDAY]
+
+
+# ---------------------------------------------------------------------------
+# Врач в запросе доступности
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_doctor_login_does_not_hide_free_slots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Прод 27.08.2026: в doctor_login пришёл «<PRIVATE_PERSON>».
+
+    CRM на такой фильтр вернула availability=[], и это выглядит как «у врача
+    нет окошек», хотя окошки есть у всех. Логин, которого CRM не давала, не
+    должен сужать поиск.
+    """
+    stub = SlotsStub({TUESDAY: ["11:00", "15:00"]})
+
+    result = run_tool(monkeypatch, stub, {"date_from": TUESDAY, "doctor_login": "<PRIVATE_PERSON>"})
+
+    assert stub.calls == [TUESDAY]
+    assert result["slot_count"] == 2, "окошки всех врачей должны остаться видны"
+    assert result["unknown_doctor_login_ignored"] == "<PRIVATE_PERSON>"
+    assert result["requested_doctor_login"] == ""
+    assert "не опознан" in result["note"]
+
+
+def test_doctor_name_instead_of_login_is_not_used_as_a_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Имя врача — не doctorLogin, даже если модель прислала его в это поле."""
+    stub = SlotsStub({TUESDAY: ["11:00"]})
+
+    result = run_tool(monkeypatch, stub, {"date_from": TUESDAY, "doctor_login": DOCTOR_NAME})
+
+    assert stub.calls[0] == TUESDAY
+    assert result["unknown_doctor_login_ignored"] == DOCTOR_NAME
+    assert result["slot_count"] == 1
+
+
+def test_real_doctor_login_still_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Настоящий логин по-прежнему сужает поиск до этого врача."""
+    stub = SlotsStub({TUESDAY: {DOCTOR_LOGIN: ["11:00"], OTHER_LOGIN: ["12:00"]}})
+
+    result = run_tool(monkeypatch, stub, {"date_from": TUESDAY, "doctor_login": DOCTOR_LOGIN})
+
+    assert stub.calls == [TUESDAY]
+    assert result["requested_doctor_login"] == DOCTOR_LOGIN
+    assert result["unknown_doctor_login_ignored"] == ""
+    assert {slot["doctor_login"] for slot in result["slots"]} == {DOCTOR_LOGIN}

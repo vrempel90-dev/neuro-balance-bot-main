@@ -119,6 +119,12 @@ _MAX_AVAILABILITY_REQUESTS = 7
 # берутся, — в инструменте доступности; объяснение пишет модель.
 _PROCEDURE_WEEKEND_DAYS = {5, 6}
 
+# doctorLogin в CRM — латиница, цифры и подчёркивание (zhuma_md, asel_k,
+# reserve). Всё остальное — имя врача, фраза пациента или плейсхолдер, а не
+# логин: фильтр по такому значению CRM просто вернёт пустоту, и пациент
+# услышит «свободных окошек нет» там, где они есть.
+_DOCTOR_LOGIN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,39}$")
+
 
 class AgentUnavailable(Exception):
     """Raised when the agent loop cannot run at all (config/budget/transport)."""
@@ -902,6 +908,23 @@ async def _tool_get_available_slots(
     doctor_login = str(args.get("doctor_login") or "").strip() or None
     time_preference = str(args.get("time_preference") or "").strip()
 
+    # Прод 27.08.2026: модель прислала в doctor_login плейсхолдер
+    # "<PRIVATE_PERSON>", CRM вернула availability=[] — то есть «врач есть, но
+    # окошек нет». Фильтровать поиск по значению, которого CRM не знает,
+    # нельзя: лучше показать окошки всех врачей и сказать модели, что логин не
+    # опознан.
+    unknown_doctor = ""
+    if doctor_login:
+        known = _known_doctors_from_offers(session)
+        session_known = session.get("crm_known_doctors")
+        if isinstance(session_known, dict):
+            known.update({str(k).lower(): v for k, v in session_known.items()})
+        looks_like_login = bool(_DOCTOR_LOGIN_RE.match(doctor_login.lower()))
+        if not looks_like_login or (known and doctor_login.lower() not in known):
+            unknown_doctor = doctor_login
+            doctor_login = None
+            _log(chat_id, "agent_availability_unknown_doctor_ignored", {"looks_like_login": looks_like_login})
+
     requested_start = start
     weekend_requested = start.weekday() in _PROCEDURE_WEEKEND_DAYS
     while start.weekday() in _PROCEDURE_WEEKEND_DAYS:
@@ -987,6 +1010,12 @@ async def _tool_get_available_slots(
         if slots
         else "CRM не вернула свободных окошек на этот период. Предложи другой период или эскалацию."
     )
+    if unknown_doctor:
+        note = (
+            "Врач в запросе не опознан: такого doctorLogin CRM не давала, поэтому "
+            "показаны окошки всех врачей. Выбирай врача только из doctors в этом "
+            "результате или вызови get_doctors. " + note
+        )
     if weekend_requested:
         note = (
             "Пациент просил субботу или воскресенье — это процедурные дни, консультаций в "
@@ -1001,6 +1030,7 @@ async def _tool_get_available_slots(
         "weekend_procedure_day_requested": weekend_requested,
         "days_ahead": days_ahead,
         "requested_doctor_login": doctor_login or "",
+        "unknown_doctor_login_ignored": unknown_doctor,
         "slot_count": len(slots),
         "slots": slots,
         "doctors": doctors,
