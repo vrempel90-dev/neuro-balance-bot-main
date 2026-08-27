@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 import uuid
@@ -1088,6 +1089,43 @@ async def _send_answer_parts(
         raise
 
 
+_CHAT_TURN_LOCKS: dict[str, asyncio.Lock] = {}
+_CHAT_TURN_USERS: dict[str, int] = {}
+
+
+@asynccontextmanager
+async def _chat_turn(chat_id: str):
+    """Один ход в чате за раз.
+
+    Wazzup доставляет каждое сообщение отдельным вебхуком, а пациент часто
+    пишет их подряд: «Шейный позвонок», через полсекунды «Протрузия». Оба хода
+    шли параллельно, каждый читал сессию до того, как другой записал свой
+    ответ, — и пациент получал два одинаковых сообщения подряд («Поняла.
+    Сколько вам полных лет?» дважды, прод 26.08.2026, chat_id 77022868013).
+    Дебаунс это не ловит: он склеивает только то, что успело прийти внутри
+    своего окна.
+
+    Сериализация делает второй ход продолжением первого: агент видит и
+    предыдущее сообщение пациента, и собственный ответ на него, поэтому
+    отвечает по существу, а не повторяет вопрос.
+    """
+    lock = _CHAT_TURN_LOCKS.setdefault(chat_id, asyncio.Lock())
+    # Счётчик держит объект живым, пока есть хоть один ждущий: удалить его
+    # раньше значило бы выдать следующему ходу другой замок и потерять
+    # взаимное исключение.
+    _CHAT_TURN_USERS[chat_id] = _CHAT_TURN_USERS.get(chat_id, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        remaining = _CHAT_TURN_USERS.get(chat_id, 1) - 1
+        if remaining > 0:
+            _CHAT_TURN_USERS[chat_id] = remaining
+        else:
+            _CHAT_TURN_USERS.pop(chat_id, None)
+            _CHAT_TURN_LOCKS.pop(chat_id, None)
+
+
 async def _debounced_process_and_send(message: dict[str, Any]) -> None:
     """Обрабатывает входящее сообщение в фоне.
 
@@ -1118,20 +1156,21 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
             message = dict(message)
             message["text"] = combined_text
 
-        answer = await _build_answer_for_message(message)
-        session_after = _get_session_safe(chat_id)
-        guard_decision = session_after.get("guard_decision") if isinstance(session_after.get("guard_decision"), dict) else {}
-        if not answer or not bool(guard_decision.get("should_send_wazzup", True)):
-            state.log_event(chat_id, "wazzup_send_blocked", {"phone": str(message.get("phone") or ""), "reason": session_after.get("no_reply_reason") or "empty_answer"})
-            return
+        async with _chat_turn(chat_id):
+            answer = await _build_answer_for_message(message)
+            session_after = _get_session_safe(chat_id)
+            guard_decision = session_after.get("guard_decision") if isinstance(session_after.get("guard_decision"), dict) else {}
+            if not answer or not bool(guard_decision.get("should_send_wazzup", True)):
+                state.log_event(chat_id, "wazzup_send_blocked", {"phone": str(message.get("phone") or ""), "reason": session_after.get("no_reply_reason") or "empty_answer"})
+                return
 
-        await _send_answer_parts(
-            chat_id=chat_id,
-            answer=answer,
-            chat_type=chat_type,
-            channel_id=channel_id,
-            phone=str(message.get("phone") or ""),
-        )
+            await _send_answer_parts(
+                chat_id=chat_id,
+                answer=answer,
+                chat_type=chat_type,
+                channel_id=channel_id,
+                phone=str(message.get("phone") or ""),
+            )
 
     except Exception as exc:
         state.log_event(chat_id, "background_processing_error", {"error": str(exc)[:1000]})
