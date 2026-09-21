@@ -394,3 +394,33 @@ def test_empty_text_logs_crm_lookup_skipped_not_result(monkeypatch):
     names = [event["event"] for event in events]
     assert "crm_lookup_skipped" in names
     assert "crm_lookup_result" not in names
+
+
+def test_instagram_chat_id_is_not_faked_into_phone(monkeypatch):
+    calls = []
+
+    async def handler(message):
+        calls.append(message)
+        return {"answer": "Нужен номер телефона", "should_send_wazzup": False}
+
+    monkeypatch.setattr(main, "handle_incoming_message", handler)
+    monkeypatch.setattr(main, "send_wazzup_message", _fake_sender)
+    monkeypatch.setattr(main, "is_bot_work_time", lambda *a, **k: True)
+
+    payload = _messages_payload(
+        _real_inbound_message(
+            messageId="instagram-no-phone-1",
+            chatType="instagram",
+            chatId="clinic_lead_username",
+            contact={"name": "Instagram Lead"},
+            channelId="chan-instagram",
+        )
+    )
+    response = TestClient(main.app).post("/webhook/wazzup", json=payload)
+
+    assert response.status_code == 200
+    assert calls
+    parsed = calls[0]
+    assert parsed["chat_type"] == "instagram"
+    assert parsed["chat_id"] == "clinic_lead_username"
+    assert parsed["phone"] == ""
