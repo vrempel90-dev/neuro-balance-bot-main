@@ -274,7 +274,7 @@ def _detect_lang(text: str, session: dict[str, Any]) -> str:
     Переключение требует уверенного сигнала: явная просьба сильнее всего,
     короткие ответы («иә», «да», «44») и смешанные сообщения язык не меняют.
     """
-    current = session.get("language")
+    current = str(session.get("language") or "")
     established = current in ("ru", "kk")
     if not established:
         current = "ru"
@@ -512,7 +512,11 @@ def _no_reply(chat_id: str, session: dict[str, Any], reason: str) -> str:
     """Сохраняет состояние и ничего не отправляет пациенту."""
     session["no_reply_reason"] = reason
     session["should_send_wazzup"] = False
-    decision = session.get("guard_decision") if isinstance(session.get("guard_decision"), dict) else {}
+    decision: dict[str, Any] = (
+        session.get("guard_decision")
+        if isinstance(session.get("guard_decision"), dict)
+        else {}
+    )
     decision.update({"allowed": False, "no_reply_reason": reason, "should_send_wazzup": False})
     session["guard_decision"] = decision
     _safe_save(chat_id, session)
