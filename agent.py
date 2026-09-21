@@ -46,8 +46,10 @@ import clinic_info
 import crm
 from config import get_settings
 
+state: Any
 try:
-    import state
+    import state as _state
+    state = _state
 except Exception:  # pragma: no cover - state is always importable in production
     state = None
 
@@ -772,8 +774,16 @@ def _clip(value: Any, field: str) -> str:
 def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls | None = None) -> dict[str, Any]:
     """Compact, structured facts so GPT never re-asks what it already knows."""
     today = today or _clinic_today()
-    facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
-    offered = session.get("crm_offered_slots") if isinstance(session.get("crm_offered_slots"), dict) else {}
+    facts: dict[str, Any] = (
+        session.get("known_user_facts")
+        if isinstance(session.get("known_user_facts"), dict)
+        else {}
+    )
+    offered: dict[str, Any] = (
+        session.get("crm_offered_slots")
+        if isinstance(session.get("crm_offered_slots"), dict)
+        else {}
+    )
     return {
         "today": today.isoformat(),
         "tomorrow": (today + timedelta(days=1)).isoformat(),
@@ -2114,7 +2124,11 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
         session["patient_relation"] = relation
         stored.append("patient_relation")
 
-    facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
+    facts: dict[str, Any] = (
+        session.get("known_user_facts")
+        if isinstance(session.get("known_user_facts"), dict)
+        else {}
+    )
     for key in ("complaint", "age", "patient_name", "patient_relation"):
         if session.get(key):
             facts[key] = session.get(key)
@@ -2281,7 +2295,7 @@ _DEFERRED_REPLY_MARKERS = (
 )
 
 
-def _normalized_reply(text: str) -> str:
+def _normalized_reply(text: Any) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip().lower())
 
 
