@@ -1552,6 +1552,7 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
             "crm_lookup_failed",
             "channel_id_mismatch",
             "duplicate_message",
+            "duplicate_answer",
             "echo_or_outgoing_message",
             "empty_text",
             "send_failed",
@@ -1647,12 +1648,33 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
     state.log_event(chat_id, "ai_or_template_response_ready", {"phone": phone, "chat_id": chat_id, "answer_preview": _preview(answer, 160), "has_answer": bool(answer), "silent_reason": silent_reason})
 
     send_result_payload: dict[str, Any] = {}
+    last_sent_answer = str(session_after.get("last_sent_answer") or "").strip()
+    if (
+        answer
+        and should_send
+        and last_sent_answer
+        and re.sub(r"\s+", " ", last_sent_answer).strip() == re.sub(r"\s+", " ", answer).strip()
+    ):
+        # A patient can send several fragments before seeing our previous
+        # question. The agent may legitimately arrive at the same next
+        # question again; do not send it twice and do not escalate.
+        should_send = False
+        silent_reason = "duplicate_answer"
+        session_after["wazzup_send_called"] = False
+        session_after["outgoing_duplicate_guard_blocked"] = True
+        state.save_session(chat_id, session_after)
+        state.log_event(chat_id, "wazzup_send_blocked", {"phone": phone, "reason": silent_reason})
+
     if answer and should_send:
         if send_enabled:
             state.log_event(chat_id, "wazzup_send_start", {"chat_id": chat_id, "channel_id": channel_id_from_payload, "text_preview": _preview(answer, 160)})
             try:
                 outbound_channel_id = channel_id_from_payload if (channel_id_from_payload and channel_id_match) else (channel_id_env or None)
                 send_result = await send_wazzup_message(chat_id=chat_id, text=answer, chat_type=message.get("chat_type") or "whatsapp", channel_id=outbound_channel_id)
+                session_after = _get_session_safe(chat_id)
+                session_after["wazzup_send_called"] = True
+                session_after["last_sent_answer"] = answer
+                state.save_session(chat_id, session_after)
                 send_result_payload = {"status_code": send_result.get("status_code"), "response_preview": _preview(send_result, 300), "success": True}
                 state.log_event(chat_id, "wazzup_send_result", send_result_payload)
             except Exception as exc:
