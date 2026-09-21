@@ -527,6 +527,28 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "select_booking_slot",
+            "description": (
+                "Зафиксировать конкретный CRM-слот, который пациент ЯВНО выбрал из ранее "
+                "показанных вариантов. Используй после ответов вроде «первый», «второй», "
+                "«14:00» или однозначного выбора врача/времени. Инструмент принимает только "
+                "слот, реально возвращённый get_available_slots в этом диалоге."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doctor_login": {"type": "string", "description": "doctorLogin выбранного CRM-слота."},
+                    "date": {"type": "string", "description": "Дата выбранного CRM-слота YYYY-MM-DD."},
+                    "time_start": {"type": "string", "description": "Время выбранного CRM-слота HH:MM."},
+                },
+                "required": ["doctor_login", "date", "time_start"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "book_appointment",
             "description": (
                 "Создать РЕАЛЬНУЮ запись в CRM. Вызывай только когда собраны: жалоба, "
@@ -738,6 +760,7 @@ AGENT_OVERRIDES = """
 - record_patient_facts — сохранить жалобу, возраст, противопоказания, имя, родство;
 - get_doctors — реальные врачи клиники;
 - get_available_slots — реальные свободные даты и время;
+- select_booking_slot — сохранить конкретный реальный слот, который пациент выбрал;
 - book_appointment — реальная запись в CRM;
 - find_my_appointment — действующая запись пациента в CRM;
 - reschedule_appointment — реальный перенос существующей записи;
@@ -772,7 +795,11 @@ AGENT_OVERRIDES = """
 
 ПОРЯДОК ЗАПИСИ (медицинская безопасность, соблюдай его):
 жалоба → возраст → противопоказания → дата → реальные слоты CRM → выбор
-времени → имя пациента → book_appointment.
+времени → select_booking_slot → имя пациента → book_appointment.
+Если пациент выбрал «первый/второй/третий» или конкретное время из только что
+показанных CRM-вариантов, зафиксируй выбор через select_booking_slot и НЕ
+переспрашивай дату, врача или время. После получения имени backend проверит
+все обязательные данные и завершит запись в CRM.
 Возраст до 16 и старше 75, а также противопоказания из чек-листа — стоп-факторы:
 вместо записи вызывай escalate_to_operator.
 
@@ -879,6 +906,11 @@ def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls 
         "tomorrow": (today + timedelta(days=1)).isoformat(),
         "weekday": today.strftime("%A"),
         "language": session.get("language") or "ru",
+        "channel": {
+            "transport": session.get("source") or "",
+            "chat_type": session.get("chat_type") or "",
+            "is_instagram": "instagram" in str(session.get("chat_type") or "").lower(),
+        },
         "sender": {"phone_masked": _mask_phone(phone or session.get("phone"))},
         "patient": {
             "booking_for_self": not bool(session.get("patient_relation")),
@@ -893,8 +925,20 @@ def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls 
             "preferred_date": session.get("preferred_date") or "",
             "time_preference": _clip(session.get("time_preference"), "time_preference"),
             "selected_doctor_login": session.get("selected_doctor_login") or "",
+            "selected_doctor_name": session.get("selected_doctor_name") or "",
             "selected_date": session.get("selected_date") or "",
             "selected_time": session.get("selected_time") or "",
+            "selected_slot_is_verified": bool(
+                session.get("selected_doctor_login")
+                and session.get("selected_date")
+                and session.get("selected_time")
+                and _offered_slot(
+                    session,
+                    str(session.get("selected_date") or ""),
+                    str(session.get("selected_time") or ""),
+                    str(session.get("selected_doctor_login") or ""),
+                )
+            ),
             "already_booked": bool(session.get("booking_confirmed")),
             "crm_slots_offered_count": len(offered),
         },
