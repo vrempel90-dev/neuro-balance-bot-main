@@ -283,3 +283,18 @@ def test_staging_crm_write_switch_blocks_real_booking(monkeypatch: pytest.Monkey
     assert session.get("booking_confirmed") is not True
 
     get_settings.cache_clear()
+
+
+
+def test_crm_write_allowlist_only_permits_configured_test_phone(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CRM_WRITE_ENABLED", "true")
+    monkeypatch.setenv("CRM_WRITE_TEST_PHONE", "+7 701 111 22 33")
+    get_settings.cache_clear()
+
+    assert agent._crm_write_allowed_for_phone("77011112233") == (True, "")
+    assert agent._crm_write_allowed_for_phone("77019998877") == (
+        False,
+        "crm_write_phone_not_allowed",
+    )
+
+    get_settings.cache_clear()
