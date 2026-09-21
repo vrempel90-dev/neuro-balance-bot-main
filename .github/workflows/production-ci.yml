@@ -1,0 +1,50 @@
+name: Production CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "fix/**"
+
+permissions:
+  contents: read
+
+jobs:
+  production-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CRM_BOT_SECRET: test-secret
+      OPENAI_API_KEY: test-key
+      SQLITE_PATH: /tmp/neuro-balance-ci.sqlite3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install runtime and verification dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r tests/requirements-dev.txt mypy
+
+      - name: Typecheck production modules
+        run: |
+          python -m mypy \
+            --ignore-missing-imports \
+            --follow-imports=skip \
+            --allow-untyped-defs \
+            --allow-incomplete-defs \
+            --no-strict-optional \
+            agent.py dialog.py crm.py state.py admission.py main.py
+
+      - name: Build and import smoke
+        run: |
+          python -m compileall -q -x 'original_crm_reference|\.git' .
+          python -c "import agent, dialog, crm, state, admission, main; print('production imports OK')"
+
+      - name: Full regression suite
+        run: python -m pytest -q
