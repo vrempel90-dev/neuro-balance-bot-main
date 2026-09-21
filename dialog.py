@@ -324,11 +324,23 @@ def _store_crm_lookup_debug(session: dict[str, Any], lookup: dict[str, Any] | No
     raw = lookup.get("raw") if isinstance(lookup, dict) and isinstance(lookup.get("raw"), dict) else lookup
     raw = raw if isinstance(raw, dict) else {}
     lead = raw.get("lead") if isinstance(raw.get("lead"), dict) else None
+    conversation = raw.get("conversation") if isinstance(raw.get("conversation"), dict) else None
     session["raw_crm_found"] = raw.get("found")
     session["raw_crm_isNew"] = raw.get("isNew")
     session["raw_crm_has_patient"] = isinstance(raw.get("patient"), dict)
     session["raw_crm_has_lead"] = bool(lead)
     session["raw_crm_lead_status"] = str((lead or {}).get("status") or "")
+    # Keep the CRM identifiers returned by the CRM itself. POST /api/bot/book
+    # accepts these identifiers so createAppointment can remain linked to the
+    # existing lead and the same POST can complete the CRM conversation/outcome.
+    session["crm_lead_id"] = (lead or {}).get("id") or raw.get("leadId") or raw.get("lead_id") or ""
+    session["crm_lead_status"] = str((lead or {}).get("status") or "")
+    session["crm_conversation_id"] = (
+        raw.get("conversationId")
+        or raw.get("conversation_id")
+        or (conversation or {}).get("id")
+        or ""
+    )
     session["raw_crm_has_lastAppointment"] = isinstance(raw.get("lastAppointment"), dict)
     session["raw_crm_hasActiveAppointment"] = raw.get("hasActiveAppointment") is True
 
@@ -594,6 +606,91 @@ async def _handoff(chat_id: str, session: dict[str, Any], answer: str, reason: s
     return answer
 
 
+def _normalized_question(text: str) -> str:
+    value = _low(text)
+    value = re.sub(r"[^a-zа-яёәғқңөұүһі0-9?]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _reasked_known_fact(session: dict[str, Any], answer: str) -> str:
+    """Detect deterministic re-asks for facts that state already contains.
+
+    This is a final postcondition, not a second dialog engine. It only matches
+    narrow question forms for the mandatory booking fields; uncertain wording
+    is left to the agent.
+    """
+    low = _low(answer)
+    if "?" not in low:
+        return ""
+
+    if session.get("complaint") and any(
+        marker in low
+        for marker in ("что вас беспокоит", "что беспокоит", "что именно беспокоит", "не мазалайды", "не мазалай")
+    ):
+        return "complaint"
+
+    if session.get("age") and any(
+        marker in low
+        for marker in ("сколько вам лет", "сколько лет пациент", "ваш возраст", "жасыңыз", "жасыныз")
+    ):
+        return "age"
+
+    if session.get("contraindications_ok") is True and any(
+        marker in low
+        for marker in ("есть ли противопоказ", "противопоказания есть", "қарсы көрсетілім", "қарсы көрсет")
+    ):
+        return "contraindications"
+
+    if (session.get("preferred_date") or session.get("selected_date")) and any(
+        marker in low
+        for marker in ("какой день", "на какой день", "какая дата", "удобный день", "қай күн")
+    ):
+        return "date"
+
+    if (session.get("selected_slot") or session.get("selected_time")) and any(
+        marker in low
+        for marker in ("какое время", "которое время", "какой вариант", "қай уақыт", "қайсы уақыт")
+    ):
+        return "time"
+
+    if session.get("patient_name") and any(
+        marker in low
+        for marker in ("как вас зовут", "имя пациента", "имя для записи", "ваше имя", "атыңыз", "атыныз")
+    ):
+        return "name"
+
+    previous = str(session.get("last_assistant_answer") or "")
+    if "?" in previous and _normalized_question(previous) == _normalized_question(answer):
+        return "exact_repeat"
+    return ""
+
+
+async def _block_repeated_question(
+    chat_id: str, session: dict[str, Any], field: str
+) -> str:
+    """Enforce the no-repeat invariant without creating a second funnel.
+
+    An exact duplicate of the immediately previous question is returned
+    unchanged so the transport duplicate guard suppresses a second outbound.
+    A first re-ask of a fact already present in structured state gets a
+    temporary operator handoff, but does not permanently transfer ownership:
+    the next patient message can still continue through the normal agent path.
+    """
+    if field == "exact_repeat":
+        previous = str(session.get("last_assistant_answer") or "").strip()
+        session["no_reply_reason"] = ""
+        session["final_answer_preview"] = previous[:160]
+        _safe_save(chat_id, session)
+        return previous
+    return await _handoff(
+        chat_id,
+        session,
+        _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK),
+        f"repeated_question:{field}",
+        human_owns=False,
+    )
+
+
 async def _finalize(chat_id: str, session: dict[str, Any], answer: str, result: Any = None) -> str:
     """Последний барьер перед отправкой: только пропустить или заблокировать.
 
@@ -611,7 +708,17 @@ async def _finalize(chat_id: str, session: dict[str, Any], answer: str, result: 
     if not answer:
         return await _handoff(chat_id, session, _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK), "empty_answer")
 
-    # 3. Дата, время или врач, которых не было ни в одном результате инструмента.
+    # 3. A mandatory fact that is already known must never be asked again.
+    repeated_field = _reasked_known_fact(session, answer)
+    if repeated_field:
+        _safe_log(
+            chat_id,
+            "repeated_question_blocked",
+            {"chat_id": chat_id, "field": repeated_field},
+        )
+        return await _block_repeated_question(chat_id, session, repeated_field)
+
+    # 4. Дата, время или врач, которых не было ни в одном результате инструмента.
     unverified = _unverified_fact(chat_id, session, answer, result)
     if unverified:
         _safe_log(chat_id, "unverified_fact_blocked", {"chat_id": chat_id, "fact": unverified})

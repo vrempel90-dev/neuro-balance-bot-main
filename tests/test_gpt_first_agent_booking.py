@@ -266,7 +266,8 @@ def test_confirmation_requires_crm_success(monkeypatch: pytest.MonkeyPatch) -> N
     assert "подтвержд" not in answer.lower()
     session = state.get_session(chat_id)
     assert session.get("booking_confirmed") is not True
-    assert session.get("crm_result") == "failed"
+    assert session.get("crm_result") == "uncertain"
+    assert session.get("booking_uncertain") is True
 
 
 def test_timeout_does_not_create_false_success(monkeypatch: pytest.MonkeyPatch) -> None:

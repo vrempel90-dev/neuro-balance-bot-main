@@ -962,7 +962,9 @@ async def _transcribe_voice_message(message: dict[str, Any]) -> str:
     return str(getattr(transcript, "text", "") or "").strip()
 
 
-async def _build_answer_for_message(message: dict[str, Any]) -> str:
+async def _build_answer_for_message(
+    message: dict[str, Any], *, stage_outbound: bool = False
+) -> str:
     chat_id = str(message["chat_id"])
     phone = str(message.get("phone") or chat_id)
     kind = str(message.get("kind") or "text")
@@ -1029,6 +1031,16 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
     answer = await _maybe_humanize_answer(chat_id, user_text, base_answer)
     answer = _guard_answer(chat_id, answer)
     _log_dialog_result(chat_id, phone, answer)
+
+    if stage_outbound and answer:
+        guard_data = _get_session_safe(chat_id).get("guard_decision")
+        may_send = not isinstance(guard_data, dict) or bool(guard_data.get("should_send_wazzup", True))
+        if may_send:
+            # Persist the exact guarded answer before this function returns.
+            # This closes the crash window after a successful CRM booking but
+            # before the HTTP transport starts sending to Wazzup.
+            _stage_pending_outbound(chat_id, message, answer)
+
     message_key = str(message.get("message_key") or message.get("message_id") or "")
     if message_key:
         state.mark_processed_message(message_key, chat_id)
@@ -1045,7 +1057,9 @@ async def handle_incoming_message(message: dict[str, Any]) -> str:
     persistence. Sending to Wazzup remains in the webhook debounce worker so this
     function is safe for tests and debug callers that only need the answer.
     """
-    return await _build_answer_for_message(message)
+    return await _build_answer_for_message(
+        message, stage_outbound=bool(message.get("_stage_outbound"))
+    )
 
 
 async def _send_answer_parts(
@@ -1079,9 +1093,17 @@ async def _send_answer_parts(
             return
         sess = _get_session_safe(chat_id)
         sess["wazzup_send_called"] = True
-        sess["last_sent_answer"] = safe_text
+        sess["wazzup_send_inflight_answer"] = safe_text
         state.save_session(chat_id, sess)
         result = await send_text(chat_id=chat_id, text=safe_text, chat_type=chat_type, channel_id=channel_id)
+        # last_sent_answer means DELIVERED, not merely attempted. Persisting it
+        # before send_text returned successfully made a failed send impossible
+        # to replay: the retry was incorrectly blocked as a duplicate.
+        sess = _get_session_safe(chat_id)
+        sess["last_sent_answer"] = safe_text
+        sess["wazzup_send_inflight_answer"] = ""
+        sess["outgoing_duplicate_guard_blocked"] = False
+        state.save_session(chat_id, sess)
         state.log_event(chat_id, "wazzup_send_result", {"phone": phone, "ok": True, "status_code": result.get("status_code")})
     except Exception as exc:
         status_code = getattr(getattr(exc, "response", None), "status_code", None)
@@ -1091,6 +1113,58 @@ async def _send_answer_parts(
 
 _CHAT_TURN_LOCKS: dict[str, asyncio.Lock] = {}
 _CHAT_TURN_USERS: dict[str, int] = {}
+
+# Durable-ish outbox for the gap between "CRM booking succeeded" and "Wazzup
+# confirmed delivery". Session storage is the persistent source; the in-memory
+# copy also survives a transient session DB write/read error within this
+# process. A retry of the same inbound message replays this answer directly and
+# never re-enters admission/LLM/CRM.
+_PENDING_OUTBOUND_MEMORY: dict[str, str] = {}
+
+
+def _outbound_key(chat_id: str, message: dict[str, Any]) -> str:
+    message_key = str(message.get("message_key") or message.get("message_id") or "").strip()
+    return f"{chat_id}|{message_key}" if message_key else ""
+
+
+def _pending_outbound(chat_id: str, message: dict[str, Any]) -> str:
+    key = _outbound_key(chat_id, message)
+    if not key:
+        return ""
+    if key in _PENDING_OUTBOUND_MEMORY:
+        return _PENDING_OUTBOUND_MEMORY[key]
+    try:
+        sess = _get_session_safe(chat_id)
+        if str(sess.get("pending_outbound_key") or "") == key:
+            return str(sess.get("pending_outbound_answer") or "")
+    except Exception:
+        return ""
+    return ""
+
+
+def _stage_pending_outbound(chat_id: str, message: dict[str, Any], answer: str) -> None:
+    key = _outbound_key(chat_id, message)
+    value = str(answer or "").strip()
+    if not key or not value:
+        return
+    _PENDING_OUTBOUND_MEMORY[key] = value
+    sess = _get_session_safe(chat_id)
+    sess["pending_outbound_key"] = key
+    sess["pending_outbound_answer"] = value
+    sess["pending_outbound_created_at"] = astana_now().isoformat()
+    state.save_session(chat_id, sess)
+
+
+def _complete_pending_outbound(chat_id: str, message: dict[str, Any]) -> None:
+    key = _outbound_key(chat_id, message)
+    if key:
+        _PENDING_OUTBOUND_MEMORY.pop(key, None)
+    sess = _get_session_safe(chat_id)
+    if not key or str(sess.get("pending_outbound_key") or "") == key:
+        sess.pop("pending_outbound_key", None)
+        sess.pop("pending_outbound_answer", None)
+        sess.pop("pending_outbound_created_at", None)
+        state.save_session(chat_id, sess)
 
 
 @asynccontextmanager
@@ -1157,12 +1231,27 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
             message["text"] = combined_text
 
         async with _chat_turn(chat_id):
-            answer = await _build_answer_for_message(message)
-            session_after = _get_session_safe(chat_id)
-            guard_decision = session_after.get("guard_decision") if isinstance(session_after.get("guard_decision"), dict) else {}
-            if not answer or not bool(guard_decision.get("should_send_wazzup", True)):
-                state.log_event(chat_id, "wazzup_send_blocked", {"phone": str(message.get("phone") or ""), "reason": session_after.get("no_reply_reason") or "empty_answer"})
-                return
+            pending_answer = _pending_outbound(chat_id, message)
+            if pending_answer:
+                # The previous attempt already completed dialog/booking but
+                # delivery failed or was interrupted. Replay the exact guarded
+                # answer; never re-run lead admission or POST /api/bot/book.
+                answer = pending_answer
+                state.log_event(
+                    chat_id,
+                    "wazzup_pending_outbound_replay",
+                    {"phone": str(message.get("phone") or ""), "message_key": str(message.get("message_key") or message.get("message_id") or "")},
+                )
+            else:
+                answer = await _build_answer_for_message(message, stage_outbound=True)
+                session_after = _get_session_safe(chat_id)
+                guard_decision = session_after.get("guard_decision") if isinstance(session_after.get("guard_decision"), dict) else {}
+                if not answer or not bool(guard_decision.get("should_send_wazzup", True)):
+                    state.log_event(chat_id, "wazzup_send_blocked", {"phone": str(message.get("phone") or ""), "reason": session_after.get("no_reply_reason") or "empty_answer"})
+                    return
+                # Stage BEFORE the external send. If Wazzup fails after the CRM
+                # booking succeeded, the exact confirmation remains replayable.
+                _stage_pending_outbound(chat_id, message, answer)
 
             await _send_answer_parts(
                 chat_id=chat_id,
@@ -1171,15 +1260,24 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
                 channel_id=channel_id,
                 phone=str(message.get("phone") or ""),
             )
+            _complete_pending_outbound(chat_id, message)
 
     except Exception as exc:
         state.log_event(chat_id, "background_processing_error", {"error": str(exc)[:1000]})
-        # Захват ключа снимаем: обработка не дошла до ответа, и повторная
-        # доставка того же вебхука должна получить второй шанс.
-        try:
-            state.release_message(str(message.get("message_key") or message.get("message_id") or ""))
-        except Exception:
-            pass
+        # If a guarded outbound answer is already staged, processing (and
+        # possibly booking) DID finish. Keep the inbound claim and replay the
+        # outbox on the next delivery instead of re-running CRM. Only failures
+        # that happened before staging may release the inbound claim.
+        if not _pending_outbound(chat_id, message):
+            try:
+                state.release_message(str(message.get("message_key") or message.get("message_id") or ""))
+            except Exception:
+                pass
+        # Do not replace a staged booking confirmation with a generic
+        # fallback. The exact guarded answer remains in the outbox and will be
+        # replayed on the next delivery of this message.
+        if _pending_outbound(chat_id, message):
+            return
         try:
             if kind == "voice" or _message_has_voice_url(message):
                 fallback_text = _voice_fallback_answer()
@@ -1451,7 +1549,24 @@ def wazzup_webhook_health_response(request: Request) -> dict[str, Any]:
     }
 
 
-async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw_msg: dict[str, Any], parse_meta: dict[str, Any], *, send_enabled: bool = True) -> dict[str, Any]:
+async def _process_wazzup_message(
+    request: Request,
+    payload: dict[str, Any],
+    raw_msg: dict[str, Any],
+    parse_meta: dict[str, Any],
+    *,
+    send_enabled: bool = True,
+) -> dict[str, Any]:
+    """Serialize the complete receive→dialog→send transaction per chat."""
+    normalized = _normalize_wazzup_message(payload, raw_msg)
+    chat_id = str(normalized.get("chat_id") or "wazzup")
+    async with _chat_turn(chat_id):
+        return await _process_wazzup_message_unlocked(
+            request, payload, raw_msg, parse_meta, send_enabled=send_enabled
+        )
+
+
+async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, Any], raw_msg: dict[str, Any], parse_meta: dict[str, Any], *, send_enabled: bool = True) -> dict[str, Any]:
     message = _normalize_wazzup_message(payload, raw_msg)
     chat_id = message["chat_id"] or "wazzup"
     phone = str(message.get("phone") or chat_id)
@@ -1588,10 +1703,28 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
     should_send = False
     no_reply_reason = ""
     crm_error = ""
+    pending_replay = False
     try:
-        result = await handle_incoming_message(message)
-        answer = _result_answer(result)
-        should_send = _result_should_send(result, chat_id)
+        pending_answer = _pending_outbound(chat_id, message)
+        if pending_answer:
+            pending_replay = True
+            answer = pending_answer
+            should_send = True
+            state.log_event(
+                chat_id,
+                "wazzup_pending_outbound_replay",
+                {
+                    "phone": phone,
+                    "message_key": str(message.get("message_key") or message.get("message_id") or ""),
+                    "ingress": "http_webhook",
+                },
+            )
+        else:
+            handled_message = dict(message)
+            handled_message["_stage_outbound"] = bool(send_enabled)
+            result = await handle_incoming_message(handled_message)
+            answer = _result_answer(result)
+            should_send = _result_should_send(result, chat_id)
     except Exception as exc:
         crm_error = str(exc)[:500]
         no_reply_reason = "crm_lookup_failed"
@@ -1633,18 +1766,31 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
     state.log_event(chat_id, "ai_or_template_response_ready", {"phone": phone, "chat_id": chat_id, "answer_preview": _preview(answer, 160), "has_answer": bool(answer), "silent_reason": silent_reason})
 
     send_result_payload: dict[str, Any] = {}
+    delivery_succeeded = False
     if answer and should_send:
         if send_enabled:
+            # A replay may come from a previous process/request. New answers
+            # were already staged inside _build_answer_for_message before it
+            # returned from the CRM/dialog path.
+            if pending_replay and not _pending_outbound(chat_id, message):
+                _stage_pending_outbound(chat_id, message, answer)
             state.log_event(chat_id, "wazzup_send_start", {"chat_id": chat_id, "channel_id": channel_id_from_payload, "text_preview": _preview(answer, 160)})
             try:
                 outbound_channel_id = channel_id_from_payload if (channel_id_from_payload and channel_id_match) else (channel_id_env or None)
                 send_result = await send_wazzup_message(chat_id=chat_id, text=answer, chat_type=message.get("chat_type") or "whatsapp", channel_id=outbound_channel_id)
                 send_result_payload = {"status_code": send_result.get("status_code"), "response_preview": _preview(send_result, 300), "success": True}
+                delivery_succeeded = True
+                sess = _get_session_safe(chat_id)
+                sess["last_sent_answer"] = str(answer or "").strip()
+                sess["wazzup_send_inflight_answer"] = ""
+                state.save_session(chat_id, sess)
+                _complete_pending_outbound(chat_id, message)
                 state.log_event(chat_id, "wazzup_send_result", send_result_payload)
             except Exception as exc:
                 status_code = getattr(getattr(exc, "response", None), "status_code", None)
                 response_preview = _preview(getattr(getattr(exc, "response", None), "text", ""), 300)
                 silent_reason = "send_failed"
+                should_send = False
                 send_result_payload = {"status_code": status_code, "response_preview": response_preview or _preview(exc, 300), "success": False, "silent_reason": silent_reason}
                 state.log_event(chat_id, "wazzup_send_result", send_result_payload)
                 state.log_event(chat_id, "bot_decision", _decision_payload(answer=answer, should_send_wazzup=False, silent_reason=silent_reason, crm_error=crm_error))
@@ -1653,8 +1799,16 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
     else:
         state.log_event(chat_id, "wazzup_send_start", {"chat_id": chat_id, "channel_id": channel_id_from_payload, "skipped": True, "silent_reason": silent_reason or "empty_text"})
         state.log_event(chat_id, "wazzup_send_result", {"status_code": None, "response_preview": "", "success": False, "skipped": True, "silent_reason": silent_reason or "empty_text"})
-    state.log_event(chat_id, "bot_processing_finish", {"phone": phone, "chat_id": chat_id, "should_send_wazzup": bool(answer and should_send and send_enabled), "silent_reason": silent_reason, "send_result": send_result_payload})
-    return {"ok": True, "ignored": False, "answer": answer, "should_send_wazzup": bool(answer and should_send), "no_reply_reason": silent_reason}
+    state.log_event(chat_id, "bot_processing_finish", {"phone": phone, "chat_id": chat_id, "should_send_wazzup": bool(answer and should_send and send_enabled and delivery_succeeded), "silent_reason": silent_reason, "send_result": send_result_payload})
+    return {
+        "ok": True,
+        "ignored": False,
+        "answer": answer,
+        "should_send_wazzup": bool(answer and should_send),
+        "no_reply_reason": silent_reason,
+        "delivery_succeeded": delivery_succeeded,
+        "pending_outbound_replay": pending_replay,
+    }
 
 
 async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) -> dict[str, Any]:

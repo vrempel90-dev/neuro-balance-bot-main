@@ -315,3 +315,69 @@ def test_wazzup_retry_of_the_same_message_does_not_double_book(e2e) -> None:
     assert first["should_send_wazzup"] is True
     assert second.get("no_reply_reason") == "duplicate_message"
     assert len(recorder.book_calls) == 1, "a Wazzup retry must never create a second CRM booking"
+
+
+def test_http_webhook_replays_confirmation_after_wazzup_failure_without_double_booking(e2e) -> None:
+    """CRM success + Wazzup failure must replay delivery, never repeat booking."""
+    recorder, outbound, monkeypatch = e2e
+    client = FakeOpenAIClient(
+        [
+            assistant_tool_call("get_available_slots", {"date_from": DATE}),
+            assistant_text("Свободно 09:20, 14:00 и 15:40. Какое время удобно?"),
+            assistant_tool_call(
+                "book_appointment",
+                {
+                    "patient_name": "Асель",
+                    "doctor_login": DOCTOR_LOGIN,
+                    "date": DATE,
+                    "time_start": "14:00",
+                },
+                call_id="call_book_replay",
+            ),
+            assistant_text(f"Готово 🌿 Записала Вас на {DATE} в 14:00 к врачу {DOCTOR_NAME}."),
+        ]
+    )
+    monkeypatch.setattr(ai, "_openai_client", lambda api_key: client)
+
+    send_attempts: list[str] = []
+
+    async def flaky_send(**kwargs: Any) -> dict[str, Any]:
+        text = str(kwargs.get("text") or "")
+        send_attempts.append(text)
+        # Availability delivery succeeds. The first confirmation delivery
+        # fails after CRM booking; retry of the same webhook must replay it.
+        if len(send_attempts) == 2:
+            raise RuntimeError("wazzup transport timeout")
+        outbound.messages.append(kwargs)
+        return {"ok": True, "status_code": 200}
+
+    monkeypatch.setattr(main, "send_wazzup_message", flaky_send)
+
+    http = TestClient(main.app)
+    chat_id = "77010005559"
+    _prepare_session(chat_id)
+
+    first = _post(http, chat_id, f"Запишите на {DATE}", "e2e-outbox-1")
+    assert first["should_send_wazzup"] is True
+
+    second = _post(http, chat_id, "14:00, Асель", "e2e-outbox-2")
+    assert second["should_send_wazzup"] is False
+    assert second["no_reply_reason"] == "send_failed"
+    assert len(recorder.book_calls) == 1
+    assert main._pending_outbound(chat_id, {
+        "chat_id": chat_id,
+        "message_id": "e2e-outbox-2",
+        "message_key": "e2e-outbox-2",
+    })
+
+    retry = _post(http, chat_id, "14:00, Асель", "e2e-outbox-2")
+    assert retry["should_send_wazzup"] is True
+    assert retry["delivery_succeeded"] is True
+    assert retry["pending_outbound_replay"] is True
+    assert len(recorder.book_calls) == 1, "retry must never POST /api/bot/book twice"
+    assert send_attempts[-1] == send_attempts[-2]
+    assert main._pending_outbound(chat_id, {
+        "chat_id": chat_id,
+        "message_id": "e2e-outbox-2",
+        "message_key": "e2e-outbox-2",
+    }) == ""
