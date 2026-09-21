@@ -127,7 +127,13 @@ def phone_lookup_variants(phone: str | None) -> list[str]:
     if raw_digits:
         variants.append(raw_digits)
     seen: set[str] = set()
-    return [v for v in variants if not (v in seen or seen.add(v))]
+    unique: list[str] = []
+    for value in variants:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
 
 
 def _normalize_phone(phone: str | None) -> str:
