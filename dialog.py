@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import admission
@@ -333,6 +334,39 @@ def _store_crm_lookup_debug(session: dict[str, Any], lookup: dict[str, Any] | No
     session["raw_crm_hasActiveAppointment"] = raw.get("hasActiveAppointment") is True
 
 
+_AI_ADMISSION_LEASE_HOURS = 12
+_AI_CONTINUATION_REASONS = {"lead_in_progress", "crm_says_not_new", "crm_found_contact"}
+
+
+def _ai_admission_lease_active(session: dict[str, Any]) -> bool:
+    """A lead admitted as NEW may finish this conversation if CRM creates the lead mid-dialog."""
+    if session.get("booking_confirmed") or session.get("manual_takeover") or session.get("escalated"):
+        return False
+    if session.get("ai_admission_closed_at"):
+        return False
+    raw = str(session.get("ai_admission_started_at") or "").strip()
+    if not raw:
+        return False
+    try:
+        started = datetime.fromisoformat(raw)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return datetime.now(timezone.utc) - started <= timedelta(hours=_AI_ADMISSION_LEASE_HOURS)
+
+
+def _activate_ai_admission_lease(session: dict[str, Any]) -> None:
+    if not session.get("ai_admission_started_at"):
+        session["ai_admission_started_at"] = datetime.now(timezone.utc).isoformat()
+    session.pop("ai_admission_closed_at", None)
+
+
+def _close_ai_admission_lease(session: dict[str, Any], reason: str) -> None:
+    session["ai_admission_closed_at"] = datetime.now(timezone.utc).isoformat()
+    session["ai_admission_closed_reason"] = str(reason or "terminal")
+
+
 async def _classify_lead(chat_id: str, phone: str, session: dict[str, Any]) -> admission.Admission:
     """Спрашивает CRM про пациента и отдаёт классификацию admission.py.
 
@@ -353,6 +387,20 @@ async def _classify_lead(chat_id: str, phone: str, session: dict[str, Any]) -> a
         lookup = None
 
     verdict = admission.classify(normalized, lookup)
+    if (
+        verdict.state == admission.RETURNING
+        and verdict.reason in _AI_CONTINUATION_REASONS
+        and _ai_admission_lease_active(session)
+    ):
+        # This conversation was admitted while the contact was genuinely NEW.
+        # Some CRMs create/update a lead after the first message; that must not
+        # mute the assistant halfway through the same booking funnel.
+        verdict = admission.Admission(
+            state=admission.NEW,
+            reason="active_ai_conversation",
+            phone=verdict.phone,
+        )
+
     session["crm_patient_state"] = _CRM_PATIENT_STATE[verdict.state]
     session["crm_state_reason"] = verdict.reason
     _store_crm_lookup_debug(session, lookup)
@@ -677,6 +725,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         _clear_admission_mute(session)
     session["first_touch_allowed"] = True
     session["ai_lead_started"] = True
+    _activate_ai_admission_lease(session)
     session["gate_reason"] = "new_lead"
     try:
         result = await agent.run_agent_turn(
@@ -710,7 +759,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     if result.escalate:
         # Агент позвал администратора — значит его нужно реально позвать, а не
         # только сказать об этом пациенту.
+        _close_ai_admission_lease(session, "agent_escalation")
         await _notify_admin_once(chat_id, session, phone, "agent_escalation")
+    elif result.booked:
+        _close_ai_admission_lease(session, "booking_confirmed")
     session["openai_used"] = True
     session["openai_brain_used"] = True
     session["answer_source"] = "gpt_agent"
