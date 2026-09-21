@@ -669,6 +669,13 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _no_reply(chat_id, session, "empty_text")
     if not _valid_crm_phone(phone or session.get("phone") or ""):
         return _no_reply(chat_id, session, "invalid_phone_for_crm_lookup")
+
+    # Once this dialog has a positively confirmed CRM booking, the sender is
+    # no longer a "new lead". Do not depend on CRM read-after-write latency to
+    # enforce NEW_LEADS_ONLY on the very next inbound message.
+    if session.get("booking_confirmed") is True or session.get("booked") is True:
+        return _no_reply(chat_id, session, "booking_already_completed")
+
     if _human_took_over(session):
         return _no_reply(chat_id, session, "manual_takeover")
 
