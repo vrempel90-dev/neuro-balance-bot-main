@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 import httpx
 
 from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File, Query
+from fastapi.responses import JSONResponse
 
 import state
 import crm
@@ -97,9 +98,9 @@ async def _protect_debug_endpoints(request: Request, call_next):
         if not supplied and auth.lower().startswith("bearer "):
             supplied = auth[7:].strip()
         if not expected:
-            raise HTTPException(status_code=503, detail="Debug token is not configured")
+            return JSONResponse(status_code=503, content={"detail": "Debug token is not configured"})
         if not supplied or not secrets.compare_digest(supplied, expected):
-            raise HTTPException(status_code=401, detail="Unauthorized debug access")
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized debug access"})
     return await call_next(request)
 
 
