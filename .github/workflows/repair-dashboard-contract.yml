@@ -51,6 +51,7 @@ permissions:
   contents: read
 
 jobs:
+  # Core assistant changes are gated by compile + booking/conversation regressions.
   core-booking-regression:
     runs-on: ubuntu-latest
     timeout-minutes: 15
