@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "agent.py"
+      - "SYSTEM_PROMPT_rendered.md"
       - "dialog.py"
       - "main.py"
       - "admission.py"
@@ -28,6 +29,7 @@ on:
     branches: [main]
     paths:
       - "agent.py"
+      - "SYSTEM_PROMPT_rendered.md"
       - "dialog.py"
       - "main.py"
       - "admission.py"
