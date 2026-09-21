@@ -2639,9 +2639,28 @@ def _safe_args(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _finish_after_openai_failure(chat_id: str, session: dict[str, Any], result: AgentResult) -> AgentResult:
-    """OpenAI died mid-loop after tools already ran — answer from tool facts."""
+    """OpenAI died after tools ran: confirm only proven success, otherwise hand off.
+
+    A tool may have booked successfully before the model transport failed. In
+    that one case the deterministic tool result is sufficient to confirm the
+    appointment. Every other unfinished outcome is escalated immediately:
+    returning "I'll check and get back to you" would end the webhook with no
+    future worker scheduled and recreate the production dead end.
+    """
     result.outcome = _classify_outcome(result, session)
     result.error = "openai_error_after_tools"
+    if not result.booked:
+        escalation = _tool_escalate(
+            chat_id,
+            session,
+            {"reason": "openai_failure_after_tools"},
+        )
+        result.tool_calls.append(
+            {"tool": "escalate_to_operator", "ok": True, "args": {"reason": True}}
+        )
+        result.tool_results.append(escalation)
+        result.escalate = True
+        result.outcome = OUTCOME_OPERATOR_ESCALATION
     result.reply = _safety_net_reply(session, result)
     _log(chat_id, "agent_silent_turn_prevented", {"outcome": result.outcome, "reason": "openai_error_after_tools"})
     return result
@@ -2683,9 +2702,9 @@ def _safety_net_reply(session: dict[str, Any], result: AgentResult) -> str:
         )
     if result.outcome == OUTCOME_SLOT_CONFLICT:
         return (
-            "Это окошко только что заняли 🌿 Сейчас уточню свободные варианты и напишу Вам."
+            "Выбранное время уже недоступно. Передам администратору, чтобы сразу подобрать другое 🌿"
             if lang != "kk"
-            else "Бұл уақытты жаңа ғана алып қойды 🌿 Қазір бос уақыттарды нақтылап жазамын."
+            else "Таңдалған уақыт енді бос емес. Басқа уақытты бірден таңдау үшін әкімшіге жіберемін 🌿"
         )
     if result.outcome in {OUTCOME_OPERATOR_ESCALATION, OUTCOME_TECHNICAL_ERROR}:
         return (
