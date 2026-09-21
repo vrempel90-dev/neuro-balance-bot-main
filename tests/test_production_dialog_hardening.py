@@ -23,6 +23,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import agent
 import ai
 import crm
+import dialog
+import state
 from config import get_settings
 from fake_openai import FakeOpenAIClient, assistant_text
 
@@ -180,3 +182,30 @@ def test_repeated_no_progress_escalates_instead_of_looping(monkeypatch: pytest.M
     assert "вернусь" not in result.reply.lower()
     assert result.reply.strip()
     assert len(client.calls) == 2
+
+
+
+def test_confirmed_booking_never_reenters_ai_even_if_crm_is_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    chat_id = "post_booking_closed"
+    state.init_db()
+    state.reset_session(chat_id)
+    session = state.get_session(chat_id)
+    session.update({
+        "phone": PHONE,
+        "language": "ru",
+        "booking_confirmed": True,
+        "booked": True,
+        "appointment_id": "9001",
+    })
+    state.save_session(chat_id, session)
+
+    async def classify_must_not_run(*args: Any, **kwargs: Any):
+        raise AssertionError("post-booking turn must not depend on CRM admission lookup")
+
+    monkeypatch.setattr(dialog, "_classify_lead", classify_must_not_run)
+
+    answer = asyncio.run(dialog.handle_message(chat_id, PHONE, "Спасибо"))
+
+    assert answer == ""
+    saved = state.get_session(chat_id)
+    assert saved["no_reply_reason"] == "booking_already_completed"
