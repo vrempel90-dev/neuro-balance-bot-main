@@ -128,8 +128,8 @@ def test_agent_availability_and_booking_reach_the_crm_functions(monkeypatch: pyt
         )
     )
     assert booking["booking_success"] is True
-    assert reached == ["check_slots", "book_appointment"], (
-        "the agent tools must reach the existing CRM client functions"
+    assert reached == ["check_slots", "check_slots", "book_appointment"], (
+        "availability must be checked when offered and revalidated immediately before booking"
     )
 
 
