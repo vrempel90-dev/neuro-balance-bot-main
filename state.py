@@ -118,7 +118,7 @@ def _safe_log_payload(chat_id: str, event_type: str, payload: dict[str, Any]) ->
     return safe
 
 
-DEFAULT_SESSION = {
+DEFAULT_SESSION: dict[str, Any] = {
     "step": "start",
     "patient_name": "",
     "phone": "",
