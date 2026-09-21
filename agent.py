@@ -713,7 +713,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "age": {"type": "integer", "description": "Возраст ПАЦИЕНТА полными годами."},
                     "contraindications_clear": {
                         "type": "boolean",
-                        "description": "true только если пациент явно подтвердил, что противопоказаний из чек-листа нет.",
+                        "description": "true только если пациент явно подтвердил, что противопоказаний из утверждённого списка нет.",
                     },
                     "contraindications_note": {
                         "type": "string",
@@ -2770,6 +2770,12 @@ async def run_agent_turn(
         result.error = result.error or "duplicate_question_blocked"
         _log(chat_id, "agent_duplicate_question_blocked", {})
 
+    if not result.escalate and not result.booked:
+        enforced = _enforce_approved_contraindications_reply(session, user_text, result.reply)
+        if enforced != result.reply:
+            result.reply = enforced
+            _log(chat_id, "agent_contraindications_wording_enforced", {})
+
     return result
 
 
@@ -2855,6 +2861,77 @@ def _operator_handoff_reply(session: dict[str, Any]) -> str:
     if str(session.get("language") or "ru") == "kk":
         return "Сұрағыңызды әкімшіге жіберемін, ол Сізбен жақын арада байланысады 🌿"
     return "Передам Ваш вопрос администратору, он свяжется с Вами в ближайшее время 🌿"
+
+
+_APPROVED_CONTRAINDICATIONS_RU = """Перед записью нужно уточнить противопоказания. Скажите, есть ли у Вас сейчас или были раньше:
+
+— кардиостимулятор, дефибриллятор, инсулиновая помпа или кохлеарный имплант;
+— тромбофлебит, тромбозы или серьёзные нарушения свёртываемости крови;
+— активное онкологическое заболевание или подозрение на него, которое ещё не исключено;
+— эпилепсия или судороги;
+— декомпенсированный сахарный диабет или тиреотоксикоз;
+— беременность;
+— высокая температура, ОРВИ, грипп или другая острая инфекция;
+— тяжёлые проблемы с сердцем, дыханием или психическим состоянием.
+
+Есть ли у Вас что-либо из перечисленного?"""
+
+
+def _must_use_approved_contraindications_reply(
+    session: dict[str, Any], user_text: str, reply: str
+) -> bool:
+    """Fail closed on the clinic's medical contraindications wording.
+
+    The model may converse freely, but it may not abbreviate, extend or invent
+    the contraindications that gate a booking. If the turn is about this gate,
+    Russian patients receive the clinic-approved list verbatim.
+    """
+    if str(session.get("language") or "ru") == "kk":
+        return False
+    if session.get("contraindications_ok") is True or session.get("contraindications_clear") is True:
+        return False
+    try:
+        age = int(session.get("age") or 0)
+    except (TypeError, ValueError):
+        age = 0
+    if age and (age <= 15 or age >= 75):
+        return False
+
+    user_low = str(user_text or "").strip().lower()
+    reply_low = str(reply or "").strip().lower()
+    previous_low = str(session.get("last_assistant_answer") or "").strip().lower()
+
+    explicit_question = (
+        "противопоказ" in user_low
+        or (
+            user_low in {"а какие", "а какие?", "какие", "какие?", "что именно", "что именно?"}
+            and "противопоказ" in previous_low
+        )
+    )
+    model_started_gate = (
+        "противопоказ" in reply_low
+        or any(
+            term in reply_low
+            for term in (
+                "кардиостимулятор",
+                "дефибриллятор",
+                "инсулиновая помпа",
+                "кохлеар",
+                "тромбоз",
+                "эпилеп",
+                "тиреотокс",
+            )
+        )
+    )
+    return explicit_question or model_started_gate
+
+
+def _enforce_approved_contraindications_reply(
+    session: dict[str, Any], user_text: str, reply: str
+) -> str:
+    if _must_use_approved_contraindications_reply(session, user_text, reply):
+        return _APPROVED_CONTRAINDICATIONS_RU
+    return reply
 
 
 def _safety_net_reply(session: dict[str, Any], result: AgentResult) -> str:
