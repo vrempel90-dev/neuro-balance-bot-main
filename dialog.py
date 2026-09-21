@@ -694,6 +694,14 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session["first_touch_allowed"] = True
     session["ai_lead_started"] = True
     session["gate_reason"] = "new_lead"
+
+    # Preserve the patient's direct answer to the question the agent itself
+    # asked on the previous turn. This does not decide the next step; it only
+    # keeps already-given facts from disappearing between turns.
+    captured = agent.capture_direct_answer_facts(chat_id, session, text)
+    if captured:
+        _safe_log(chat_id, "direct_answer_facts_captured", {"fields": captured})
+
     try:
         result = await agent.run_agent_turn(
             chat_id=chat_id,
