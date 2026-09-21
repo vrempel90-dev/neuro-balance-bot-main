@@ -1665,3 +1665,58 @@ def test_system_prompt_forbids_patient_facing_checklist_wording() -> None:
     assert "пациенту никогда не говори «чек-лист»" in prompt
     assert "кардиостимулятор, дефибриллятор, инсулиновая помпа" in prompt
     assert "тяжёлые проблемы с сердцем, дыханием или психическим состоянием" in prompt
+
+
+def test_crm_write_disabled_blocks_booking_before_crm_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = install_crm(monkeypatch, CRMStub())
+    monkeypatch.setenv("CRM_WRITE_ENABLED", "false")
+    get_settings.cache_clear()
+
+    chat_id = "crm_write_kill_switch"
+    session = ready_session(
+        chat_id,
+        patient_name="Асель",
+        selected_slot={
+            "doctor_login": DOCTOR_LOGIN,
+            "doctor_name": DOCTOR_NAME,
+            "date": DATE,
+            "time_start": SLOT_TIMES[0],
+        },
+        selected_date=DATE,
+        selected_time=SLOT_TIMES[0],
+        selected_doctor_login=DOCTOR_LOGIN,
+        selected_doctor_name=DOCTOR_NAME,
+    )
+    agent._remember_offered_slots(
+        session,
+        [{
+            "doctor_login": DOCTOR_LOGIN,
+            "doctor_name": DOCTOR_NAME,
+            "date": DATE,
+            "time_start": SLOT_TIMES[0],
+        }],
+    )
+
+    result = asyncio.run(
+        agent._tool_book_appointment(
+            chat_id,
+            session,
+            PHONE,
+            {
+                "patient_name": "Асель",
+                "doctor_login": DOCTOR_LOGIN,
+                "date": DATE,
+                "time_start": SLOT_TIMES[0],
+            },
+        )
+    )
+
+    assert result["booking_success"] is False
+    assert result["error"] == "crm_write_disabled"
+    assert stub.book_calls == []
+
+
+def test_prompt_is_strictly_new_leads_only() -> None:
+    prompt = agent.agent_system_prompt().lower()
+    assert "ai работает строго только с новыми лидами" in prompt
+    assert "он может начать новую консультацию/новую запись" not in prompt
