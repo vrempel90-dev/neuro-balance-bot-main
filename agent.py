@@ -1125,6 +1125,18 @@ def _looks_like_slot_conflict(text: str) -> bool:
     return any(marker in low for marker in _SLOT_CONFLICT_MARKERS)
 
 
+def _crm_write_allowed_for_phone(normalized_phone: str) -> tuple[bool, str]:
+    settings = get_settings()
+    if not bool(getattr(settings, "crm_write_enabled", True)):
+        return False, "crm_write_disabled"
+    allowed_raw = str(getattr(settings, "crm_write_test_phone", "") or "").strip()
+    if allowed_raw:
+        allowed_phone = crm.normalize_phone(allowed_raw)
+        if not allowed_phone or allowed_phone != crm.normalize_phone(normalized_phone):
+            return False, "crm_write_phone_not_allowed"
+    return True, ""
+
+
 async def _tool_book_appointment(
     chat_id: str, session: dict[str, Any], phone: str, args: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1258,15 +1270,20 @@ async def _tool_book_appointment(
             }.get(gate_reason, "Обязательные шаги записи не пройдены."),
         }
 
-    if not bool(getattr(get_settings(), "crm_write_enabled", True)):
-        _log(chat_id, "agent_booking_write_disabled", {"date": date, "time_start": time_start})
+    write_allowed, write_block_reason = _crm_write_allowed_for_phone(normalized_phone)
+    if not write_allowed:
+        _log(chat_id, "agent_booking_write_disabled", {
+            "date": date,
+            "time_start": time_start,
+            "reason": write_block_reason,
+        })
         return {
             "ok": False,
             "booking_success": False,
-            "error": "crm_write_disabled",
+            "error": write_block_reason,
             "message": (
-                "CRM write operations are disabled in this environment. "
-                "Не подтверждай запись пациенту; это безопасный staging-режим."
+                "CRM write operations are not allowed for this phone in this environment. "
+                "Не подтверждай запись пациенту; это контролируемый staging-режим."
             ),
         }
 
@@ -1779,13 +1796,17 @@ async def _tool_reschedule_appointment(
             "message": "Перенос уже выполнен ранее в этом диалоге, повторный перенос не делался.",
         }
 
-    if not bool(getattr(get_settings(), "crm_write_enabled", True)):
-        _log(chat_id, "agent_reschedule_write_disabled", {"appointment_id": appointment_id})
+    write_allowed, write_block_reason = _crm_write_allowed_for_phone(normalized_phone)
+    if not write_allowed:
+        _log(chat_id, "agent_reschedule_write_disabled", {
+            "appointment_id": appointment_id,
+            "reason": write_block_reason,
+        })
         return {
             "ok": False,
             "reschedule_success": False,
-            "error": "crm_write_disabled",
-            "message": "CRM write operations are disabled in this environment; перенос не выполнен.",
+            "error": write_block_reason,
+            "message": "CRM write operations are not allowed for this phone in this environment; перенос не выполнен.",
         }
 
     bot_tools.mark_tool(session, "reschedule_appointment", gate="passed")
@@ -1973,13 +1994,17 @@ async def _tool_cancel_appointment(
             "message": "Нет номера телефона пациента для отмены записи.",
         }
 
-    if not bool(getattr(get_settings(), "crm_write_enabled", True)):
-        _log(chat_id, "agent_cancel_write_disabled", {"appointment_id": appointment_id})
+    write_allowed, write_block_reason = _crm_write_allowed_for_phone(normalized_phone)
+    if not write_allowed:
+        _log(chat_id, "agent_cancel_write_disabled", {
+            "appointment_id": appointment_id,
+            "reason": write_block_reason,
+        })
         return {
             "ok": False,
             "cancel_success": False,
-            "error": "crm_write_disabled",
-            "message": "CRM write operations are disabled in this environment; отмена не выполнена.",
+            "error": write_block_reason,
+            "message": "CRM write operations are not allowed for this phone in this environment; отмена не выполнена.",
         }
 
     bot_tools.mark_tool(session, "cancel_appointment", gate="passed")
