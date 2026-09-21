@@ -19,6 +19,10 @@ class Settings(BaseSettings):
             "X_BOT_SECRET",
         ),
     )
+    crm_write_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("CRM_WRITE_ENABLED", "crm_write_enabled"),
+    )
 
     # OpenAI / AI
     # Main conversational agent: balanced GPT-5.6 tier for reliable tool use.
