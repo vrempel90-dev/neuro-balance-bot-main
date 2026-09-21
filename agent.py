@@ -2444,11 +2444,22 @@ async def run_agent_turn(
         content = str(getattr(message, "content", "") or "").strip()
 
         if not tool_calls:
-            no_progress = (
-                not content
-                or _looks_like_deferred_reply(content)
-                or _repeats_previous_assistant_reply(content, session, recent_history)
-            )
+            duplicate_reply = _repeats_previous_assistant_reply(content, session, recent_history)
+            deferred_reply = _looks_like_deferred_reply(content)
+
+            # An exact repeat is not a reason to ask the model for yet another
+            # answer. The final dialog guard suppresses it, so two adjacent
+            # inbound messages cannot turn one already-asked question into two
+            # outbound messages. Recovery is reserved for true dead ends:
+            # empty output or a promise to do work later.
+            if content and duplicate_reply and not deferred_reply:
+                result.reply = content
+                result.iterations = iterations
+                result.error = "duplicate_model_reply"
+                _log(chat_id, "agent_duplicate_reply_detected", {})
+                break
+
+            no_progress = not content or deferred_reply
             if no_progress and not no_progress_recovery_used:
                 no_progress_recovery_used = True
                 _log(
@@ -2457,7 +2468,7 @@ async def run_agent_turn(
                     {
                         "empty": not bool(content),
                         "deferred": _looks_like_deferred_reply(content),
-                        "duplicate": _repeats_previous_assistant_reply(content, session, recent_history),
+                        "duplicate": duplicate_reply,
                     },
                 )
                 if content:
