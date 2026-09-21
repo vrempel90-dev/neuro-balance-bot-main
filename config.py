@@ -23,6 +23,10 @@ class Settings(BaseSettings):
         default=True,
         validation_alias=AliasChoices("CRM_WRITE_ENABLED", "crm_write_enabled"),
     )
+    crm_write_test_phone: str = Field(
+        default="",
+        validation_alias=AliasChoices("CRM_WRITE_TEST_PHONE", "crm_write_test_phone"),
+    )
 
     # OpenAI / AI
     # Main conversational agent: balanced GPT-5.6 tier for reliable tool use.
