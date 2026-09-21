@@ -112,12 +112,13 @@ _MAX_DAYS_AHEAD = 21
 # and an all-empty period never triggers the "enough slots" early exit.
 _MAX_AVAILABILITY_REQUESTS = 7
 
-# Суббота и воскресенье в клинике — процедурные дни: консультации в эти дни не
-# ведутся. Раньше это правило жило в weekend_booking_policy.py, который
-# монкипатчил приватную функцию dialog.py на импорте и приклеивал объяснение
-# текстом перед ответом бота. Правило про даты и должно жить там, где даты
-# берутся, — в инструменте доступности; объяснение пишет модель.
-_PROCEDURE_WEEKEND_DAYS = {5, 6}
+# Календарные ограничения клиники — часть deterministic booking policy.
+# Суббота: процедурный день, консультационные записи не создаются.
+# Воскресенье: выходной, клиника не принимает. Оба дня исключены из поиска
+# консультационных слотов, но причина различается и передаётся модели явно.
+_SATURDAY_PROCEDURE_DAY = 5
+_SUNDAY_CLOSED_DAY = 6
+_NON_CONSULTATION_DAYS = {_SATURDAY_PROCEDURE_DAY, _SUNDAY_CLOSED_DAY}
 
 # doctorLogin в CRM — латиница, цифры и подчёркивание (zhuma_md, asel_k,
 # reserve). Всё остальное — имя врача, фраза пациента или плейсхолдер, а не
@@ -427,6 +428,28 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "select_offered_slot",
+            "description": (
+                "Зафиксировать в state конкретное РЕАЛЬНОЕ время, которое пациент выбрал "
+                "из результата get_available_slots. Вызывай сразу после однозначного выбора "
+                "пациента и ДО вопроса об имени. Инструмент принимает только ранее "
+                "предложенный CRM-вариант и не создаёт запись."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doctor_login": {"type": "string", "description": "doctorLogin выбранного CRM-варианта."},
+                    "date": {"type": "string", "description": "Дата выбранного CRM-варианта YYYY-MM-DD."},
+                    "time_start": {"type": "string", "description": "Время выбранного CRM-варианта HH:MM."},
+                },
+                "required": ["doctor_login", "date", "time_start"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "book_appointment",
             "description": (
                 "Создать РЕАЛЬНУЮ запись в CRM. Вызывай только когда собраны: жалоба, "
@@ -638,6 +661,7 @@ AGENT_OVERRIDES = """
 - record_patient_facts — сохранить жалобу, возраст, противопоказания, имя, родство;
 - get_doctors — реальные врачи клиники;
 - get_available_slots — реальные свободные даты и время;
+- select_offered_slot — зафиксировать точный CRM-вариант после выбора пациента;
 - book_appointment — реальная запись в CRM;
 - find_my_appointment — действующая запись пациента в CRM;
 - reschedule_appointment — реальный перенос существующей записи;
@@ -672,7 +696,9 @@ AGENT_OVERRIDES = """
 
 ПОРЯДОК ЗАПИСИ (медицинская безопасность, соблюдай его):
 жалоба → возраст → противопоказания → дата → реальные слоты CRM → выбор
-времени → имя пациента → book_appointment.
+времени → select_offered_slot → имя пациента → book_appointment.
+После однозначного выбора времени ВСЕГДА сначала вызови select_offered_slot.
+Это сохраняет выбор между сообщениями и не даёт потерять state перед именем.
 Возраст до 16 и старше 75, а также противопоказания из чек-листа — стоп-факторы:
 вместо записи вызывай escalate_to_operator.
 
@@ -926,8 +952,10 @@ async def _tool_get_available_slots(
             _log(chat_id, "agent_availability_unknown_doctor_ignored", {"looks_like_login": looks_like_login})
 
     requested_start = start
-    weekend_requested = start.weekday() in _PROCEDURE_WEEKEND_DAYS
-    while start.weekday() in _PROCEDURE_WEEKEND_DAYS:
+    saturday_procedure_requested = requested_start.weekday() == _SATURDAY_PROCEDURE_DAY
+    sunday_closed_requested = requested_start.weekday() == _SUNDAY_CLOSED_DAY
+    non_consultation_requested = requested_start.weekday() in _NON_CONSULTATION_DAYS
+    while start.weekday() in _NON_CONSULTATION_DAYS:
         start += timedelta(days=1)
 
     collected: list[dict[str, str]] = []
@@ -937,7 +965,7 @@ async def _tool_get_available_slots(
     requested_days = 0
     day_date = start
     while requested_days < days_ahead:
-        if day_date.weekday() in _PROCEDURE_WEEKEND_DAYS:
+        if day_date.weekday() in _NON_CONSULTATION_DAYS:
             day_date += timedelta(days=1)
             continue
         day = day_date.isoformat()
@@ -996,7 +1024,9 @@ async def _tool_get_available_slots(
         {
             "date_from": start.isoformat(),
             "requested_date_from": requested_start.isoformat(),
-            "weekend_procedure_day_requested": weekend_requested,
+            "saturday_procedure_day_requested": saturday_procedure_requested,
+            "sunday_closed_day_requested": sunday_closed_requested,
+            "non_consultation_day_requested": non_consultation_requested,
             "days_ahead": days_ahead,
             "doctor_login": doctor_login or "",
             "doctor_count": len(doctors),
@@ -1016,18 +1046,27 @@ async def _tool_get_available_slots(
             "показаны окошки всех врачей. Выбирай врача только из doctors в этом "
             "результате или вызови get_doctors. " + note
         )
-    if weekend_requested:
+    if saturday_procedure_requested:
         note = (
-            "Пациент просил субботу или воскресенье — это процедурные дни, консультаций в "
-            "них нет. Скажи об этом своими словами и предложи окошки ближайшего рабочего "
-            "дня. " + note
+            "Пациент просил субботу: суббота — процедурный день, консультационной записи "
+            "в этот день нет. Скажи это своими словами и предложи реальные окошки "
+            "ближайшего консультационного дня. " + note
+        )
+    elif sunday_closed_requested:
+        note = (
+            "Пациент просил воскресенье: воскресенье — выходной, клиника не принимает. "
+            "Скажи это своими словами и предложи реальные окошки ближайшего рабочего дня. "
+            + note
         )
 
     return {
         "ok": True,
         "date_from": start.isoformat(),
         "requested_date_from": requested_start.isoformat(),
-        "weekend_procedure_day_requested": weekend_requested,
+        "weekend_procedure_day_requested": saturday_procedure_requested,
+        "saturday_procedure_day_requested": saturday_procedure_requested,
+        "sunday_closed_day_requested": sunday_closed_requested,
+        "non_consultation_day_requested": non_consultation_requested,
         "days_ahead": days_ahead,
         "requested_doctor_login": doctor_login or "",
         "unknown_doctor_login_ignored": unknown_doctor,
@@ -1038,6 +1077,61 @@ async def _tool_get_available_slots(
         "crm_partially_unavailable": partial,
         "note": note,
     }
+
+
+def _tool_select_offered_slot(
+    chat_id: str, session: dict[str, Any], args: dict[str, Any]
+) -> dict[str, Any]:
+    """Persist one exact CRM-offered slot as the patient's explicit choice."""
+    doctor_login = str(args.get("doctor_login") or "").strip()
+    date = str(args.get("date") or "").strip()[:10]
+    time_start = str(args.get("time_start") or "").strip()[:5]
+    slot = _offered_slot(session, date, time_start, doctor_login)
+    if slot is None:
+        _log(
+            chat_id,
+            "agent_slot_selection_rejected",
+            {"doctor_login": doctor_login, "date": date, "time_start": time_start},
+        )
+        return {
+            "ok": False,
+            "selected": False,
+            "error": "slot_not_offered_by_crm",
+            "message": "Такого варианта CRM не предлагала. Сначала обнови реальные свободные варианты.",
+        }
+
+    day_error = _consultation_day_error(date)
+    if day_error:
+        return {
+            "ok": False,
+            "selected": False,
+            "error": day_error,
+            "message": "Этот день недоступен для консультационной записи. Получи другой реальный вариант.",
+        }
+
+    session["selected_slot"] = dict(slot)
+    session["selected_doctor_login"] = slot["doctor_login"]
+    session["selected_doctor_name"] = slot["doctor_name"]
+    session["selected_date"] = slot["date"]
+    session["selected_time"] = slot["time_start"]
+    session["preferred_date"] = slot["date"]
+    session["step"] = "booking" if session.get("patient_name") else "name"
+    _log(
+        chat_id,
+        "agent_slot_selected",
+        {"doctor_login": slot["doctor_login"], "date": slot["date"], "time_start": slot["time_start"]},
+    )
+    return {
+        "ok": True,
+        "selected": True,
+        "doctor_login": slot["doctor_login"],
+        "doctor_name": slot["doctor_name"],
+        "date": slot["date"],
+        "time_start": slot["time_start"],
+        "message": "Выбор сохранён. Если имя пациента ещё неизвестно — спроси только имя.",
+    }
+
+
 
 
 def _crm_booking_succeeded(response: Any) -> bool:
@@ -1112,6 +1206,81 @@ def _looks_like_slot_conflict(text: str) -> bool:
     return any(marker in low for marker in _SLOT_CONFLICT_MARKERS)
 
 
+def _consultation_day_error(date_value: str) -> str:
+    parsed = _parse_iso_date(date_value)
+    if parsed is None:
+        return "invalid_booking_date"
+    if parsed.weekday() == _SATURDAY_PROCEDURE_DAY:
+        return "saturday_procedure_day"
+    if parsed.weekday() == _SUNDAY_CLOSED_DAY:
+        return "sunday_closed"
+    return ""
+
+
+def _forget_offered_slot(session: dict[str, Any], slot: dict[str, str]) -> None:
+    registry = session.get("crm_offered_slots")
+    key = _slot_key(slot["date"], slot["time_start"], slot["doctor_login"])
+    if isinstance(registry, dict):
+        registry.pop(key, None)
+    selected = session.get("selected_slot")
+    if isinstance(selected, dict) and _slot_key(
+        str(selected.get("date") or ""),
+        str(selected.get("time_start") or selected.get("timeStart") or ""),
+        str(selected.get("doctor_login") or selected.get("doctorLogin") or ""),
+    ) == key:
+        for field in (
+            "selected_slot", "selected_doctor_login", "selected_doctor_name",
+            "selected_date", "selected_time",
+        ):
+            session.pop(field, None)
+        session["step"] = "time"
+
+
+async def _revalidate_booking_slot(
+    chat_id: str, session: dict[str, Any], slot: dict[str, str]
+) -> tuple[dict[str, str] | None, str]:
+    """Fresh GET immediately before booking; cached availability is forbidden."""
+    date = slot["date"]
+    doctor_login = slot["doctor_login"]
+    try:
+        # clear_slots_cache is synchronous. The following awaited coroutine checks
+        # its cache before its first network await, so this invocation cannot reuse
+        # the 25-second availability cache.
+        crm.clear_slots_cache(date)
+        data = await crm.check_slots(date, doctor_login=doctor_login)
+    except Exception as exc:
+        _log(
+            chat_id,
+            "agent_booking_slot_revalidation_error",
+            {"date": date, "doctor_login": doctor_login, "error_type": type(exc).__name__},
+        )
+        return None, "slot_revalidation_failed"
+
+    fresh_slots = _normalize_crm_slots(data, fallback_date=date)
+    expected_key = _slot_key(date, slot["time_start"], doctor_login)
+    fresh = next(
+        (candidate for candidate in fresh_slots
+         if _slot_key(candidate["date"], candidate["time_start"], candidate["doctor_login"]) == expected_key),
+        None,
+    )
+    if fresh is None:
+        _forget_offered_slot(session, slot)
+        _log(
+            chat_id,
+            "agent_booking_slot_revalidation_conflict",
+            {"date": date, "doctor_login": doctor_login, "time_start": slot["time_start"]},
+        )
+        return None, "slot_conflict"
+
+    _remember_offered_slots(session, [fresh])
+    _log(
+        chat_id,
+        "agent_booking_slot_revalidated",
+        {"date": date, "doctor_login": doctor_login, "time_start": fresh["time_start"]},
+    )
+    return fresh, ""
+
+
 async def _tool_book_appointment(
     chat_id: str, session: dict[str, Any], phone: str, args: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1139,6 +1308,22 @@ async def _tool_book_appointment(
     if not (doctor_login and date and time_start):
         return {"ok": False, "booking_success": False, "error": "missing_slot_fields",
                 "message": "Нужны doctor_login, date и time_start ровно из результата get_available_slots."}
+
+    day_error = _consultation_day_error(date)
+    if day_error:
+        _log(chat_id, "agent_booking_rejected_non_consultation_day", {"date": date, "reason": day_error})
+        return {
+            "ok": False,
+            "booking_success": False,
+            "error": day_error,
+            "message": (
+                "Суббота — процедурный день, консультационную запись создавать нельзя."
+                if day_error == "saturday_procedure_day"
+                else "Воскресенье — выходной, запись создавать нельзя."
+                if day_error == "sunday_closed"
+                else "Дата записи некорректна."
+            ),
+        }
 
     normalized_phone = crm.normalize_phone(phone or session.get("phone") or "")
     if not normalized_phone:
@@ -1187,6 +1372,32 @@ async def _tool_book_appointment(
                 "и предложи пациенту реальные варианты."
             ),
         }
+
+    selected = session.get("selected_slot")
+    if isinstance(selected, dict) and selected:
+        selected_key = _slot_key(
+            str(selected.get("date") or ""),
+            str(selected.get("time_start") or selected.get("timeStart") or ""),
+            str(selected.get("doctor_login") or selected.get("doctorLogin") or ""),
+        )
+        requested_key = _slot_key(date, time_start, doctor_login)
+        if selected_key != requested_key:
+            _log(chat_id, "agent_booking_rejected_selection_mismatch", {"date": date, "time_start": time_start})
+            return {
+                "ok": False,
+                "booking_success": False,
+                "error": "selected_slot_mismatch",
+                "message": "Пациент выбрал другой CRM-вариант. Не меняй дату, время или врача без нового выбора.",
+            }
+    else:
+        # Backward-compatible safety: older dialog history may predate the
+        # select_offered_slot tool. The exact validated offer becomes selected
+        # before any booking attempt.
+        session["selected_slot"] = dict(slot)
+        session["selected_doctor_login"] = slot["doctor_login"]
+        session["selected_doctor_name"] = slot["doctor_name"]
+        session["selected_date"] = slot["date"]
+        session["selected_time"] = slot["time_start"]
 
     # --- doctor must be a real CRM doctor ---
     known_doctors = _known_doctors_from_offers(session)
@@ -1249,6 +1460,28 @@ async def _tool_book_appointment(
         session["patient_relation"] = relation
     session["patient_name"] = patient_name
 
+    # A slot shown seconds ago is not sufficient proof that it is still free.
+    # Revalidate against the uncached CRM immediately before acquiring the
+    # booking claim and issuing POST /api/bot/book.
+    fresh_slot, revalidation_error = await _revalidate_booking_slot(chat_id, session, slot)
+    if fresh_slot is None:
+        return {
+            "ok": False,
+            "booking_success": False,
+            "error": revalidation_error,
+            "message": (
+                "Это время уже недоступно. Снова вызови get_available_slots и предложи только новые реальные варианты."
+                if revalidation_error == "slot_conflict"
+                else "Не удалось заново проверить доступность времени. Не создавай запись и передай диалог администратору."
+            ),
+        }
+    slot = fresh_slot
+    session["selected_slot"] = dict(slot)
+    session["selected_doctor_login"] = slot["doctor_login"]
+    session["selected_doctor_name"] = slot["doctor_name"]
+    session["selected_date"] = slot["date"]
+    session["selected_time"] = slot["time_start"]
+
     payload = {
         "patient_name": patient_name,
         "phone": normalized_phone,
@@ -1257,6 +1490,8 @@ async def _tool_book_appointment(
         "date": slot["date"],
         "time_start": slot["time_start"],
         "notes": _booking_notes(session, relation),
+        "conversation_id": session.get("crm_conversation_id") or None,
+        "lead_id": session.get("crm_lead_id") or None,
     }
 
     # --- atomic cross-request claim: exactly one CRM POST per slot ----------
@@ -1339,8 +1574,9 @@ async def _tool_book_appointment(
             "agent_booking_crm_error",
             {"error_type": type(exc).__name__, "latency_ms": int((time.monotonic() - started) * 1000)},
         )
-        session["crm_result"] = "failed"
+        session["crm_result"] = "uncertain"
         session["booking_confirmed"] = False
+        session["booking_uncertain"] = True
         # Timeout / connection error: the CRM may have created the appointment
         # anyway, so the claim is deliberately NOT released — a retry must not
         # be able to book the same patient twice.
@@ -1350,8 +1586,8 @@ async def _tool_book_appointment(
             "booking_success": False,
             "error": "crm_unavailable",
             "message": (
-                "CRM не ответила, запись НЕ создана. Не подтверждай запись пациенту — "
-                "скажи, что уточнишь у администратора, или вызови escalate_to_operator."
+                "Связь с CRM оборвалась, поэтому статус записи НЕИЗВЕСТЕН. "
+                "Не подтверждай и не повторяй POST на тот же слот; передай диалог администратору для проверки."
             ),
         }
 
@@ -2159,6 +2395,8 @@ async def execute_tool(
         return await _tool_get_doctors(chat_id, session)
     if name == "get_available_slots":
         return await _tool_get_available_slots(chat_id, session, args)
+    if name == "select_offered_slot":
+        return _tool_select_offered_slot(chat_id, session, args)
     if name == "book_appointment":
         return await _tool_book_appointment(chat_id, session, phone, args)
     if name == "find_my_appointment":
@@ -2290,7 +2528,7 @@ async def run_agent_turn(
         if not allowed:
             _log(chat_id, "agent_budget_exhausted_mid_turn", {"reason": budget_block, "rounds": rounds})
             if result.tool_calls:
-                return _finish_after_openai_failure(chat_id, session, result)
+                return await _finish_after_openai_failure(chat_id, phone, session, result)
             return AgentResult(used=False, skip_reason=budget_block or "ai_budget_blocked")
 
         try:
@@ -2311,7 +2549,7 @@ async def run_agent_turn(
             )
             if result.tool_calls:
                 # Tools already ran (possibly a real booking). Never end silently.
-                return _finish_after_openai_failure(chat_id, session, result)
+                return await _finish_after_openai_failure(chat_id, phone, session, result)
             return AgentResult(used=False, skip_reason="openai_error", error=str(exc)[:200], tool_calls=result.tool_calls)
 
         try:
@@ -2433,11 +2671,13 @@ async def run_agent_turn(
     )
 
     if not result.reply.strip():
-        # SILENT TURN PROTECTION: the model produced no text. Never return an
-        # empty reply from an accepted active turn.
-        result.reply = _safety_net_reply(session, result)
+        # SILENT TURN PROTECTION: there is no background worker that can
+        # actually "come back later". Complete a safe pending booking in this
+        # same inbound turn, otherwise terminate by real operator escalation.
         result.error = result.error or "empty_model_reply"
-        _log(chat_id, "agent_silent_turn_prevented", {"outcome": result.outcome})
+        return await _recover_after_agent_interruption(
+            chat_id, phone, session, result, reason=result.error
+        )
 
     return result
 
@@ -2479,13 +2719,80 @@ def _safe_args(args: dict[str, Any]) -> dict[str, Any]:
     return safe
 
 
-def _finish_after_openai_failure(chat_id: str, session: dict[str, Any], result: AgentResult) -> AgentResult:
-    """OpenAI died mid-loop after tools already ran — answer from tool facts."""
+def _pending_booking_args(session: dict[str, Any]) -> dict[str, Any] | None:
+    slot = session.get("selected_slot")
+    if not isinstance(slot, dict) or not slot or not session.get("patient_name"):
+        return None
+    doctor_login = str(slot.get("doctor_login") or slot.get("doctorLogin") or "").strip()
+    date = str(slot.get("date") or "").strip()[:10]
+    time_start = str(slot.get("time_start") or slot.get("timeStart") or slot.get("time") or "").strip()[:5]
+    if not (doctor_login and date and time_start):
+        return None
+    return {
+        "patient_name": str(session.get("patient_name") or "").strip(),
+        "patient_relation": str(session.get("patient_relation") or "").strip(),
+        "doctor_login": doctor_login,
+        "date": date,
+        "time_start": time_start,
+    }
+
+
+async def _recover_after_agent_interruption(
+    chat_id: str,
+    phone: str,
+    session: dict[str, Any],
+    result: AgentResult,
+    *,
+    reason: str,
+) -> AgentResult:
+    """Terminal recovery: synchronously finish a safe booking or escalate.
+
+    Never promise asynchronous continuation. A real CRM POST is retried here
+    only when no booking tool ran in this turn and all persisted prerequisites,
+    including an exact selected CRM slot, are present.
+    """
     result.outcome = _classify_outcome(result, session)
-    result.error = "openai_error_after_tools"
+    if result.booked:
+        result.reply = _safety_net_reply(session, result)
+        return result
+
+    if result.booking is None:
+        pending = _pending_booking_args(session)
+        if pending is not None:
+            recovered = await _tool_book_appointment(chat_id, session, phone, pending)
+            result.tool_calls.append({"tool": "book_appointment", "ok": bool(recovered.get("ok")), "args": _safe_args(pending)})
+            result.tool_results.append(recovered)
+            result.booking = recovered
+            if recovered.get("booking_success") is True:
+                result.outcome = OUTCOME_SUCCESS
+                result.reply = _safety_net_reply(session, result)
+                _log(chat_id, "agent_interruption_booking_recovered", {"reason": reason})
+                return result
+
+    if not result.escalate:
+        escalation = _tool_escalate(
+            chat_id,
+            session,
+            {"reason": "technical interruption; booking status requires operator verification"},
+        )
+        result.tool_calls.append({"tool": "escalate_to_operator", "ok": bool(escalation.get("ok")), "args": {"reason": True}})
+        result.tool_results.append(escalation)
+        result.escalate = True
+
+    result.outcome = OUTCOME_OPERATOR_ESCALATION
     result.reply = _safety_net_reply(session, result)
-    _log(chat_id, "agent_silent_turn_prevented", {"outcome": result.outcome, "reason": "openai_error_after_tools"})
+    _log(chat_id, "agent_silent_turn_prevented", {"outcome": result.outcome, "reason": reason})
     return result
+
+
+async def _finish_after_openai_failure(
+    chat_id: str, phone: str, session: dict[str, Any], result: AgentResult
+) -> AgentResult:
+    """OpenAI died mid-loop after tools ran — finish now, never later."""
+    result.error = "openai_error_after_tools"
+    return await _recover_after_agent_interruption(
+        chat_id, phone, session, result, reason="openai_error_after_tools"
+    )
 
 
 def _classify_outcome(result: AgentResult, session: dict[str, Any]) -> str:
@@ -2496,7 +2803,7 @@ def _classify_outcome(result: AgentResult, session: dict[str, Any]) -> str:
     booking = result.booking or {}
     if booking.get("error") == "slot_conflict":
         return OUTCOME_SLOT_CONFLICT
-    if booking.get("error") in {"crm_unavailable", "crm_error", "crm_rejected", "crm_unconfirmed"}:
+    if booking.get("error") in {"crm_unavailable", "crm_error", "crm_rejected", "crm_unconfirmed", "slot_revalidation_failed"}:
         return OUTCOME_TECHNICAL_ERROR
     if session.get("crm_availability_empty") is True:
         return OUTCOME_NO_SLOTS
@@ -2524,9 +2831,9 @@ def _safety_net_reply(session: dict[str, Any], result: AgentResult) -> str:
         )
     if result.outcome == OUTCOME_SLOT_CONFLICT:
         return (
-            "Это окошко только что заняли 🌿 Сейчас уточню свободные варианты и напишу Вам."
+            "Это время уже заняли. Передам администратору, чтобы подобрать новый реальный вариант 🌿"
             if lang != "kk"
-            else "Бұл уақытты жаңа ғана алып қойды 🌿 Қазір бос уақыттарды нақтылап жазамын."
+            else "Бұл уақыт бос емес. Жаңа нақты уақытты таңдау үшін әкімшіге жіберемін 🌿"
         )
     if result.outcome in {OUTCOME_OPERATOR_ESCALATION, OUTCOME_TECHNICAL_ERROR}:
         return (
@@ -2535,7 +2842,7 @@ def _safety_net_reply(session: dict[str, Any], result: AgentResult) -> str:
             else "Сұрағыңызды әкімшіге жіберемін, ол Сізбен жақын арада байланысады 🌿"
         )
     return (
-        "Секунду, уточню информацию и вернусь к Вам 🌿"
+        "Передам диалог администратору, чтобы он продолжил без потери данных 🌿"
         if lang != "kk"
-        else "Бір сәт, ақпаратты нақтылап, Сізге жазамын 🌿"
+        else "Деректер жоғалмауы үшін диалогты әкімшіге жіберемін 🌿"
     )
