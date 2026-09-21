@@ -512,11 +512,8 @@ def _no_reply(chat_id: str, session: dict[str, Any], reason: str) -> str:
     """Сохраняет состояние и ничего не отправляет пациенту."""
     session["no_reply_reason"] = reason
     session["should_send_wazzup"] = False
-    decision: dict[str, Any] = (
-        session.get("guard_decision")
-        if isinstance(session.get("guard_decision"), dict)
-        else {}
-    )
+    raw_decision = session.get("guard_decision")
+    decision: dict[str, Any] = dict(raw_decision) if isinstance(raw_decision, dict) else {}
     decision.update({"allowed": False, "no_reply_reason": reason, "should_send_wazzup": False})
     session["guard_decision"] = decision
     _safe_save(chat_id, session)
