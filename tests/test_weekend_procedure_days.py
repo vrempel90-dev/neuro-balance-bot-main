@@ -1,4 +1,4 @@
-"""Суббота и воскресенье — процедурные дни: консультаций в них нет.
+"""Суббота — процедурный день, воскресенье — выходной; консультаций в оба дня нет.
 
 Правило клиники раньше жило в weekend_booking_policy.py, который на импорте
 подменял приватную функцию dialog.py и приклеивал объяснение текстом перед
@@ -74,7 +74,8 @@ def test_saturday_request_is_answered_with_the_next_working_day(monkeypatch: pyt
     assert result["requested_date_from"] == SATURDAY
     assert result["date_from"] == MONDAY
     assert {slot["date"] for slot in result["slots"]} == {MONDAY}
-    assert "процедурные дни" in result["note"]
+    assert "процедурный день" in result["note"]
+    assert result["sunday_closed_requested"] is False
 
 
 def test_the_model_is_told_to_explain_it_itself(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -83,6 +84,9 @@ def test_the_model_is_told_to_explain_it_itself(monkeypatch: pytest.MonkeyPatch)
 
     result = run_tool(monkeypatch, stub, {"date_from": SUNDAY})
 
+    assert result["weekend_procedure_day_requested"] is False
+    assert result["sunday_closed_requested"] is True
+    assert "выходной" in result["note"]
     assert "своими словами" in result["note"]
 
 
