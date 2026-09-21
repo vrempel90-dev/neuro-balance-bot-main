@@ -1079,9 +1079,17 @@ async def _send_answer_parts(
             return
         sess = _get_session_safe(chat_id)
         sess["wazzup_send_called"] = True
-        sess["last_sent_answer"] = safe_text
+        sess["wazzup_send_inflight_answer"] = safe_text
         state.save_session(chat_id, sess)
         result = await send_text(chat_id=chat_id, text=safe_text, chat_type=chat_type, channel_id=channel_id)
+        # last_sent_answer means DELIVERED, not merely attempted. Persisting it
+        # before send_text returned successfully made a failed send impossible
+        # to replay: the retry was incorrectly blocked as a duplicate.
+        sess = _get_session_safe(chat_id)
+        sess["last_sent_answer"] = safe_text
+        sess["wazzup_send_inflight_answer"] = ""
+        sess["outgoing_duplicate_guard_blocked"] = False
+        state.save_session(chat_id, sess)
         state.log_event(chat_id, "wazzup_send_result", {"phone": phone, "ok": True, "status_code": result.get("status_code")})
     except Exception as exc:
         status_code = getattr(getattr(exc, "response", None), "status_code", None)
@@ -1091,6 +1099,58 @@ async def _send_answer_parts(
 
 _CHAT_TURN_LOCKS: dict[str, asyncio.Lock] = {}
 _CHAT_TURN_USERS: dict[str, int] = {}
+
+# Durable-ish outbox for the gap between "CRM booking succeeded" and "Wazzup
+# confirmed delivery". Session storage is the persistent source; the in-memory
+# copy also survives a transient session DB write/read error within this
+# process. A retry of the same inbound message replays this answer directly and
+# never re-enters admission/LLM/CRM.
+_PENDING_OUTBOUND_MEMORY: dict[str, str] = {}
+
+
+def _outbound_key(chat_id: str, message: dict[str, Any]) -> str:
+    message_key = str(message.get("message_key") or message.get("message_id") or "").strip()
+    return f"{chat_id}|{message_key}" if message_key else ""
+
+
+def _pending_outbound(chat_id: str, message: dict[str, Any]) -> str:
+    key = _outbound_key(chat_id, message)
+    if not key:
+        return ""
+    if key in _PENDING_OUTBOUND_MEMORY:
+        return _PENDING_OUTBOUND_MEMORY[key]
+    try:
+        sess = _get_session_safe(chat_id)
+        if str(sess.get("pending_outbound_key") or "") == key:
+            return str(sess.get("pending_outbound_answer") or "")
+    except Exception:
+        return ""
+    return ""
+
+
+def _stage_pending_outbound(chat_id: str, message: dict[str, Any], answer: str) -> None:
+    key = _outbound_key(chat_id, message)
+    value = str(answer or "").strip()
+    if not key or not value:
+        return
+    _PENDING_OUTBOUND_MEMORY[key] = value
+    sess = _get_session_safe(chat_id)
+    sess["pending_outbound_key"] = key
+    sess["pending_outbound_answer"] = value
+    sess["pending_outbound_created_at"] = astana_now().isoformat()
+    state.save_session(chat_id, sess)
+
+
+def _complete_pending_outbound(chat_id: str, message: dict[str, Any]) -> None:
+    key = _outbound_key(chat_id, message)
+    if key:
+        _PENDING_OUTBOUND_MEMORY.pop(key, None)
+    sess = _get_session_safe(chat_id)
+    if not key or str(sess.get("pending_outbound_key") or "") == key:
+        sess.pop("pending_outbound_key", None)
+        sess.pop("pending_outbound_answer", None)
+        sess.pop("pending_outbound_created_at", None)
+        state.save_session(chat_id, sess)
 
 
 @asynccontextmanager
@@ -1157,12 +1217,27 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
             message["text"] = combined_text
 
         async with _chat_turn(chat_id):
-            answer = await _build_answer_for_message(message)
-            session_after = _get_session_safe(chat_id)
-            guard_decision = session_after.get("guard_decision") if isinstance(session_after.get("guard_decision"), dict) else {}
-            if not answer or not bool(guard_decision.get("should_send_wazzup", True)):
-                state.log_event(chat_id, "wazzup_send_blocked", {"phone": str(message.get("phone") or ""), "reason": session_after.get("no_reply_reason") or "empty_answer"})
-                return
+            pending_answer = _pending_outbound(chat_id, message)
+            if pending_answer:
+                # The previous attempt already completed dialog/booking but
+                # delivery failed or was interrupted. Replay the exact guarded
+                # answer; never re-run lead admission or POST /api/bot/book.
+                answer = pending_answer
+                state.log_event(
+                    chat_id,
+                    "wazzup_pending_outbound_replay",
+                    {"phone": str(message.get("phone") or ""), "message_key": str(message.get("message_key") or message.get("message_id") or "")},
+                )
+            else:
+                answer = await _build_answer_for_message(message)
+                session_after = _get_session_safe(chat_id)
+                guard_decision = session_after.get("guard_decision") if isinstance(session_after.get("guard_decision"), dict) else {}
+                if not answer or not bool(guard_decision.get("should_send_wazzup", True)):
+                    state.log_event(chat_id, "wazzup_send_blocked", {"phone": str(message.get("phone") or ""), "reason": session_after.get("no_reply_reason") or "empty_answer"})
+                    return
+                # Stage BEFORE the external send. If Wazzup fails after the CRM
+                # booking succeeded, the exact confirmation remains replayable.
+                _stage_pending_outbound(chat_id, message, answer)
 
             await _send_answer_parts(
                 chat_id=chat_id,
@@ -1171,15 +1246,19 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
                 channel_id=channel_id,
                 phone=str(message.get("phone") or ""),
             )
+            _complete_pending_outbound(chat_id, message)
 
     except Exception as exc:
         state.log_event(chat_id, "background_processing_error", {"error": str(exc)[:1000]})
-        # Захват ключа снимаем: обработка не дошла до ответа, и повторная
-        # доставка того же вебхука должна получить второй шанс.
-        try:
-            state.release_message(str(message.get("message_key") or message.get("message_id") or ""))
-        except Exception:
-            pass
+        # If a guarded outbound answer is already staged, processing (and
+        # possibly booking) DID finish. Keep the inbound claim and replay the
+        # outbox on the next delivery instead of re-running CRM. Only failures
+        # that happened before staging may release the inbound claim.
+        if not _pending_outbound(chat_id, message):
+            try:
+                state.release_message(str(message.get("message_key") or message.get("message_id") or ""))
+            except Exception:
+                pass
         try:
             if kind == "voice" or _message_has_voice_url(message):
                 fallback_text = _voice_fallback_answer()
