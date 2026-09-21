@@ -309,3 +309,75 @@ def test_staging_browser_dialog_ui_is_available() -> None:
         assert "/debug/chat" in response.text
         assert "x-debug-token" in response.text
         assert "eDzLUbkGiHM" not in response.text
+
+
+
+def test_direct_answers_are_persisted_without_reasking() -> None:
+    session: dict[str, Any] = {
+        "language": "ru",
+        "last_assistant_answer": "Здравствуйте! Что Вас беспокоит?",
+    }
+
+    stored = agent.capture_direct_answer_facts("direct_fact_memory", session, "болит спина")
+    assert "complaint" in stored
+    assert session["complaint"] == "болит спина"
+
+    session["last_assistant_answer"] = "Подскажите, пожалуйста, сколько Вам лет?"
+    stored = agent.capture_direct_answer_facts("direct_fact_memory", session, "75")
+    assert "age" in stored
+    assert session["age"] == 75
+    assert agent._age_block_reason(session["age"]) == ""
+
+
+def test_agent_recovers_instead_of_reasking_known_complaint(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = FakeOpenAIClient([
+        assistant_text("Подскажите, пожалуйста, что именно Вас беспокоит?"),
+        assistant_text("Есть ли у Вас противопоказания из списка клиники?"),
+    ])
+    monkeypatch.setattr(ai, "_openai_client", lambda api_key: client)
+
+    session = {
+        "language": "ru",
+        "complaint": "болит спина",
+        "complaint_gate": "COMPLAINT_OK",
+        "age": 75,
+        "known_user_facts": {"complaint": "болит спина", "age": 75},
+    }
+
+    result = asyncio.run(
+        agent.run_agent_turn(
+            chat_id="known_complaint_no_repeat",
+            phone=PHONE,
+            session=session,
+            user_text="75",
+            recent_history=[
+                {"role": "user", "text": "болит спина"},
+                {"role": "assistant", "text": "Подскажите, пожалуйста, сколько Вам лет?"},
+            ],
+        )
+    )
+
+    assert result.reply == "Есть ли у Вас противопоказания из списка клиники?"
+    assert len(client.calls) == 2
+    assert result.escalate is False
+
+
+def test_strong_pain_alone_cannot_escalate_new_lead() -> None:
+    session = {
+        "language": "ru",
+        "last_user_text": "спина болит сильно",
+        "complaint": "болит спина",
+        "age": 75,
+        "contraindications_ok": None,
+    }
+
+    result = agent._tool_escalate(
+        "severity_is_not_handoff",
+        session,
+        {"reason": "сильная боль, медицинские сомнения"},
+    )
+
+    assert result["ok"] is False
+    assert result["escalated"] is False
+    assert result["error"] == "escalation_not_justified"
+    assert session.get("manual_takeover") is not True
