@@ -7,6 +7,7 @@ import logging
 import uuid
 import mimetypes
 import re
+import secrets
 from typing import Any
 from types import SimpleNamespace
 from datetime import datetime, timezone
@@ -76,6 +77,30 @@ except Exception:
 
 
 app = FastAPI(title="Neuro Balance Hybrid WhatsApp Booking Bot")
+
+
+@app.middleware("http")
+async def _protect_debug_endpoints(request: Request, call_next):
+    """Optionally require a token for every /debug/* route.
+
+    Production remains backward-compatible because the switch defaults to
+    false. Staging enables it so a public Railway domain cannot be used to
+    drive CRM/OpenAI debug flows without authorization.
+    """
+    settings = get_settings()
+    if request.url.path.startswith("/debug/") and bool(
+        getattr(settings, "debug_endpoints_require_token", False)
+    ):
+        expected = str(getattr(settings, "debug_admin_token", "") or "")
+        supplied = str(request.headers.get("x-debug-token") or "")
+        auth = str(request.headers.get("authorization") or "")
+        if not supplied and auth.lower().startswith("bearer "):
+            supplied = auth[7:].strip()
+        if not expected:
+            raise HTTPException(status_code=503, detail="Debug token is not configured")
+        if not supplied or not secrets.compare_digest(supplied, expected):
+            raise HTTPException(status_code=401, detail="Unauthorized debug access")
+    return await call_next(request)
 
 
 class _WebhookAccessLogFilter(logging.Filter):
