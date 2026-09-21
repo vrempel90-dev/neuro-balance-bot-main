@@ -1015,6 +1015,13 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
 
     session = _get_session_safe(chat_id)
     session["source"] = source
+    session["chat_type"] = str(message.get("chat_type") or "").strip().lower()
+    session["channel_id"] = str(message.get("channel_id") or "").strip()
+    session["inbound_channel"] = (
+        "instagram"
+        if "instagram" in session["chat_type"]
+        else (session["chat_type"] or source)
+    )
     session["local_time"] = astana_now().isoformat()
     session["working_hours_allowed"] = True
     session["guard_decision"] = decision.to_dict()

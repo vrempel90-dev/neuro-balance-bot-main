@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 
@@ -177,3 +177,117 @@ def test_daytime_test_window_ignored_when_disabled(monkeypatch):
     monkeypatch.setenv("BOT_TEST_WINDOW_DATE", "2026-07-08")
     config.get_settings.cache_clear()
     assert is_bot_work_time(datetime.fromisoformat("2026-07-08T14:15:00+05:00")) is False
+
+
+
+def test_new_lead_keeps_bounded_access_when_crm_marks_same_lead_in_progress(monkeypatch):
+    async def scenario():
+        async def fake_lookup(phone):
+            return {
+                "ok": True,
+                "found": True,
+                "isNew": False,
+                "lead": {"id": "lead-1", "status": "В работе"},
+                "patient": None,
+                "appointments": [],
+            }
+
+        monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
+        chat_id = "active_new_lead_continuation"
+        state.reset_session(chat_id)
+        session = state.get_session(chat_id)
+        dialog._activate_ai_admission_lease(session)
+        state.save_session(chat_id, session)
+
+        verdict = await dialog._classify_lead(chat_id, "77008984505", session)
+
+        assert verdict.state == "NEW"
+        assert verdict.reason == "active_ai_conversation"
+
+    asyncio.run(scenario())
+
+
+def test_admission_lease_never_turns_existing_patient_into_new_lead(monkeypatch):
+    async def scenario():
+        async def fake_lookup(phone):
+            return {
+                "ok": True,
+                "found": True,
+                "isNew": False,
+                "patient": {"id": "patient-1", "name": "Алия"},
+                "lead": {"id": "lead-1", "status": "В работе"},
+                "appointments": [],
+            }
+
+        monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
+        chat_id = "existing_patient_not_overridden"
+        state.reset_session(chat_id)
+        session = state.get_session(chat_id)
+        dialog._activate_ai_admission_lease(session)
+        state.save_session(chat_id, session)
+
+        verdict = await dialog._classify_lead(chat_id, "77008984505", session)
+
+        assert verdict.state == "RETURNING"
+        assert verdict.reason == "patient_exists"
+
+    asyncio.run(scenario())
+
+
+def test_expired_admission_lease_does_not_keep_lead_eligible(monkeypatch):
+    async def scenario():
+        async def fake_lookup(phone):
+            return {
+                "ok": True,
+                "found": True,
+                "isNew": False,
+                "lead": {"id": "lead-1", "status": "В работе"},
+                "appointments": [],
+            }
+
+        monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
+        chat_id = "expired_new_lead_lease"
+        state.reset_session(chat_id)
+        session = state.get_session(chat_id)
+        session["ai_admission_started_at"] = (
+            datetime.now(timezone.utc) - timedelta(hours=13)
+        ).isoformat()
+        state.save_session(chat_id, session)
+
+        verdict = await dialog._classify_lead(chat_id, "77008984505", session)
+
+        assert verdict.state == "RETURNING"
+        assert verdict.reason == "lead_in_progress"
+
+    asyncio.run(scenario())
+
+
+
+def test_confirmed_booking_is_never_reopened_as_new_lead(monkeypatch):
+    async def scenario():
+        lookup_calls = 0
+
+        async def fake_lookup(phone):
+            nonlocal lookup_calls
+            lookup_calls += 1
+            return {"ok": True, "found": False, "isNew": True, "appointments": []}
+
+        monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
+        chat_id = "confirmed_booking_local_terminal"
+        state.reset_session(chat_id)
+        session = state.get_session(chat_id)
+        session["booking_confirmed"] = True
+        session["booked"] = True
+        session["appointment_id"] = "a-confirmed"
+        state.save_session(chat_id, session)
+
+        answer = await dialog.handle_message(chat_id, "77008984505", "У меня ещё вопрос")
+        final = state.get_session(chat_id)
+
+        assert answer == ""
+        assert lookup_calls == 0
+        assert final["ai_muted"] is True
+        assert final["manual_takeover"] is True
+        assert final["no_reply_reason"] == "booking_completed_ai_disabled"
+
+    asyncio.run(scenario())

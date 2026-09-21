@@ -268,6 +268,133 @@ def _offered_slot(session: dict[str, Any], date: str, time_start: str, doctor_lo
     return dict(slot) if isinstance(slot, dict) else None
 
 
+_SLOT_ORDINALS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (1, ("первый", "первое", "первую", "1 вариант", "вариант 1", "№1", "бірінші")),
+    (2, ("второй", "второе", "вторую", "2 вариант", "вариант 2", "№2", "екінші")),
+    (3, ("третий", "третье", "третью", "3 вариант", "вариант 3", "№3", "үшінші")),
+    (4, ("четвертый", "четвёртый", "четвертое", "четвёртое", "4 вариант", "вариант 4", "№4", "төртінші")),
+    (5, ("пятый", "пятое", "5 вариант", "вариант 5", "№5", "бесінші")),
+    (6, ("шестой", "шестое", "6 вариант", "вариант 6", "№6", "алтыншы")),
+)
+
+_SIMPLE_NAME_STOPWORDS = {
+    "да", "нет", "ага", "ок", "okay", "хорошо", "можно", "давайте", "запишите",
+    "спасибо", "благодарю", "первый", "второй", "третий", "четвертый", "четвёртый",
+    "пятый", "шестой", "сегодня", "завтра", "утром", "вечером", "обед", "адрес",
+    "цена", "стоимость", "сколько", "когда", "где", "мама", "папа", "сын", "дочь",
+    "бірінші", "екінші", "үшінші", "төртінші", "бесінші", "иә", "жоқ", "рахмет",
+}
+
+
+def _recent_offered_slots(session: dict[str, Any]) -> list[dict[str, str]]:
+    """Return recently shown CRM slots in the same order as the patient saw them."""
+    raw_slots = session.get("last_slots")
+    if not isinstance(raw_slots, list):
+        return []
+    slots: list[dict[str, str]] = []
+    for item in raw_slots:
+        if not isinstance(item, dict):
+            continue
+        slot = {
+            "doctor_login": str(item.get("doctor_login") or item.get("doctorLogin") or "").strip(),
+            "doctor_name": str(item.get("doctor_name") or item.get("doctorName") or "").strip(),
+            "date": str(item.get("date") or "")[:10],
+            "time_start": str(item.get("time_start") or item.get("timeStart") or item.get("time") or "")[:5],
+        }
+        if not all((slot["doctor_login"], slot["date"], slot["time_start"])):
+            continue
+        verified = _offered_slot(session, slot["date"], slot["time_start"], slot["doctor_login"])
+        if verified is not None:
+            slots.append(verified)
+    return slots
+
+
+def _persist_selected_slot(session: dict[str, Any], slot: dict[str, str]) -> None:
+    session["selected_slot"] = dict(slot)
+    session["selected_date"] = slot["date"]
+    session["selected_time"] = slot["time_start"]
+    session["selected_doctor_login"] = slot["doctor_login"]
+    session["selected_doctor_name"] = slot.get("doctor_name") or ""
+    session["step"] = "booking" if session.get("patient_name") else "name"
+
+
+def _resolve_explicit_slot_choice(session: dict[str, Any], user_text: str) -> dict[str, str] | None:
+    """Resolve explicit choices such as first, second or 14:00 against real CRM offers."""
+    if session.get("booking_confirmed"):
+        return None
+    slots = _recent_offered_slots(session)
+    if not slots:
+        return None
+    low = re.sub(r"\s+", " ", str(user_text or "").strip().lower())
+    if not low:
+        return None
+
+    chosen: dict[str, str] | None = None
+    normalized_choice = low.strip(" .,!?:;")
+    choice_prefixes = ("давайте ", "выбираю ", "беру ", "хочу ", "мне ", "таңдаймын ")
+    for ordinal, markers in _SLOT_ORDINALS:
+        exact_number = bool(re.fullmatch(rf"(?:№\s*)?{ordinal}[.)]?", normalized_choice))
+        explicit_marker = normalized_choice in markers or any(
+            normalized_choice == prefix + marker
+            for prefix in choice_prefixes
+            for marker in markers
+        )
+        if exact_number or explicit_marker:
+            if ordinal <= len(slots):
+                chosen = slots[ordinal - 1]
+            break
+
+    if chosen is None:
+        time_matches = re.findall(r"(?<!\d)([01]?\d|2[0-3])[:.]([0-5]\d)(?!\d)", low)
+        wanted_times = {f"{int(hour):02d}:{minute}" for hour, minute in time_matches}
+        if len(wanted_times) == 1:
+            wanted = next(iter(wanted_times))
+            matches = [slot for slot in slots if slot["time_start"] == wanted]
+            if len(matches) == 1:
+                chosen = matches[0]
+
+    if chosen is None:
+        return None
+    _persist_selected_slot(session, chosen)
+    return dict(chosen)
+
+
+_NAME_QUESTION_MARKERS = (
+    "имя", "как вас зовут", "как зовут пациента", "имя пациента",
+    "атыңыз", "есіміңіз", "пациенттің аты",
+)
+
+
+def _simple_patient_name_candidate(session: dict[str, Any], user_text: str) -> str:
+    """Conservative fallback for a direct answer to the immediately preceding name question."""
+    if session.get("patient_name") or not session.get("selected_time") or session.get("booking_confirmed"):
+        return ""
+
+    previous = str(session.get("last_assistant_answer") or "").lower()
+    if not any(marker in previous for marker in _NAME_QUESTION_MARKERS):
+        return ""
+
+    text = re.sub(r"\s+", " ", str(user_text or "").strip())
+    if not text or len(text) > 80 or "?" in text:
+        return ""
+    if not re.fullmatch(r"[A-Za-zА-Яа-яЁёӘәҒғҚқҢңӨөҰұҮүҺһІі'’\- ]{2,80}", text):
+        return ""
+
+    words_original = [w.strip("'’-") for w in text.split() if w.strip("'’-")]
+    words = [w.lower() for w in words_original]
+    if not 1 <= len(words) <= 3:
+        return ""
+    if any(word in _SIMPLE_NAME_STOPWORDS for word in words):
+        return ""
+    if any(word in {"у", "меня", "есть", "вопрос", "подскажите", "почему", "хочу", "нужно", "надо"} for word in words):
+        return ""
+    # Multi-word deterministic capture is intentionally stricter. Lowercase or
+    # ambiguous full-name phrases are left to GPT + record_patient_facts.
+    if len(words_original) > 1 and not all(word[:1].isupper() for word in words_original):
+        return ""
+    return text
+
+
 def _known_doctors_from_offers(session: dict[str, Any]) -> dict[str, str]:
     registry = session.get("crm_offered_slots")
     doctors: dict[str, str] = {}
@@ -420,6 +547,28 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["date_from"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "select_booking_slot",
+            "description": (
+                "Зафиксировать конкретный CRM-слот, который пациент ЯВНО выбрал из ранее "
+                "показанных вариантов. Используй после ответов вроде «первый», «второй», "
+                "«14:00» или однозначного выбора врача/времени. Инструмент принимает только "
+                "слот, реально возвращённый get_available_slots в этом диалоге."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doctor_login": {"type": "string", "description": "doctorLogin выбранного CRM-слота."},
+                    "date": {"type": "string", "description": "Дата выбранного CRM-слота YYYY-MM-DD."},
+                    "time_start": {"type": "string", "description": "Время выбранного CRM-слота HH:MM."},
+                },
+                "required": ["doctor_login", "date", "time_start"],
                 "additionalProperties": False,
             },
         },
@@ -638,6 +787,7 @@ AGENT_OVERRIDES = """
 - record_patient_facts — сохранить жалобу, возраст, противопоказания, имя, родство;
 - get_doctors — реальные врачи клиники;
 - get_available_slots — реальные свободные даты и время;
+- select_booking_slot — сохранить конкретный реальный слот, который пациент выбрал;
 - book_appointment — реальная запись в CRM;
 - find_my_appointment — действующая запись пациента в CRM;
 - reschedule_appointment — реальный перенос существующей записи;
@@ -672,7 +822,11 @@ AGENT_OVERRIDES = """
 
 ПОРЯДОК ЗАПИСИ (медицинская безопасность, соблюдай его):
 жалоба → возраст → противопоказания → дата → реальные слоты CRM → выбор
-времени → имя пациента → book_appointment.
+времени → select_booking_slot → имя пациента → book_appointment.
+Если пациент выбрал «первый/второй/третий» или конкретное время из только что
+показанных CRM-вариантов, зафиксируй выбор через select_booking_slot и НЕ
+переспрашивай дату, врача или время. После получения имени backend проверит
+все обязательные данные и завершит запись в CRM.
 Возраст до 16 и старше 75, а также противопоказания из чек-листа — стоп-факторы:
 вместо записи вызывай escalate_to_operator.
 
@@ -779,6 +933,11 @@ def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls 
         "tomorrow": (today + timedelta(days=1)).isoformat(),
         "weekday": today.strftime("%A"),
         "language": session.get("language") or "ru",
+        "channel": {
+            "transport": session.get("source") or "",
+            "chat_type": session.get("chat_type") or "",
+            "is_instagram": "instagram" in str(session.get("chat_type") or "").lower(),
+        },
         "sender": {"phone_masked": _mask_phone(phone or session.get("phone"))},
         "patient": {
             "booking_for_self": not bool(session.get("patient_relation")),
@@ -793,8 +952,20 @@ def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls 
             "preferred_date": session.get("preferred_date") or "",
             "time_preference": _clip(session.get("time_preference"), "time_preference"),
             "selected_doctor_login": session.get("selected_doctor_login") or "",
+            "selected_doctor_name": session.get("selected_doctor_name") or "",
             "selected_date": session.get("selected_date") or "",
             "selected_time": session.get("selected_time") or "",
+            "selected_slot_is_verified": bool(
+                session.get("selected_doctor_login")
+                and session.get("selected_date")
+                and session.get("selected_time")
+                and _offered_slot(
+                    session,
+                    str(session.get("selected_date") or ""),
+                    str(session.get("selected_time") or ""),
+                    str(session.get("selected_doctor_login") or ""),
+                )
+            ),
             "already_booked": bool(session.get("booking_confirmed")),
             "crm_slots_offered_count": len(offered),
         },
@@ -1037,6 +1208,47 @@ async def _tool_get_available_slots(
         "time_preference_had_no_slots": dropped_by_preference,
         "crm_partially_unavailable": partial,
         "note": note,
+    }
+
+
+def _tool_select_booking_slot(
+    chat_id: str, session: dict[str, Any], args: dict[str, Any]
+) -> dict[str, Any]:
+    doctor_login = str(args.get("doctor_login") or "").strip()
+    date = str(args.get("date") or "").strip()[:10]
+    time_start = str(args.get("time_start") or "").strip()[:5]
+    slot = _offered_slot(session, date, time_start, doctor_login)
+    if slot is None:
+        _log(
+            chat_id,
+            "agent_slot_selection_rejected",
+            {"doctor_login": doctor_login, "date": date, "time_start": time_start},
+        )
+        return {
+            "ok": False,
+            "error": "slot_not_offered_by_crm",
+            "message": "Этот вариант не был возвращён CRM. Сначала получи реальные слоты через get_available_slots.",
+        }
+
+    _persist_selected_slot(session, slot)
+    _log(
+        chat_id,
+        "agent_slot_selected",
+        {"doctor_login": slot["doctor_login"], "date": slot["date"], "time_start": slot["time_start"]},
+    )
+    return {
+        "ok": True,
+        "selected": True,
+        "doctor_login": slot["doctor_login"],
+        "doctor_name": slot["doctor_name"],
+        "date": slot["date"],
+        "time_start": slot["time_start"],
+        "needs_patient_name": not bool(session.get("patient_name")),
+        "message": (
+            "Выбранный CRM-слот сохранён. Спроси имя пациента."
+            if not session.get("patient_name")
+            else "Выбранный CRM-слот сохранён, имя уже известно."
+        ),
     }
 
 
@@ -2151,6 +2363,45 @@ def _tool_escalate(chat_id: str, session: dict[str, Any], args: dict[str, Any]) 
     }
 
 
+async def _try_auto_complete_booking(
+    chat_id: str, session: dict[str, Any], phone: str
+) -> dict[str, Any] | None:
+    """Finish the prompt's booking step deterministically when every prerequisite is present."""
+    if session.get("booking_confirmed") or session.get("manual_takeover") or session.get("escalated"):
+        return None
+
+    patient_name = str(session.get("patient_name") or "").strip()
+    doctor_login = str(session.get("selected_doctor_login") or "").strip()
+    date = str(session.get("selected_date") or "").strip()[:10]
+    time_start = str(session.get("selected_time") or "").strip()[:5]
+    if not all((patient_name, doctor_login, date, time_start)):
+        return None
+    if _offered_slot(session, date, time_start, doctor_login) is None:
+        return None
+
+    gate_ok, _gate_reason = bot_tools.booking_gate_status(session)
+    if not gate_ok or _age_block_reason(session.get("age")):
+        return None
+
+    _log(
+        chat_id,
+        "agent_booking_auto_completion_started",
+        {"doctor_login": doctor_login, "date": date, "time_start": time_start},
+    )
+    return await _tool_book_appointment(
+        chat_id,
+        session,
+        phone,
+        {
+            "patient_name": patient_name,
+            "patient_relation": str(session.get("patient_relation") or ""),
+            "doctor_login": doctor_login,
+            "date": date,
+            "time_start": time_start,
+        },
+    )
+
+
 async def execute_tool(
     *, chat_id: str, session: dict[str, Any], phone: str, name: str, args: dict[str, Any]
 ) -> dict[str, Any]:
@@ -2159,6 +2410,8 @@ async def execute_tool(
         return await _tool_get_doctors(chat_id, session)
     if name == "get_available_slots":
         return await _tool_get_available_slots(chat_id, session, args)
+    if name == "select_booking_slot":
+        return _tool_select_booking_slot(chat_id, session, args)
     if name == "book_appointment":
         return await _tool_book_appointment(chat_id, session, phone, args)
     if name == "find_my_appointment":
@@ -2241,11 +2494,62 @@ async def run_agent_turn(
         _log(chat_id, "agent_skipped", {"reason": skip_reason, "step": session.get("step") or "start"})
         return AgentResult(used=False, skip_reason=skip_reason)
 
+    resolved_slot = _resolve_explicit_slot_choice(session, user_text)
+    if resolved_slot is not None:
+        _log(
+            chat_id,
+            "agent_slot_choice_resolved_from_user_text",
+            {
+                "doctor_login": resolved_slot["doctor_login"],
+                "date": resolved_slot["date"],
+                "time_start": resolved_slot["time_start"],
+            },
+        )
+
+    name_candidate = _simple_patient_name_candidate(session, user_text)
+    if name_candidate:
+        _tool_record_patient_facts(chat_id, session, {"patient_name": name_candidate})
+        _log(chat_id, "agent_patient_name_captured_for_booking", {"captured": True})
+
+    preflight_booking = await _try_auto_complete_booking(chat_id, session, phone)
+    if preflight_booking and preflight_booking.get("booking_success") is True:
+        result = AgentResult(
+            used=True,
+            booking=preflight_booking,
+            tool_results=[preflight_booking],
+            tool_calls=[{"tool": "book_appointment", "ok": True, "args": {"automatic": True}}],
+            outcome=OUTCOME_SUCCESS,
+        )
+        result.reply = _safety_net_reply(session, result)
+        _log(
+            chat_id,
+            "agent_turn_finished",
+            {
+                "outcome": result.outcome,
+                "iterations": 0,
+                "tool_calls": ["book_appointment"],
+                "has_reply": True,
+                "booking_success": True,
+                "error": "",
+                "automatic_completion": True,
+            },
+        )
+        return result
+
     settings = get_settings()
     model = getattr(settings, "ai_brain_model", "") or getattr(settings, "openai_model", "")
     temperature = float(getattr(settings, "ai_brain_temperature", 0.2) or 0.2)
 
     context = build_agent_context(session=session, phone=phone)
+    if preflight_booking:
+        context["automatic_booking_result"] = {
+            key: preflight_booking.get(key)
+            for key in (
+                "ok", "booking_success", "error", "message",
+                "doctor_login", "doctor_name", "date", "time_start",
+            )
+            if preflight_booking.get(key) not in (None, "")
+        }
     # The structured context contains patient-written text (complaint, name).
     # It is passed as a user-role message, not a system one: text originating
     # from a patient must never carry the authority of a system instruction,
@@ -2264,6 +2568,9 @@ async def run_agent_turn(
     messages.append({"role": "user", "content": str(user_text)[:2000]})
 
     result = AgentResult(used=True)
+    if preflight_booking:
+        result.booking = preflight_booking
+        result.tool_results.append(preflight_booking)
     # Per-turn state: a stale value from a previous turn would misclassify this
     # turn's outcome (e.g. as NO_SLOTS when no availability call happened).
     session.pop("crm_availability_empty", None)
@@ -2402,6 +2709,13 @@ async def run_agent_turn(
                     "message": "Инструмент временно недоступен. Не выдумывай данные, предложи эскалацию.",
                 }
 
+            if name in {"record_patient_facts", "select_booking_slot"}:
+                automatic_booking = await _try_auto_complete_booking(chat_id, session, phone)
+                if automatic_booking is not None:
+                    tool_result = dict(tool_result)
+                    tool_result["automatic_booking"] = automatic_booking
+                    result.booking = automatic_booking
+
             result.tool_calls.append({"tool": name, "ok": bool(tool_result.get("ok")), "args": _safe_args(args)})
             result.tool_results.append(tool_result)
             if name == "book_appointment":
@@ -2433,11 +2747,28 @@ async def run_agent_turn(
     )
 
     if not result.reply.strip():
-        # SILENT TURN PROTECTION: the model produced no text. Never return an
-        # empty reply from an accepted active turn.
+        # There is no background continuation after this webhook. An empty
+        # answer therefore becomes a real operator handoff, never a fake wait.
+        result.escalate = True
+        result.outcome = OUTCOME_OPERATOR_ESCALATION
         result.reply = _safety_net_reply(session, result)
         result.error = result.error or "empty_model_reply"
         _log(chat_id, "agent_silent_turn_prevented", {"outcome": result.outcome})
+
+    if _looks_like_nonterminal_promise(result.reply) and not result.booked:
+        result.escalate = True
+        result.outcome = OUTCOME_OPERATOR_ESCALATION
+        result.reply = _operator_handoff_reply(session)
+        result.error = result.error or "nonterminal_promise_blocked"
+        _log(chat_id, "agent_nonterminal_promise_blocked", {})
+
+    previous = str(session.get("last_assistant_answer") or "")
+    if previous and "?" in result.reply and _normalized_reply(previous) == _normalized_reply(result.reply):
+        result.escalate = True
+        result.outcome = OUTCOME_OPERATOR_ESCALATION
+        result.reply = _operator_handoff_reply(session)
+        result.error = result.error or "duplicate_question_blocked"
+        _log(chat_id, "agent_duplicate_question_blocked", {})
 
     return result
 
@@ -2503,6 +2834,29 @@ def _classify_outcome(result: AgentResult, session: dict[str, Any]) -> str:
     return OUTCOME_CONTINUE
 
 
+def _normalized_reply(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]+", " ", str(text or "").lower())).strip()
+
+
+def _looks_like_nonterminal_promise(text: str) -> bool:
+    low = str(text or "").lower()
+    return any(
+        marker in low
+        for marker in (
+            "секунду, уточню",
+            "уточню информацию и вернусь",
+            "вернусь к вам",
+            "бір сәт, ақпаратты нақтылап",
+        )
+    )
+
+
+def _operator_handoff_reply(session: dict[str, Any]) -> str:
+    if str(session.get("language") or "ru") == "kk":
+        return "Сұрағыңызды әкімшіге жіберемін, ол Сізбен жақын арада байланысады 🌿"
+    return "Передам Ваш вопрос администратору, он свяжется с Вами в ближайшее время 🌿"
+
+
 def _safety_net_reply(session: dict[str, Any], result: AgentResult) -> str:
     """Minimal technical fallback text.
 
@@ -2534,8 +2888,4 @@ def _safety_net_reply(session: dict[str, Any], result: AgentResult) -> str:
             if lang != "kk"
             else "Сұрағыңызды әкімшіге жіберемін, ол Сізбен жақын арада байланысады 🌿"
         )
-    return (
-        "Секунду, уточню информацию и вернусь к Вам 🌿"
-        if lang != "kk"
-        else "Бір сәт, ақпаратты нақтылап, Сізге жазамын 🌿"
-    )
+    return _operator_handoff_reply(session)

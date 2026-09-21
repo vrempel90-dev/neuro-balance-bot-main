@@ -1453,3 +1453,149 @@ def test_all_empty_period_is_bounded_by_request_count(monkeypatch: pytest.Monkey
         "and stop there — an upper bound alone would also accept a search that "
         "gave up on the first empty day"
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: the real production stall reported by the clinic
+# ---------------------------------------------------------------------------
+
+
+def test_first_option_then_name_is_booked_even_if_model_does_not_call_booking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """'Первый' -> name must deterministically finish CRM booking.
+
+    Regression for the production failure where the model understood the slot,
+    asked for the name, then answered 'Секунду...' without ever calling
+    book_appointment. The backend now owns the final transition once all prompt
+    prerequisites are present.
+    """
+    stub = install_crm(monkeypatch, CRMStub())
+    client = install_openai(
+        monkeypatch,
+        [
+            assistant_tool_call("get_available_slots", {"date_from": DATE, "days_ahead": 1}),
+            assistant_text(
+                f"Есть варианты: 1) {DATE} {SLOT_TIMES[0]}, "
+                f"2) {DATE} {SLOT_TIMES[1]}, 3) {DATE} {SLOT_TIMES[2]}. Какой выбираете?"
+            ),
+            # Deliberately NO select_booking_slot/book_appointment call here.
+            # The deterministic resolver must persist "Первый" itself.
+            assistant_text("Вы выбрали первый вариант. Для оформления записи подскажите, пожалуйста, Ваше имя."),
+        ],
+    )
+    chat_id = "regression_first_then_name"
+    ready_session(chat_id)
+
+    first = run_turn(chat_id, f"Что свободно {DATE}?")
+    assert SLOT_TIMES[0] in first
+    assert stub.book_calls == []
+
+    second = run_turn(chat_id, "Первый")
+    selected = state.get_session(chat_id)
+    assert selected["selected_time"] == SLOT_TIMES[0]
+    assert selected["selected_date"] == DATE
+    assert selected["selected_doctor_login"] == DOCTOR_LOGIN
+    assert "имя" in second.lower()
+    assert stub.book_calls == []
+
+    third = run_turn(chat_id, "Азамат")
+    final = state.get_session(chat_id)
+
+    assert len(stub.book_calls) == 1
+    assert stub.book_calls[0]["patient_name"] == "Азамат"
+    assert stub.book_calls[0]["time_start"] == SLOT_TIMES[0]
+    assert final["booking_confirmed"] is True
+    assert final["appointment_time"] == SLOT_TIMES[0]
+    assert "секунду, уточню" not in third.lower()
+    assert "вернусь к вам" not in third.lower()
+    assert DATE in third
+    assert SLOT_TIMES[0] in third
+    # Third turn is completed before another LLM request is needed.
+    assert len(client.calls) == 3
+
+
+def test_vague_wait_reply_becomes_real_operator_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_crm(monkeypatch, CRMStub())
+    install_openai(
+        monkeypatch,
+        [assistant_text("Секунду, уточню информацию и вернусь к Вам 🌿")],
+    )
+    chat_id = "regression_no_fake_wait"
+    ready_session(chat_id)
+
+    answer = run_turn(chat_id, "Хорошо, жду")
+    session = state.get_session(chat_id)
+
+    assert "вернусь к вам" not in answer.lower()
+    assert "администратор" in answer.lower()
+    assert session["manual_takeover"] is True
+    assert session["escalated"] is True
+
+
+def test_instagram_transport_is_exposed_in_agent_context() -> None:
+    context = agent.build_agent_context(
+        session={
+            "source": "wazzup",
+            "chat_type": "instagram",
+            "language": "ru",
+        },
+        phone=PHONE,
+    )
+    assert context["channel"]["transport"] == "wazzup"
+    assert context["channel"]["chat_type"] == "instagram"
+    assert context["channel"]["is_instagram"] is True
+
+
+
+def test_name_fallback_requires_explicit_previous_name_question() -> None:
+    session = {
+        "selected_time": SLOT_TIMES[0],
+        "last_assistant_answer": "Какой вариант Вам подходит?",
+    }
+    assert agent._simple_patient_name_candidate(session, "Азамат") == ""
+
+    session["last_assistant_answer"] = "Подскажите, пожалуйста, имя пациента."
+    assert agent._simple_patient_name_candidate(session, "Азамат") == "Азамат"
+    assert agent._simple_patient_name_candidate(session, "У меня вопрос") == ""
+
+
+def test_ambiguous_slot_text_is_not_resolved_deterministically() -> None:
+    session: dict[str, Any] = {
+        "last_slots": [
+            {
+                "doctorLogin": DOCTOR_LOGIN,
+                "doctorName": DOCTOR_NAME,
+                "date": DATE,
+                "timeStart": SLOT_TIMES[0],
+            },
+            {
+                "doctorLogin": DOCTOR_LOGIN,
+                "doctorName": DOCTOR_NAME,
+                "date": DATE,
+                "timeStart": SLOT_TIMES[1],
+            },
+        ]
+    }
+    agent._remember_offered_slots(
+        session,
+        [
+            {
+                "doctor_login": DOCTOR_LOGIN,
+                "doctor_name": DOCTOR_NAME,
+                "date": DATE,
+                "time_start": SLOT_TIMES[0],
+            },
+            {
+                "doctor_login": DOCTOR_LOGIN,
+                "doctor_name": DOCTOR_NAME,
+                "date": DATE,
+                "time_start": SLOT_TIMES[1],
+            },
+        ],
+    )
+
+    assert agent._resolve_explicit_slot_choice(session, "не первый, второй") is None
+    assert agent._resolve_explicit_slot_choice(session, f"не {SLOT_TIMES[0]}, а {SLOT_TIMES[1]}") is None
