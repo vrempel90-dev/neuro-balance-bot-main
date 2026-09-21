@@ -1547,3 +1547,55 @@ def test_instagram_transport_is_exposed_in_agent_context() -> None:
     assert context["channel"]["transport"] == "wazzup"
     assert context["channel"]["chat_type"] == "instagram"
     assert context["channel"]["is_instagram"] is True
+
+
+
+def test_name_fallback_requires_explicit_previous_name_question() -> None:
+    session = {
+        "selected_time": SLOT_TIMES[0],
+        "last_assistant_answer": "Какой вариант Вам подходит?",
+    }
+    assert agent._simple_patient_name_candidate(session, "Азамат") == ""
+
+    session["last_assistant_answer"] = "Подскажите, пожалуйста, имя пациента."
+    assert agent._simple_patient_name_candidate(session, "Азамат") == "Азамат"
+    assert agent._simple_patient_name_candidate(session, "У меня вопрос") == ""
+
+
+def test_ambiguous_slot_text_is_not_resolved_deterministically() -> None:
+    session: dict[str, Any] = {
+        "last_slots": [
+            {
+                "doctorLogin": DOCTOR_LOGIN,
+                "doctorName": DOCTOR_NAME,
+                "date": DATE,
+                "timeStart": SLOT_TIMES[0],
+            },
+            {
+                "doctorLogin": DOCTOR_LOGIN,
+                "doctorName": DOCTOR_NAME,
+                "date": DATE,
+                "timeStart": SLOT_TIMES[1],
+            },
+        ]
+    }
+    agent._remember_offered_slots(
+        session,
+        [
+            {
+                "doctor_login": DOCTOR_LOGIN,
+                "doctor_name": DOCTOR_NAME,
+                "date": DATE,
+                "time_start": SLOT_TIMES[0],
+            },
+            {
+                "doctor_login": DOCTOR_LOGIN,
+                "doctor_name": DOCTOR_NAME,
+                "date": DATE,
+                "time_start": SLOT_TIMES[1],
+            },
+        ],
+    )
+
+    assert agent._resolve_explicit_slot_choice(session, "не первый, второй") is None
+    assert agent._resolve_explicit_slot_choice(session, f"не {SLOT_TIMES[0]}, а {SLOT_TIMES[1]}") is None
