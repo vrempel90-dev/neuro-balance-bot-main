@@ -2271,6 +2271,37 @@ def _escalation_category(reason: str) -> str:
 
 def _tool_escalate(chat_id: str, session: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     reason = str(args.get("reason") or "operator_requested").strip()
+    last_user = _normalized_reply(session.get("last_user_text"))
+    explicit_human = any(marker in last_user for marker in (
+        "оператор", "администратор", "человек", "живой специалист", "менеджер",
+        "адам", "әкімші",
+    ))
+    age_block = bool(_age_block_reason(session.get("age")))
+    contraindication_block = session.get("contraindications_ok") is False
+    technical_block = bool(
+        session.get("crm_lookup_error")
+        or session.get("crm_unavailable")
+        or (session.get("crm_called") and any(
+            marker in reason.lower() for marker in ("crm", "ошиб", "недоступ", "таймаут", "timeout")
+        ))
+    )
+
+    # Severity by itself is not an escalation condition. The final dialog guard
+    # separately handles a narrow deterministic list of genuine emergency red
+    # flags. This prevents phrases such as "спина болит сильно" from killing a
+    # normal new-lead booking flow.
+    if not (explicit_human or age_block or contraindication_block or technical_block):
+        _log(chat_id, "agent_escalation_rejected", {"reason_length": len(reason)})
+        return {
+            "ok": False,
+            "escalated": False,
+            "error": "escalation_not_justified",
+            "message": (
+                "Эскалация не подтверждена правилами. Продолжай обычный диалог и следующий "
+                "недостающий шаг. Сильная боль сама по себе не является причиной передачи."
+            ),
+        }
+
     bot_tools.escalate_to_human(session, reason)
     session["manual_takeover"] = True
     # The reason is model-written text derived from the patient's message and
@@ -2349,6 +2380,70 @@ def _looks_like_deferred_reply(text: str) -> bool:
     """True when the model promises future work instead of completing this turn."""
     low = _normalized_reply(text)
     return bool(low) and any(marker in low for marker in _DEFERRED_REPLY_MARKERS)
+
+
+_COMPLAINT_QUESTION_MARKERS = (
+    "что вас беспокоит", "что именно вас беспокоит", "на что жалуетесь",
+    "что беспокоит", "не мазалайды", "не алаңдатады",
+)
+_AGE_QUESTION_MARKERS = (
+    "сколько вам лет", "сколько лет пациенту", "ваш возраст",
+    "жасыңыз нешеде", "жасы нешеде",
+)
+_CONTRA_QUESTION_MARKERS = (
+    "противопоказ", "кардиостимулятор", "беременн", "онколог",
+)
+_NAME_QUESTION_MARKERS = (
+    "как вас зовут", "имя пациента", "как зовут пациента",
+    "атыңыз кім", "пациенттің аты",
+)
+
+
+def _asks_for_known_fact(text: str, session: dict[str, Any]) -> str:
+    low = _normalized_reply(text)
+    if session.get("complaint") and any(marker in low for marker in _COMPLAINT_QUESTION_MARKERS):
+        return "complaint"
+    if session.get("age") and any(marker in low for marker in _AGE_QUESTION_MARKERS):
+        return "age"
+    if session.get("contraindications_ok") is not None and any(marker in low for marker in _CONTRA_QUESTION_MARKERS):
+        return "contraindications"
+    if session.get("patient_name") and any(marker in low for marker in _NAME_QUESTION_MARKERS):
+        return "patient_name"
+    return ""
+
+
+def capture_direct_answer_facts(chat_id: str, session: dict[str, Any], user_text: str) -> list[str]:
+    """Persist an obvious answer to the exact question the agent just asked.
+
+    This is memory capture, not a second dialog engine: it never chooses the next
+    step and never writes a reply. It only prevents the agent from forgetting an
+    answer it explicitly requested on the previous turn.
+    """
+    previous = _normalized_reply(session.get("last_assistant_answer"))
+    current = str(user_text or "").strip()
+    if not previous or not current:
+        return []
+
+    args: dict[str, Any] = {}
+    if not session.get("complaint") and any(marker in previous for marker in _COMPLAINT_QUESTION_MARKERS):
+        args["complaint"] = current
+    elif not session.get("age") and any(marker in previous for marker in _AGE_QUESTION_MARKERS):
+        match = re.fullmatch(r"\s*(\d{1,3})\s*(?:лет|года|год|жас|жаста)?\s*[.!?]?\s*", current.lower())
+        if match:
+            args["age"] = int(match.group(1))
+    elif session.get("contraindications_ok") is None and any(marker in previous for marker in _CONTRA_QUESTION_MARKERS):
+        low = _normalized_reply(current)
+        if low in {"нет", "не было", "нету", "жок", "жоқ"} or "противопоказаний нет" in low:
+            args["contraindications_clear"] = True
+            args["contraindications_note"] = current
+    elif not session.get("patient_name") and any(marker in previous for marker in _NAME_QUESTION_MARKERS):
+        if not re.search(r"\d", current) and 1 <= len(current.split()) <= 4:
+            args["patient_name"] = current
+
+    if not args:
+        return []
+    result = _tool_record_patient_facts(chat_id, session, args)
+    return list(result.get("stored") or [])
 
 
 def _repeats_previous_assistant_reply(
@@ -2501,6 +2596,7 @@ async def run_agent_turn(
         if not tool_calls:
             duplicate_reply = _repeats_previous_assistant_reply(content, session, recent_history)
             deferred_reply = _looks_like_deferred_reply(content)
+            repeated_known_fact = _asks_for_known_fact(content, session)
 
             # An exact repeat is not a reason to ask the model for yet another
             # answer. The final dialog guard suppresses it, so two adjacent
@@ -2514,7 +2610,7 @@ async def run_agent_turn(
                 _log(chat_id, "agent_duplicate_reply_detected", {})
                 break
 
-            no_progress = not content or deferred_reply
+            no_progress = not content or deferred_reply or bool(repeated_known_fact)
             if no_progress and not no_progress_recovery_used:
                 no_progress_recovery_used = True
                 _log(
@@ -2524,6 +2620,7 @@ async def run_agent_turn(
                         "empty": not bool(content),
                         "deferred": _looks_like_deferred_reply(content),
                         "duplicate": duplicate_reply,
+                        "repeated_known_fact": repeated_known_fact,
                     },
                 )
                 if content:
