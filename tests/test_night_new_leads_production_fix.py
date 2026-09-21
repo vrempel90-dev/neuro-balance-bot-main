@@ -291,3 +291,139 @@ def test_confirmed_booking_is_never_reopened_as_new_lead(monkeypatch):
         assert final["no_reply_reason"] == "booking_completed_ai_disabled"
 
     asyncio.run(scenario())
+
+
+def test_instagram_requests_phone_before_crm_or_ai(monkeypatch):
+    async def scenario():
+        _enable_new_leads_only(monkeypatch)
+        chat_id = "instagram_identity_gate"
+        state.reset_session(chat_id)
+        session = state.get_session(chat_id)
+        session["chat_type"] = "instagram"
+        session["inbound_channel"] = "instagram"
+        state.save_session(chat_id, session)
+
+        lookup_calls = 0
+        agent_calls = 0
+
+        async def forbidden_lookup(phone):
+            nonlocal lookup_calls
+            lookup_calls += 1
+            raise AssertionError("CRM must not be called before Instagram supplies a phone")
+
+        async def forbidden_agent(**kwargs):
+            nonlocal agent_calls
+            agent_calls += 1
+            raise AssertionError("AI must not run before Instagram identity is verified")
+
+        monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", forbidden_lookup)
+        monkeypatch.setattr(dialog.agent, "run_agent_turn", forbidden_agent)
+
+        answer = await dialog.handle_message(
+            chat_id, "instagram_username", "Здравствуйте, хочу записаться"
+        )
+        saved = state.get_session(chat_id)
+
+        assert "номер телефона" in answer.lower()
+        assert lookup_calls == 0
+        assert agent_calls == 0
+        assert saved["instagram_identity_pending"] is True
+        assert saved["phone"] == ""
+
+    asyncio.run(scenario())
+
+
+def test_instagram_phone_is_verified_through_new_lead_crm_gate(monkeypatch):
+    async def scenario():
+        _enable_new_leads_only(monkeypatch)
+        chat_id = "instagram_phone_verified"
+        state.reset_session(chat_id)
+        session = state.get_session(chat_id)
+        session["chat_type"] = "instagram"
+        session["inbound_channel"] = "instagram"
+        state.save_session(chat_id, session)
+
+        seen = {"lookup_phone": "", "agent_phone": ""}
+
+        async def fake_lookup(phone):
+            seen["lookup_phone"] = phone
+            return {
+                "ok": True,
+                "found": False,
+                "isNew": True,
+                "patient": None,
+                "lead": None,
+                "lastAppointment": None,
+                "hasActiveAppointment": False,
+                "appointment": None,
+                "appointments": [],
+            }
+
+        async def fake_agent(**kwargs):
+            seen["agent_phone"] = kwargs["phone"]
+            return dialog.agent.AgentResult(
+                used=True,
+                reply="Подскажите, пожалуйста, что Вас беспокоит?",
+                outcome=dialog.agent.OUTCOME_CONTINUE,
+            )
+
+        monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
+        monkeypatch.setattr(dialog.agent, "run_agent_turn", fake_agent)
+
+        answer = await dialog.handle_message(
+            chat_id, "instagram_username", "Мой номер +7 700 898 45 05"
+        )
+        saved = state.get_session(chat_id)
+
+        assert seen["lookup_phone"] == "77008984505"
+        assert seen["agent_phone"] == "77008984505"
+        assert saved["phone"] == "77008984505"
+        assert saved["crm_patient_state"] == "NEW_PATIENT"
+        assert "что вас беспокоит" in answer.lower()
+
+    asyncio.run(scenario())
+
+
+def test_instagram_existing_patient_is_silent_after_phone_verification(monkeypatch):
+    async def scenario():
+        _enable_new_leads_only(monkeypatch)
+        chat_id = "instagram_existing_patient"
+        state.reset_session(chat_id)
+        session = state.get_session(chat_id)
+        session["chat_type"] = "instagram"
+        session["inbound_channel"] = "instagram"
+        state.save_session(chat_id, session)
+
+        async def fake_lookup(phone):
+            return {
+                "ok": True,
+                "found": True,
+                "isNew": False,
+                "patient": {"name": "Existing"},
+                "lead": {"id": "old", "status": "В работе"},
+                "lastAppointment": None,
+                "hasActiveAppointment": False,
+                "appointment": None,
+                "appointments": [],
+            }
+
+        async def forbidden_agent(**kwargs):
+            raise AssertionError("existing Instagram patient must never reach AI")
+
+        async def fake_escalate(**kwargs):
+            return {"ok": True}
+
+        monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
+        monkeypatch.setattr(crm, "escalate_to_operator", fake_escalate)
+        monkeypatch.setattr(dialog.agent, "run_agent_turn", forbidden_agent)
+
+        answer = await dialog.handle_message(
+            chat_id, "instagram_username", "+7 700 898 45 05"
+        )
+        saved = state.get_session(chat_id)
+
+        assert answer == ""
+        assert saved["crm_patient_state"] == "RETURNING_PATIENT_NO_ACTIVE_BOOKING"
+        assert saved["silent_old_lead"] is True
+
+    asyncio.run(scenario())
