@@ -298,3 +298,14 @@ def test_crm_write_allowlist_only_permits_configured_test_phone(monkeypatch: pyt
     )
 
     get_settings.cache_clear()
+
+
+
+def test_staging_browser_dialog_ui_is_available() -> None:
+    with TestClient(main.app) as client:
+        response = client.get("/test-dialog")
+        assert response.status_code == 200
+        assert "Neuro Balance" in response.text
+        assert "/debug/chat" in response.text
+        assert "x-debug-token" in response.text
+        assert "eDzLUbkGiHM" not in response.text
