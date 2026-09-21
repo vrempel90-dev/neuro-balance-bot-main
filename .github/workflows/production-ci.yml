@@ -34,6 +34,7 @@ jobs:
       - name: Typecheck production modules
         run: |
           python -m mypy \
+            --explicit-package-bases \
             --ignore-missing-imports \
             --follow-imports=skip \
             --allow-untyped-defs \
