@@ -2467,11 +2467,62 @@ async def run_agent_turn(
         _log(chat_id, "agent_skipped", {"reason": skip_reason, "step": session.get("step") or "start"})
         return AgentResult(used=False, skip_reason=skip_reason)
 
+    resolved_slot = _resolve_explicit_slot_choice(session, user_text)
+    if resolved_slot is not None:
+        _log(
+            chat_id,
+            "agent_slot_choice_resolved_from_user_text",
+            {
+                "doctor_login": resolved_slot["doctor_login"],
+                "date": resolved_slot["date"],
+                "time_start": resolved_slot["time_start"],
+            },
+        )
+
+    name_candidate = _simple_patient_name_candidate(session, user_text)
+    if name_candidate:
+        _tool_record_patient_facts(chat_id, session, {"patient_name": name_candidate})
+        _log(chat_id, "agent_patient_name_captured_for_booking", {"captured": True})
+
+    preflight_booking = await _try_auto_complete_booking(chat_id, session, phone)
+    if preflight_booking and preflight_booking.get("booking_success") is True:
+        result = AgentResult(
+            used=True,
+            booking=preflight_booking,
+            tool_results=[preflight_booking],
+            tool_calls=[{"tool": "book_appointment", "ok": True, "args": {"automatic": True}}],
+            outcome=OUTCOME_SUCCESS,
+        )
+        result.reply = _safety_net_reply(session, result)
+        _log(
+            chat_id,
+            "agent_turn_finished",
+            {
+                "outcome": result.outcome,
+                "iterations": 0,
+                "tool_calls": ["book_appointment"],
+                "has_reply": True,
+                "booking_success": True,
+                "error": "",
+                "automatic_completion": True,
+            },
+        )
+        return result
+
     settings = get_settings()
     model = getattr(settings, "ai_brain_model", "") or getattr(settings, "openai_model", "")
     temperature = float(getattr(settings, "ai_brain_temperature", 0.2) or 0.2)
 
     context = build_agent_context(session=session, phone=phone)
+    if preflight_booking:
+        context["automatic_booking_result"] = {
+            key: preflight_booking.get(key)
+            for key in (
+                "ok", "booking_success", "error", "message",
+                "doctor_login", "doctor_name", "date", "time_start",
+            )
+            if preflight_booking.get(key) not in (None, "")
+        }
     # The structured context contains patient-written text (complaint, name).
     # It is passed as a user-role message, not a system one: text originating
     # from a patient must never carry the authority of a system instruction,
@@ -2490,6 +2541,9 @@ async def run_agent_turn(
     messages.append({"role": "user", "content": str(user_text)[:2000]})
 
     result = AgentResult(used=True)
+    if preflight_booking:
+        result.booking = preflight_booking
+        result.tool_results.append(preflight_booking)
     # Per-turn state: a stale value from a previous turn would misclassify this
     # turn's outcome (e.g. as NO_SLOTS when no availability call happened).
     session.pop("crm_availability_empty", None)
@@ -2628,6 +2682,13 @@ async def run_agent_turn(
                     "message": "Инструмент временно недоступен. Не выдумывай данные, предложи эскалацию.",
                 }
 
+            if name in {"record_patient_facts", "select_booking_slot"}:
+                automatic_booking = await _try_auto_complete_booking(chat_id, session, phone)
+                if automatic_booking is not None:
+                    tool_result = dict(tool_result)
+                    tool_result["automatic_booking"] = automatic_booking
+                    result.booking = automatic_booking
+
             result.tool_calls.append({"tool": name, "ok": bool(tool_result.get("ok")), "args": _safe_args(args)})
             result.tool_results.append(tool_result)
             if name == "book_appointment":
@@ -2659,11 +2720,28 @@ async def run_agent_turn(
     )
 
     if not result.reply.strip():
-        # SILENT TURN PROTECTION: the model produced no text. Never return an
-        # empty reply from an accepted active turn.
+        # There is no background continuation after this webhook. An empty
+        # answer therefore becomes a real operator handoff, never a fake wait.
+        result.escalate = True
+        result.outcome = OUTCOME_OPERATOR_ESCALATION
         result.reply = _safety_net_reply(session, result)
         result.error = result.error or "empty_model_reply"
         _log(chat_id, "agent_silent_turn_prevented", {"outcome": result.outcome})
+
+    if _looks_like_nonterminal_promise(result.reply) and not result.booked:
+        result.escalate = True
+        result.outcome = OUTCOME_OPERATOR_ESCALATION
+        result.reply = _operator_handoff_reply(session)
+        result.error = result.error or "nonterminal_promise_blocked"
+        _log(chat_id, "agent_nonterminal_promise_blocked", {})
+
+    previous = str(session.get("last_assistant_answer") or "")
+    if previous and "?" in result.reply and _normalized_reply(previous) == _normalized_reply(result.reply):
+        result.escalate = True
+        result.outcome = OUTCOME_OPERATOR_ESCALATION
+        result.reply = _operator_handoff_reply(session)
+        result.error = result.error or "duplicate_question_blocked"
+        _log(chat_id, "agent_duplicate_question_blocked", {})
 
     return result
 
@@ -2729,6 +2807,29 @@ def _classify_outcome(result: AgentResult, session: dict[str, Any]) -> str:
     return OUTCOME_CONTINUE
 
 
+def _normalized_reply(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s]+", " ", str(text or "").lower())).strip()
+
+
+def _looks_like_nonterminal_promise(text: str) -> bool:
+    low = str(text or "").lower()
+    return any(
+        marker in low
+        for marker in (
+            "секунду, уточню",
+            "уточню информацию и вернусь",
+            "вернусь к вам",
+            "бір сәт, ақпаратты нақтылап",
+        )
+    )
+
+
+def _operator_handoff_reply(session: dict[str, Any]) -> str:
+    if str(session.get("language") or "ru") == "kk":
+        return "Сұрағыңызды әкімшіге жіберемін, ол Сізбен жақын арада байланысады 🌿"
+    return "Передам Ваш вопрос администратору, он свяжется с Вами в ближайшее время 🌿"
+
+
 def _safety_net_reply(session: dict[str, Any], result: AgentResult) -> str:
     """Minimal technical fallback text.
 
@@ -2760,8 +2861,4 @@ def _safety_net_reply(session: dict[str, Any], result: AgentResult) -> str:
             if lang != "kk"
             else "Сұрағыңызды әкімшіге жіберемін, ол Сізбен жақын арада байланысады 🌿"
         )
-    return (
-        "Секунду, уточню информацию и вернусь к Вам 🌿"
-        if lang != "kk"
-        else "Бір сәт, ақпаратты нақтылап, Сізге жазамын 🌿"
-    )
+    return _operator_handoff_reply(session)
