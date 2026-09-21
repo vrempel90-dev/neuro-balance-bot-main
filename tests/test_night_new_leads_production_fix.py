@@ -260,3 +260,34 @@ def test_expired_admission_lease_does_not_keep_lead_eligible(monkeypatch):
         assert verdict.reason == "lead_in_progress"
 
     asyncio.run(scenario())
+
+
+
+def test_confirmed_booking_is_never_reopened_as_new_lead(monkeypatch):
+    async def scenario():
+        lookup_calls = 0
+
+        async def fake_lookup(phone):
+            nonlocal lookup_calls
+            lookup_calls += 1
+            return {"ok": True, "found": False, "isNew": True, "appointments": []}
+
+        monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
+        chat_id = "confirmed_booking_local_terminal"
+        state.reset_session(chat_id)
+        session = state.get_session(chat_id)
+        session["booking_confirmed"] = True
+        session["booked"] = True
+        session["appointment_id"] = "a-confirmed"
+        state.save_session(chat_id, session)
+
+        answer = await dialog.handle_message(chat_id, "77008984505", "У меня ещё вопрос")
+        final = state.get_session(chat_id)
+
+        assert answer == ""
+        assert lookup_calls == 0
+        assert final["ai_muted"] is True
+        assert final["manual_takeover"] is True
+        assert final["no_reply_reason"] == "booking_completed_ai_disabled"
+
+    asyncio.run(scenario())
