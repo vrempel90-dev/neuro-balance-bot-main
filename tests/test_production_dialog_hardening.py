@@ -136,10 +136,9 @@ def test_deferred_reply_is_not_allowed_to_end_turn(monkeypatch: pytest.MonkeyPat
     assert len(client.calls) == 2
 
 
-def test_exact_previous_reply_gets_one_recovery_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exact_previous_reply_is_detected_without_an_extra_model_call(monkeypatch: pytest.MonkeyPatch) -> None:
     client = FakeOpenAIClient([
         assistant_text("Сколько Вам лет?"),
-        assistant_text("Есть ли противопоказания из списка клиники?"),
     ])
     monkeypatch.setattr(ai, "_openai_client", lambda api_key: client)
     session = {"language": "ru", "last_assistant_answer": "Сколько Вам лет?"}
@@ -154,8 +153,9 @@ def test_exact_previous_reply_gets_one_recovery_pass(monkeypatch: pytest.MonkeyP
         )
     )
 
-    assert result.reply == "Есть ли противопоказания из списка клиники?"
-    assert len(client.calls) == 2
+    assert result.reply == "Сколько Вам лет?"
+    assert result.error == "duplicate_model_reply"
+    assert len(client.calls) == 1
 
 
 def test_repeated_no_progress_escalates_instead_of_looping(monkeypatch: pytest.MonkeyPatch) -> None:
