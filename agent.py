@@ -1184,6 +1184,47 @@ async def _tool_get_available_slots(
     }
 
 
+def _tool_select_booking_slot(
+    chat_id: str, session: dict[str, Any], args: dict[str, Any]
+) -> dict[str, Any]:
+    doctor_login = str(args.get("doctor_login") or "").strip()
+    date = str(args.get("date") or "").strip()[:10]
+    time_start = str(args.get("time_start") or "").strip()[:5]
+    slot = _offered_slot(session, date, time_start, doctor_login)
+    if slot is None:
+        _log(
+            chat_id,
+            "agent_slot_selection_rejected",
+            {"doctor_login": doctor_login, "date": date, "time_start": time_start},
+        )
+        return {
+            "ok": False,
+            "error": "slot_not_offered_by_crm",
+            "message": "Этот вариант не был возвращён CRM. Сначала получи реальные слоты через get_available_slots.",
+        }
+
+    _persist_selected_slot(session, slot)
+    _log(
+        chat_id,
+        "agent_slot_selected",
+        {"doctor_login": slot["doctor_login"], "date": slot["date"], "time_start": slot["time_start"]},
+    )
+    return {
+        "ok": True,
+        "selected": True,
+        "doctor_login": slot["doctor_login"],
+        "doctor_name": slot["doctor_name"],
+        "date": slot["date"],
+        "time_start": slot["time_start"],
+        "needs_patient_name": not bool(session.get("patient_name")),
+        "message": (
+            "Выбранный CRM-слот сохранён. Спроси имя пациента."
+            if not session.get("patient_name")
+            else "Выбранный CRM-слот сохранён, имя уже известно."
+        ),
+    }
+
+
 def _crm_booking_succeeded(response: Any) -> bool:
     """A booking counts as real only when the CRM response *confirms* it.
 
@@ -2295,6 +2336,45 @@ def _tool_escalate(chat_id: str, session: dict[str, Any], args: dict[str, Any]) 
     }
 
 
+async def _try_auto_complete_booking(
+    chat_id: str, session: dict[str, Any], phone: str
+) -> dict[str, Any] | None:
+    """Finish the prompt's booking step deterministically when every prerequisite is present."""
+    if session.get("booking_confirmed") or session.get("manual_takeover") or session.get("escalated"):
+        return None
+
+    patient_name = str(session.get("patient_name") or "").strip()
+    doctor_login = str(session.get("selected_doctor_login") or "").strip()
+    date = str(session.get("selected_date") or "").strip()[:10]
+    time_start = str(session.get("selected_time") or "").strip()[:5]
+    if not all((patient_name, doctor_login, date, time_start)):
+        return None
+    if _offered_slot(session, date, time_start, doctor_login) is None:
+        return None
+
+    gate_ok, _gate_reason = bot_tools.booking_gate_status(session)
+    if not gate_ok or _age_block_reason(session.get("age")):
+        return None
+
+    _log(
+        chat_id,
+        "agent_booking_auto_completion_started",
+        {"doctor_login": doctor_login, "date": date, "time_start": time_start},
+    )
+    return await _tool_book_appointment(
+        chat_id,
+        session,
+        phone,
+        {
+            "patient_name": patient_name,
+            "patient_relation": str(session.get("patient_relation") or ""),
+            "doctor_login": doctor_login,
+            "date": date,
+            "time_start": time_start,
+        },
+    )
+
+
 async def execute_tool(
     *, chat_id: str, session: dict[str, Any], phone: str, name: str, args: dict[str, Any]
 ) -> dict[str, Any]:
@@ -2303,6 +2383,8 @@ async def execute_tool(
         return await _tool_get_doctors(chat_id, session)
     if name == "get_available_slots":
         return await _tool_get_available_slots(chat_id, session, args)
+    if name == "select_booking_slot":
+        return _tool_select_booking_slot(chat_id, session, args)
     if name == "book_appointment":
         return await _tool_book_appointment(chat_id, session, phone, args)
     if name == "find_my_appointment":
