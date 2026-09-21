@@ -1,0 +1,52 @@
+name: Production hardening CI
+
+on:
+  push:
+    branches:
+      - hardening/production-ready-dialog
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CRM_BOT_SECRET: test
+      OPENAI_API_KEY: test-key
+      AI_ENABLED: "true"
+      OPENAI_BRAIN_ENABLED: "true"
+      NEW_LEADS_ONLY: "true"
+      SQLITE_PATH: /tmp/neuro-balance-ci.sqlite3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r tests/requirements-dev.txt
+
+      - name: Syntax build
+        run: python -m compileall -q agent.py dialog.py crm.py state.py schedule.py admission.py main.py live_main.py
+
+      - name: Typecheck production core
+        run: |
+          mypy \
+            --ignore-missing-imports \
+            --follow-imports=skip \
+            --allow-untyped-defs \
+            --check-untyped-defs \
+            agent.py dialog.py crm.py state.py schedule.py admission.py
+
+      - name: Import smoke build
+        run: python -c "import agent, dialog, crm, state, schedule, admission, main, live_main"
+
+      - name: Regression and full test suite
+        run: pytest -q
