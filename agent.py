@@ -1258,6 +1258,18 @@ async def _tool_book_appointment(
             }.get(gate_reason, "Обязательные шаги записи не пройдены."),
         }
 
+    if not bool(getattr(get_settings(), "crm_write_enabled", True)):
+        _log(chat_id, "agent_booking_write_disabled", {"date": date, "time_start": time_start})
+        return {
+            "ok": False,
+            "booking_success": False,
+            "error": "crm_write_disabled",
+            "message": (
+                "CRM write operations are disabled in this environment. "
+                "Не подтверждай запись пациенту; это безопасный staging-режим."
+            ),
+        }
+
     if relation:
         session["patient_relation"] = relation
     session["patient_name"] = patient_name
@@ -1767,6 +1779,15 @@ async def _tool_reschedule_appointment(
             "message": "Перенос уже выполнен ранее в этом диалоге, повторный перенос не делался.",
         }
 
+    if not bool(getattr(get_settings(), "crm_write_enabled", True)):
+        _log(chat_id, "agent_reschedule_write_disabled", {"appointment_id": appointment_id})
+        return {
+            "ok": False,
+            "reschedule_success": False,
+            "error": "crm_write_disabled",
+            "message": "CRM write operations are disabled in this environment; перенос не выполнен.",
+        }
+
     bot_tools.mark_tool(session, "reschedule_appointment", gate="passed")
     session["crm_called"] = True
     _log(
@@ -1950,6 +1971,15 @@ async def _tool_cancel_appointment(
             "cancel_success": False,
             "error": "missing_phone",
             "message": "Нет номера телефона пациента для отмены записи.",
+        }
+
+    if not bool(getattr(get_settings(), "crm_write_enabled", True)):
+        _log(chat_id, "agent_cancel_write_disabled", {"appointment_id": appointment_id})
+        return {
+            "ok": False,
+            "cancel_success": False,
+            "error": "crm_write_disabled",
+            "message": "CRM write operations are disabled in this environment; отмена не выполнена.",
         }
 
     bot_tools.mark_tool(session, "cancel_appointment", gate="passed")
