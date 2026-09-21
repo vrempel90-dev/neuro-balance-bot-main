@@ -1549,7 +1549,24 @@ def wazzup_webhook_health_response(request: Request) -> dict[str, Any]:
     }
 
 
-async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw_msg: dict[str, Any], parse_meta: dict[str, Any], *, send_enabled: bool = True) -> dict[str, Any]:
+async def _process_wazzup_message(
+    request: Request,
+    payload: dict[str, Any],
+    raw_msg: dict[str, Any],
+    parse_meta: dict[str, Any],
+    *,
+    send_enabled: bool = True,
+) -> dict[str, Any]:
+    """Serialize the complete receive→dialog→send transaction per chat."""
+    normalized = _normalize_wazzup_message(payload, raw_msg)
+    chat_id = str(normalized.get("chat_id") or "wazzup")
+    async with _chat_turn(chat_id):
+        return await _process_wazzup_message_unlocked(
+            request, payload, raw_msg, parse_meta, send_enabled=send_enabled
+        )
+
+
+async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, Any], raw_msg: dict[str, Any], parse_meta: dict[str, Any], *, send_enabled: bool = True) -> dict[str, Any]:
     message = _normalize_wazzup_message(payload, raw_msg)
     chat_id = message["chat_id"] or "wazzup"
     phone = str(message.get("phone") or chat_id)
@@ -1688,25 +1705,24 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
     crm_error = ""
     pending_replay = False
     try:
-        async with _chat_turn(chat_id):
-            pending_answer = _pending_outbound(chat_id, message)
-            if pending_answer:
-                pending_replay = True
-                answer = pending_answer
-                should_send = True
-                state.log_event(
-                    chat_id,
-                    "wazzup_pending_outbound_replay",
-                    {
-                        "phone": phone,
-                        "message_key": str(message.get("message_key") or message.get("message_id") or ""),
-                        "ingress": "http_webhook",
-                    },
-                )
-            else:
-                result = await handle_incoming_message(message, stage_outbound=send_enabled)
-                answer = _result_answer(result)
-                should_send = _result_should_send(result, chat_id)
+        pending_answer = _pending_outbound(chat_id, message)
+        if pending_answer:
+            pending_replay = True
+            answer = pending_answer
+            should_send = True
+            state.log_event(
+                chat_id,
+                "wazzup_pending_outbound_replay",
+                {
+                    "phone": phone,
+                    "message_key": str(message.get("message_key") or message.get("message_id") or ""),
+                    "ingress": "http_webhook",
+                },
+            )
+        else:
+            result = await handle_incoming_message(message, stage_outbound=send_enabled)
+            answer = _result_answer(result)
+            should_send = _result_should_send(result, chat_id)
     except Exception as exc:
         crm_error = str(exc)[:500]
         no_reply_reason = "crm_lookup_failed"
