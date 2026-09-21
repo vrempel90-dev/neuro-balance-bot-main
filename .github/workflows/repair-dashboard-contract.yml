@@ -3,6 +3,26 @@ name: Claude Repair Dashboard Contract
 on:
   pull_request:
     paths:
+      - "agent.py"
+      - "dialog.py"
+      - "main.py"
+      - "admission.py"
+      - "crm.py"
+      - "state.py"
+      - "tests/test_gpt_first_agent_booking.py"
+      - "tests/test_gpt_first_conversation.py"
+      - "tests/test_night_new_leads_production_fix.py"
+      - "tests/test_wazzup_production_webhook.py"
+      - "agent.py"
+      - "dialog.py"
+      - "main.py"
+      - "admission.py"
+      - "crm.py"
+      - "state.py"
+      - "tests/test_gpt_first_agent_booking.py"
+      - "tests/test_gpt_first_conversation.py"
+      - "tests/test_night_new_leads_production_fix.py"
+      - "tests/test_wazzup_production_webhook.py"
       - "repair_app.py"
       - "repair_status.py"
       - "repair_service.py"
@@ -31,6 +51,28 @@ permissions:
   contents: read
 
 jobs:
+  core-booking-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+      - name: Compile core assistant modules
+        run: python -m py_compile agent.py dialog.py main.py admission.py crm.py state.py
+      - name: Run core booking regression tests
+        run: |
+          python -m pytest -q \
+            tests/test_gpt_first_agent_booking.py \
+            tests/test_gpt_first_conversation.py \
+            tests/test_night_new_leads_production_fix.py \
+            tests/test_wazzup_production_webhook.py
+
   dashboard-contract:
     runs-on: ubuntu-latest
     timeout-minutes: 10
