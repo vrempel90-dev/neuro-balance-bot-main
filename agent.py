@@ -952,6 +952,9 @@ async def _tool_get_available_slots(
             _log(chat_id, "agent_availability_unknown_doctor_ignored", {"looks_like_login": looks_like_login})
 
     requested_start = start
+    session["preferred_date"] = requested_start.isoformat()
+    if time_preference:
+        session["time_preference"] = time_preference
     saturday_procedure_requested = requested_start.weekday() == _SATURDAY_PROCEDURE_DAY
     sunday_closed_requested = requested_start.weekday() == _SUNDAY_CLOSED_DAY
     non_consultation_requested = requested_start.weekday() in _NON_CONSULTATION_DAYS
@@ -2222,6 +2225,31 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
     """
     stored: list[str] = []
 
+    # Relation is patient identity, not a cosmetic field. If the sender changes
+    # from self to a relative (or from one relative to another), patient-scoped
+    # medical facts from the previous identity must not leak into the new one.
+    relation_supplied = "patient_relation" in args
+    relation = str(args.get("patient_relation") or "").strip()
+    previous_relation = str(session.get("patient_relation") or "").strip()
+    if relation_supplied and relation != previous_relation:
+        for field in (
+            "complaint", "complaint_gate", "age",
+            "contraindications_ok", "contraindications_verdict", "contraindications_raw",
+            "patient_name", "selected_slot", "selected_doctor_login",
+            "selected_doctor_name", "selected_date", "selected_time",
+        ):
+            session.pop(field, None)
+        facts = session.get("known_user_facts")
+        if isinstance(facts, dict):
+            for field in ("complaint", "age", "patient_name", "patient_relation"):
+                facts.pop(field, None)
+        if relation:
+            session["patient_relation"] = relation
+        else:
+            session.pop("patient_relation", None)
+        session["step"] = "complaint"
+        stored.append("patient_identity_changed")
+
     complaint = str(args.get("complaint") or "").strip()
     if complaint:
         session["complaint"] = complaint
@@ -2267,10 +2295,13 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
         session["patient_name"] = patient_name
         stored.append("patient_name")
 
-    relation = str(args.get("patient_relation") or "").strip()
-    if relation:
-        session["patient_relation"] = relation
-        stored.append("patient_relation")
+    if relation_supplied:
+        if relation:
+            session["patient_relation"] = relation
+            stored.append("patient_relation")
+        else:
+            session.pop("patient_relation", None)
+            stored.append("patient_relation_self")
 
     facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
     for key in ("complaint", "age", "patient_name", "patient_relation"):
