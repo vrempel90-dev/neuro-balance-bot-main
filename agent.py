@@ -774,16 +774,10 @@ def _clip(value: Any, field: str) -> str:
 def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls | None = None) -> dict[str, Any]:
     """Compact, structured facts so GPT never re-asks what it already knows."""
     today = today or _clinic_today()
-    facts: dict[str, Any] = (
-        session.get("known_user_facts")
-        if isinstance(session.get("known_user_facts"), dict)
-        else {}
-    )
-    offered: dict[str, Any] = (
-        session.get("crm_offered_slots")
-        if isinstance(session.get("crm_offered_slots"), dict)
-        else {}
-    )
+    raw_facts = session.get("known_user_facts")
+    facts: dict[str, Any] = dict(raw_facts) if isinstance(raw_facts, dict) else {}
+    raw_offered = session.get("crm_offered_slots")
+    offered: dict[str, Any] = dict(raw_offered) if isinstance(raw_offered, dict) else {}
     return {
         "today": today.isoformat(),
         "tomorrow": (today + timedelta(days=1)).isoformat(),
@@ -2124,11 +2118,8 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
         session["patient_relation"] = relation
         stored.append("patient_relation")
 
-    facts: dict[str, Any] = (
-        session.get("known_user_facts")
-        if isinstance(session.get("known_user_facts"), dict)
-        else {}
-    )
+    raw_facts = session.get("known_user_facts")
+    facts: dict[str, Any] = dict(raw_facts) if isinstance(raw_facts, dict) else {}
     for key in ("complaint", "age", "patient_name", "patient_relation"):
         if session.get(key):
             facts[key] = session.get(key)
