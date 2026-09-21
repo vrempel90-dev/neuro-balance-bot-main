@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 import httpx
 
 from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 import state
 import crm
@@ -377,6 +377,148 @@ def _time_debug_payload(now: datetime | None = None) -> dict[str, Any]:
         "time_gate_reason": str(gate["time_gate_reason"]),
         "reason": str(gate["time_gate_reason"]),
     }
+
+
+@app.get("/test-dialog", response_class=HTMLResponse)
+def test_dialog_ui() -> HTMLResponse:
+    """Browser UI for staging dialog testing.
+
+    The page contains no credentials. The tester supplies the debug token in
+    the browser; JavaScript sends it only in the x-debug-token request header.
+    """
+    html = r"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Neuro Balance — тест диалога</title>
+  <style>
+    body{font-family:Arial,sans-serif;max-width:920px;margin:28px auto;padding:0 16px;background:#f6f7f9;color:#171717}
+    .card{background:#fff;border:1px solid #ddd;border-radius:14px;padding:18px;margin-bottom:14px}
+    h1{font-size:22px;margin:0 0 8px}.muted{color:#666;font-size:13px}
+    label{display:block;font-weight:600;margin:10px 0 5px}
+    input,textarea{width:100%;box-sizing:border-box;padding:10px;border:1px solid #bbb;border-radius:9px;font-size:15px}
+    textarea{min-height:82px;resize:vertical}
+    button{padding:10px 15px;border:0;border-radius:9px;cursor:pointer;font-weight:700;margin-right:8px}
+    #send{background:#111;color:#fff} #reset{background:#e8e8e8} #newchat{background:#e8e8e8}
+    #history{white-space:pre-wrap;min-height:180px;background:#fafafa;border:1px solid #e5e5e5;border-radius:10px;padding:12px}
+    .user{font-weight:700}.bot{font-weight:700}.error{color:#a40000}.ok{color:#146c2e}
+    .status{font-family:ui-monospace,Consolas,monospace;font-size:12px;white-space:pre-wrap}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Neuro Balance — staging тест диалога</h1>
+    <div class="muted">Сообщения клиентам не отправляются через Wazzup. Debug API защищён токеном.</div>
+    <label>Debug token</label>
+    <input id="token" type="password" autocomplete="off" placeholder="Вставь x-debug-token">
+    <label>Тестовый номер пациента</label>
+    <input id="phone" placeholder="7701XXXXXXX">
+    <label>Chat ID</label>
+    <input id="chatid">
+  </div>
+
+  <div class="card">
+    <label>Сообщение пациента</label>
+    <textarea id="message" placeholder="Например: Здравствуйте, хочу записаться"></textarea>
+    <button id="send">Отправить</button>
+    <button id="reset">Сбросить сессию</button>
+    <button id="newchat">Новый Chat ID</button>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size:17px">Диалог</h2>
+    <div id="history">Диалог ещё не начат.</div>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size:17px">Состояние</h2>
+    <div id="status" class="status">—</div>
+  </div>
+
+<script>
+const $ = id => document.getElementById(id);
+function newChatId(){ $('chatid').value='staging-'+Date.now(); }
+newChatId();
+$('token').value = sessionStorage.getItem('nb_debug_token') || '';
+$('phone').value = sessionStorage.getItem('nb_test_phone') || '';
+
+function appendLine(role, text){
+  const h=$('history');
+  if(h.textContent==='Диалог ещё не начат.') h.textContent='';
+  h.textContent += (h.textContent ? '\n\n' : '') + role + ': ' + (text || '[пустой ответ]');
+}
+
+async function api(path, body){
+  const token=$('token').value.trim();
+  if(!token) throw new Error('Вставь debug token');
+  sessionStorage.setItem('nb_debug_token', token);
+  sessionStorage.setItem('nb_test_phone', $('phone').value.trim());
+  const r=await fetch(path,{
+    method:'POST',
+    headers:{'Content-Type':'application/json','x-debug-token':token},
+    body:JSON.stringify(body)
+  });
+  const txt=await r.text();
+  let data;
+  try{ data=JSON.parse(txt); }catch{ data={raw:txt}; }
+  if(!r.ok) throw new Error((data && data.detail) || ('HTTP '+r.status));
+  return data;
+}
+
+$('send').onclick=async()=>{
+  const text=$('message').value.trim();
+  const phone=$('phone').value.trim();
+  const chat_id=$('chatid').value.trim();
+  if(!phone){ alert('Укажи тестовый номер'); return; }
+  if(!text){ return; }
+  appendLine('ПАЦИЕНТ',text);
+  $('message').value='';
+  $('send').disabled=true;
+  try{
+    const d=await api('/debug/chat',{chat_id,phone,text,force:true,debug:true});
+    appendLine('AI',d.answer || '');
+    const s=d.session || {};
+    $('status').textContent=JSON.stringify({
+      step:d.current_step || s.step || '',
+      no_reply_reason:d.no_reply_reason || s.no_reply_reason || '',
+      language:s.language || '',
+      crm_patient_state:d.crm_patient_state || s.crm_patient_state || '',
+      crm_patient_is_new:d.crm_patient_is_new,
+      selected_date:s.selected_date || '',
+      selected_time:s.selected_time || '',
+      selected_doctor:s.selected_doctor_name || '',
+      booking_confirmed:!!s.booking_confirmed,
+      crm_result:s.crm_result || '',
+      answer_source:s.answer_source || ''
+    },null,2);
+  }catch(e){
+    appendLine('ОШИБКА',e.message);
+  }finally{$('send').disabled=false;}
+};
+
+$('reset').onclick=async()=>{
+  const chat_id=$('chatid').value.trim();
+  try{
+    await api('/debug/reset',{chat_id});
+    $('history').textContent='Сессия сброшена.';
+    $('status').textContent='—';
+  }catch(e){ $('history').textContent='Ошибка: '+e.message; }
+};
+
+$('newchat').onclick=()=>{
+  newChatId();
+  $('history').textContent='Новый Chat ID создан.';
+  $('status').textContent='—';
+};
+
+$('message').addEventListener('keydown',e=>{
+  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); $('send').click(); }
+});
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 @app.get("/health")
