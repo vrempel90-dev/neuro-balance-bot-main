@@ -1599,3 +1599,69 @@ def test_ambiguous_slot_text_is_not_resolved_deterministically() -> None:
 
     assert agent._resolve_explicit_slot_choice(session, "не первый, второй") is None
     assert agent._resolve_explicit_slot_choice(session, f"не {SLOT_TIMES[0]}, а {SLOT_TIMES[1]}") is None
+
+
+def test_contraindications_reply_uses_only_approved_list() -> None:
+    session = {
+        "language": "ru",
+        "age": 68,
+        "last_assistant_answer": "Подскажите, пожалуйста, есть ли противопоказания?",
+    }
+    wrong_model_reply = (
+        "Есть ли кардиостимулятор, металлические импланты "
+        "или другие противопоказания?"
+    )
+
+    answer = agent._enforce_approved_contraindications_reply(
+        session, "А какие ?", wrong_model_reply
+    )
+    low = answer.lower()
+
+    assert "чек-лист" not in low
+    assert "металлическ" not in low
+    assert "другие противопоказания" not in low
+    for required in (
+        "кардиостимулятор",
+        "дефибриллятор",
+        "инсулиновая помпа",
+        "кохлеарный имплант",
+        "тромбофлебит",
+        "тромбоз",
+        "свёртываемости крови",
+        "онкологическое заболевание",
+        "эпилепсия",
+        "судороги",
+        "сахарный диабет",
+        "тиреотоксикоз",
+        "беременность",
+        "высокая температура",
+        "орви",
+        "грипп",
+        "острая инфекция",
+        "сердцем",
+        "дыханием",
+        "психическим состоянием",
+    ):
+        assert required in low
+
+
+def test_contraindications_guard_does_not_override_completed_gate() -> None:
+    session = {
+        "language": "ru",
+        "age": 68,
+        "contraindications_ok": True,
+        "last_assistant_answer": "Есть ли противопоказания?",
+    }
+    reply = "На какой день Вам было бы удобно записаться?"
+    assert (
+        agent._enforce_approved_contraindications_reply(session, "Ничего нет", reply)
+        == reply
+    )
+
+
+def test_system_prompt_forbids_patient_facing_checklist_wording() -> None:
+    prompt = agent.agent_system_prompt().lower()
+    assert "75 лет и старше" in prompt
+    assert "пациенту никогда не говори «чек-лист»" in prompt
+    assert "кардиостимулятор, дефибриллятор, инсулиновая помпа" in prompt
+    assert "тяжёлые проблемы с сердцем, дыханием или психическим состоянием" in prompt
