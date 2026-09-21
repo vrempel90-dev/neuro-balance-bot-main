@@ -340,7 +340,12 @@ _AI_CONTINUATION_REASONS = {"lead_in_progress", "crm_says_not_new", "crm_found_c
 
 def _ai_admission_lease_active(session: dict[str, Any]) -> bool:
     """A lead admitted as NEW may finish this conversation if CRM creates the lead mid-dialog."""
-    if session.get("booking_confirmed") or session.get("manual_takeover") or session.get("escalated"):
+    if (
+        session.get("booking_confirmed")
+        or session.get("manual_takeover")
+        or session.get("ai_muted")
+        or session.get("escalated")
+    ):
         return False
     if session.get("ai_admission_closed_at"):
         return False
@@ -757,8 +762,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         )
 
     if result.escalate:
-        # Агент позвал администратора — значит его нужно реально позвать, а не
-        # только сказать об этом пациенту.
+        # Если ход завершён передачей человеку, AI больше не должен продолжать
+        # этот диалог на следующем сообщении.
+        session["manual_takeover"] = True
+        session["escalated"] = True
         _close_ai_admission_lease(session, "agent_escalation")
         await _notify_admin_once(chat_id, session, phone, "agent_escalation")
     elif result.booked:
