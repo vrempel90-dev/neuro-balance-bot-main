@@ -1259,6 +1259,11 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
                 state.release_message(str(message.get("message_key") or message.get("message_id") or ""))
             except Exception:
                 pass
+        # Do not replace a staged booking confirmation with a generic
+        # fallback. The exact guarded answer remains in the outbox and will be
+        # replayed on the next delivery of this message.
+        if _pending_outbound(chat_id, message):
+            return
         try:
             if kind == "voice" or _message_has_voice_url(message):
                 fallback_text = _voice_fallback_answer()
