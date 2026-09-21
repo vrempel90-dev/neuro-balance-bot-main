@@ -14,6 +14,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import pytest
+import httpx
 
 import agent
 import ai
@@ -99,3 +100,64 @@ def test_two_messages_at_once_do_not_produce_a_duplicate_reply(monkeypatch: pyte
     assert sent, "хотя бы один ответ пациент получить обязан"
     assert len(sent) == len(set(sent)), f"пациенту ушёл дубль: {sent}"
     assert len(sent) == 1, f"на два сообщения подряд ушло {len(sent)} ответов: {sent}"
+
+
+def test_production_webhook_serializes_distinct_messages_per_chat(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real POST webhook path must serialize different messages in one chat."""
+    monkeypatch.setenv("BOT_AUTO_REPLY_ENABLED", "true")
+    monkeypatch.setenv("WAZZUP_CHANNEL_ID", "test-channel")
+    get_settings.cache_clear()
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: True)
+
+    active = 0
+    max_active = 0
+    sent: list[str] = []
+
+    async def handler(message: dict[str, Any]) -> dict[str, Any]:
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.05)
+        active -= 1
+        return {"answer": f"Ответ: {message['text']}", "should_send_wazzup": True}
+
+    async def sender(**kwargs: Any) -> dict[str, Any]:
+        sent.append(str(kwargs.get("text") or ""))
+        await asyncio.sleep(0.01)
+        return {"ok": True, "status_code": 200}
+
+    monkeypatch.setattr(main, "handle_incoming_message", handler)
+    monkeypatch.setattr(main, "send_wazzup_message", sender)
+
+    chat_id = "serialized-webhook-chat"
+    for key in ("serialized-1", "serialized-2"):
+        state.release_message(key)
+
+    def payload(mid: str, text: str) -> dict[str, Any]:
+        return {
+            "chatId": chat_id,
+            "phone": PHONE,
+            "text": text,
+            "messageId": mid,
+            "dateTime": "2026-09-21T21:00:00+05:00",
+            "status": "inbound",
+            "isEcho": False,
+            "channelId": "test-channel",
+            "chatType": "whatsapp",
+            "type": "text",
+        }
+
+    async def scenario() -> None:
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            first, second = await asyncio.gather(
+                client.post("/webhook/wazzup", json=payload("serialized-1", "Первое")),
+                client.post("/webhook/wazzup", json=payload("serialized-2", "Второе")),
+            )
+            assert first.status_code == 200
+            assert second.status_code == 200
+
+    asyncio.run(scenario())
+
+    assert max_active == 1, "two distinct Wazzup turns for one chat ran concurrently"
+    assert len(sent) == 2
