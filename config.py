@@ -65,6 +65,14 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("DEPRECATED_PUBLIC_BASE_URLS", "deprecated_public_base_urls"),
     )
     webhook_secret: str = Field(default="", validation_alias=AliasChoices("WEBHOOK_SECRET", "webhook_secret"))
+    debug_endpoints_require_token: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("DEBUG_ENDPOINTS_REQUIRE_TOKEN", "debug_endpoints_require_token"),
+    )
+    debug_admin_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("DEBUG_ADMIN_TOKEN", "OPENAI_DEBUG_ADMIN_TOKEN", "debug_admin_token"),
+    )
     sqlite_path: str = Field(default="bot.sqlite3", validation_alias=AliasChoices("SQLITE_PATH", "sqlite_path"))
 
     # Slots
