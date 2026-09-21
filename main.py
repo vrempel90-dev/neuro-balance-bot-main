@@ -1047,9 +1047,7 @@ async def _build_answer_for_message(
     return answer
 
 
-async def handle_incoming_message(
-    message: dict[str, Any], *, stage_outbound: bool = False
-) -> str:
+async def handle_incoming_message(message: dict[str, Any]) -> str:
     """Production message pipeline entry point.
 
     This is the explicit single ingress for one normalized incoming message.  It
@@ -1059,7 +1057,9 @@ async def handle_incoming_message(
     persistence. Sending to Wazzup remains in the webhook debounce worker so this
     function is safe for tests and debug callers that only need the answer.
     """
-    return await _build_answer_for_message(message, stage_outbound=stage_outbound)
+    return await _build_answer_for_message(
+        message, stage_outbound=bool(message.get("_stage_outbound"))
+    )
 
 
 async def _send_answer_parts(
@@ -1720,7 +1720,9 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
                 },
             )
         else:
-            result = await handle_incoming_message(message, stage_outbound=send_enabled)
+            handled_message = dict(message)
+            handled_message["_stage_outbound"] = bool(send_enabled)
+            result = await handle_incoming_message(handled_message)
             answer = _result_answer(result)
             should_send = _result_should_send(result, chat_id)
     except Exception as exc:
