@@ -268,6 +268,106 @@ def _offered_slot(session: dict[str, Any], date: str, time_start: str, doctor_lo
     return dict(slot) if isinstance(slot, dict) else None
 
 
+_SLOT_ORDINALS: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (1, ("первый", "первое", "первую", "1 вариант", "вариант 1", "№1", "бірінші")),
+    (2, ("второй", "второе", "вторую", "2 вариант", "вариант 2", "№2", "екінші")),
+    (3, ("третий", "третье", "третью", "3 вариант", "вариант 3", "№3", "үшінші")),
+    (4, ("четвертый", "четвёртый", "четвертое", "четвёртое", "4 вариант", "вариант 4", "№4", "төртінші")),
+    (5, ("пятый", "пятое", "5 вариант", "вариант 5", "№5", "бесінші")),
+    (6, ("шестой", "шестое", "6 вариант", "вариант 6", "№6", "алтыншы")),
+)
+
+_SIMPLE_NAME_STOPWORDS = {
+    "да", "нет", "ага", "ок", "okay", "хорошо", "можно", "давайте", "запишите",
+    "спасибо", "благодарю", "первый", "второй", "третий", "четвертый", "четвёртый",
+    "пятый", "шестой", "сегодня", "завтра", "утром", "вечером", "обед", "адрес",
+    "цена", "стоимость", "сколько", "когда", "где", "мама", "папа", "сын", "дочь",
+    "бірінші", "екінші", "үшінші", "төртінші", "бесінші", "иә", "жоқ", "рахмет",
+}
+
+
+def _recent_offered_slots(session: dict[str, Any]) -> list[dict[str, str]]:
+    """Return recently shown CRM slots in the same order as the patient saw them."""
+    raw_slots = session.get("last_slots")
+    if not isinstance(raw_slots, list):
+        return []
+    slots: list[dict[str, str]] = []
+    for item in raw_slots:
+        if not isinstance(item, dict):
+            continue
+        slot = {
+            "doctor_login": str(item.get("doctor_login") or item.get("doctorLogin") or "").strip(),
+            "doctor_name": str(item.get("doctor_name") or item.get("doctorName") or "").strip(),
+            "date": str(item.get("date") or "")[:10],
+            "time_start": str(item.get("time_start") or item.get("timeStart") or item.get("time") or "")[:5],
+        }
+        if not all((slot["doctor_login"], slot["date"], slot["time_start"])):
+            continue
+        verified = _offered_slot(session, slot["date"], slot["time_start"], slot["doctor_login"])
+        if verified is not None:
+            slots.append(verified)
+    return slots
+
+
+def _persist_selected_slot(session: dict[str, Any], slot: dict[str, str]) -> None:
+    session["selected_slot"] = dict(slot)
+    session["selected_date"] = slot["date"]
+    session["selected_time"] = slot["time_start"]
+    session["selected_doctor_login"] = slot["doctor_login"]
+    session["selected_doctor_name"] = slot.get("doctor_name") or ""
+    session["step"] = "booking" if session.get("patient_name") else "name"
+
+
+def _resolve_explicit_slot_choice(session: dict[str, Any], user_text: str) -> dict[str, str] | None:
+    """Resolve explicit choices such as first, second or 14:00 against real CRM offers."""
+    if session.get("booking_confirmed"):
+        return None
+    slots = _recent_offered_slots(session)
+    if not slots:
+        return None
+    low = re.sub(r"\s+", " ", str(user_text or "").strip().lower())
+    if not low:
+        return None
+
+    chosen: dict[str, str] | None = None
+    for ordinal, markers in _SLOT_ORDINALS:
+        exact_number = bool(re.fullmatch(rf"(?:№\s*)?{ordinal}[.)]?", low))
+        if exact_number or any(marker in low for marker in markers):
+            if ordinal <= len(slots):
+                chosen = slots[ordinal - 1]
+            break
+
+    if chosen is None:
+        match = re.search(r"(?<!\d)([01]?\d|2[0-3])[:.]([0-5]\d)(?!\d)", low)
+        if match:
+            wanted = f"{int(match.group(1)):02d}:{match.group(2)}"
+            matches = [slot for slot in slots if slot["time_start"] == wanted]
+            if len(matches) == 1:
+                chosen = matches[0]
+
+    if chosen is None:
+        return None
+    _persist_selected_slot(session, chosen)
+    return dict(chosen)
+
+
+def _simple_patient_name_candidate(session: dict[str, Any], user_text: str) -> str:
+    """Capture a short name only when a verified slot is already selected and name is the missing field."""
+    if session.get("patient_name") or not session.get("selected_time") or session.get("booking_confirmed"):
+        return ""
+    text = re.sub(r"\s+", " ", str(user_text or "").strip())
+    if not text or len(text) > 80 or "?" in text:
+        return ""
+    if not re.fullmatch(r"[A-Za-zА-Яа-яЁёӘәҒғҚқҢңӨөҰұҮүҺһІі'’\- ]{2,80}", text):
+        return ""
+    words = [w.strip("'’\-").lower() for w in text.split() if w.strip("'’\-")]
+    if not 1 <= len(words) <= 4:
+        return ""
+    if any(word in _SIMPLE_NAME_STOPWORDS for word in words):
+        return ""
+    return text
+
+
 def _known_doctors_from_offers(session: dict[str, Any]) -> dict[str, str]:
     registry = session.get("crm_offered_slots")
     doctors: dict[str, str] = {}
