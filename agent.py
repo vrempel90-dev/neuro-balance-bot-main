@@ -330,17 +330,25 @@ def _resolve_explicit_slot_choice(session: dict[str, Any], user_text: str) -> di
         return None
 
     chosen: dict[str, str] | None = None
+    normalized_choice = low.strip(" .,!?:;")
+    choice_prefixes = ("давайте ", "выбираю ", "беру ", "хочу ", "мне ", "таңдаймын ")
     for ordinal, markers in _SLOT_ORDINALS:
-        exact_number = bool(re.fullmatch(rf"(?:№\s*)?{ordinal}[.)]?", low))
-        if exact_number or any(marker in low for marker in markers):
+        exact_number = bool(re.fullmatch(rf"(?:№\s*)?{ordinal}[.)]?", normalized_choice))
+        explicit_marker = normalized_choice in markers or any(
+            normalized_choice == prefix + marker
+            for prefix in choice_prefixes
+            for marker in markers
+        )
+        if exact_number or explicit_marker:
             if ordinal <= len(slots):
                 chosen = slots[ordinal - 1]
             break
 
     if chosen is None:
-        match = re.search(r"(?<!\d)([01]?\d|2[0-3])[:.]([0-5]\d)(?!\d)", low)
-        if match:
-            wanted = f"{int(match.group(1)):02d}:{match.group(2)}"
+        time_matches = re.findall(r"(?<!\d)([01]?\d|2[0-3])[:.]([0-5]\d)(?!\d)", low)
+        wanted_times = {f"{int(hour):02d}:{minute}" for hour, minute in time_matches}
+        if len(wanted_times) == 1:
+            wanted = next(iter(wanted_times))
             matches = [slot for slot in slots if slot["time_start"] == wanted]
             if len(matches) == 1:
                 chosen = matches[0]
@@ -351,19 +359,38 @@ def _resolve_explicit_slot_choice(session: dict[str, Any], user_text: str) -> di
     return dict(chosen)
 
 
+_NAME_QUESTION_MARKERS = (
+    "имя", "как вас зовут", "как зовут пациента", "имя пациента",
+    "атыңыз", "есіміңіз", "пациенттің аты",
+)
+
+
 def _simple_patient_name_candidate(session: dict[str, Any], user_text: str) -> str:
-    """Capture a short name only when a verified slot is already selected and name is the missing field."""
+    """Conservative fallback for a direct answer to the immediately preceding name question."""
     if session.get("patient_name") or not session.get("selected_time") or session.get("booking_confirmed"):
         return ""
+
+    previous = str(session.get("last_assistant_answer") or "").lower()
+    if not any(marker in previous for marker in _NAME_QUESTION_MARKERS):
+        return ""
+
     text = re.sub(r"\s+", " ", str(user_text or "").strip())
     if not text or len(text) > 80 or "?" in text:
         return ""
     if not re.fullmatch(r"[A-Za-zА-Яа-яЁёӘәҒғҚқҢңӨөҰұҮүҺһІі'’\- ]{2,80}", text):
         return ""
-    words = [w.strip("'’-").lower() for w in text.split() if w.strip("'’-")]
-    if not 1 <= len(words) <= 4:
+
+    words_original = [w.strip("'’-") for w in text.split() if w.strip("'’-")]
+    words = [w.lower() for w in words_original]
+    if not 1 <= len(words) <= 3:
         return ""
     if any(word in _SIMPLE_NAME_STOPWORDS for word in words):
+        return ""
+    if any(word in {"у", "меня", "есть", "вопрос", "подскажите", "почему", "хочу", "нужно", "надо"} for word in words):
+        return ""
+    # Multi-word deterministic capture is intentionally stricter. Lowercase or
+    # ambiguous full-name phrases are left to GPT + record_patient_facts.
+    if len(words_original) > 1 and not all(word[:1].isupper() for word in words_original):
         return ""
     return text
 
