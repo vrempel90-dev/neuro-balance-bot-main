@@ -232,3 +232,54 @@ def test_debug_routes_can_be_locked_down_for_staging(monkeypatch: pytest.MonkeyP
         assert allowed.json()["ok"] is True
 
     get_settings.cache_clear()
+
+
+
+def test_staging_crm_write_switch_blocks_real_booking(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CRM_WRITE_ENABLED", "false")
+    get_settings.cache_clear()
+
+    session = _ready_session()
+    agent._remember_offered_slots(
+        session,
+        [{
+            "doctor_login": DOCTOR_LOGIN,
+            "doctor_name": DOCTOR_NAME,
+            "date": DATE,
+            "time_start": "14:00",
+        }],
+    )
+
+    calls = {"book": 0, "check": 0}
+
+    async def must_not_check(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        calls["check"] += 1
+        raise AssertionError("staging write guard must stop before booking revalidation")
+
+    async def must_not_book(**kwargs: Any) -> dict[str, Any]:
+        calls["book"] += 1
+        raise AssertionError("staging write guard must prevent CRM booking POST")
+
+    monkeypatch.setattr(crm, "check_slots", must_not_check)
+    monkeypatch.setattr(crm, "book_appointment", must_not_book)
+
+    result = asyncio.run(
+        agent._tool_book_appointment(
+            "staging_write_block",
+            session,
+            PHONE,
+            {
+                "patient_name": "Асель",
+                "doctor_login": DOCTOR_LOGIN,
+                "date": DATE,
+                "time_start": "14:00",
+            },
+        )
+    )
+
+    assert result["booking_success"] is False
+    assert result["error"] == "crm_write_disabled"
+    assert calls == {"book": 0, "check": 0}
+    assert session.get("booking_confirmed") is not True
+
+    get_settings.cache_clear()
