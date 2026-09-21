@@ -1351,8 +1351,15 @@ def _normalize_wazzup_message(payload: dict[str, Any], msg: dict[str, Any]) -> d
     is_incoming = _is_wazzup_incoming(is_echo=is_echo, from_me=from_me, status=status, direction=explicit_direction)
     direction = explicit_direction or status or ("incoming" if is_incoming else "outgoing")
     channel_id = str(_first_deep_value(merged, ["channelId", "channel_id", "channel.id", "message.channelId", "message.channel_id"]) or "").strip()
+    chat_type = str(_first_deep_value(merged, ["chatType", "chat_type"]) or "whatsapp").strip().lower()
     chat_id = str(chat_id or phone or "").strip()
-    phone = str(phone or chat_id).strip()
+    # Wazzup chatId is a phone only for phone-backed messengers. For Instagram
+    # it is the username, so copying it into phone makes strict CRM admission
+    # reject a valid social lead (or worse, treat digits in a username as a
+    # phone). Keep phone empty until Wazzup/user actually provides one.
+    phone = str(phone or "").strip()
+    if not phone and chat_type in {"whatsapp", "viber"}:
+        phone = chat_id
     return {
         "source": "wazzup",
         "chat_id": chat_id,
@@ -1362,7 +1369,7 @@ def _normalize_wazzup_message(payload: dict[str, Any], msg: dict[str, Any]) -> d
         "message_timestamp": str(message_timestamp or "").strip(),
         "timestamp": str(message_timestamp or "").strip(),
         "channel_id": channel_id,
-        "chat_type": str(_first_deep_value(merged, ["chatType", "chat_type"]) or "whatsapp"),
+        "chat_type": chat_type,
         "message_type": message_type,
         "direction": direction,
         "status": status,
@@ -1458,7 +1465,7 @@ def wazzup_webhook_health_response(request: Request) -> dict[str, Any]:
     }
 
 
-async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw_msg: dict[str, Any], parse_meta: dict[str, Any], *, send_enabled: bool = True) -> dict[str, Any]:
+async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, Any], raw_msg: dict[str, Any], parse_meta: dict[str, Any], *, send_enabled: bool = True) -> dict[str, Any]:
     message = _normalize_wazzup_message(payload, raw_msg)
     chat_id = message["chat_id"] or "wazzup"
     phone = str(message.get("phone") or chat_id)
@@ -1662,6 +1669,33 @@ async def _process_wazzup_message(request: Request, payload: dict[str, Any], raw
         state.log_event(chat_id, "wazzup_send_result", {"status_code": None, "response_preview": "", "success": False, "skipped": True, "silent_reason": silent_reason or "empty_text"})
     state.log_event(chat_id, "bot_processing_finish", {"phone": phone, "chat_id": chat_id, "should_send_wazzup": bool(answer and should_send and send_enabled), "silent_reason": silent_reason, "send_result": send_result_payload})
     return {"ok": True, "ignored": False, "answer": answer, "should_send_wazzup": bool(answer and should_send), "no_reply_reason": silent_reason}
+
+
+async def _process_wazzup_message(
+    request: Request,
+    payload: dict[str, Any],
+    raw_msg: dict[str, Any],
+    parse_meta: dict[str, Any],
+    *,
+    send_enabled: bool = True,
+) -> dict[str, Any]:
+    """Serialize a complete production Wazzup turn per chat.
+
+    Wazzup can deliver two distinct messages from the same patient in parallel.
+    Duplicate-message idempotency only protects retries of the *same* message;
+    this lock guarantees that different messages cannot read/write the dialog
+    state or send replies out of order.
+    """
+    message = _normalize_wazzup_message(payload, raw_msg)
+    chat_id = str(message.get("chat_id") or "wazzup")
+    async with _chat_turn(chat_id):
+        return await _process_wazzup_message_unlocked(
+            request,
+            payload,
+            raw_msg,
+            parse_meta,
+            send_enabled=send_enabled,
+        )
 
 
 async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) -> dict[str, Any]:
