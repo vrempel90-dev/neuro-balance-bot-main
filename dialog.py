@@ -220,6 +220,37 @@ def _valid_crm_phone(phone: str | None) -> bool:
     return bool(re.fullmatch(r"77\d{9}", normalized or ""))
 
 
+def _is_instagram_session(session: dict[str, Any]) -> bool:
+    return "instagram" in str(
+        session.get("chat_type") or session.get("inbound_channel") or ""
+    ).strip().lower()
+
+
+def _extract_kz_phone_from_text(text: str) -> str:
+    """Extract an explicitly supplied KZ mobile number from a free-form reply."""
+    raw = str(text or "")
+    candidates = re.findall(r"(?:\+?7|8)[\d\s()\-]{9,20}", raw)
+    for candidate in candidates:
+        normalized = sanitize_kz_phone(candidate)
+        if _valid_crm_phone(normalized):
+            return normalized
+    stripped = raw.strip()
+    normalized = sanitize_kz_phone(stripped)
+    return normalized if _valid_crm_phone(normalized) else ""
+
+
+def _instagram_phone_request(session: dict[str, Any]) -> str:
+    if str(session.get("language") or "ru") == "kk":
+        return (
+            "Жазылуды жалғастыру үшін, деректерді тексеруге және жазылуды рәсімдеуге "
+            "болатын телефон нөміріңізді +7 7XX XXX XX XX форматында жазыңыз."
+        )
+    return (
+        "Для продолжения записи напишите, пожалуйста, номер телефона, по которому "
+        "можно проверить данные и оформить запись, в формате +7 7XX XXX XX XX."
+    )
+
+
 def _strip_quoted_bot_text(text: str) -> str:
     """Убирает из входящего текста служебные строки Wazzup-реплая.
 
@@ -682,7 +713,17 @@ async def _finalize(chat_id: str, session: dict[str, Any], answer: str, result: 
 def _start_turn(chat_id: str, session: dict[str, Any], phone: str, text: str) -> None:
     """Состояние хода: всё, что относится к предыдущему сообщению, обнуляется."""
     session["chat_id"] = chat_id
-    session["phone"] = phone or session.get("phone") or ""
+    incoming_phone = str(phone or "").strip()
+    existing_phone = str(session.get("phone") or "").strip()
+    session["transport_identity"] = incoming_phone or str(session.get("transport_identity") or "")
+    # For Instagram Wazzup passes the username as chatId. Never overwrite a
+    # phone the patient already supplied with that social identifier.
+    if _valid_crm_phone(incoming_phone):
+        session["phone"] = crm.normalize_phone(incoming_phone) or sanitize_kz_phone(incoming_phone)
+    elif _valid_crm_phone(existing_phone):
+        session["phone"] = existing_phone
+    else:
+        session["phone"] = ""
     session["last_user_text"] = text
     session["language"] = _detect_lang(text, session)
     session["NEW_LEADS_ONLY"] = _is_new_leads_only_enabled()
@@ -716,7 +757,22 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
 
     if not text:
         return _no_reply(chat_id, session, "empty_text")
-    if not _valid_crm_phone(phone or session.get("phone") or ""):
+
+    if _is_instagram_session(session):
+        supplied_phone = _extract_kz_phone_from_text(text)
+        if supplied_phone:
+            session["phone"] = supplied_phone
+            session["instagram_phone_verified_from_message"] = True
+            session["instagram_identity_pending"] = False
+            _safe_save(chat_id, session)
+        if not _valid_crm_phone(session.get("phone") or ""):
+            session["instagram_identity_pending"] = True
+            session["answer_source"] = "instagram_identity_gate"
+            session["skip_humanize"] = True
+            return await _finalize(chat_id, session, _instagram_phone_request(session))
+
+    effective_phone = str(session.get("phone") or phone or "").strip()
+    if not _valid_crm_phone(effective_phone):
         return _no_reply(chat_id, session, "invalid_phone_for_crm_lookup")
     if _human_took_over(session):
         return _no_reply(chat_id, session, "manual_takeover")
@@ -728,10 +784,10 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         _close_ai_admission_lease(session, "booking_already_completed")
         return _no_reply(chat_id, session, "booking_completed_ai_disabled")
 
-    verdict = await _classify_lead(chat_id, phone, session)
+    verdict = await _classify_lead(chat_id, effective_phone, session)
     if not verdict.bot_may_reply:
         # Не новый лид (или CRM молчит и мы не знаем, кто это) — fail-closed.
-        return await _mute_lead(chat_id, session, phone, verdict.state)
+        return await _mute_lead(chat_id, session, effective_phone, verdict.state)
 
     if _admission_muted(session):
         _clear_admission_mute(session)
@@ -742,7 +798,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     try:
         result = await agent.run_agent_turn(
             chat_id=chat_id,
-            phone=phone,
+            phone=effective_phone,
             session=session,
             user_text=text,
             recent_history=_recent_history_for_brain(chat_id, session, text),
@@ -774,7 +830,7 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["manual_takeover"] = True
         session["escalated"] = True
         _close_ai_admission_lease(session, "agent_escalation")
-        await _notify_admin_once(chat_id, session, phone, "agent_escalation")
+        await _notify_admin_once(chat_id, session, effective_phone, "agent_escalation")
     elif result.booked:
         _close_ai_admission_lease(session, "booking_confirmed")
     session["openai_used"] = True
