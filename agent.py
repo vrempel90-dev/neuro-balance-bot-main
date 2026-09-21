@@ -46,8 +46,10 @@ import clinic_info
 import crm
 from config import get_settings
 
+state: Any
 try:
-    import state
+    import state as _state
+    state = _state
 except Exception:  # pragma: no cover - state is always importable in production
     state = None
 
@@ -112,12 +114,12 @@ _MAX_DAYS_AHEAD = 21
 # and an all-empty period never triggers the "enough slots" early exit.
 _MAX_AVAILABILITY_REQUESTS = 7
 
-# Суббота и воскресенье в клинике — процедурные дни: консультации в эти дни не
-# ведутся. Раньше это правило жило в weekend_booking_policy.py, который
-# монкипатчил приватную функцию dialog.py на импорте и приклеивал объяснение
-# текстом перед ответом бота. Правило про даты и должно жить там, где даты
-# берутся, — в инструменте доступности; объяснение пишет модель.
-_PROCEDURE_WEEKEND_DAYS = {5, 6}
+# В субботу консультационных записей нет: это процедурный день. Воскресенье —
+# выходной. Оба дня недопустимы для консультационной записи, но причина разная
+# и возвращается модели отдельно, чтобы она не сообщала пациенту неверный факт.
+_SATURDAY_PROCEDURE_DAY = 5
+_SUNDAY_CLOSED_DAY = 6
+_NON_CONSULTATION_DAYS = {_SATURDAY_PROCEDURE_DAY, _SUNDAY_CLOSED_DAY}
 
 # doctorLogin в CRM — латиница, цифры и подчёркивание (zhuma_md, asel_k,
 # reserve). Всё остальное — имя врача, фраза пациента или плейсхолдер, а не
@@ -772,8 +774,10 @@ def _clip(value: Any, field: str) -> str:
 def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls | None = None) -> dict[str, Any]:
     """Compact, structured facts so GPT never re-asks what it already knows."""
     today = today or _clinic_today()
-    facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
-    offered = session.get("crm_offered_slots") if isinstance(session.get("crm_offered_slots"), dict) else {}
+    raw_facts = session.get("known_user_facts")
+    facts: dict[str, Any] = dict(raw_facts) if isinstance(raw_facts, dict) else {}
+    raw_offered = session.get("crm_offered_slots")
+    offered: dict[str, Any] = dict(raw_offered) if isinstance(raw_offered, dict) else {}
     return {
         "today": today.isoformat(),
         "tomorrow": (today + timedelta(days=1)).isoformat(),
@@ -926,8 +930,10 @@ async def _tool_get_available_slots(
             _log(chat_id, "agent_availability_unknown_doctor_ignored", {"looks_like_login": looks_like_login})
 
     requested_start = start
-    weekend_requested = start.weekday() in _PROCEDURE_WEEKEND_DAYS
-    while start.weekday() in _PROCEDURE_WEEKEND_DAYS:
+    saturday_procedure_requested = start.weekday() == _SATURDAY_PROCEDURE_DAY
+    sunday_closed_requested = start.weekday() == _SUNDAY_CLOSED_DAY
+    weekend_requested = saturday_procedure_requested or sunday_closed_requested
+    while start.weekday() in _NON_CONSULTATION_DAYS:
         start += timedelta(days=1)
 
     collected: list[dict[str, str]] = []
@@ -937,7 +943,7 @@ async def _tool_get_available_slots(
     requested_days = 0
     day_date = start
     while requested_days < days_ahead:
-        if day_date.weekday() in _PROCEDURE_WEEKEND_DAYS:
+        if day_date.weekday() in _NON_CONSULTATION_DAYS:
             day_date += timedelta(days=1)
             continue
         day = day_date.isoformat()
@@ -996,7 +1002,8 @@ async def _tool_get_available_slots(
         {
             "date_from": start.isoformat(),
             "requested_date_from": requested_start.isoformat(),
-            "weekend_procedure_day_requested": weekend_requested,
+            "weekend_procedure_day_requested": saturday_procedure_requested,
+            "sunday_closed_requested": sunday_closed_requested,
             "days_ahead": days_ahead,
             "doctor_login": doctor_login or "",
             "doctor_count": len(doctors),
@@ -1016,18 +1023,24 @@ async def _tool_get_available_slots(
             "показаны окошки всех врачей. Выбирай врача только из doctors в этом "
             "результате или вызови get_doctors. " + note
         )
-    if weekend_requested:
+    if saturday_procedure_requested:
         note = (
-            "Пациент просил субботу или воскресенье — это процедурные дни, консультаций в "
-            "них нет. Скажи об этом своими словами и предложи окошки ближайшего рабочего "
-            "дня. " + note
+            "Пациент просил субботу — это процедурный день, консультационных записей нет. "
+            "Скажи об этом своими словами и предложи окошки ближайшего рабочего дня. " + note
+        )
+    elif sunday_closed_requested:
+        note = (
+            "Пациент просил воскресенье — клиника в этот день не ведёт консультационный "
+            "приём, это выходной. Скажи об этом своими словами и предложи окошки ближайшего "
+            "рабочего дня. " + note
         )
 
     return {
         "ok": True,
         "date_from": start.isoformat(),
         "requested_date_from": requested_start.isoformat(),
-        "weekend_procedure_day_requested": weekend_requested,
+        "weekend_procedure_day_requested": saturday_procedure_requested,
+        "sunday_closed_requested": sunday_closed_requested,
         "days_ahead": days_ahead,
         "requested_doctor_login": doctor_login or "",
         "unknown_doctor_login_ignored": unknown_doctor,
@@ -1110,6 +1123,18 @@ def _crm_booking_explicitly_rejected(response: Any) -> bool:
 def _looks_like_slot_conflict(text: str) -> bool:
     low = str(text or "").lower()
     return any(marker in low for marker in _SLOT_CONFLICT_MARKERS)
+
+
+def _crm_write_allowed_for_phone(normalized_phone: str) -> tuple[bool, str]:
+    settings = get_settings()
+    if not bool(getattr(settings, "crm_write_enabled", True)):
+        return False, "crm_write_disabled"
+    allowed_raw = str(getattr(settings, "crm_write_test_phone", "") or "").strip()
+    if allowed_raw:
+        allowed_phone = crm.normalize_phone(allowed_raw)
+        if not allowed_phone or allowed_phone != crm.normalize_phone(normalized_phone):
+            return False, "crm_write_phone_not_allowed"
+    return True, ""
 
 
 async def _tool_book_appointment(
@@ -1245,6 +1270,23 @@ async def _tool_book_appointment(
             }.get(gate_reason, "Обязательные шаги записи не пройдены."),
         }
 
+    write_allowed, write_block_reason = _crm_write_allowed_for_phone(normalized_phone)
+    if not write_allowed:
+        _log(chat_id, "agent_booking_write_disabled", {
+            "date": date,
+            "time_start": time_start,
+            "reason": write_block_reason,
+        })
+        return {
+            "ok": False,
+            "booking_success": False,
+            "error": write_block_reason,
+            "message": (
+                "CRM write operations are not allowed for this phone in this environment. "
+                "Не подтверждай запись пациенту; это контролируемый staging-режим."
+            ),
+        }
+
     if relation:
         session["patient_relation"] = relation
     session["patient_name"] = patient_name
@@ -1282,6 +1324,75 @@ async def _tool_book_appointment(
                 "Не создавай вторую и не подтверждай, пока не будет результата."
             ),
         }
+
+    # --- mandatory just-in-time slot revalidation --------------------------
+    # A slot that was free when it was offered may already be taken when the
+    # patient finally gives their name. The durable claim prevents duplicate
+    # POSTs from this bot; a cache-bypassed CRM read prevents booking a stale
+    # offer. Since no booking POST has happened yet, every failure here may
+    # safely release the claim.
+    try:
+        crm.clear_slots_cache(date)
+        fresh_data = await crm.check_slots(date, doctor_login=doctor_login)
+        fresh_slots = _normalize_crm_slots(fresh_data, fallback_date=date)
+    except Exception as exc:
+        if state is not None:
+            try:
+                state.release_booking_claim(idempotency_key)
+            except Exception:
+                pass
+        _log(chat_id, "agent_booking_revalidation_error", {"error_type": type(exc).__name__})
+        return {
+            "ok": False,
+            "booking_success": False,
+            "error": "crm_unavailable",
+            "message": (
+                "Перед записью не удалось повторно проверить свободен ли слот. "
+                "Не подтверждай запись пациенту; вызови escalate_to_operator."
+            ),
+        }
+
+    fresh_slot = next(
+        (
+            candidate
+            for candidate in fresh_slots
+            if _slot_key(candidate["date"], candidate["time_start"], candidate["doctor_login"])
+            == _slot_key(date, time_start, doctor_login)
+        ),
+        None,
+    )
+    if fresh_slot is None:
+        if state is not None:
+            try:
+                state.release_booking_claim(idempotency_key)
+            except Exception:
+                pass
+        try:
+            crm.clear_slots_cache(date)
+        except Exception:
+            pass
+        _log(
+            chat_id,
+            "agent_booking_revalidation_conflict",
+            {"doctor_login": doctor_login, "date": date, "time_start": time_start},
+        )
+        return {
+            "ok": False,
+            "booking_success": False,
+            "error": "slot_conflict",
+            "message": (
+                "Перед записью CRM показала, что выбранное окошко уже недоступно. "
+                "Вызови get_available_slots заново и предложи реальные альтернативы."
+            ),
+        }
+
+    slot = fresh_slot
+    _remember_offered_slots(session, [fresh_slot])
+    _log(
+        chat_id,
+        "agent_booking_revalidated",
+        {"doctor_login": doctor_login, "date": date, "time_start": time_start},
+    )
 
     bot_tools.mark_tool(session, "book_appointment", gate="passed")
     session["crm_called"] = True
@@ -1685,6 +1796,19 @@ async def _tool_reschedule_appointment(
             "message": "Перенос уже выполнен ранее в этом диалоге, повторный перенос не делался.",
         }
 
+    write_allowed, write_block_reason = _crm_write_allowed_for_phone(normalized_phone)
+    if not write_allowed:
+        _log(chat_id, "agent_reschedule_write_disabled", {
+            "appointment_id": appointment_id,
+            "reason": write_block_reason,
+        })
+        return {
+            "ok": False,
+            "reschedule_success": False,
+            "error": write_block_reason,
+            "message": "CRM write operations are not allowed for this phone in this environment; перенос не выполнен.",
+        }
+
     bot_tools.mark_tool(session, "reschedule_appointment", gate="passed")
     session["crm_called"] = True
     _log(
@@ -1870,6 +1994,19 @@ async def _tool_cancel_appointment(
             "message": "Нет номера телефона пациента для отмены записи.",
         }
 
+    write_allowed, write_block_reason = _crm_write_allowed_for_phone(normalized_phone)
+    if not write_allowed:
+        _log(chat_id, "agent_cancel_write_disabled", {
+            "appointment_id": appointment_id,
+            "reason": write_block_reason,
+        })
+        return {
+            "ok": False,
+            "cancel_success": False,
+            "error": write_block_reason,
+            "message": "CRM write operations are not allowed for this phone in this environment; отмена не выполнена.",
+        }
+
     bot_tools.mark_tool(session, "cancel_appointment", gate="passed")
     session["crm_called"] = True
     _log(
@@ -2036,7 +2173,8 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
         session["patient_relation"] = relation
         stored.append("patient_relation")
 
-    facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
+    raw_facts = session.get("known_user_facts")
+    facts: dict[str, Any] = dict(raw_facts) if isinstance(raw_facts, dict) else {}
     for key in ("complaint", "age", "patient_name", "patient_relation"):
         if session.get(key):
             facts[key] = session.get(key)
@@ -2133,6 +2271,37 @@ def _escalation_category(reason: str) -> str:
 
 def _tool_escalate(chat_id: str, session: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     reason = str(args.get("reason") or "operator_requested").strip()
+    last_user = _normalized_reply(session.get("last_user_text"))
+    explicit_human = any(marker in last_user for marker in (
+        "оператор", "администратор", "человек", "живой специалист", "менеджер",
+        "адам", "әкімші",
+    ))
+    age_block = bool(_age_block_reason(session.get("age")))
+    contraindication_block = session.get("contraindications_ok") is False
+    technical_block = bool(
+        session.get("crm_lookup_error")
+        or session.get("crm_unavailable")
+        or (session.get("crm_called") and any(
+            marker in reason.lower() for marker in ("crm", "ошиб", "недоступ", "таймаут", "timeout")
+        ))
+    )
+
+    # Severity by itself is not an escalation condition. The final dialog guard
+    # separately handles a narrow deterministic list of genuine emergency red
+    # flags. This prevents phrases such as "спина болит сильно" from killing a
+    # normal new-lead booking flow.
+    if not (explicit_human or age_block or contraindication_block or technical_block):
+        _log(chat_id, "agent_escalation_rejected", {"reason_length": len(reason)})
+        return {
+            "ok": False,
+            "escalated": False,
+            "error": "escalation_not_justified",
+            "message": (
+                "Эскалация не подтверждена правилами. Продолжай обычный диалог и следующий "
+                "недостающий шаг. Сильная боль сама по себе не является причиной передачи."
+            ),
+        }
+
     bot_tools.escalate_to_human(session, reason)
     session["manual_takeover"] = True
     # The reason is model-written text derived from the patient's message and
@@ -2195,6 +2364,105 @@ def _history_messages(recent_history: list[dict[str, Any]] | None, limit: int = 
         elif role in {"assistant", "bot", "admin", "operator", "manager", "human"}:
             messages.append({"role": "assistant", "content": text[:1500]})
     return messages
+
+
+_DEFERRED_REPLY_MARKERS = (
+    "секунду", "минуту", "уточню", "вернусь", "подождите", "ожидайте",
+    "бір сәт", "нақтылап", "күте тұрыңыз", "кейін жазамын",
+)
+
+
+def _normalized_reply(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def _looks_like_deferred_reply(text: str) -> bool:
+    """True when the model promises future work instead of completing this turn."""
+    low = _normalized_reply(text)
+    return bool(low) and any(marker in low for marker in _DEFERRED_REPLY_MARKERS)
+
+
+_COMPLAINT_QUESTION_MARKERS = (
+    "что вас беспокоит", "что именно вас беспокоит", "на что жалуетесь",
+    "что беспокоит", "не мазалайды", "не алаңдатады",
+)
+_AGE_QUESTION_MARKERS = (
+    "сколько вам лет", "сколько лет пациенту", "ваш возраст",
+    "жасыңыз нешеде", "жасы нешеде",
+)
+_CONTRA_QUESTION_MARKERS = (
+    "противопоказ", "кардиостимулятор", "беременн", "онколог",
+)
+_NAME_QUESTION_MARKERS = (
+    "как вас зовут", "имя пациента", "как зовут пациента",
+    "атыңыз кім", "пациенттің аты",
+)
+
+
+def _asks_for_known_fact(text: str, session: dict[str, Any]) -> str:
+    low = _normalized_reply(text)
+    if session.get("complaint") and any(marker in low for marker in _COMPLAINT_QUESTION_MARKERS):
+        return "complaint"
+    if session.get("age") and any(marker in low for marker in _AGE_QUESTION_MARKERS):
+        return "age"
+    if session.get("contraindications_ok") is not None and any(marker in low for marker in _CONTRA_QUESTION_MARKERS):
+        return "contraindications"
+    if session.get("patient_name") and any(marker in low for marker in _NAME_QUESTION_MARKERS):
+        return "patient_name"
+    return ""
+
+
+def capture_direct_answer_facts(chat_id: str, session: dict[str, Any], user_text: str) -> list[str]:
+    """Persist an obvious answer to the exact question the agent just asked.
+
+    This is memory capture, not a second dialog engine: it never chooses the next
+    step and never writes a reply. It only prevents the agent from forgetting an
+    answer it explicitly requested on the previous turn.
+    """
+    previous = _normalized_reply(session.get("last_assistant_answer"))
+    current = str(user_text or "").strip()
+    if not previous or not current:
+        return []
+
+    args: dict[str, Any] = {}
+    if not session.get("complaint") and any(marker in previous for marker in _COMPLAINT_QUESTION_MARKERS):
+        args["complaint"] = current
+    elif not session.get("age") and any(marker in previous for marker in _AGE_QUESTION_MARKERS):
+        match = re.fullmatch(r"\s*(\d{1,3})\s*(?:лет|года|год|жас|жаста)?\s*[.!?]?\s*", current.lower())
+        if match:
+            args["age"] = int(match.group(1))
+    elif session.get("contraindications_ok") is None and any(marker in previous for marker in _CONTRA_QUESTION_MARKERS):
+        low = _normalized_reply(current)
+        if low in {"нет", "не было", "нету", "жок", "жоқ"} or "противопоказаний нет" in low:
+            args["contraindications_clear"] = True
+            args["contraindications_note"] = current
+    elif not session.get("patient_name") and any(marker in previous for marker in _NAME_QUESTION_MARKERS):
+        if not re.search(r"\d", current) and 1 <= len(current.split()) <= 4:
+            args["patient_name"] = current
+
+    if not args:
+        return []
+    result = _tool_record_patient_facts(chat_id, session, args)
+    return list(result.get("stored") or [])
+
+
+def _repeats_previous_assistant_reply(
+    text: str,
+    session: dict[str, Any],
+    recent_history: list[dict[str, Any]] | None,
+) -> bool:
+    """Exact normalized repeat guard for the most recent assistant answer."""
+    current = _normalized_reply(text)
+    if not current:
+        return False
+    previous = _normalized_reply(session.get("last_assistant_answer"))
+    if previous and current == previous:
+        return True
+    for item in reversed(recent_history or []):
+        role = str(item.get("role") or "").lower()
+        if role in {"assistant", "bot", "admin", "operator", "manager", "human"}:
+            return current == _normalized_reply(item.get("text") or item.get("content"))
+    return False
 
 
 def agent_skip_reason(session: dict[str, Any], user_text: str) -> str:
@@ -2281,6 +2549,7 @@ async def run_agent_turn(
 
     iterations = 0
     rounds = 0
+    no_progress_recovery_used = False
     while True:
         # The budget is re-checked before every round-trip, not only before the
         # first: one turn can make several calls, and the clinic runs on a fixed
@@ -2325,6 +2594,64 @@ async def run_agent_turn(
         content = str(getattr(message, "content", "") or "").strip()
 
         if not tool_calls:
+            duplicate_reply = _repeats_previous_assistant_reply(content, session, recent_history)
+            deferred_reply = _looks_like_deferred_reply(content)
+            repeated_known_fact = _asks_for_known_fact(content, session)
+
+            # An exact repeat is not a reason to ask the model for yet another
+            # answer. The final dialog guard suppresses it, so two adjacent
+            # inbound messages cannot turn one already-asked question into two
+            # outbound messages. Recovery is reserved for true dead ends:
+            # empty output or a promise to do work later.
+            if content and duplicate_reply and not deferred_reply:
+                result.reply = content
+                result.iterations = iterations
+                result.error = "duplicate_model_reply"
+                _log(chat_id, "agent_duplicate_reply_detected", {})
+                break
+
+            no_progress = not content or deferred_reply or bool(repeated_known_fact)
+            if no_progress and not no_progress_recovery_used:
+                no_progress_recovery_used = True
+                _log(
+                    chat_id,
+                    "agent_no_progress_retry",
+                    {
+                        "empty": not bool(content),
+                        "deferred": _looks_like_deferred_reply(content),
+                        "duplicate": duplicate_reply,
+                        "repeated_known_fact": repeated_known_fact,
+                    },
+                )
+                if content:
+                    messages.append({"role": "assistant", "content": content})
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "RUNTIME GUARD: этот ход нельзя завершать обещанием вернуться позже, "
+                            "пустым ответом или повтором предыдущего ответа. Выполни нужный tool-call "
+                            "СЕЙЧАС. Если для действия не хватает ровно одного факта — задай только "
+                            "этот новый вопрос. Уже отвеченные вопросы не повторяй."
+                        ),
+                    }
+                )
+                continue
+            if no_progress:
+                escalation = _tool_escalate(
+                    chat_id,
+                    session,
+                    {"reason": "agent_no_progress_after_retry"},
+                )
+                result.tool_calls.append({"tool": "escalate_to_operator", "ok": True, "args": {"reason": True}})
+                result.tool_results.append(escalation)
+                result.escalate = True
+                result.reply = ""
+                result.iterations = iterations
+                result.error = "agent_no_progress_after_retry"
+                _log(chat_id, "agent_no_progress_escalated", {})
+                break
+
             result.reply = content
             result.iterations = iterations
             break
@@ -2480,9 +2807,28 @@ def _safe_args(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _finish_after_openai_failure(chat_id: str, session: dict[str, Any], result: AgentResult) -> AgentResult:
-    """OpenAI died mid-loop after tools already ran — answer from tool facts."""
+    """OpenAI died after tools ran: confirm only proven success, otherwise hand off.
+
+    A tool may have booked successfully before the model transport failed. In
+    that one case the deterministic tool result is sufficient to confirm the
+    appointment. Every other unfinished outcome is escalated immediately:
+    returning "I'll check and get back to you" would end the webhook with no
+    future worker scheduled and recreate the production dead end.
+    """
     result.outcome = _classify_outcome(result, session)
     result.error = "openai_error_after_tools"
+    if not result.booked:
+        escalation = _tool_escalate(
+            chat_id,
+            session,
+            {"reason": "openai_failure_after_tools"},
+        )
+        result.tool_calls.append(
+            {"tool": "escalate_to_operator", "ok": True, "args": {"reason": True}}
+        )
+        result.tool_results.append(escalation)
+        result.escalate = True
+        result.outcome = OUTCOME_OPERATOR_ESCALATION
     result.reply = _safety_net_reply(session, result)
     _log(chat_id, "agent_silent_turn_prevented", {"outcome": result.outcome, "reason": "openai_error_after_tools"})
     return result
@@ -2524,9 +2870,9 @@ def _safety_net_reply(session: dict[str, Any], result: AgentResult) -> str:
         )
     if result.outcome == OUTCOME_SLOT_CONFLICT:
         return (
-            "Это окошко только что заняли 🌿 Сейчас уточню свободные варианты и напишу Вам."
+            "Выбранное время уже недоступно. Передам администратору, чтобы сразу подобрать другое 🌿"
             if lang != "kk"
-            else "Бұл уақытты жаңа ғана алып қойды 🌿 Қазір бос уақыттарды нақтылап жазамын."
+            else "Таңдалған уақыт енді бос емес. Басқа уақытты бірден таңдау үшін әкімшіге жіберемін 🌿"
         )
     if result.outcome in {OUTCOME_OPERATOR_ESCALATION, OUTCOME_TECHNICAL_ERROR}:
         return (
@@ -2535,7 +2881,7 @@ def _safety_net_reply(session: dict[str, Any], result: AgentResult) -> str:
             else "Сұрағыңызды әкімшіге жіберемін, ол Сізбен жақын арада байланысады 🌿"
         )
     return (
-        "Секунду, уточню информацию и вернусь к Вам 🌿"
+        "Передам Ваш вопрос администратору, чтобы не задерживать ответ 🌿"
         if lang != "kk"
-        else "Бір сәт, ақпаратты нақтылап, Сізге жазамын 🌿"
+        else "Жауапты кешіктірмеу үшін сұрағыңызды әкімшіге жіберемін 🌿"
     )

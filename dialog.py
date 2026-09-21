@@ -274,7 +274,7 @@ def _detect_lang(text: str, session: dict[str, Any]) -> str:
     Переключение требует уверенного сигнала: явная просьба сильнее всего,
     короткие ответы («иә», «да», «44») и смешанные сообщения язык не меняют.
     """
-    current = session.get("language")
+    current = str(session.get("language") or "")
     established = current in ("ru", "kk")
     if not established:
         current = "ru"
@@ -512,7 +512,8 @@ def _no_reply(chat_id: str, session: dict[str, Any], reason: str) -> str:
     """Сохраняет состояние и ничего не отправляет пациенту."""
     session["no_reply_reason"] = reason
     session["should_send_wazzup"] = False
-    decision = session.get("guard_decision") if isinstance(session.get("guard_decision"), dict) else {}
+    raw_decision = session.get("guard_decision")
+    decision: dict[str, Any] = dict(raw_decision) if isinstance(raw_decision, dict) else {}
     decision.update({"allowed": False, "no_reply_reason": reason, "should_send_wazzup": False})
     session["guard_decision"] = decision
     _safe_save(chat_id, session)
@@ -611,7 +612,15 @@ async def _finalize(chat_id: str, session: dict[str, Any], answer: str, result: 
     if not answer:
         return await _handoff(chat_id, session, _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK), "empty_answer")
 
-    # 3. Дата, время или врач, которых не было ни в одном результате инструмента.
+    # 3. Exact repeat of the last sent/accepted assistant answer is suppressed,
+    # not rewritten. This is especially important when a patient sends two
+    # short messages at once: the second serialized turn may cause the model to
+    # ask the same already-asked question again.
+    previous_answer = _clean_outgoing(str(session.get("last_assistant_answer") or ""))
+    if previous_answer and previous_answer == answer:
+        return _no_reply(chat_id, session, "duplicate_answer")
+
+    # 4. Дата, время или врач, которых не было ни в одном результате инструмента.
     unverified = _unverified_fact(chat_id, session, answer, result)
     if unverified:
         _safe_log(chat_id, "unverified_fact_blocked", {"chat_id": chat_id, "fact": unverified})
@@ -665,6 +674,13 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _no_reply(chat_id, session, "empty_text")
     if not _valid_crm_phone(phone or session.get("phone") or ""):
         return _no_reply(chat_id, session, "invalid_phone_for_crm_lookup")
+
+    # Once this dialog has a positively confirmed CRM booking, the sender is
+    # no longer a "new lead". Do not depend on CRM read-after-write latency to
+    # enforce NEW_LEADS_ONLY on the very next inbound message.
+    if session.get("booking_confirmed") is True or session.get("booked") is True:
+        return _no_reply(chat_id, session, "booking_already_completed")
+
     if _human_took_over(session):
         return _no_reply(chat_id, session, "manual_takeover")
 
@@ -678,6 +694,14 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session["first_touch_allowed"] = True
     session["ai_lead_started"] = True
     session["gate_reason"] = "new_lead"
+
+    # Preserve the patient's direct answer to the question the agent itself
+    # asked on the previous turn. This does not decide the next step; it only
+    # keeps already-given facts from disappearing between turns.
+    captured = agent.capture_direct_answer_facts(chat_id, session, text)
+    if captured:
+        _safe_log(chat_id, "direct_answer_facts_captured", {"fields": captured})
+
     try:
         result = await agent.run_agent_turn(
             chat_id=chat_id,
