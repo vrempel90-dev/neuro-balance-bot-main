@@ -41,6 +41,7 @@ jobs:
           mypy \
             --ignore-missing-imports \
             --follow-imports=skip \
+            --explicit-package-bases \
             --allow-untyped-defs \
             --check-untyped-defs \
             agent.py dialog.py crm.py state.py schedule.py admission.py
