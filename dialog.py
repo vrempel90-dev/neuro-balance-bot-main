@@ -665,6 +665,32 @@ def _reasked_known_fact(session: dict[str, Any], answer: str) -> str:
     return ""
 
 
+async def _block_repeated_question(
+    chat_id: str, session: dict[str, Any], field: str
+) -> str:
+    """Enforce the no-repeat invariant without creating a second funnel.
+
+    An exact duplicate of the immediately previous question is returned
+    unchanged so the transport duplicate guard suppresses a second outbound.
+    A first re-ask of a fact already present in structured state gets a
+    temporary operator handoff, but does not permanently transfer ownership:
+    the next patient message can still continue through the normal agent path.
+    """
+    if field == "exact_repeat":
+        previous = str(session.get("last_assistant_answer") or "").strip()
+        session["no_reply_reason"] = ""
+        session["final_answer_preview"] = previous[:160]
+        _safe_save(chat_id, session)
+        return previous
+    return await _handoff(
+        chat_id,
+        session,
+        _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK),
+        f"repeated_question:{field}",
+        human_owns=False,
+    )
+
+
 async def _finalize(chat_id: str, session: dict[str, Any], answer: str, result: Any = None) -> str:
     """Последний барьер перед отправкой: только пропустить или заблокировать.
 
@@ -690,12 +716,7 @@ async def _finalize(chat_id: str, session: dict[str, Any], answer: str, result: 
             "repeated_question_blocked",
             {"chat_id": chat_id, "field": repeated_field},
         )
-        return await _handoff(
-            chat_id,
-            session,
-            _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK),
-            f"repeated_question:{repeated_field}",
-        )
+        return await _block_repeated_question(chat_id, session, repeated_field)
 
     # 4. Дата, время или врач, которых не было ни в одном результате инструмента.
     unverified = _unverified_fact(chat_id, session, answer, result)
