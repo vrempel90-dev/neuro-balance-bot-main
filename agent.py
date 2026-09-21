@@ -1327,6 +1327,21 @@ def _looks_like_slot_conflict(text: str) -> bool:
 async def _tool_book_appointment(
     chat_id: str, session: dict[str, Any], phone: str, args: dict[str, Any]
 ) -> dict[str, Any]:
+    # This is the final server-side kill switch for real appointment creation.
+    # It is checked inside the tool, immediately before any booking path can
+    # reach CRM, so model behavior cannot bypass it.
+    if not bool(getattr(get_settings(), "crm_write_enabled", True)):
+        _log(chat_id, "agent_booking_write_blocked", {})
+        return {
+            "ok": False,
+            "booking_success": False,
+            "error": "crm_write_disabled",
+            "message": (
+                "Создание записи в CRM отключено настройкой окружения. "
+                "Не подтверждай запись пациенту."
+            ),
+        }
+
     patient_name = str(args.get("patient_name") or "").strip()
     doctor_login = str(args.get("doctor_login") or "").strip()
     date = str(args.get("date") or "").strip()[:10]
