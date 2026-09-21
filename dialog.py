@@ -612,7 +612,15 @@ async def _finalize(chat_id: str, session: dict[str, Any], answer: str, result: 
     if not answer:
         return await _handoff(chat_id, session, _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK), "empty_answer")
 
-    # 3. Дата, время или врач, которых не было ни в одном результате инструмента.
+    # 3. Exact repeat of the last sent/accepted assistant answer is suppressed,
+    # not rewritten. This is especially important when a patient sends two
+    # short messages at once: the second serialized turn may cause the model to
+    # ask the same already-asked question again.
+    previous_answer = _clean_outgoing(str(session.get("last_assistant_answer") or ""))
+    if previous_answer and previous_answer == answer:
+        return _no_reply(chat_id, session, "duplicate_answer")
+
+    # 4. Дата, время или врач, которых не было ни в одном результате инструмента.
     unverified = _unverified_fact(chat_id, session, answer, result)
     if unverified:
         _safe_log(chat_id, "unverified_fact_blocked", {"chat_id": chat_id, "fact": unverified})
