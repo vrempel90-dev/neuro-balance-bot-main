@@ -720,6 +720,13 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         return _no_reply(chat_id, session, "invalid_phone_for_crm_lookup")
     if _human_took_over(session):
         return _no_reply(chat_id, session, "manual_takeover")
+    if session.get("booking_confirmed") is True:
+        # A successfully booked patient is no longer a new lead. Do not depend
+        # on CRM propagation timing to enforce NEW_LEADS_ONLY.
+        session["ai_muted"] = True
+        session["manual_takeover"] = True
+        _close_ai_admission_lease(session, "booking_already_completed")
+        return _no_reply(chat_id, session, "booking_completed_ai_disabled")
 
     verdict = await _classify_lead(chat_id, phone, session)
     if not verdict.bot_may_reply:
