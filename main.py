@@ -596,6 +596,13 @@ def _mark_working_hours_disabled(
     """Persist and log the daytime silence decision before any AI/CRM path runs."""
     session = _get_session_safe(chat_id)
     session["source"] = source
+    session["chat_type"] = str(message.get("chat_type") or "").strip().lower()
+    session["channel_id"] = str(message.get("channel_id") or "").strip()
+    session["inbound_channel"] = (
+        "instagram"
+        if "instagram" in session["chat_type"]
+        else (session["chat_type"] or source)
+    )
     session["local_time"] = astana_now().isoformat()
     session["working_hours_allowed"] = False
     session["no_reply_reason"] = "working_hours_ai_disabled"
