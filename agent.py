@@ -2764,11 +2764,13 @@ async def run_agent_turn(
 
     previous = str(session.get("last_assistant_answer") or "")
     if previous and "?" in result.reply and _normalized_reply(previous) == _normalized_reply(result.reply):
-        result.escalate = True
-        result.outcome = OUTCOME_OPERATOR_ESCALATION
-        result.reply = _operator_handoff_reply(session)
-        result.error = result.error or "duplicate_question_blocked"
-        _log(chat_id, "agent_duplicate_question_blocked", {})
+        # The patient may have sent a second fragment before seeing our first
+        # question. Escalating here creates a false operator handoff. Keep the
+        # same reply and let the outbound duplicate guard suppress sending it:
+        # the unanswered question is already visible in the chat.
+        result.reply = previous
+        result.error = result.error or "duplicate_question_suppressed"
+        _log(chat_id, "agent_duplicate_question_suppressed", {})
 
     if not result.escalate and not result.booked:
         enforced = _enforce_approved_contraindications_reply(session, user_text, result.reply)
