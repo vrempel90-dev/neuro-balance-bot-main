@@ -360,7 +360,7 @@ def _simple_patient_name_candidate(session: dict[str, Any], user_text: str) -> s
         return ""
     if not re.fullmatch(r"[A-Za-zА-Яа-яЁёӘәҒғҚқҢңӨөҰұҮүҺһІі'’\- ]{2,80}", text):
         return ""
-    words = [w.strip("'’\-").lower() for w in text.split() if w.strip("'’\-")]
+    words = [w.strip("'’-").lower() for w in text.split() if w.strip("'’-")]
     if not 1 <= len(words) <= 4:
         return ""
     if any(word in _SIMPLE_NAME_STOPWORDS for word in words):
