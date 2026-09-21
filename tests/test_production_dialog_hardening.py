@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 
 os.environ["SQLITE_PATH"] = tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite3").name
 os.environ.setdefault("CRM_BOT_SECRET", "test")
@@ -24,6 +25,7 @@ import agent
 import ai
 import crm
 import dialog
+import main
 import state
 from config import get_settings
 from fake_openai import FakeOpenAIClient, assistant_text
@@ -209,3 +211,24 @@ def test_confirmed_booking_never_reenters_ai_even_if_crm_is_stale(monkeypatch: p
     assert answer == ""
     saved = state.get_session(chat_id)
     assert saved["no_reply_reason"] == "booking_already_completed"
+
+
+
+def test_debug_routes_can_be_locked_down_for_staging(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEBUG_ENDPOINTS_REQUIRE_TOKEN", "true")
+    monkeypatch.setenv("DEBUG_ADMIN_TOKEN", "staging-test-token")
+    get_settings.cache_clear()
+
+    with TestClient(main.app) as client:
+        denied = client.post("/debug/reset", json={"chat_id": "protected"})
+        assert denied.status_code == 401
+
+        allowed = client.post(
+            "/debug/reset",
+            json={"chat_id": "protected"},
+            headers={"x-debug-token": "staging-test-token"},
+        )
+        assert allowed.status_code == 200
+        assert allowed.json()["ok"] is True
+
+    get_settings.cache_clear()
