@@ -44,6 +44,7 @@ import ai_budget
 import bot_tools
 import clinic_info
 import crm
+import services
 from config import get_settings
 
 try:
@@ -701,10 +702,11 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "record_patient_facts",
             "description": (
                 "Сохранить факты, которые сообщил пациент: жалобу, возраст, "
-                "отсутствие противопоказаний, имя, за кого запись. Вызывай сразу, "
-                "как только пациент их назвал — до записи. Без сохранённых жалобы, "
-                "возраста и подтверждённого отсутствия противопоказаний "
-                "book_appointment будет отклонён."
+                "отсутствие противопоказаний, имя, за кого запись. Жалоба сначала "
+                "проверяется backend по утверждённому профилю клиники. Возраст и "
+                "следующие шаги разрешены только если profile_status=profile. "
+                "Неизвестная или непрофильная жалоба не может автоматически "
+                "продолжить воронку записи."
             ),
             "parameters": {
                 "type": "object",
@@ -801,9 +803,9 @@ AGENT_OVERRIDES = """
 сказал. Иначе book_appointment будет отклонён, даже если пациент всё назвал.
 
 ВОЗРАСТ ОБЯЗАТЕЛЕН: без сохранённого возраста запись невозможна. Автоматическая
-запись допустима только с 16 до 74 лет включительно. Если пациенту 15 лет и
-меньше либо 75 лет и старше — не записывай, вызови escalate_to_operator и
-спокойно объясни пациенту.
+запись допустима с 16 до 75 лет включительно. Если пациенту 15 лет и меньше
+либо 76 лет и старше — не записывай, вызови escalate_to_operator и спокойно
+объясни пациенту.
 
 ЖЁСТКИЕ ПРАВИЛА ФАКТОВ:
 1. Никогда не называй дату, время или врача, которых не вернул инструмент.
@@ -831,7 +833,7 @@ AGENT_OVERRIDES = """
 показанных CRM-вариантов, зафиксируй выбор через select_booking_slot и НЕ
 переспрашивай дату, врача или время. После получения имени backend проверит
 все обязательные данные и завершит запись в CRM.
-Возраст до 16 и 75 лет и старше, а также противопоказания из утверждённого
+Возраст до 16 и 76 лет и старше, а также противопоказания из утверждённого
 списка — стоп-факторы: вместо записи вызывай escalate_to_operator.
 
 ЗАПИСЬ ЗА ДРУГОГО ЧЕЛОВЕКА:
@@ -2218,10 +2220,34 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
     stored: list[str] = []
 
     complaint = str(args.get("complaint") or "").strip()
+    profile_status = str(session.get("profile_status") or "").strip()
+    profile_reason = ""
     if complaint:
+        classification = services.classify_by_keywords(complaint)
+        can_help = classification.get("can_help")
+        profile_reason = str(classification.get("reason") or "")
         session["complaint"] = complaint
-        bot_tools.record_chief_complaint(session, complaint, is_in_profile=True)
+        if can_help is True:
+            bot_tools.record_chief_complaint(session, complaint, is_in_profile=True)
+            session.pop("irrelevant", None)
+            profile_status = "profile"
+        elif can_help is False:
+            bot_tools.record_chief_complaint(session, complaint, is_in_profile=False)
+            bot_tools.mark_irrelevant(session, "non_profile_complaint")
+            profile_status = "non_profile"
+        else:
+            session["profile_status"] = "unclear"
+            session["complaint_gate"] = "PROFILE_UNCLEAR"
+            bot_tools.mark_tool(
+                session,
+                "record_chief_complaint",
+                complaint=complaint,
+                is_in_profile=None,
+            )
+            profile_status = "unclear"
         stored.append("complaint")
+
+    profile_allows_booking = profile_status == "profile"
 
     age_value = args.get("age")
     age: int | None = None
@@ -2233,7 +2259,9 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
             age = None
             age_rejected = "not_a_number"
     if age is not None:
-        if 0 < age < 130:
+        if not profile_allows_booking:
+            age_rejected = "profile_not_approved"
+        elif 0 < age < 130:
             session["age"] = age
             stored.append("age")
         else:
@@ -2246,7 +2274,9 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
         session.pop("age", None)
 
     note = str(args.get("contraindications_note") or "").strip()
-    if args.get("contraindications_clear") is True:
+    if not profile_allows_booking:
+        pass
+    elif args.get("contraindications_clear") is True:
         session["contraindications_raw"] = note or str(session.get("contraindications_raw") or "нет")
         bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, session["contraindications_raw"])
         stored.append("contraindications_clear")
@@ -2293,25 +2323,36 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
         },
     )
 
-    if age_block:
+    if profile_status == "non_profile":
         message = (
-            f"Возраст пациента вне правил клиники ({MIN_PATIENT_AGE}–{MAX_PATIENT_AGE} лет). "
+            "Жалоба не относится к утверждённому профилю Neuro Balance. "
+            "Останови воронку записи: не спрашивай возраст, противопоказания, день "
+            "и не предлагай свободное время."
+        )
+    elif profile_status == "unclear":
+        message = (
+            "Профиль жалобы не подтверждён. Задай один конкретный уточняющий вопрос "
+            "о жалобе. До подтверждения profile не спрашивай возраст, противопоказания "
+            "или день и не предлагай запись."
+        )
+    elif age_block:
+        message = (
+            f"Возраст пациента вне правил клиники ({MIN_PATIENT_AGE}–{MAX_PATIENT_AGE} лет включительно). "
             "Записывать нельзя — вызови escalate_to_operator."
         )
-    elif age_rejected:
-        # Silently dropping the value and still reporting success would leave
-        # the model believing the age is known, and the booking would be
-        # refused later for a reason it was never told about.
+    elif age_rejected and age_rejected != "profile_not_approved":
         message = (
             "Возраст не сохранён: значение не похоже на возраст. "
             "Переспроси возраст пациента числом полных лет."
         )
     else:
-        message = "Факты сохранены."
+        message = "Факты сохранены. profile_status=profile."
 
     return {
-        "ok": not bool(age_rejected),
+        "ok": profile_status == "profile" and not bool(age_rejected),
         "stored": stored,
+        "profile_status": profile_status or "unclear",
+        "profile_reason": profile_reason,
         "booking_gate": dict(zip(("allowed", "reason"), bot_tools.booking_gate_status(session))),
         "age_outside_clinic_limits": bool(age_block),
         "age_rejected": age_rejected,
@@ -2915,7 +2956,7 @@ def _must_use_approved_contraindications_reply(
         age = int(session.get("age") or 0)
     except (TypeError, ValueError):
         age = 0
-    if age and (age <= 15 or age >= 75):
+    if age and (age <= 15 or age > 75):
         return False
 
     user_low = str(user_text or "").strip().lower()
