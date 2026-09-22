@@ -75,7 +75,8 @@ def test_saturday_request_is_answered_with_the_next_working_day(monkeypatch: pyt
     assert result["requested_date_from"] == SATURDAY
     assert result["date_from"] == MONDAY
     assert {slot["date"] for slot in result["slots"]} == {MONDAY}
-    assert "суббота — процедурный день" in result["note"].lower()\n    assert "воскресенье — выходной" in result["note"].lower()
+    assert "суббота — процедурный день" in result["note"].lower()
+    assert "воскресенье — выходной" in result["note"].lower()
 
 
 def test_the_model_is_told_to_explain_it_itself(monkeypatch: pytest.MonkeyPatch) -> None:
