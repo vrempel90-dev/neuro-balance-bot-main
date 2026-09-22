@@ -2835,7 +2835,7 @@ async def run_agent_turn(
         _log(chat_id, "agent_duplicate_question_suppressed", {})
 
     if not result.escalate and not result.booked:
-        profile_enforced = _enforce_profile_gate_reply(session, result, result.reply)
+        profile_enforced = _enforce_profile_gate_reply(session, result, user_text, result.reply)
         if profile_enforced != result.reply:
             result.reply = profile_enforced
             _log(
@@ -3015,14 +3015,67 @@ def _current_turn_profile_status(result: AgentResult) -> str:
     return ""
 
 
-def _enforce_profile_gate_reply(session: dict[str, Any], result: AgentResult, reply: str) -> str:
-    """Never let a non-profile/unknown complaint advance to age or booking."""
+def _enforce_profile_gate_reply(
+    session: dict[str, Any], result: AgentResult, user_text: str, reply: str
+) -> str:
+    """Never let the model skip the clinic profile gate.
+
+    Usually the model calls record_patient_facts and the tool result carries the
+    profile verdict. This fallback also classifies the inbound text locally so
+    a model that forgets the tool still cannot ask age/contraindications after
+    an explicitly non-profile complaint such as heel pain.
+    """
     status = _current_turn_profile_status(result)
+    complaint_text = str(session.get("complaint") or "").strip()
+
+    if not status and str(session.get("profile_status") or "") != "profile":
+        local = services.classify_by_keywords(user_text)
+        can_help = local.get("can_help")
+        if can_help is True:
+            # Deterministic recovery when the model understood a clearly
+            # profile complaint but forgot to persist it through the tool.
+            complaint_text = str(user_text or "").strip()
+            if complaint_text:
+                bot_tools.record_chief_complaint(session, complaint_text, is_in_profile=True)
+                facts = session.get("known_user_facts")
+                if not isinstance(facts, dict):
+                    facts = {}
+                facts["complaint"] = complaint_text
+                session["known_user_facts"] = facts
+            return reply
+        if can_help is False:
+            status = "non_profile"
+            complaint_text = str(user_text or "").strip()
+            if complaint_text:
+                bot_tools.record_chief_complaint(session, complaint_text, is_in_profile=False)
+                bot_tools.mark_irrelevant(session, "non_profile_complaint")
+        else:
+            # Unknown text does not need an override if the model is correctly
+            # asking what hurts. It only becomes a hard guard if the model tries
+            # to advance the funnel before profile confirmation.
+            reply_low = str(reply or "").lower()
+            advancing = any(
+                marker in reply_low
+                for marker in (
+                    "сколько вам лет",
+                    "сколько лет",
+                    "жасыңыз",
+                    "противопоказ",
+                    "қарсы көрсет",
+                    "на какой день",
+                    "қай күн",
+                    "свободное время",
+                    "свободные",
+                )
+            )
+            if advancing:
+                status = "unclear"
+
     if status not in {"non_profile", "unclear"}:
         return reply
 
     lang = str(session.get("language") or "ru")
-    complaint = str(session.get("complaint") or "").lower()
+    complaint = complaint_text.lower()
 
     if status == "non_profile":
         if lang == "kk":
