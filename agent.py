@@ -2261,13 +2261,13 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
             age = None
             age_rejected = "not_a_number"
     if age is not None:
-        if not profile_allows_booking:
+        if not (0 < age < 130):
+            age_rejected = "out_of_plausible_range"
+        elif not profile_allows_booking:
             age_rejected = "profile_not_approved"
-        elif 0 < age < 130:
+        else:
             session["age"] = age
             stored.append("age")
-        else:
-            age_rejected = "out_of_plausible_range"
     if age_rejected:
         # Drop whatever age was stored before. Keeping it would report
         # ``age_known: true`` for a value the patient just contradicted, and the
