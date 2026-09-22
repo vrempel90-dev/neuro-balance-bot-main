@@ -951,6 +951,8 @@ def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls 
             "patient_name": _clip(session.get("patient_name"), "patient_name"),
             "age": session.get("age"),
             "complaint": _clip(session.get("complaint"), "complaint"),
+            "profile_status": session.get("profile_status") or "",
+            "complaint_gate": session.get("complaint_gate") or "",
         },
         "booking_state": {
             "step": session.get("step") or "start",
@@ -2833,6 +2835,15 @@ async def run_agent_turn(
         _log(chat_id, "agent_duplicate_question_suppressed", {})
 
     if not result.escalate and not result.booked:
+        profile_enforced = _enforce_profile_gate_reply(session, result, result.reply)
+        if profile_enforced != result.reply:
+            result.reply = profile_enforced
+            _log(
+                chat_id,
+                "agent_profile_gate_reply_enforced",
+                {"profile_status": _current_turn_profile_status(result)},
+            )
+
         enforced = _enforce_approved_contraindications_reply(session, user_text, result.reply)
         if enforced != result.reply:
             result.reply = enforced
@@ -2994,6 +3005,55 @@ def _enforce_approved_contraindications_reply(
     if _must_use_approved_contraindications_reply(session, user_text, reply):
         return _APPROVED_CONTRAINDICATIONS_RU
     return reply
+
+
+def _current_turn_profile_status(result: AgentResult) -> str:
+    for tool_result in reversed(result.tool_results):
+        status = str(tool_result.get("profile_status") or "").strip()
+        if status:
+            return status
+    return ""
+
+
+def _enforce_profile_gate_reply(session: dict[str, Any], result: AgentResult, reply: str) -> str:
+    """Never let a non-profile/unknown complaint advance to age or booking."""
+    status = _current_turn_profile_status(result)
+    if status not in {"non_profile", "unclear"}:
+        return reply
+
+    lang = str(session.get("language") or "ru")
+    complaint = str(session.get("complaint") or "").lower()
+
+    if status == "non_profile":
+        if lang == "kk":
+            if any(term in complaint for term in ("өкше", "пятк", "пяточ", "шпор", "фасциит")):
+                return (
+                    "Түсінемін 🙏🏻 Өкше ауыруы біздің клиниканың бекітілген бағытына жатпайды. "
+                    "Ортопед-травматологқа жүгінген дұрыс."
+                )
+            return (
+                "Түсінемін 🙏🏻 Бұл шағым біздің клиниканың бекітілген бағытына жатпайды. "
+                "Профильді дәрігерге жүгінген дұрыс."
+            )
+        if any(term in complaint for term in ("пятк", "пяточ", "шпор", "подошв", "фасциит")):
+            return (
+                "Понимаю Вас 🙏🏻 С жалобами на боль в пятке наша клиника не ведёт приём. "
+                "Лучше обратиться к ортопеду-травматологу."
+            )
+        return (
+            "Понимаю Вас 🙏🏻 Эта жалоба не относится к утверждённому профилю нашей клиники. "
+            "Лучше обратиться к профильному врачу."
+        )
+
+    if lang == "kk":
+        return (
+            "Нақтылап айтыңызшы, ауырсыну буында, арқада/мойында/белде ме, "
+            "әлде басқа аймақта ма?"
+        )
+    return (
+        "Уточните, пожалуйста, боль связана с суставом, спиной/шеей/поясницей "
+        "или речь о другой области?"
+    )
 
 
 def _safety_net_reply(session: dict[str, Any], result: AgentResult) -> str:
