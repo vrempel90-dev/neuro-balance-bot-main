@@ -104,6 +104,7 @@ def test_model_cannot_ask_age_after_heel_was_marked_non_profile() -> None:
     reply = agent._enforce_profile_gate_reply(
         session,
         result,
+        "Болит пятка",
         "Понял. Подскажите, пожалуйста, сколько Вам лет?",
     )
 
@@ -125,3 +126,52 @@ def test_canonical_prompt_allows_75_and_blocks_from_76() -> None:
     assert "75 лет и старше — автоматическую запись не делай" not in prompt
     assert "проверка профиля клиники" in prompt
     assert "боль в пятке" in prompt
+
+
+def test_model_cannot_skip_profile_tool_and_ask_age_after_heel_complaint() -> None:
+    session: dict = {}
+    result = agent.AgentResult()
+
+    reply = agent._enforce_profile_gate_reply(
+        session,
+        result,
+        "Болит пятка уже несколько месяцев",
+        "Понял. Подскажите, пожалуйста, сколько Вам лет?",
+    )
+
+    assert session["profile_status"] == "non_profile"
+    assert session["complaint_gate"] == "NON_PROFILE"
+    assert "сколько вам лет" not in reply.lower()
+    assert "пятк" in reply.lower()
+
+
+def test_unknown_complaint_cannot_advance_to_age_without_profile_confirmation() -> None:
+    session: dict = {}
+    result = agent.AgentResult()
+
+    reply = agent._enforce_profile_gate_reply(
+        session,
+        result,
+        "Непонятно тянет кисть уже месяц",
+        "Подскажите, пожалуйста, сколько Вам лет?",
+    )
+
+    assert "сколько вам лет" not in reply.lower()
+    assert "уточните" in reply.lower()
+
+
+def test_clear_profile_complaint_is_recovered_if_model_skips_tool() -> None:
+    session: dict = {}
+    result = agent.AgentResult()
+    model_reply = "Подскажите, пожалуйста, сколько Вам лет?"
+
+    reply = agent._enforce_profile_gate_reply(
+        session,
+        result,
+        "Болит коленный сустав",
+        model_reply,
+    )
+
+    assert reply == model_reply
+    assert session["profile_status"] == "profile"
+    assert session["complaint_gate"] == "COMPLAINT_OK"
