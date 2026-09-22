@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - "agent.py"
+      - "ai.py"
+      - "services.py"
       - "SYSTEM_PROMPT_rendered.md"
       - "dialog.py"
       - "main.py"
@@ -17,6 +19,7 @@ on:
       - "tests/test_wazzup_production_webhook.py"
       - "tests/test_concurrent_messages.py"
       - "tests/test_weekend_procedure_days.py"
+      - "tests/test_profile_gate.py"
       - "repair_app.py"
       - "repair_status.py"
       - "repair_service.py"
@@ -31,6 +34,8 @@ on:
     branches: [main]
     paths:
       - "agent.py"
+      - "ai.py"
+      - "services.py"
       - "SYSTEM_PROMPT_rendered.md"
       - "dialog.py"
       - "main.py"
@@ -43,6 +48,7 @@ on:
       - "tests/test_night_new_leads_production_fix.py"
       - "tests/test_wazzup_production_webhook.py"
       - "tests/test_weekend_procedure_days.py"
+      - "tests/test_profile_gate.py"
       - "repair_app.py"
       - "repair_status.py"
       - "repair_service.py"
@@ -72,7 +78,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pytest
       - name: Compile core assistant modules
-        run: python -m py_compile agent.py dialog.py main.py admission.py crm.py state.py
+        run: python -m py_compile agent.py ai.py services.py dialog.py main.py admission.py crm.py state.py
       - name: Run core booking regression tests
         run: |
           python -m pytest -q \
@@ -81,7 +87,8 @@ jobs:
             tests/test_night_new_leads_production_fix.py \
             tests/test_wazzup_production_webhook.py \
             tests/test_concurrent_messages.py \
-            tests/test_weekend_procedure_days.py
+            tests/test_weekend_procedure_days.py \
+            tests/test_profile_gate.py
 
   dashboard-contract:
     runs-on: ubuntu-latest
