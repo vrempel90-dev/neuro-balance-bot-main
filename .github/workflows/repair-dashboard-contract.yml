@@ -10,11 +10,13 @@ on:
       - "admission.py"
       - "crm.py"
       - "state.py"
+      - "clinic_info.py"
       - "tests/test_gpt_first_agent_booking.py"
       - "tests/test_gpt_first_conversation.py"
       - "tests/test_night_new_leads_production_fix.py"
       - "tests/test_wazzup_production_webhook.py"
       - "tests/test_concurrent_messages.py"
+      - "tests/test_weekend_procedure_days.py"
       - "repair_app.py"
       - "repair_status.py"
       - "repair_service.py"
@@ -35,10 +37,12 @@ on:
       - "admission.py"
       - "crm.py"
       - "state.py"
+      - "clinic_info.py"
       - "tests/test_gpt_first_agent_booking.py"
       - "tests/test_gpt_first_conversation.py"
       - "tests/test_night_new_leads_production_fix.py"
       - "tests/test_wazzup_production_webhook.py"
+      - "tests/test_weekend_procedure_days.py"
       - "repair_app.py"
       - "repair_status.py"
       - "repair_service.py"
@@ -76,7 +80,8 @@ jobs:
             tests/test_gpt_first_conversation.py \
             tests/test_night_new_leads_production_fix.py \
             tests/test_wazzup_production_webhook.py \
-            tests/test_concurrent_messages.py
+            tests/test_concurrent_messages.py \
+            tests/test_weekend_procedure_days.py
 
   dashboard-contract:
     runs-on: ubuntu-latest
