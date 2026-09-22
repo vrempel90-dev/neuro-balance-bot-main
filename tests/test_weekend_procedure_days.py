@@ -24,6 +24,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import pytest
 
 import agent
+import clinic_info
 import crm
 import state
 
@@ -149,3 +150,32 @@ def test_real_doctor_login_still_filters(monkeypatch: pytest.MonkeyPatch) -> Non
     assert result["requested_doctor_login"] == DOCTOR_LOGIN
     assert result["unknown_doctor_login_ignored"] == ""
     assert {slot["doctor_login"] for slot in result["slots"]} == {DOCTOR_LOGIN}
+
+
+def test_clinic_facts_do_not_offer_saturday_consultation_or_prepayment() -> None:
+    schedule = clinic_info.get_clinic_info("schedule", "ru") or ""
+
+    assert "Суббота: консультаций нет — процедурный день" in schedule
+    assert "Воскресенье: выходной" in schedule
+    assert "kaspi_prepay_saturday" not in clinic_info.topics()
+    assert "На субботу запись закрепляется" not in "\n".join(clinic_info.CLINIC_INFO_TEMPLATES.values())
+
+
+def test_kazakh_clinic_facts_match_weekend_policy() -> None:
+    schedule = clinic_info.get_clinic_info("schedule", "kk") or ""
+
+    assert "Сенбі: консультация жоқ — процедуралық күн" in schedule
+    assert "Жексенбі: демалыс" in schedule
+    assert "kaspi_prepay_saturday" not in clinic_info.kazakh_topics()
+
+
+def test_weekend_tool_distinguishes_saturday_from_sunday_and_forbids_prepayment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stub = SlotsStub({MONDAY: ["10:00"]})
+
+    result = run_tool(monkeypatch, stub, {"date_from": SATURDAY})
+
+    assert "суббота — процедурный день" in result["note"].lower()
+    assert "воскресенье — выходной" in result["note"].lower()
+    assert "не предлагай предоплату" in result["note"].lower()
