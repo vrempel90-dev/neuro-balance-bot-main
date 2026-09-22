@@ -1661,7 +1661,7 @@ def test_contraindications_guard_does_not_override_completed_gate() -> None:
 
 def test_system_prompt_forbids_patient_facing_checklist_wording() -> None:
     prompt = agent.agent_system_prompt().lower()
-    assert "75 лет и старше" in prompt
+    assert "76 лет и старше" in prompt\n    assert "75 лет и старше" not in prompt
     assert "пациенту никогда не говори «чек-лист»" in prompt
     assert "кардиостимулятор, дефибриллятор, инсулиновая помпа" in prompt
     assert "тяжёлые проблемы с сердцем, дыханием или психическим состоянием" in prompt
