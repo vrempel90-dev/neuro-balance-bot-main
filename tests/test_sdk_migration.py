@@ -10,7 +10,7 @@ import pytest
 
 import agent
 import agents_sdk_runtime as runtime
-from response_policy import violation
+from response_policy import violation, repeated_question
 
 
 class _Result:
@@ -167,3 +167,9 @@ def test_sdk_failure_after_tool_does_not_restart_booking(monkeypatch):
     assert calls == ["record_patient_facts"]
     assert result.escalate is True
     assert result.reply == "Подключаю администратора."
+
+
+def test_repeated_question_is_blocked_but_requested_repeat_is_allowed():
+    assert repeated_question("Сколько лет пациенту?", "Сколько лет пациенту?", "62") is True
+    assert repeated_question("Сколько лет пациенту?", "Сколько лет пациенту?", "Повторите") is False
+    assert repeated_question("Всё понял.", "Всё понял.", "Да") is False
