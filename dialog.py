@@ -695,6 +695,19 @@ async def _finalize(chat_id: str, session: dict[str, Any], answer: str, result: 
     if not answer:
         return await _handoff(chat_id, session, _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK), "empty_answer")
 
+    # Block fabricated contact links, clinic addresses and CRM action confirmations.
+    # This is a deterministic fail-closed check independent of the LLM runtime.
+    from response_policy import violation as outbound_violation
+    policy_violation = outbound_violation(answer, result)
+    if policy_violation:
+        _safe_log(chat_id, "unverified_fact_blocked", {
+            "chat_id": chat_id, "fact": policy_violation,
+        })
+        return await _handoff(
+            chat_id, session, _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK),
+            policy_violation,
+        )
+
     # 3. Дата, время или врач, которых не было ни в одном результате инструмента.
     unverified = _unverified_fact(chat_id, session, answer, result)
     if unverified:
