@@ -1022,6 +1022,70 @@ def _answer_language_instruction(session: dict[str, Any]) -> str:
     )
 
 
+async def _ensure_reply_language(
+    *, client: Any, model: str, session: dict[str, Any],
+    chat_id: str, answer: str,
+) -> str:
+    """One text-only correction, never replay a booking/CRM tool call.
+
+    Preserve names, dates, slots and clinical facts; the final outbound
+    validator still checks doctor/time against the CRM registry.
+    """
+    try:
+        from language_guard import response_language_violation
+    except ImportError:
+        return answer
+    expected = str(session.get("language") or "ru")
+    violation = response_language_violation(answer, expected)
+    if not violation or not answer.strip():
+        return answer
+    _log(chat_id, "agent_language_mismatch", {
+        "expected": expected, "violation": violation,
+    })
+    allowed, reason = ai_budget.check_allowed(ai_budget.PURPOSE_BRAIN)
+    if not allowed:
+        _log(chat_id, "agent_language_correction_skipped", {"reason": reason or "budget"})
+        return answer
+    language_name = "казахском" if expected == "kk" else "русском"
+    try:
+        repaired = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": (
+                    "Ты редактируешь только ЯЗЫК готового сообщения администратора "
+                    "медицинской клиники. Верни только готовый текст на " + language_name +
+                    " языке, без пояснений. Не добавляй, не сокращай и не меняй "
+                    "противопоказания, медицинские факты, условия записи, "
+                    "имена врачей, даты, время, телефоны, URL и числа. "
+                    "Никаких инструментов и CRM-действий. "
+                    "Если текст уже на нужном языке, оставь его без изменений."
+                )},
+                {"role": "user", "content": answer[:3500]},
+            ],
+            **ai._brain_token_limit_kwargs(model),
+        )
+        ai_budget.record_usage(repaired, model=model, purpose=ai_budget.PURPOSE_BRAIN)
+        fixed = str(repaired.choices[0].message.content or "").strip()
+    except Exception as exc:
+        _log(chat_id, "agent_language_correction_failed", {"error_type": type(exc).__name__})
+        return answer
+
+    if not fixed or response_language_violation(fixed, expected):
+        _log(chat_id, "agent_language_correction_unresolved", {"expected": expected})
+        return answer
+
+    # Language-only rewrites must not silently change hard factual tokens.
+    import re as _re
+    critical = lambda value: sorted(_re.findall(
+        r"https?://\\S+|(?<!\\d)\\d{1,4}(?::\\d{2})?(?!\\d)", value
+    ))
+    if critical(answer) != critical(fixed):
+        _log(chat_id, "agent_language_correction_fact_mismatch", {"expected": expected})
+        return answer
+    _log(chat_id, "agent_language_corrected", {"expected": expected})
+    return fixed
+
+
 def _clinic_today() -> date_cls:
     """Today in the clinic's timezone, not the Railway host's.
 
@@ -2794,7 +2858,7 @@ async def run_agent_turn(
     # from a patient must never carry the authority of a system instruction,
     # or a message crafted to look like an instruction would be weighted as one.
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": agent_system_prompt() + "\\n\\n" + _answer_language_instruction(session)},
+        {"role": "system", "content": agent_system_prompt() + "\n\n" + _answer_language_instruction(session)},
         {
             "role": "user",
             "content": (
@@ -2970,6 +3034,11 @@ async def run_agent_turn(
                 }
             )
 
+    if result.reply:
+        result.reply = await _ensure_reply_language(
+            client=client, model=model, session=session,
+            chat_id=chat_id, answer=result.reply,
+        )
     result.iterations = iterations
     result.outcome = _classify_outcome(result, session)
     _log(
