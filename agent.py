@@ -1291,7 +1291,7 @@ async def _tool_get_available_slots(
     # Only the patient can choose a clinician. A GPT-supplied doctor_login
     # alone is not consent; resolve a direct name request against a doctor name
     # already verified by CRM.
-    if doctor_login and not session.get("preferred_doctor_login"):
+    if doctor_login and session.get("last_user_text") and not session.get("preferred_doctor_login"):
         known = session.get("crm_known_doctors")
         known_name = (known or {}).get(doctor_login.casefold()) if isinstance(known, dict) else ""
         if known_name and _doctor_name_matches(
@@ -2878,7 +2878,8 @@ async def run_agent_turn(
     # from a patient must never carry the authority of a system instruction,
     # or a message crafted to look like an instruction would be weighted as one.
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": agent_system_prompt() + "\n\n" + _answer_language_instruction(session)},
+        {"role": "system", "content": agent_system_prompt()},
+        {"role": "user", "content": _answer_language_instruction(session)},
         {
             "role": "user",
             "content": (
