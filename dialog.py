@@ -697,8 +697,13 @@ async def _finalize(chat_id: str, session: dict[str, Any], answer: str, result: 
 
     # Block fabricated contact links, clinic addresses and CRM action confirmations.
     # This is a deterministic fail-closed check independent of the LLM runtime.
-    from response_policy import violation as outbound_violation
+    from response_policy import violation as outbound_violation, repeated_question
     policy_violation = outbound_violation(answer, result)
+    if not policy_violation and repeated_question(
+        answer, str(session.get("last_assistant_answer") or ""),
+        str(session.get("last_user_text") or ""),
+    ):
+        policy_violation = "repeated_question"
     if policy_violation:
         _safe_log(chat_id, "unverified_fact_blocked", {
             "chat_id": chat_id, "fact": policy_violation,
