@@ -283,7 +283,8 @@ def test_doctor_that_no_tool_returned_is_blocked(monkeypatch: pytest.MonkeyPatch
     assert "Иванов" not in answer
 
 
-def test_empty_answer_is_handed_off_never_sent_as_silence() -> None:
+def test_empty_answer_is_handed_off_never_sent_as_silence(monkeypatch: pytest.MonkeyPatch) -> None:
+    stub = install_crm(monkeypatch, CRMStub())
     chat_id = "dialog_empty_answer"
     fresh_chat(chat_id, language="ru", last_user_text="ну")
 
@@ -292,6 +293,7 @@ def test_empty_answer_is_handed_off_never_sent_as_silence() -> None:
 
     assert answer == dialog.OPERATOR_HANDOFF_RU
     assert session["handoff_reason"] == "empty_answer"
+    assert stub.escalate_calls, "A patient-facing handoff must have a real acknowledged CRM request"
 
 
 # ---------------------------------------------------------------------------

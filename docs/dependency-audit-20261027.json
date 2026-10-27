@@ -1,0 +1,65 @@
+{
+  "before": [
+    {
+      "package": "python-dotenv",
+      "version": "1.0.1",
+      "advisories": [
+        "PYSEC-2026-2270"
+      ]
+    },
+    {
+      "package": "python-multipart",
+      "version": "0.0.12",
+      "advisories": [
+        "PYSEC-2026-1851",
+        "PYSEC-2026-1852",
+        "PYSEC-2026-3036",
+        "PYSEC-2026-3037",
+        "PYSEC-2026-3038",
+        "PYSEC-2026-3039",
+        "PYSEC-2026-3040"
+      ]
+    },
+    {
+      "package": "pyjwt",
+      "version": "2.10.1",
+      "advisories": [
+        "GHSA-pxh4-856f-4h89",
+        "PYSEC-2025-183",
+        "PYSEC-2026-120",
+        "PYSEC-2026-175",
+        "PYSEC-2026-176",
+        "PYSEC-2026-177",
+        "PYSEC-2026-178",
+        "PYSEC-2026-179",
+        "PYSEC-2026-4140",
+        "PYSEC-2026-4141",
+        "PYSEC-2026-4144",
+        "PYSEC-2026-4145",
+        "PYSEC-2026-4147",
+        "PYSEC-2026-4148",
+        "PYSEC-2026-4149",
+        "PYSEC-2026-4152",
+        "PYSEC-2026-4183"
+      ]
+    },
+    {
+      "package": "starlette",
+      "version": "0.41.3",
+      "advisories": [
+        "PYSEC-2026-161",
+        "PYSEC-2026-1941",
+        "PYSEC-2026-1942",
+        "PYSEC-2026-2280",
+        "PYSEC-2026-2281",
+        "PYSEC-2026-248",
+        "PYSEC-2026-249"
+      ]
+    }
+  ],
+  "after": {
+    "dependencies_checked": 34,
+    "known_vulnerabilities": 0
+  },
+  "method": "pip-audit resolving requirements.txt; advisory database snapshot at execution; does not prove absence of unknown vulnerabilities"
+}

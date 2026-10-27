@@ -104,6 +104,14 @@ class CRMRecorder:
     async def lookup_active_appointments_by_phone(self, phone: str) -> dict[str, Any]:
         return {"ok": True, "found": False, "isNew": True, "appointments": [], "appointment": None}
 
+    async def lookup_appointment_by_id(self, appointment_id: str) -> dict[str, Any]:
+        assert str(appointment_id) == "7777"
+        assert self.book_calls, "Read-back cannot succeed before the booking POST"
+        created = self.book_calls[-1]
+        return {"id": 7777, "phone": created["phone"],
+                "doctorLogin": created["doctor_login"], "date": created["date"],
+                "timeStart": created["time_start"]}
+
 
 @pytest.fixture
 def e2e(monkeypatch: pytest.MonkeyPatch):
@@ -120,6 +128,7 @@ def e2e(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(crm, "book_appointment", recorder.book_appointment)
     monkeypatch.setattr(crm, "get_doctors", recorder.get_doctors)
     monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", recorder.lookup_active_appointments_by_phone)
+    monkeypatch.setattr(crm.CRMClient, "lookup_appointment_by_id", lambda client, appointment_id: recorder.lookup_appointment_by_id(appointment_id))
 
     outbound = Outbound()
     monkeypatch.setattr(main, "send_wazzup_message", outbound.send)

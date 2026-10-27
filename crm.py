@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 from functools import lru_cache
 from typing import Any
 from datetime import date as date_cls, datetime, timedelta
 import logging
 import time
 import re
+from zoneinfo import ZoneInfo
 
 import httpx
 
 from config import get_settings
+from phone import sanitize_kz_phone
 
 
 class CRMError(Exception):
@@ -22,9 +25,12 @@ class CRMResponseError(CRMError):
         self.status_code = response.status_code
         self.response_text = response.text
         self.data = data or {}
-        self.code = str(self.data.get("code") or "")
-        message = self.data.get("error") or self.data.get("message") or self.response_text
-        super().__init__(f"CRM {label} error {self.status_code}: {message}")
+        code = str(self.data.get("code") or "")
+        self.code = code if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code) else ""
+        # Exceptions are logged by callers. Response bodies can contain patient
+        # names, phones, complaints and proxy credentials, so keep them out of
+        # the exception string even when the CRM itself returns them as errors.
+        super().__init__(f"CRM {label} error {self.status_code}")
 
 
 logger = logging.getLogger(__name__)
@@ -75,11 +81,10 @@ def _response_json(response: httpx.Response) -> dict[str, Any] | None:
 def _log_crm_response(response: httpx.Response, label: str) -> dict[str, Any] | None:
     data = _response_json(response)
     logger.info(
-        "CRM %s response status=%s text=%s json=%s",
+        "CRM %s response status=%s json_object=%s",
         label,
         response.status_code,
-        response.text[:2000],
-        data,
+        isinstance(data, dict),
     )
     return data
 
@@ -88,6 +93,16 @@ def _raise_for_crm(response: httpx.Response, label: str) -> None:
     data = _log_crm_response(response, label)
     if response.status_code >= 400:
         raise CRMResponseError(label, response, data)
+
+
+def _read_object(response: httpx.Response, label: str) -> dict[str, Any]:
+    """A successful HTTP read must still satisfy the CRM JSON contract."""
+    data = _response_json(response)
+    if data is None:
+        raise CRMError(f"CRM {label} returned a non-object JSON response")
+    if data.get("ok") is False or data.get("success") is False or data.get("error"):
+        raise CRMError(f"CRM {label} returned an unsuccessful result")
+    return data
 
 
 def clear_slots_cache(date: str | None = None) -> None:
@@ -108,16 +123,13 @@ _META_CACHE_TTL = 300.0
 
 
 def normalize_phone(phone: str | None) -> str:
-    digits = re.sub(r"\D+", "", phone or "")
-    if len(digits) == 10 and digits.startswith("7"):
-        digits = "7" + digits
-    elif digits.startswith("8") and len(digits) == 11:
-        digits = "7" + digits[1:]
-    return digits
+    return sanitize_kz_phone(phone)
 
 
 def phone_lookup_variants(phone: str | None) -> list[str]:
     normalized = normalize_phone(phone)
+    if not normalized:
+        return []
     variants: list[str] = []
     if normalized:
         variants.extend([normalized, f"+{normalized}"])
@@ -139,7 +151,19 @@ def _patient_lookup_url() -> str:
 
 
 def _normalize_patient_lookup_response(data: dict[str, Any]) -> dict[str, Any]:
-    data.setdefault("hasActiveAppointment", bool(data.get("appointment")))
+    if not isinstance(data, dict):
+        raise CRMError("CRM patient-lookup returned a non-object response")
+    for field in ("found", "isNew", "hasActiveAppointment"):
+        if field in data and not isinstance(data[field], bool):
+            raise CRMError("CRM patient-lookup returned an invalid classification flag")
+    for key in ("patient", "lead", "appointment", "lastAppointment", "activeAppointment"):
+        if data.get(key) is not None and (not isinstance(data[key], dict) or not data[key]):
+            raise CRMError("CRM patient-lookup returned invalid identity data")
+    for key in ("appointments", "records", "items"):
+        if key in data and (not isinstance(data[key], list) or any(not isinstance(item, dict) for item in data[key])):
+            raise CRMError("CRM patient-lookup returned invalid appointment history")
+    data = dict(data)
+    data.setdefault("hasActiveAppointment", False)
     data.setdefault("ok", True)
     return data
 
@@ -147,11 +171,10 @@ def _normalize_patient_lookup_response(data: dict[str, Any]) -> dict[str, Any]:
 async def patient_lookup_raw(phone_param: str) -> dict[str, Any]:
     endpoint = _patient_lookup_url()
     params = {"phone": phone_param}
-    logger.info("CRM patient-lookup request endpoint=%s params=%s headers=%s", endpoint, params, _redacted_headers())
+    logger.info("CRM patient-lookup request")
     response = await _client().get(endpoint, params=params, headers=_headers())
-    logger.info("CRM patient-lookup status_code=%s endpoint=%s params=%s", response.status_code, endpoint, params)
     _raise_for_crm(response, "patient-lookup")
-    data = response.json()
+    data = _read_object(response, "patient-lookup")
     return _normalize_patient_lookup_response(data)
 
 
@@ -172,7 +195,7 @@ async def get_doctors(force: bool = False) -> dict[str, Any]:
     )
     _raise_for_crm(response, "doctors")
 
-    data = response.json()
+    data = _read_object(response, "doctors")
     data.setdefault("ok", True)
     _DOCTORS_CACHE = (now, data)
     return data
@@ -191,7 +214,7 @@ async def get_services(force: bool = False) -> dict[str, Any]:
     )
     _raise_for_crm(response, "services")
 
-    data = response.json()
+    data = _read_object(response, "services")
     data.setdefault("treatable", [])
     data.setdefault("notTreatable", [])
     data.setdefault("doctorCount", 0)
@@ -223,8 +246,10 @@ async def check_slots(date: str, doctor_login: str | None = None) -> dict[str, A
     )
     _raise_for_crm(response, "check-slots")
 
-    data = response.json()
+    data = _read_object(response, "check-slots")
     availability = data.get("availability") or []
+    if not isinstance(availability, list):
+        raise CRMError("CRM check-slots returned invalid availability")
     slots: list[dict[str, Any]] = []
 
     for item in availability:
@@ -438,8 +463,8 @@ async def cancel_appointment(
     )
     _raise_for_crm(response, "appointment/cancel")
 
-    data = response.json()
-    data.setdefault("ok", bool(data.get("success", True)))
+    data = _read_object(response, "appointment/cancel")
+    data.setdefault("ok", any(data.get(key) is True for key in ("success", "cancelled", "alreadyCancelled")))
     data.setdefault("cancelled", bool(data.get("success") or data.get("alreadyCancelled")))
     return data
 
@@ -476,9 +501,9 @@ async def reschedule_appointment(
     )
     _raise_for_crm(response, "appointment/reschedule")
 
-    data = response.json()
-    data.setdefault("ok", True)
-    data.setdefault("rescheduled", True)
+    data = _read_object(response, "appointment/reschedule")
+    data.setdefault("ok", any(data.get(key) is True for key in ("success", "rescheduled")))
+    data.setdefault("rescheduled", data.get("success") is True)
 
     for key in list(_SLOTS_CACHE.keys()):
         if key[0] == new_date:
@@ -510,73 +535,116 @@ def _extract_appointments(data: dict[str, Any]) -> list[dict[str, Any]]:
     candidates = data.get("appointments") or data.get("records") or data.get("items") or []
     if not isinstance(candidates, list):
         candidates = []
-    return [a for a in candidates if isinstance(a, dict)]
+    appointments = [a for a in candidates if isinstance(a, dict)]
+    for key in ("appointment", "activeAppointment", "lastAppointment"):
+        candidate = data.get(key)
+        if isinstance(candidate, dict) and candidate and candidate not in appointments:
+            appointments.append(candidate)
+    return appointments
 
 
 def _is_active_future_appointment(appt: dict[str, Any]) -> bool:
     status = str(appt.get("status") or appt.get("appointmentStatus") or "").lower()
-    if status in {"cancelled", "canceled", "completed", "deleted", "no_show", "no-show", "done"}:
+    if status in {"cancelled", "canceled", "completed", "deleted", "no_show", "no-show", "done", "отменена", "отменён", "отменен", "отменено", "не_пришел", "не_пришёл", "завершен", "завершён"}:
         return False
     if not _appointment_id(appt):
         return False
     dt = _appointment_datetime(appt)
     if dt is None:
         return bool(appt)
-    return dt >= datetime.now().replace(tzinfo=None)
+    clinic_now = datetime.now(ZoneInfo("Asia/Almaty")).replace(tzinfo=None)
+    return dt >= clinic_now
 
 
 class CRMClient:
     async def lookup_active_appointments_by_phone(self, phone: str) -> dict[str, Any]:
+        """Look up EVERY supported number representation before admitting a lead.
+
+        A 200/unknown response for +7 must not shadow an existing patient whose
+        CRM phone is saved as 8... or 10 digits. Never treat partial responses
+        as permission for an AI conversation.
+        """
         variants = phone_lookup_variants(phone)
-        errors: list[str] = []
-        last_status: int | None = None
+        if not variants:
+            raise CRMError("CRM lookup failed: invalid_phone")
         endpoint = _patient_lookup_url()
-        last_params: dict[str, Any] = {}
-        for variant in variants or [phone]:
-            last_params = {"phone": variant}
+
+        async def _one(variant: str) -> tuple[str, dict[str, Any] | None, str]:
             try:
+                # Some integrations intentionally override patient_lookup.
                 if getattr(patient_lookup, "__module__", "crm") != __name__:
                     data = await patient_lookup(variant)
                 else:
                     data = await patient_lookup_raw(variant)
-                last_status = 200
-            except CRMResponseError as exc:
-                last_status = exc.status_code
-                errors.append(str(exc))
-                logger.exception("CRM active appointment lookup response error endpoint=%s params=%s status_code=%s", endpoint, last_params, exc.status_code)
-                continue
+                if not isinstance(data, dict) or data.get("ok") is False or data.get("error"):
+                    return variant, None, "crm_invalid_response"
+                if not isinstance(data.get("found"), bool) or not isinstance(data.get("isNew"), bool):
+                    return variant, None, "crm_missing_identity_fields"
+                return variant, data, ""
             except Exception as exc:
-                errors.append(str(exc))
-                logger.exception("CRM active appointment lookup failed endpoint=%s params=%s", endpoint, last_params)
-                continue
-            appointments = _extract_appointments(data)
-            active = [a for a in appointments if _is_active_future_appointment(a)]
-            active.sort(key=lambda a: _appointment_datetime(a) or datetime.max)
-            return {
-                "ok": True,
-                "status_code": last_status or 200,
-                "phone_raw": phone,
-                "phone_normalized": normalize_phone(phone),
-                "phone_variants": variants,
-                "endpoint_url": endpoint,
-                "query_params": last_params,
-                "appointments_raw_count": len(appointments),
-                "appointments": active,
-                "appointment": active[0] if active else None,
-                "appointments_cache": active[1:],
-                "active_count": len(active),
-                "raw": data,
-            }
-        err = CRMError("CRM lookup failed: " + "; ".join(errors[-3:]))
-        setattr(err, "status_code", last_status)
-        setattr(err, "endpoint_url", endpoint)
-        setattr(err, "query_params", last_params)
-        raise err
+                logger.warning("CRM phone variant lookup failed error=%s", type(exc).__name__)
+                return variant, None, type(exc).__name__
+
+        results = await asyncio.gather(*(_one(variant) for variant in variants))
+        successes = [(variant, data) for variant, data, error in results if data is not None]
+        failures = [(variant, error) for variant, _, error in results if error]
+        if not successes:
+            raise CRMError("CRM lookup failed for all phone formats")
+        if failures:
+            # Even one unresolved format could hide an already booked patient.
+            raise CRMError("CRM lookup incomplete for phone formats")
+
+        def _priority(payload: dict[str, Any]) -> int:
+            appointments = _extract_appointments(payload)
+            active = any(_is_active_future_appointment(x) for x in appointments)
+            if active or payload.get("hasActiveAppointment") is True:
+                return 6
+            if payload.get("patient") or payload.get("lastAppointment") or appointments:
+                return 5
+            if payload.get("lead"):
+                return 4
+            if payload.get("found") is True or payload.get("isNew") is False:
+                return 3
+            return 1
+
+        variant, data = max(successes, key=lambda item: _priority(item[1]))
+        all_appointments = [
+            a for _, item in successes for a in _extract_appointments(item)
+        ]
+        active = [a for a in all_appointments if _is_active_future_appointment(a)]
+        # De-duplicate cross-format CRM matches by appointment id.
+        deduped: dict[str, dict[str, Any]] = {}
+        for appt in active:
+            key = str(_appointment_id(appt) or "")
+            if key:
+                deduped[key] = appt
+        active = list(deduped.values())
+        active.sort(key=lambda a: _appointment_datetime(a) or datetime.max)
+        # If any format found an active appointment, admission must see it,
+        # even if the selected response contained only the patient record.
+        merged = dict(data)
+        if active:
+            merged["hasActiveAppointment"] = True
+        return {
+            "ok": True,
+            "status_code": 200,
+            "phone_raw": phone,
+            "phone_normalized": normalize_phone(phone),
+            "phone_variants": variants,
+            "endpoint_url": endpoint,
+            "query_params": {"phone": variant},
+            "appointments_raw_count": len(all_appointments),
+            "appointments": active,
+            "appointment": active[0] if active else None,
+            "appointments_cache": active[1:],
+            "active_count": len(active),
+            "raw": merged,
+        }
 
     async def lookup_appointment_by_id(self, appointment_id: str | int) -> dict[str, Any]:
         response = await _client().get(_url("/api/bot/appointment"), params={"appointmentId": appointment_id}, headers=_headers())
         _raise_for_crm(response, "appointment")
-        data = response.json(); data.setdefault("ok", True); return data
+        data = _read_object(response, "appointment"); data.setdefault("ok", True); return data
 
     async def check_slots_for_date(self, date: str | date_cls, doctor_login: str | None = None) -> dict[str, Any]:
         return await check_slots_for_date(date, doctor_login)
@@ -599,6 +667,77 @@ class CRMClient:
 
 async def lookup_active_appointments_by_phone(phone: str) -> dict[str, Any]:
     return await CRMClient().lookup_active_appointments_by_phone(phone)
+
+
+def _booking_matches(
+    appointment: dict[str, Any], *, appointment_id: str, phone: str,
+    doctor_login: str, date: str, time_start: str, doctor_name: str | None,
+    phone_scoped: bool,
+) -> bool:
+    """Compare persisted fields, never convenience defaults from the POST."""
+    if str(_appointment_id(appointment) or "") != appointment_id:
+        return False
+    status = str(appointment.get("status") or appointment.get("appointmentStatus") or "").strip().lower()
+    if status in {"cancelled", "canceled", "deleted", "rejected", "completed", "done", "no_show", "no-show", "отменена", "отменен", "отменён", "отменено", "не_пришел", "не_пришёл", "не пришел", "не пришёл", "завершен", "завершён"} or any(marker in status for marker in ("отмен", "cancel", "reject", "удален", "удалён")):
+        return False
+    stored_phone = appointment.get("phone") or appointment.get("patientPhone")
+    if stored_phone and normalize_phone(str(stored_phone)) != normalize_phone(phone):
+        return False
+    if not phone_scoped and not stored_phone:
+        return False
+    stored_date = appointment.get("date") or appointment.get("appointmentDate")
+    stored_time = appointment.get("timeStart") or appointment.get("time_start") or appointment.get("time")
+    if str(stored_date or "")[:10] != date[:10] or str(stored_time or "")[:5] != time_start[:5]:
+        return False
+    stored_doctor = appointment.get("doctorLogin") or appointment.get("doctor_login")
+    if stored_doctor:
+        return str(stored_doctor) == str(doctor_login)
+    stored_name = appointment.get("doctorName") or appointment.get("doctor_name")
+    return bool(doctor_name and stored_name and str(stored_name).strip() == str(doctor_name).strip())
+
+
+async def verify_saved_booking(
+    response: dict[str, Any], *, phone: str, doctor_login: str,
+    date: str, time_start: str, doctor_name: str | None = None,
+) -> dict[str, Any]:
+    """Read back a persisted booking before the caller tells a patient success.
+
+    No POST is retried here. A failed/mismatching read is an uncertain outcome,
+    so the caller must retain its durable booking claim for reconciliation.
+    """
+    appointment_id = str(_appointment_id(response) or "")
+    if not appointment_id and isinstance(response.get("appointment"), dict):
+        appointment_id = str(_appointment_id(response["appointment"]) or "")
+    if not appointment_id:
+        return {"verified": False, "reason": "appointment_id_missing"}
+    expected = {
+        "appointment_id": appointment_id, "phone": phone,
+        "doctor_login": doctor_login, "date": date, "time_start": time_start,
+        "doctor_name": doctor_name,
+    }
+    try:
+        data = await CRMClient().lookup_appointment_by_id(appointment_id)
+        candidates = _extract_appointments(data)
+        if _appointment_id(data):
+            candidates.append(data)
+        for appointment in candidates:
+            if _booking_matches(appointment, **expected, phone_scoped=False):
+                return {"verified": True, "reason": "appointment_readback", "appointment": appointment}
+    except Exception as exc:
+        logger.warning("CRM booking ID verification unavailable error=%s", type(exc).__name__)
+    try:
+        lookup = await lookup_active_appointments_by_phone(phone)
+        if not isinstance(lookup, dict) or lookup.get("ok") is False:
+            return {"verified": False, "reason": "lookup_unavailable"}
+        raw = lookup.get("raw") if isinstance(lookup.get("raw"), dict) else lookup
+        if raw.get("ok") is False or raw.get("error"):
+            return {"verified": False, "reason": "lookup_unavailable"}
+        for appointment in _extract_appointments(raw) + _extract_appointments(lookup):
+            if _booking_matches(appointment, **expected, phone_scoped=True):
+                return {"verified": True, "reason": "phone_lookup_readback", "appointment": appointment}
+    except Exception as exc:
+        logger.warning("CRM booking phone verification unavailable error=%s", type(exc).__name__)
+    return {"verified": False, "reason": "appointment_not_verified"}
 
 async def escalate_to_operator(
     *,
@@ -625,8 +764,10 @@ async def escalate_to_operator(
     )
     _raise_for_crm(response, "escalate")
 
-    data = response.json()
-    data.setdefault("ok", True)
+    data = _read_object(response, "escalate")
+    accepted = any(data.get(key) is True for key in ("ok", "success", "escalated", "accepted"))
+    accepted = accepted or bool(data.get("escalationId") or data.get("ticketId"))
+    data["ok"] = bool(accepted)
     return data
 
 

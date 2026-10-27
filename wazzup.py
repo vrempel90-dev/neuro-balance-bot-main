@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote, urlsplit
 import httpx
 from functools import lru_cache
 from config import get_settings
@@ -8,7 +9,10 @@ from config import get_settings
 
 @lru_cache(maxsize=1)
 def _client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0), follow_redirects=True)
+    return httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0), follow_redirects=False)
+
+
+MAX_MEDIA_BYTES = 25 * 1024 * 1024
 
 
 AUDIO_EXT_BY_MIME = {
@@ -96,11 +100,32 @@ async def send_text(chat_id: str, text: str, chat_type: str = "whatsapp", channe
             "Authorization": f"Bearer {settings.wazzup_api_key}",
             "Content-Type": "application/json",
         },
+        follow_redirects=False,
     )
     response.raise_for_status()
-    data = response.json() if response.text else {"ok": True}
-    if isinstance(data, dict):
-        data.setdefault("status_code", response.status_code)
+    try:
+        data = response.json()
+    except ValueError as exc:
+        # A 2xx with an empty/HTML body is not a delivery acknowledgement.
+        # The caller keeps its outgoing claim uncertain, without a blind retry.
+        raise ValueError("Invalid Wazzup acknowledgement JSON") from exc
+    if (
+        not isinstance(data, dict)
+        or data.get("ok") is False
+        or data.get("success") is False
+        or bool(data.get("error"))
+        or bool(data.get("errors"))
+        or str(data.get("status") or "").lower() in {"error", "failed", "failure"}
+    ):
+        raise ValueError("Wazzup did not acknowledge the message")
+    acknowledged = (
+        data.get("ok") is True
+        or data.get("success") is True
+        or bool(str(data.get("messageId") or data.get("id") or "").strip())
+    )
+    if not acknowledged:
+        raise ValueError("Wazzup acknowledgement has no message identity or success flag")
+    data["status_code"] = response.status_code
     return data
 
 
@@ -249,30 +274,57 @@ def _message_media(msg: dict[str, Any]) -> dict[str, str]:
     }
 
 
-async def download_media(media_url: str | None = None, file_id: str | None = None) -> tuple[bytes, str]:
-    """Скачивает голосовой файл.
+def media_request_headers(url: str) -> dict[str, str]:
+    """Validate provider media location; credentials go only to the API origin.
 
-    Если webhook даёт прямой media_url — качаем его.
-    Если даёт только file_id — пробуем WAZZUP_MEDIA_ENDPOINT_TEMPLATE.
-    Возможно, под реальный кабинет Wazzup endpoint придётся поменять в .env.
+    Redirects are deliberately disabled by the downloader. A trusted CDN URL
+    must work without the account bearer; we never forward it across origins.
     """
+    settings = get_settings()
+    try:
+        target = urlsplit(url)
+        configured = urlsplit(settings.wazzup_api_url)
+        host = str(target.hostname or "").lower()
+        api_host = str(configured.hostname or "").lower()
+        port = target.port or 443
+        api_port = configured.port or 443
+    except ValueError as exc:
+        raise ValueError("Invalid media URL") from exc
+    same_origin = target.scheme == configured.scheme == "https" and host == api_host and port == api_port
+    trusted_cdn = (host == "wazzup24.com" or host.endswith(".wazzup24.com")) and port == 443
+    if target.scheme != "https" or not host or target.username is not None or target.password is not None or not (same_origin or trusted_cdn):
+        raise ValueError("Untrusted media URL")
+    return {"Authorization": f"Bearer {settings.wazzup_api_key}"} if same_origin else {}
+
+
+async def download_media(media_url: str | None = None, file_id: str | None = None) -> tuple[bytes, str]:
+    """Download bounded media from a trusted provider origin without redirects."""
     settings = get_settings()
     url = (media_url or "").strip()
     if not url and file_id:
         url = settings.wazzup_media_endpoint_template.format(
             api_url=settings.wazzup_api_url.rstrip("/"),
-            file_id=file_id,
+            file_id=quote(str(file_id), safe=""),
         )
     if not url:
-        raise ValueError("Нет media_url или file_id для скачивания голосового")
-
-    response = await _client().get(
-        url,
-        headers={"Authorization": f"Bearer {settings.wazzup_api_key}"},
-    )
-    response.raise_for_status()
-    content_type = response.headers.get("content-type", "")
-    return response.content, content_type
+        raise ValueError("Missing media URL or file identity")
+    headers = media_request_headers(url)
+    async with _client().stream("GET", url, headers=headers, follow_redirects=False) as response:
+        response.raise_for_status()
+        length = response.headers.get("content-length")
+        if length is not None:
+            try:
+                declared_length = int(length)
+            except ValueError as exc:
+                raise ValueError("Invalid media content length") from exc
+            if declared_length < 0 or declared_length > MAX_MEDIA_BYTES:
+                raise ValueError("Media exceeds size limit")
+        chunks = bytearray()
+        async for chunk in response.aiter_bytes():
+            if len(chunks) + len(chunk) > MAX_MEDIA_BYTES:
+                raise ValueError("Media exceeds size limit")
+            chunks.extend(chunk)
+        return bytes(chunks), response.headers.get("content-type", "")
 
 
 def extract_incoming_messages(payload: dict[str, Any]) -> list[dict[str, str]]:

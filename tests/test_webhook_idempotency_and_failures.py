@@ -81,11 +81,11 @@ def offline_crm(monkeypatch: pytest.MonkeyPatch) -> None:
             "phone_normalized": phone, "phone_variants": [phone],
             "endpoint_url": "test", "query_params": {},
             "appointments_raw_count": 0, "appointments": [], "appointment": None,
-            "appointments_cache": [], "active_count": 0, "raw": {"found": False},
+            "appointments_cache": [], "active_count": 0, "raw": {"found": False, "isNew": True},
         }
 
     async def fake_patient_lookup(phone: str) -> dict[str, Any]:
-        return {"found": False}
+        return {"found": False, "isNew": True}
 
     monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", fake_lookup)
     monkeypatch.setattr(crm, "patient_lookup", fake_patient_lookup)

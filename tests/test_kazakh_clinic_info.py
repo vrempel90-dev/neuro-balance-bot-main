@@ -108,10 +108,19 @@ def test_bot_tools_defaults_to_russian_without_session_language() -> None:
         ("objection_will_think", "instagram.com/neuro_balance_ast"),
         ("installment", "Kaspi RED"),
         ("price_first_visit", "5 000 тг"),
-        ("kaspi_prepay_saturday", "2 000 тг"),
     ],
 )
 def test_kazakh_templates_keep_links_brands_and_numbers(topic: str, fragment: str) -> None:
     """Ссылки, бренды, номера домов и цены переводить нельзя."""
     kk = clinic_info.get_clinic_info(topic, "kk")
     assert fragment.lower() in kk.lower()
+
+
+def test_removed_saturday_prepayment_is_not_offered_in_either_language() -> None:
+    """The approved policy has no Saturday consultations or prepayment.
+
+    An obsolete assertion used to require an invented 2,000 KZT charge. Keep
+    this retired topic absent rather than restoring it just to satisfy a test.
+    """
+    for language in ("ru", "kk"):
+        assert clinic_info.get_clinic_info("kaspi_prepay_saturday", language) is None

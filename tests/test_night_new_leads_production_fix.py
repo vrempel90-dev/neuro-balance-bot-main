@@ -180,7 +180,7 @@ def test_daytime_test_window_ignored_when_disabled(monkeypatch):
 
 
 
-def test_new_lead_keeps_bounded_access_when_crm_marks_same_lead_in_progress(monkeypatch):
+def test_crm_in_progress_lead_is_excluded_even_when_ai_session_is_recent(monkeypatch):
     async def scenario():
         async def fake_lookup(phone):
             return {
@@ -201,8 +201,9 @@ def test_new_lead_keeps_bounded_access_when_crm_marks_same_lead_in_progress(monk
 
         verdict = await dialog._classify_lead(chat_id, "77008984505", session)
 
-        assert verdict.state == "NEW"
-        assert verdict.reason == "active_ai_conversation"
+        assert verdict.state == "RETURNING"
+        assert verdict.reason == "lead_in_progress"
+        assert verdict.bot_may_reply is False
 
     asyncio.run(scenario())
 

@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
+import hmac
+import os
+import re
+import secrets
+from copy import deepcopy
 import sqlite3
 from collections import deque
 from datetime import datetime, timezone
@@ -12,6 +18,9 @@ from schedule import astana_now, time_gate_status
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("production_events")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+_LOG_FALLBACK_SALT = secrets.token_bytes(32)
 _LAST_EVENTS_MEMORY: deque[dict[str, Any]] = deque(maxlen=500)
 
 _SECRET_KEY_PARTS = ("secret", "api_key", "apikey", "token", "authorization", "password")
@@ -45,17 +54,37 @@ _STDOUT_EVENTS = {
 }
 
 
+def anonymize_identifier(value: Any) -> str:
+    """Stable keyed reference; never expose a phone-derived unhashed identifier."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"ref_[0-9a-f]{20}", text):
+        return text
+    settings = get_settings()
+    salt = str(os.getenv("LOG_REDACTION_SECRET") or getattr(settings, "crm_bot_secret", "") or "").encode() or _LOG_FALLBACK_SALT
+    return "ref_" + hmac.new(salt, text.encode(), hashlib.sha256).hexdigest()[:20]
+
+
 def _safe_log_value(key: str, value: Any) -> Any:
     key_low = key.lower()
     if any(part in key_low for part in _SECRET_KEY_PARTS):
         return "***"
+    if key_low in {"chat_id", "phone", "phone_raw", "phone_normalized", "message_id", "message_key", "patient_id", "lead_id", "appointment_id"}:
+        return anonymize_identifier(value)
+    # Free-form bodies and exceptions may contain names, complaints, signed URLs
+    # or credentials. Preserve operational flags/counts, never a text preview.
+    if (key_low in {"text", "content", "transcript", "answer", "complaint", "patient_name", "name", "history", "messages", "raw", "payload", "note", "error", "crm_error", "details", "arguments", "args", "patient", "lead", "appointment", "response"}
+        or key_low.endswith(("_preview", "_raw", "_name", "_error", "_url"))):
+        return "[redacted]" if value else ""
     if isinstance(value, dict):
         return {str(k): _safe_log_value(str(k), v) for k, v in value.items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [_safe_log_value(key, item) for item in value[:20]]
     if isinstance(value, str):
-        limit = 120 if key_low in {"text", "content", "transcript", "answer"} else 500
-        return value.replace("\n", " ").strip()[:limit]
+        safe = re.sub(r"(?i)(?:Bearer\s+[^\s]+|sk-[a-z0-9_-]+|https?://[^\s]+|[^\s@]+@[^\s@]+\.[^\s@]+)", "[redacted]", value)
+        safe = re.sub(r"(?<!\d)\+?[78][\s().-]*(?:\d[\s().-]*){10}(?!\d)", "[redacted]", safe)
+        return safe.replace("\n", " ").strip()[:500]
     return value
 
 
@@ -111,7 +140,7 @@ def should_emit_production_event(event_type: str, payload: dict[str, Any] | None
 
 def _safe_log_payload(chat_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     enriched = {**log_window_status(), **(payload or {})}
-    safe = {"event": event_type, "chat_id": chat_id}
+    safe = {"event": event_type, "chat_id": anonymize_identifier(chat_id)}
     for key, value in enriched.items():
         out_key = "text_preview" if str(key).lower() in {"text", "content", "transcript"} else str(key)
         safe[out_key] = _safe_log_value(str(key), value)
@@ -150,7 +179,10 @@ def _connect() -> sqlite3.Connection:
     settings = get_settings()
     if "/" in settings.sqlite_path:
         Path(settings.sqlite_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(settings.sqlite_path)
+    conn = sqlite3.connect(settings.sqlite_path, timeout=15.0)
+    conn.execute("PRAGMA busy_timeout=15000")
+    if settings.sqlite_path != ":memory:":
+        os.chmod(settings.sqlite_path, 0o600)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -161,6 +193,7 @@ def now_iso() -> str:
 
 def init_db() -> None:
     with _connect() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -194,6 +227,14 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS outgoing_messages (
+                message_key TEXT PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at, event_type);
             CREATE TABLE IF NOT EXISTS ai_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 day TEXT NOT NULL,
@@ -317,7 +358,9 @@ def add_message(chat_id: str, role: str, content: str) -> None:
 def log_event(chat_id: str, event_type: str, payload: dict[str, Any]) -> None:
     payload = dict(payload or {})
     enriched_payload = {**log_window_status(), **payload}
-    event_record = {"chat_id": chat_id, "event_type": event_type, "payload": enriched_payload, "created_at": now_iso()}
+    safe_record = _safe_log_payload(chat_id, event_type, enriched_payload)
+    safe_payload = {k: v for k, v in safe_record.items() if k != "event"}
+    event_record = {"chat_id": anonymize_identifier(chat_id), "event_type": event_type, "payload": safe_payload, "created_at": now_iso()}
     _LAST_EVENTS_MEMORY.append(event_record)
     if event_type in _STDOUT_EVENTS or _is_startup_health_event(event_type) or _is_error_warning_event(event_type, payload):
         if should_emit_production_event(event_type, payload):
@@ -325,7 +368,7 @@ def log_event(chat_id: str, event_type: str, payload: dict[str, Any]) -> None:
     with _connect() as conn:
         conn.execute(
             "INSERT INTO events(chat_id, event_type, payload_json, created_at) VALUES (?, ?, ?, ?)",
-            (chat_id, event_type, json.dumps(enriched_payload, ensure_ascii=False), now_iso()),
+            (anonymize_identifier(chat_id), event_type, json.dumps(safe_payload, ensure_ascii=False), now_iso()),
         )
 
 
@@ -351,17 +394,21 @@ def get_session(chat_id: str) -> dict[str, Any]:
     with _connect() as conn:
         row = conn.execute("SELECT data_json FROM sessions WHERE chat_id=?", (chat_id,)).fetchone()
     if not row:
-        return dict(DEFAULT_SESSION)
-    data = dict(DEFAULT_SESSION)
+        return deepcopy(DEFAULT_SESSION)
+    data = deepcopy(DEFAULT_SESSION)
     try:
-        data.update(json.loads(row["data_json"]))
-    except Exception:
-        pass
+        decoded = json.loads(row["data_json"])
+        if not isinstance(decoded, dict):
+            raise ValueError("invalid session shape")
+        data.update(decoded)
+    except (ValueError, TypeError):
+        # Corrupt session must not silently turn a booked/manual patient new.
+        data.update({"ai_muted": True, "manual_takeover": True, "session_state_error": True})
     return data
 
 
 def save_session(chat_id: str, data: dict[str, Any]) -> None:
-    cleaned = dict(DEFAULT_SESSION)
+    cleaned = deepcopy(DEFAULT_SESSION)
     cleaned.update(data)
     with _connect() as conn:
         row = conn.execute("SELECT data_json FROM sessions WHERE chat_id=?", (chat_id,)).fetchone()
@@ -395,7 +442,7 @@ def save_session(chat_id: str, data: dict[str, Any]) -> None:
 
 
 def reset_session(chat_id: str) -> None:
-    save_session(chat_id, dict(DEFAULT_SESSION))
+    save_session(chat_id, deepcopy(DEFAULT_SESSION))
 
 
 def count_events_since(event_type: str, since_iso: str) -> int:
@@ -601,11 +648,11 @@ def recent_events_for_phone(phone: str, limit: int = 50) -> list[dict[str, Any]]
             """
             SELECT chat_id, event_type, payload_json, created_at
             FROM events
-            WHERE chat_id=? OR payload_json LIKE ?
+            WHERE chat_id=? OR chat_id=? OR payload_json LIKE ? OR payload_json LIKE ?
             ORDER BY id DESC
             LIMIT ?
             """,
-            (phone, like, int(limit or 50)),
+            (phone, anonymize_identifier(phone), like, f'%"phone": "{anonymize_identifier(phone)}"%', int(limit or 50)),
         ).fetchall()
     out: list[dict[str, Any]] = []
     for row in reversed(rows):
@@ -615,9 +662,9 @@ def recent_events_for_phone(phone: str, limit: int = 50) -> list[dict[str, Any]]
             payload = {}
         out.append({
             "created_at": row["created_at"],
-            "chat_id": row["chat_id"],
+            "chat_id": anonymize_identifier(row["chat_id"]),
             "event": row["event_type"],
-            "payload": payload,
+            "payload": {str(k): _safe_log_value(str(k), v) for k, v in payload.items()},
         })
     return out
 
@@ -658,3 +705,50 @@ def determine_next_step(session: dict[str, Any]) -> str:
     if not session.get("patient_name"):
         return "name"
     return "booking"
+
+
+_OUTGOING_MESSAGES_DDL = """
+CREATE TABLE IF NOT EXISTS outgoing_messages (
+    message_key TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+
+def claim_outgoing_message(message_key: str, chat_id: str) -> bool:
+    """Persist BEFORE sending. A restart must never retry an uncertain delivery.
+
+    Callers supply a stable inbound-message/channel/chat key, not response text.
+    There is no automatic expiry: provider timeout may still mean delivery.
+    """
+    if not message_key:
+        return False
+    with _connect() as conn:
+        conn.execute(_OUTGOING_MESSAGES_DDL)
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO outgoing_messages(message_key, chat_id, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (message_key, anonymize_identifier(chat_id), "sending", now_iso(), now_iso()),
+        )
+    return cur.rowcount == 1
+
+
+def mark_outgoing_message(message_key: str, status: str) -> None:
+    if not message_key:
+        return
+    if status not in {"sending", "confirmed", "uncertain", "rejected"}:
+        raise ValueError("invalid outgoing message status")
+    with _connect() as conn:
+        conn.execute(_OUTGOING_MESSAGES_DDL)
+        conn.execute("UPDATE outgoing_messages SET status=?, updated_at=? WHERE message_key=?", (status, now_iso(), message_key))
+
+
+def outgoing_message_status(message_key: str) -> str:
+    if not message_key:
+        return ""
+    with _connect() as conn:
+        conn.execute(_OUTGOING_MESSAGES_DDL)
+        row = conn.execute("SELECT status FROM outgoing_messages WHERE message_key=?", (message_key,)).fetchone()
+    return str(row["status"]) if row else ""

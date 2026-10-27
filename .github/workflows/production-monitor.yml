@@ -1,0 +1,121 @@
+name: NeuroBalance Production Monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  push:
+    branches: [main]
+    paths:
+      - "*.py"
+      - "requirements.txt"
+      - ".github/workflows/production-monitor.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: neurobalance-production-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      NEUROBALANCE_URL: https://neuro-balance-bot-main-production.up.railway.app
+    steps:
+      - name: Verify health, storage, queues and read-only dependencies
+        env:
+          RUN_DEPENDENCY_PROBES: ${{ github.event_name != 'schedule' }}
+          EXPECTED_RELEASE: ${{ github.event_name == 'push' && github.sha || '' }}
+        run: |
+          python - <<'PY'
+          import json, os, time, urllib.request, urllib.error
+          from pathlib import Path
+
+          root = os.environ['NEUROBALANCE_URL'].rstrip('/')
+          destination = Path('monitor-results')
+          destination.mkdir()
+          output = {}
+          failures = []
+
+          def request(url, *, token=None, method='GET', timeout=15):
+              headers = {'Accept': 'application/json'}
+              if token:
+                  headers['Authorization'] = 'Bearer ' + token
+              req = urllib.request.Request(url, headers=headers, method=method)
+              with urllib.request.urlopen(req, timeout=timeout) as response:
+                  if response.status != 200:
+                      raise RuntimeError('unexpected_http_status')
+                  return json.load(response)
+
+          try:
+              health = request(root + '/health', timeout=10)
+              expected = os.getenv('EXPECTED_RELEASE') or ''
+              # A push can precede Railway finishing its build. Poll a bounded
+              # four-minute interval; each request/sleep remains below 60 s.
+              if expected:
+                  deadline = time.monotonic() + 240
+                  while health.get('release_sha') != expected and time.monotonic() < deadline:
+                      time.sleep(10)
+                      health = request(root + '/health', timeout=10)
+                  if health.get('release_sha') != expected:
+                      failures.append('release_not_observed_within_240_seconds')
+              output['health'] = {
+                  k: health.get(k) for k in ('ok', 'release_sha', 'utc_time', 'timezone', 'new_leads_only')
+              }
+              if health.get('ok') is not True:
+                  failures.append('health_not_ok')
+          except Exception as exc:
+              output['health'] = {'ok': False, 'error_type': type(exc).__name__}
+              failures.append('health_request_failed')
+
+          try:
+              oidc_url = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']
+              oidc_url += ('&' if '?' in oidc_url else '?') + 'audience=neurobalance-production-monitor'
+              oidc = request(oidc_url, token=os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN'])
+              token = oidc['value']
+              print('::add-mask::' + token)
+              # The token is never printed, uploaded, or persisted.
+              if os.environ.get('RUN_DEPENDENCY_PROBES') == 'true':
+                  hardening = request(root + '/internal/monitor/secure-webhook', token=token, method='POST', timeout=55)
+                  output['webhook_auth_hardening'] = hardening
+                  if hardening.get('ok') is not True:
+                      failures.append('webhook_auth_requires_attention')
+              status = request(root + '/internal/monitor/status', token=token)
+              output['status'] = status
+              if status.get('ok') is not True:
+                  failures.append('runtime_status_requires_attention')
+              if status.get('config', {}).get('new_leads_only') is not True:
+                  failures.append('new_leads_gate_disabled')
+              if os.environ.get('RUN_DEPENDENCY_PROBES') == 'true':
+                  probe = request(root + '/internal/monitor/probe', token=token, method='POST', timeout=55)
+                  output['dependency_probes'] = probe
+                  if probe.get('ok') is not True:
+                      failures.append('dependency_probe_failed')
+          except Exception as exc:
+              output['monitor_request'] = {'ok': False, 'error_type': type(exc).__name__}
+              failures.append('authenticated_monitor_request_failed')
+
+          output['failures'] = failures
+          (destination / 'result.json').write_text(json.dumps(output, ensure_ascii=False, indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('### NeuroBalance production check\n\n')
+              summary.write('Result: ' + ('FAILED' if failures else 'PASS') + '\n\n')
+              summary.write('This is periodic checking; GitHub scheduling may be delayed. No CRM writes or patient messages.\n\n')
+              if failures:
+                  summary.write('\n'.join('- ' + failure for failure in failures) + '\n')
+          print(json.dumps({'ok': not failures, 'failures': failures}))
+          if failures:
+              raise SystemExit(1)
+          PY
+      - name: Preserve sanitized monitoring evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neurobalance-monitor-${{ github.run_id }}
+          path: monitor-results/result.json
+          retention-days: 14
+          if-no-files-found: warn

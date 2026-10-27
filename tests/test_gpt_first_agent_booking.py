@@ -133,12 +133,24 @@ class CRMStub:
     async def lookup_active_appointments_by_phone(self, phone: str) -> dict[str, Any]:
         return {"ok": True, "found": False, "isNew": True, "appointments": [], "appointment": None}
 
+    async def lookup_appointment_by_id(self, appointment_id: str) -> dict[str, Any]:
+        # Model a separately persisted row, not an unconditional verified=True.
+        # Error/ambiguous POST scenarios deliberately have no matching row.
+        if not self.book_calls or self.book_error is not None or self.book_response is not None:
+            return {}
+        assert str(appointment_id) == "9001"
+        created = self.book_calls[-1]
+        return {"id": 9001, "phone": created["phone"],
+                "doctorLogin": created["doctor_login"], "date": created["date"],
+                "timeStart": created["time_start"]}
+
 
 def install_crm(monkeypatch: pytest.MonkeyPatch, stub: CRMStub) -> CRMStub:
     monkeypatch.setattr(crm, "check_slots", stub.check_slots)
     monkeypatch.setattr(crm, "book_appointment", stub.book_appointment)
     monkeypatch.setattr(crm, "get_doctors", stub.get_doctors)
     monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", stub.lookup_active_appointments_by_phone)
+    monkeypatch.setattr(crm.CRMClient, "lookup_appointment_by_id", lambda client, appointment_id: stub.lookup_appointment_by_id(appointment_id))
     return stub
 
 
@@ -263,10 +275,14 @@ def test_confirmation_requires_crm_success(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert answer.strip(), "a failed booking must still answer the patient"
     assert "записаны" not in answer.lower()
-    assert "подтвержд" not in answer.lower()
+    assert "запись подтверждена" not in answer.lower()
+    assert "вы записаны" not in answer.lower()
     session = state.get_session(chat_id)
     assert session.get("booking_confirmed") is not True
-    assert session.get("crm_result") == "failed"
+    # A connection reset after issuing POST is indeterminate, not a proven
+    # rejection. Never free the claim or tell the patient to book again.
+    assert session.get("crm_result") == "uncertain"
+    assert session.get("booking_uncertain") is True
 
 
 def test_timeout_does_not_create_false_success(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -958,11 +974,11 @@ def test_booking_without_a_recorded_age_is_refused(monkeypatch: pytest.MonkeyPat
     ("response", "expected"),
     [
         ({"ok": True, "id": 1}, True),
-        ({"success": True}, True),
+        ({"success": True}, False),
         ({"id": 42}, True),
         ({"appointmentId": "a-1"}, True),
         # A CRM may return "created" as a timestamp rather than a flag; that is
-        # not a confirmation on its own, but an id alongside it is.
+        # not a confirmation flag. A wrong flag type stays invalid even with ID.
         ({"created": "2026-09-01T10:00:00Z"}, False),
         ({"created": "2026-09-01T10:00:00Z", "id": 7}, False),
         ({"booked": "yes"}, False),
@@ -1519,6 +1535,11 @@ def test_vague_wait_reply_becomes_real_operator_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     install_crm(monkeypatch, CRMStub())
+    escalation_calls = []
+    async def acknowledge_escalation(**kwargs: Any) -> dict[str, Any]:
+        escalation_calls.append(kwargs)
+        return {"ok": True}
+    monkeypatch.setattr(crm, "escalate_to_operator", acknowledge_escalation)
     install_openai(
         monkeypatch,
         [assistant_text("Секунду, уточню информацию и вернусь к Вам 🌿")],
@@ -1530,9 +1551,11 @@ def test_vague_wait_reply_becomes_real_operator_handoff(
     session = state.get_session(chat_id)
 
     assert "вернусь к вам" not in answer.lower()
-    assert "администратор" in answer.lower()
+    assert answer == dialog.OPERATOR_HANDOFF_RU
     assert session["manual_takeover"] is True
     assert session["escalated"] is True
+    assert escalation_calls
+    assert session["operator_handoff_confirmed"] is True
 
 
 def test_instagram_transport_is_exposed_in_agent_context() -> None:

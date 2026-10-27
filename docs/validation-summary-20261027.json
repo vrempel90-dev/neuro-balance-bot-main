@@ -1,0 +1,11 @@
+{
+  "tests": 753,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "seconds": 19.746,
+  "timestamp": "2026-10-27T22:13:14.496495+03:00",
+  "command": "OPENAI_API_KEY= DURABLE_WEBHOOK_ENABLED=false python -m pytest -q --junitxml=validation-results.xml",
+  "external_services": "isolated scripted clients / mocked HTTP; live providers separately verified",
+  "baseline_commit": "60f438fb3aa5da174323441dc6990f9b781fdd3d"
+}

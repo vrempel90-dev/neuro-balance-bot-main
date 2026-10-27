@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 import admission
@@ -63,18 +63,18 @@ except Exception:  # pragma: no cover
 # Их ровно два, и оба означают «дальше говорит человек». Всё остальное, что
 # получает пациент, пишет агент.
 
-OPERATOR_HANDOFF_RU = "Секунду, подключаю администратора 🌿"
-OPERATOR_HANDOFF_KK = "Бір сәт, әкімшіні қосамын 🌿"
+OPERATOR_HANDOFF_RU = "Обращение передано сотруднику клиники 🌿"
+OPERATOR_HANDOFF_KK = "Өтінішіңіз клиника қызметкеріне жіберілді 🌿"
+HANDOFF_UNAVAILABLE_RU = "Сейчас не удалось обработать запрос. Пожалуйста, свяжитесь с клиникой по телефону из её официальных контактов."
+HANDOFF_UNAVAILABLE_KK = "Қазір сұрауыңызды өңдеу мүмкін болмады. Клиниканың ресми байланыс нөміріне хабарласыңызшы."
 
 EMERGENCY_103_RU = (
     "То, что Вы описываете, может быть неотложным состоянием. Пожалуйста, "
-    "сразу позвоните 103 или обратитесь в скорую помощь 🌿 Я передаю Ваше "
-    "сообщение администратору."
+    "сразу позвоните 103 или обратитесь в скорую помощь 🌿"
 )
 EMERGENCY_103_KK = (
     "Сіз сипаттаған жағдай шұғыл көмекті қажет етуі мүмкін. Өтінемін, дереу "
-    "103-ке қоңырау шалыңыз немесе жедел жәрдемге хабарласыңыз 🌿 "
-    "Хабарламаңызды әкімшіге беремін."
+    "103-ке қоңырау шалыңыз немесе жедел жәрдемге хабарласыңыз 🌿"
 )
 
 # Острые симптомы, при которых пациенту нужна скорая, а не запись на приём.
@@ -319,8 +319,7 @@ def _detect_lang(text: str, session: dict[str, Any]) -> str:
         except Exception:
             pass
 
-    if session.get("language_locked") and established:
-        return current
+    # A persisted language lock must not override the patient switching languages.
     if not analyze_message_language:
         return current
     try:
@@ -365,33 +364,6 @@ def _store_crm_lookup_debug(session: dict[str, Any], lookup: dict[str, Any] | No
     session["raw_crm_hasActiveAppointment"] = raw.get("hasActiveAppointment") is True
 
 
-_AI_ADMISSION_LEASE_HOURS = 12
-_AI_CONTINUATION_REASONS = {"lead_in_progress", "crm_says_not_new", "crm_found_contact"}
-
-
-def _ai_admission_lease_active(session: dict[str, Any]) -> bool:
-    """A lead admitted as NEW may finish this conversation if CRM creates the lead mid-dialog."""
-    if (
-        session.get("booking_confirmed")
-        or session.get("manual_takeover")
-        or session.get("ai_muted")
-        or session.get("escalated")
-    ):
-        return False
-    if session.get("ai_admission_closed_at"):
-        return False
-    raw = str(session.get("ai_admission_started_at") or "").strip()
-    if not raw:
-        return False
-    try:
-        started = datetime.fromisoformat(raw)
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-    except ValueError:
-        return False
-    return datetime.now(timezone.utc) - started <= timedelta(hours=_AI_ADMISSION_LEASE_HOURS)
-
-
 def _activate_ai_admission_lease(session: dict[str, Any]) -> None:
     if not session.get("ai_admission_started_at"):
         session["ai_admission_started_at"] = datetime.now(timezone.utc).isoformat()
@@ -423,19 +395,9 @@ async def _classify_lead(chat_id: str, phone: str, session: dict[str, Any]) -> a
         lookup = None
 
     verdict = admission.classify(normalized, lookup)
-    if (
-        verdict.state == admission.RETURNING
-        and verdict.reason in _AI_CONTINUATION_REASONS
-        and _ai_admission_lease_active(session)
-    ):
-        # This conversation was admitted while the contact was genuinely NEW.
-        # Some CRMs create/update a lead after the first message; that must not
-        # mute the assistant halfway through the same booking funnel.
-        verdict = admission.Admission(
-            state=admission.NEW,
-            reason="active_ai_conversation",
-            phone=verdict.phone,
-        )
+    # The fresh CRM verdict is authoritative on EVERY message. A local
+    # admission timestamp cannot turn an existing or staff-owned lead into a
+    # new patient; genuinely fresh CRM leads already classify as NEW.
 
     session["crm_patient_state"] = _CRM_PATIENT_STATE[verdict.state]
     session["crm_state_reason"] = verdict.reason
@@ -450,23 +412,28 @@ async def _classify_lead(chat_id: str, phone: str, session: dict[str, Any]) -> a
     return verdict
 
 
-async def _notify_admin_once(chat_id: str, session: dict[str, Any], phone: str, reason: str) -> None:
-    """Сообщает администратору о ходе, который бот не ведёт — раз на диалог.
+async def _notify_admin_once(chat_id: str, session: dict[str, Any], phone: str, reason: str) -> bool:
+    """Only an acknowledged CRM escalation counts as a delivered handoff.
 
-    Пациент либо не получает ответа, либо получает «подключаю администратора»,
-    поэтому единственный способ не потерять обращение — передать чат человеку.
-    Повторять уведомление на каждое сообщение значило бы спамить, поэтому флаг
-    живёт в сессии. Ошибка уведомления не должна ломать ход: администратор
-    увидит событие в логе.
+    A failed request remains retryable on a later inbound turn. No callback or
+    live operator is promised merely because we set a local session flag.
     """
-    if session.get("admin_notified_reason") == reason:
-        return
-    session["admin_notified_reason"] = reason
-    _safe_log(chat_id, "admin_notified", {"chat_id": chat_id, "reason": reason})
+    if session.get("operator_handoff_confirmed") is True:
+        return True
     try:
-        await crm.escalate_to_operator(phone=phone or session.get("phone") or "", reason=reason)
+        response = await crm.escalate_to_operator(phone=phone or session.get("phone") or "", reason=reason)
+        if not isinstance(response, dict) or response.get("ok") is not True or response.get("error"):
+            raise ValueError("unconfirmed_operator_handoff")
     except Exception as exc:
-        _safe_log(chat_id, "admin_notify_failed", {"chat_id": chat_id, "error_type": type(exc).__name__})
+        session["operator_handoff_confirmed"] = False
+        session["operator_handoff_error"] = type(exc).__name__
+        _safe_log(chat_id, "admin_notify_failed", {"reason": reason, "error_type": type(exc).__name__})
+        return False
+    session["admin_notified_reason"] = reason
+    session["operator_handoff_confirmed"] = True
+    session.pop("operator_handoff_error", None)
+    _safe_log(chat_id, "admin_notified", {"reason": reason})
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +511,9 @@ def _known_doctor_names(session: dict[str, Any], result: Any) -> set[str]:
             _add(appointment.get("doctor_name"))
     for name in (session.get("crm_known_doctors") or {}).values() if isinstance(session.get("crm_known_doctors"), dict) else []:
         _add(name)
+    for option in session.get("doctor_options") or []:
+        if isinstance(option, dict):
+            _add(option.get("doctor_name"))
     for key in ("appointment_doctor_name", "selected_doctor_name"):
         _add(session.get(key))
     for tool_result in getattr(result, "tool_results", None) or []:
@@ -557,8 +527,63 @@ def _known_doctor_names(session: dict[str, Any], result: Any) -> set[str]:
     return names
 
 
+_DIAGNOSIS_TERMS = (
+    r"остеохондроз|артрит|артроз|радикулит|ишиас|невралги[яи]|"
+    r"грыж[ауыи]|протрузи[яи]|инсульт|инфаркт|тромбоз|диабет|"
+    r"эпилепси[яи]|пневмони[яи]|диагноз|остеохондрозы|жарық"
+)
+_MEDICATION_TERMS = (
+    r"препарат|таблет|капсул|обезболива|антибиотик|ибупрофен|"
+    r"диклофенак|парацетамол|анальгин|кеторол|нимесулид|аспирин|"
+    r"дәрі(?:ні|лер|сін)?|д[әа]рмек|\d+(?:[.,]\d+)?\s*(?:мг|мл|mg|ml)\b"
+)
+
+
+def _medical_advice_violation(answer: str) -> bool:
+    """Block explicit diagnosis/prescription, not general registrar information.
+
+    This intentionally narrow deterministic check complements the model's
+    instructions. It is not a medical classifier and does not certify every
+    possible clinical statement as safe.
+    """
+    low = str(answer or "").casefold()
+    diagnosis = (
+        r"(?:у\s+вас|у\s+пациента)\s+(?:(?:вероятно|точно|возможно|нет)\s+|"
+        r"скорее\s+всего\s+|может\s+быть\s+)?(?:" + _DIAGNOSIS_TERMS + r")"
+        r"|(?:ваш\s+диагноз|ставлю\s+(?:вам\s+)?диагноз|диагноз\s*[:—–])"
+        r"|(?:сізде\s+(?:" + _DIAGNOSIS_TERMS + r")|сіздің\s+диагнозыңыз|"
+        r"диагнозыңыз\s*[:—–]|диагноз\s+қоямын)"
+    )
+    if re.search(diagnosis, low):
+        return True
+    # A drug/dose plus a direct patient instruction is a prescription. General
+    # descriptions such as 'врач назначит лечение' have no direct instruction.
+    for sentence in re.split(r"[.!?\n]+", low):
+        drug_or_dose = bool(re.search(_MEDICATION_TERMS, sentence))
+        directive_text = re.sub(r"\bне\s+(?:принимайте|примите|пейте|попейте|назначаю|назначаем|начните|рекомендую)\b", " ", sentence)
+        directive = bool(re.search(
+            r"\b(?:принимайте|примите|пейте|попейте|назначаю|назначаем)\b|"
+            r"(?:начните\s+принимать|рекомендую\s+(?:принимать|пить)|"
+            r"вам\s+(?:нужно|следует)\s+(?:принимать|пить|колоть)|"
+            r"қабылдаңыз|ішіңіз|ішініз|тағайындаймын|егіңіз)", directive_text))
+        if drug_or_dose and directive:
+            return True
+    return False
+
+
 def _unverified_fact(chat_id: str, session: dict[str, Any], answer: str, result: Any) -> str:
     """Возвращает факт из ответа, которого не было ни в одном результате инструмента."""
+    low = str(answer or "").casefold()
+    if _medical_advice_violation(answer):
+        return "medical_diagnosis_or_prescription"
+    if session.get("booking_uncertain") is True and session.get("booking_confirmed") is not True:
+        return "booking_uncertain"
+    confirmation = re.search(r"(?:запись\s+(?:успешно\s+)?(?:подтверждена|создана|оформлена)|вы\s+(?:успешно\s+)?записаны|\bзаписал[аи]?\b|жазылуыңыз\s+расталды|сізді\s+жаздым|жазып\s+қойдым|жазба\s+расталды)", low)
+    confirmed = bool(getattr(result, "booked", False)) or (session.get("booking_confirmed") is True and bool(session.get("appointment_id") or session.get("crm_booking_id")))
+    if confirmation and not confirmed:
+        return "booking_confirmation"
+    if re.search(r"(?:подключ(?:аю|у|им)\s+(?:вам\s+)?(?:администратора|оператора)|переда(?:ю|м)\s+.*(?:администратору|оператору)|әкімшіні\s+қосамын)", low) and session.get("operator_handoff_confirmed") is not True:
+        return "handoff_unconfirmed"
     sources = _crm_fact_sources(chat_id, session, result)
 
     known_times = _times_in(sources)
@@ -665,14 +690,18 @@ async def _handoff(chat_id: str, session: dict[str, Any], answer: str, reason: s
     как только агент снова работает, бот продолжает диалог сам. Иначе один
     таймаут OpenAI молча выключал бы бота для этого пациента навсегда.
     """
+    delivered = await _notify_admin_once(chat_id, session, str(session.get("phone") or ""), reason)
     session["escalated"] = True
-    session["manual_takeover"] = bool(human_owns) or bool(session.get("manual_takeover"))
+    session["manual_takeover"] = (bool(human_owns) and delivered) or bool(session.get("manual_admin_intervention"))
+    if reason != "red_flag":
+        answer = _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK) if delivered else _tr(session, HANDOFF_UNAVAILABLE_RU, HANDOFF_UNAVAILABLE_KK)
+        if session.get("booking_uncertain") is True and session.get("booking_confirmed") is not True:
+            answer = _tr(session, "Статус Вашей записи пока не подтверждён. ", "Жазылуыңыздың мәртебесі әлі расталған жоқ. ") + answer
     session["answer_source"] = "python_template"
     session["skip_humanize"] = True
     session["handoff_reason"] = reason
     session["last_assistant_answer"] = answer
     _safe_log(chat_id, "handoff_to_operator", {"chat_id": chat_id, "reason": reason})
-    await _notify_admin_once(chat_id, session, str(session.get("phone") or ""), reason)
     _safe_add_message(chat_id, "assistant", answer)
     _safe_save(chat_id, session)
     return answer
@@ -699,8 +728,31 @@ async def _finalize(chat_id: str, session: dict[str, Any], answer: str, result: 
     unverified = _unverified_fact(chat_id, session, answer, result)
     if unverified:
         _safe_log(chat_id, "unverified_fact_blocked", {"chat_id": chat_id, "fact": unverified})
-        return await _handoff(chat_id, session, _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK), "unverified_fact")
+        if unverified == "medical_diagnosis_or_prescription":
+            answer = _tr(session,
+                "Я могу помочь с информацией о клинике и записью. Диагноз и лечение определяет врач на приёме.",
+                "Мен клиника туралы ақпарат беріп, қабылдауға жазылуға көмектесе аламын. Диагнозды дәрігер қойып, емді қабылдауда тағайындайды.")
+            session["answer_source"] = "medical_safety_template"
+        else:
+            return await _handoff(chat_id, session, _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK), "unverified_fact")
 
+    # Bind only CRM slots actually named to the patient. Otherwise a time
+    # shared by several doctors cannot be resolved safely on the next turn.
+    agent._remember_presented_slots(session, answer)
+    # A failed language-only correction must never leak a Russian response
+    # into a Kazakh conversation (or vice versa). Verified booking facts can
+    # use the deterministic bilingual confirmation without replaying tools.
+    from language_guard import enforce_response_language, response_language_violation
+    answer, language_status = enforce_response_language(answer, str(session.get("language") or "ru"))
+    if response_language_violation(answer, str(session.get("language") or "ru")):
+        if getattr(result, "booked", False):
+            answer = agent._safety_net_reply(session, result)
+        else:
+            answer = _tr(session,
+                "Не удалось подготовить корректный ответ. Пожалуйста, попробуйте написать позже.",
+                "Дұрыс жауап дайындау мүмкін болмады. Кейінірек қайта жазыңызшы.")
+        language_status = "unresolved_language_blocked"
+    session["language_guard_result"] = language_status or "ok"
     session["last_assistant_answer"] = answer
     session["final_answer_preview"] = answer[:160]
     session["no_reply_reason"] = ""
@@ -720,7 +772,7 @@ def _start_turn(chat_id: str, session: dict[str, Any], phone: str, text: str) ->
     # phone the patient already supplied with that social identifier.
     if _valid_crm_phone(incoming_phone):
         session["phone"] = crm.normalize_phone(incoming_phone) or sanitize_kz_phone(incoming_phone)
-    elif _valid_crm_phone(existing_phone):
+    elif _is_instagram_session(session) and _valid_crm_phone(existing_phone):
         session["phone"] = existing_phone
     else:
         session["phone"] = ""
@@ -830,7 +882,9 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         session["manual_takeover"] = True
         session["escalated"] = True
         _close_ai_admission_lease(session, "agent_escalation")
-        await _notify_admin_once(chat_id, session, effective_phone, "agent_escalation")
+        delivered = await _notify_admin_once(chat_id, session, effective_phone, "agent_escalation")
+        session["manual_takeover"] = delivered
+        result.reply = _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK) if delivered else _tr(session, HANDOFF_UNAVAILABLE_RU, HANDOFF_UNAVAILABLE_KK)
     elif result.booked:
         _close_ai_admission_lease(session, "booking_confirmed")
     session["openai_used"] = True

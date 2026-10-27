@@ -1,8 +1,9 @@
-fastapi==0.115.6
+fastapi==0.162.0
+starlette==1.10.0
 uvicorn[standard]==0.34.0
 httpx==0.28.1
 openai==1.59.7
-python-dotenv==1.0.1
+python-dotenv==1.2.4
 pydantic-settings==2.7.1
-python-multipart==0.0.12
-PyJWT[crypto]==2.10.1
+python-multipart==0.0.32
+PyJWT[crypto]==2.15.1

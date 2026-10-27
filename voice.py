@@ -9,7 +9,7 @@ from fastapi import UploadFile
 from openai import AsyncOpenAI
 
 from config import get_settings
-from wazzup import download_media
+from wazzup import MAX_MEDIA_BYTES, download_media
 
 
 VOICE_EXT_BY_MIME = {
@@ -54,8 +54,11 @@ async def transcribe_bytes(
     if not data:
         return VoiceTranscript(text="", filename=filename)
 
+    if len(data) > MAX_MEDIA_BYTES:
+        raise ValueError("Audio exceeds size limit")
+
     settings = get_settings()
-    client = AsyncOpenAI(api_key=settings.openai_api_key)
+    client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=30.0, max_retries=0)
 
     # OpenAI SDK стабильнее принимает файл с диска, чем tuple(bytes) на разных версиях.
     suffix = os.path.splitext(filename)[1] or ".ogg"
@@ -76,10 +79,13 @@ async def transcribe_bytes(
             os.remove(tmp_path)
         except OSError:
             pass
+        await client.close()
 
 
 async def transcribe_upload(file: UploadFile, language: str = "ru") -> VoiceTranscript:
-    data = await file.read()
+    data = await file.read(MAX_MEDIA_BYTES + 1)
+    if len(data) > MAX_MEDIA_BYTES:
+        raise ValueError("Audio exceeds size limit")
     filename = file.filename or filename_from_content_type(file.content_type)
     result = await transcribe_bytes(data, filename=filename, language=language)
     result.content_type = file.content_type
