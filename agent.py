@@ -1288,6 +1288,20 @@ async def _tool_get_available_slots(
 
     doctor_login = str(args.get("doctor_login") or "").strip() or None
     time_preference = str(args.get("time_preference") or "").strip()
+    # Only the patient can choose a clinician. A GPT-supplied doctor_login
+    # alone is not consent; resolve a direct name request against a doctor name
+    # already verified by CRM.
+    if doctor_login and not session.get("preferred_doctor_login"):
+        known = session.get("crm_known_doctors")
+        known_name = (known or {}).get(doctor_login.casefold()) if isinstance(known, dict) else ""
+        if known_name and _doctor_name_matches(
+            str(session.get("last_user_text") or ""), str(known_name)
+        ):
+            session["preferred_doctor_login"] = doctor_login
+            session["preferred_doctor_name"] = str(known_name)
+        elif not session.get("doctor_options"):
+            doctor_login = None  # first present the real CRM doctor choices
+
     options = session.get("doctor_options")
     if isinstance(options, list) and options and doctor_login and not session.get("preferred_doctor_login"):
         # A doctor may not be selected from a previous list without the
