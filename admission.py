@@ -151,6 +151,9 @@ def classify(phone: str, crm_lookup: dict[str, Any] | None) -> Admission:
     if last_appointment:
         # Запись есть, но она отменена или уже в прошлом: пациент не новый.
         return Admission(state=RETURNING, reason="past_or_cancelled_appointment", phone=normalized)
+    if lookup.get("appointments") or raw.get("appointments") or raw.get("records"):
+        # A finished/cancelled appointment is still proof of an existing patient.
+        return Admission(state=RETURNING, reason="appointment_history_exists", phone=normalized)
     if lead:
         # An existing CRM lead is not a genuinely unknown new number. Even
         # the status "новая" may belong to an old, unprocessed contact.
@@ -159,7 +162,7 @@ def classify(phone: str, crm_lookup: dict[str, Any] | None) -> Admission:
         return Admission(state=RETURNING, reason="crm_lead_already_exists", phone=normalized)
     if raw.get("isNew") is False:
         return Admission(state=RETURNING, reason="crm_says_not_new", phone=normalized)
-    if raw.get("isNew") is not True and raw.get("found") is True:
+    if raw.get("found") is True:
         return Admission(state=RETURNING, reason="crm_found_contact", phone=normalized)
 
     return Admission(state=NEW, reason="no_existing_contact", phone=normalized)
