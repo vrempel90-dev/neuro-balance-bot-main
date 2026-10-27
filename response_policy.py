@@ -86,8 +86,8 @@ def repeated_question(answer: str, previous: str, user_text: str) -> bool:
     """Escalate instead of trapping a patient in an identical question loop."""
     if "?" not in (answer or "") or not previous or not user_text:
         return False
-    if re.search(r"\\b(?:повтор\\w*|ещё раз|снова спроси|қайталашы)\\b",
+    if re.search(r"\b(?:повтор\w*|ещё раз|снова спроси|қайталашы)\b",
                  user_text, flags=re.IGNORECASE):
         return False
-    normalize = lambda text: re.sub(r"\\s+", " ", text.casefold()).strip()
+    normalize = lambda text: re.sub(r"\s+", " ", text.casefold()).strip()
     return normalize(answer) == normalize(previous)
