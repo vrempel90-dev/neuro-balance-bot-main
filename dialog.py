@@ -544,6 +544,9 @@ def _known_doctor_names(session: dict[str, Any], result: Any) -> set[str]:
             _add(appointment.get("doctor_name"))
     for name in (session.get("crm_known_doctors") or {}).values() if isinstance(session.get("crm_known_doctors"), dict) else []:
         _add(name)
+    for option in session.get("doctor_options") or []:
+        if isinstance(option, dict):
+            _add(option.get("doctor_name"))
     for key in ("appointment_doctor_name", "selected_doctor_name"):
         _add(session.get(key))
     for tool_result in getattr(result, "tool_results", None) or []:
