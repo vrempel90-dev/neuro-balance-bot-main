@@ -366,7 +366,7 @@ def _store_crm_lookup_debug(session: dict[str, Any], lookup: dict[str, Any] | No
 
 
 _AI_ADMISSION_LEASE_HOURS = 12
-_AI_CONTINUATION_REASONS = {"lead_in_progress", "crm_says_not_new", "crm_found_contact"}
+_AI_CONTINUATION_REASONS = {"lead_in_progress", "crm_lead_already_exists", "crm_says_not_new", "crm_found_contact"}
 
 
 def _ai_admission_lease_active(session: dict[str, Any]) -> bool:
