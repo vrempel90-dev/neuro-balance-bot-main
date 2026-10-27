@@ -305,9 +305,9 @@ def _real_doctor_options(slots: list[dict[str, str]]) -> list[dict[str, str]]:
 
 def _doctor_name_matches(text: str, doctor_name: str) -> bool:
     """Match full real clinician names, allowing common Russian case suffixes."""
-    tokens = [v for v in re.findall(r"[^\\W\\d_]+", doctor_name.casefold(), re.UNICODE)
+    tokens = [v for v in re.findall(r"[^\W\d_]+", doctor_name.casefold(), re.UNICODE)
               if len(v) >= 5]
-    words = re.findall(r"[^\\W\\d_]+", text.casefold(), re.UNICODE)
+    words = re.findall(r"[^\W\d_]+", text.casefold(), re.UNICODE)
     if not tokens:
         return False
     # Two long name parts are stronger than an ambiguous common given name.
@@ -328,7 +328,7 @@ def _resolve_explicit_doctor_choice(session: dict[str, Any], user_text: str) -> 
     candidates = [opt for opt in options
                   if isinstance(opt, dict) and _doctor_name_matches(
                       user, str(opt.get("doctor_name") or ""))]
-    number = re.fullmatch(r"\\s*(?:врач\\s*|вариант\\s*|№\\s*)?(\\d{1,2})[.)]?\\s*", user.casefold())
+    number = re.fullmatch(r"\s*(?:врач\s*|вариант\s*|№\s*)?(\d{1,2})[.)]?\s*", user.casefold())
     if not candidates and number:
         idx = int(number.group(1)) - 1
         if 0 <= idx < len(options):
@@ -358,7 +358,7 @@ def _remember_presented_slots(session: dict[str, Any], answer: str) -> None:
         session["last_presented_slots"] = []
         return
     times = {f"{int(h):02d}:{m}" for h, m in
-             re.findall(r"(?<!\\d)([01]?\\d|2[0-3])[:.]([0-5]\\d)(?!\\d)", text)}
+             re.findall(r"(?<!\d)([01]?\d|2[0-3])[:.]([0-5]\d)(?!\d)", text)}
     candidates = [dict(s) for s in registry.values() if isinstance(s, dict)
                   and str(s.get("time_start") or "")[:5] in times]
     choices = _real_doctor_options(candidates)
