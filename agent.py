@@ -287,6 +287,89 @@ _SIMPLE_NAME_STOPWORDS = {
 }
 
 
+def _real_doctor_options(slots: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Only actual named CRM clinicians, not scheduling placeholders."""
+    options: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for slot in slots:
+        login = str(slot.get("doctor_login") or "").strip()
+        name = str(slot.get("doctor_name") or "").strip()
+        if not login or not name or login.casefold() in {"reserve", "reserved", "rezerv"}:
+            continue
+        if name.casefold() in {"резерв", "reserve"} or login.casefold() in seen:
+            continue
+        seen.add(login.casefold())
+        options.append({"doctor_login": login, "doctor_name": name})
+    return options
+
+
+def _doctor_name_matches(text: str, doctor_name: str) -> bool:
+    """Match full real clinician names, allowing common Russian case suffixes."""
+    tokens = [v for v in re.findall(r"[^\\W\\d_]+", doctor_name.casefold(), re.UNICODE)
+              if len(v) >= 5]
+    words = re.findall(r"[^\\W\\d_]+", text.casefold(), re.UNICODE)
+    if not tokens:
+        return False
+    # Two long name parts are stronger than an ambiguous common given name.
+    matches = sum(any(w.startswith(token) or token.startswith(w) for w in words
+                      if len(w) >= 5) for token in tokens)
+    return matches >= min(2, len(tokens))
+
+
+def _resolve_explicit_doctor_choice(session: dict[str, Any], user_text: str) -> dict[str, str] | None:
+    options = session.get("doctor_options")
+    if not isinstance(options, list) or not options:
+        return None
+    user = str(user_text or "").strip()
+    if not user:
+        return None
+    candidates = [opt for opt in options
+                  if isinstance(opt, dict) and _doctor_name_matches(
+                      user, str(opt.get("doctor_name") or ""))]
+    number = re.fullmatch(r"\\s*(?:врач\\s*|вариант\\s*|№\\s*)?(\\d{1,2})[.)]?\\s*", user.casefold())
+    if not candidates and number:
+        idx = int(number.group(1)) - 1
+        if 0 <= idx < len(options):
+            candidates = [options[idx]]
+    if len(candidates) != 1:
+        return None
+    chosen = candidates[0]
+    session["preferred_doctor_login"] = chosen["doctor_login"]
+    session["preferred_doctor_name"] = chosen["doctor_name"]
+    return chosen
+
+
+def _remember_presented_slots(session: dict[str, Any], answer: str) -> None:
+    """Persist only the clinician's slots actually presented to the patient.
+
+    The tool may return several clinicians with the same time. A time alone
+    must never select a random one from the internal list.
+    """
+    text = str(answer or "")
+    registry = session.get("crm_offered_slots")
+    if not isinstance(registry, dict):
+        session["last_presented_slots"] = []
+        return
+    times = {f"{int(h):02d}:{m}" for h, m in
+             re.findall(r"(?<!\\d)([01]?\\d|2[0-3])[:.]([0-5]\\d)(?!\\d)", text)}
+    candidates = [dict(s) for s in registry.values() if isinstance(s, dict)
+                  and str(s.get("time_start") or "")[:5] in times]
+    choices = _real_doctor_options(candidates)
+    named = [opt for opt in choices if _doctor_name_matches(text, opt["doctor_name"])]
+    if len(named) == 1:
+        chosen_login = named[0]["doctor_login"]
+    elif not named and session.get("preferred_doctor_login"):
+        chosen_login = str(session["preferred_doctor_login"])
+    else:
+        chosen_login = ""
+    matched = [s for s in candidates if s.get("doctor_login") == chosen_login]
+    # If several dates have identical clock times, the patient must specify
+    # the day too. Do not guess from the registry.
+    if len({s.get("date") for s in matched}) > 1:
+        matched = []
+    session["last_presented_slots"] = matched
+
+
 def _recent_offered_slots(session: dict[str, Any]) -> list[dict[str, str]]:
     """Return recently shown CRM slots in the same order as the patient saw them."""
     raw_slots = session.get("last_slots")
@@ -323,7 +406,16 @@ def _resolve_explicit_slot_choice(session: dict[str, Any], user_text: str) -> di
     """Resolve explicit choices such as first, second or 14:00 against real CRM offers."""
     if session.get("booking_confirmed"):
         return None
-    slots = _recent_offered_slots(session)
+    if "last_presented_slots" in session:
+        raw = session.get("last_presented_slots") or []
+        slots = [
+            _offered_slot(session, str(s.get("date") or ""), str(s.get("time_start") or ""),
+                          str(s.get("doctor_login") or ""))
+            for s in raw if isinstance(s, dict)
+        ]
+        slots = [s for s in slots if s is not None]
+    else:
+        slots = _recent_offered_slots(session)
     if not slots:
         return None
     low = re.sub(r"\s+", " ", str(user_text or "").strip().lower())
@@ -802,6 +894,19 @@ AGENT_OVERRIDES = """
 запись), нужно СОХРАНЯТЬ через record_patient_facts сразу, как пациент это
 сказал. Иначе book_appointment будет отклонён, даже если пациент всё назвал.
 
+ВЫБОР ВРАЧА: после уточнения жалобы, возраста и противопоказаний проверь
+реальных врачей через get_available_slots. Если tool вернул
+doctor_choice_required=true, обязательно перечисли doctor_options по именам
+и спроси, к кому пациент хочет записаться. Не выбирай врача за него.
+Когда пациент выбрал врача, передай именно его doctor_login в
+get_available_slots, используя pending_doctor_date_from и
+pending_doctor_time_preference, если день и время уже известны.
+Если врач назван пациентом с самого начала, проверь через get_doctors
+и покажи доступность только этого врача. Если он недоступен, предложи
+других реальных врачей, но не переключайся без согласия пациента.
+Перед вопросом об имени пациента конкретные врач, дата и время должны быть
+сохранены в selected_doctor_login/selected_date/selected_time.
+
 ВОЗРАСТ ОБЯЗАТЕЛЕН: без сохранённого возраста запись невозможна. Автоматическая
 запись допустима с 16 до 75 лет включительно. Если пациенту 15 лет и меньше
 либо 76 лет и старше — не записывай, вызови escalate_to_operator и спокойно
@@ -976,6 +1081,11 @@ def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls 
             ),
             "already_booked": bool(session.get("booking_confirmed")),
             "crm_slots_offered_count": len(offered),
+            "doctor_options": session.get("doctor_options") or [],
+            "preferred_doctor_login": session.get("preferred_doctor_login") or "",
+            "preferred_doctor_name": session.get("preferred_doctor_name") or "",
+            "pending_doctor_date_from": session.get("pending_doctor_date_from") or "",
+            "pending_doctor_time_preference": session.get("pending_doctor_time_preference") or "",
         },
         "known_facts": {
             key: (_clip(value, str(key)) if isinstance(value, str) else value)
@@ -1086,6 +1196,19 @@ async def _tool_get_available_slots(
 
     doctor_login = str(args.get("doctor_login") or "").strip() or None
     time_preference = str(args.get("time_preference") or "").strip()
+    options = session.get("doctor_options")
+    if isinstance(options, list) and options and doctor_login and not session.get("preferred_doctor_login"):
+        # A doctor may not be selected from a previous list without the
+        # patient's explicit confirmation.
+        return {"ok": False, "error": "doctor_choice_not_confirmed",
+                "doctor_options": options, "slots": [],
+                "message": "Уточните, к какому из предложенных врачей записать."}
+    if session.get("preferred_doctor_login"):
+        preferred = str(session["preferred_doctor_login"])
+        if doctor_login and doctor_login != preferred:
+            return {"ok": False, "error": "different_doctor_without_consent",
+                    "message": "Пациент уже выбрал другого врача. Попросите подтверждение изменения."}
+        doctor_login = preferred
 
     # Прод 27.08.2026: модель прислала в doctor_login плейсхолдер
     # "<PRIVATE_PERSON>", CRM вернула availability=[] — то есть «врач есть, но
@@ -1147,8 +1270,33 @@ async def _tool_get_available_slots(
     partial = bool(http_error and collected)
     filtered = _filter_by_time_preference(collected, time_preference) if time_preference else collected
     dropped_by_preference = bool(time_preference and collected and not filtered)
-    slots = (filtered or collected)[:_MAX_SLOTS_IN_TOOL_RESULT]
+    available = filtered if time_preference else collected
 
+    if not doctor_login and not session.get("preferred_doctor_login") and available:
+        real_doctors = _real_doctor_options(available)
+        if real_doctors:
+            session["doctor_options"] = real_doctors
+            session["pending_doctor_date_from"] = start.isoformat()
+            session["pending_doctor_time_preference"] = time_preference
+            session["step"] = "doctor"
+            _log(chat_id, "agent_doctor_choice_required", {
+                "doctor_count": len(real_doctors), "date_from": start.isoformat(),
+            })
+            return {
+                "ok": True, "doctor_choice_required": True,
+                "doctor_options": real_doctors, "slots": [],
+                "date_from": start.isoformat(), "time_preference": time_preference,
+                "message": (
+                    "Назови реальных врачей из doctor_options и спроси пациента, "
+                    "к кому он предпочитает записаться. Не выбирай врача сам, "
+                    "не называй конкретное время до его выбора."
+                ),
+            }
+    # Do not resurrect morning slots when an afternoon-only preference had no
+    # matching time. In that case honestly report no matching slots.
+    slots = available[:_MAX_SLOTS_IN_TOOL_RESULT]
+    if doctor_login:
+        session["doctor_options"] = []  # clinician preference has been resolved
     _remember_offered_slots(session, slots)
     if slots:
         session["last_slots"] = [
@@ -2556,6 +2704,9 @@ async def run_agent_turn(
         _log(chat_id, "agent_skipped", {"reason": skip_reason, "step": session.get("step") or "start"})
         return AgentResult(used=False, skip_reason=skip_reason)
 
+    chosen_doctor = _resolve_explicit_doctor_choice(session, user_text)
+    if chosen_doctor:
+        _log(chat_id, "agent_doctor_selected", {"doctor_login": chosen_doctor["doctor_login"]})
     resolved_slot = _resolve_explicit_slot_choice(session, user_text)
     if resolved_slot is not None:
         _log(
