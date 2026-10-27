@@ -138,8 +138,14 @@ class ScenarioCRM:
             )
         if mode == "unconfirmed":
             return {}
-        return {"ok": True, "id": 9001, "status": "Записан", "date": kwargs.get("date"),
-                "timeStart": kwargs.get("time_start"), "doctorName": kwargs.get("doctor_name")}
+        appointment = {"id": 9001, "phone": kwargs["phone"], "doctorLogin": kwargs["doctor_login"],
+                       "status": "Записан", "date": kwargs["date"],
+                       "timeStart": kwargs["time_start"], "doctorName": kwargs.get("doctor_name")}
+        self.appointments.append(appointment)
+        return {"ok": True, **appointment}
+
+    async def lookup_appointment_by_id(self, appointment_id: str) -> dict[str, Any]:
+        return next((dict(row) for row in self.appointments if str(row["id"]) == str(appointment_id)), {})
 
     async def get_doctors(self, force: bool = False) -> dict[str, Any]:
         return {"ok": True, "doctors": [
@@ -166,6 +172,7 @@ class ScenarioCRM:
 
 
 def install_crm(monkeypatch: pytest.MonkeyPatch, stub: ScenarioCRM) -> ScenarioCRM:
+    monkeypatch.setattr(crm.CRMClient, "lookup_appointment_by_id", lambda client, appointment_id: stub.lookup_appointment_by_id(appointment_id))
     for name in ("lookup_active_appointments_by_phone", "check_slots", "book_appointment",
                  "get_doctors", "reschedule_appointment", "cancel_appointment", "escalate_to_operator"):
         monkeypatch.setattr(crm, name, getattr(stub, name))

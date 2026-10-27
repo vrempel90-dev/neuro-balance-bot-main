@@ -1,0 +1,44 @@
+# Production stabilization: 27 October 2026
+
+## Scope and baseline
+
+Existing repository `vrempel90-dev/neuro-balance-bot-main`, main at `60f438fb3aa5da174323441dc6990f9b781fdd3d`; existing Railway project `5e80bd3a-b128-40cc-99bf-47a8fc3d7ff2`, production environment `ad8c9a26-7897-4430-8dbd-6c02f90dbe07`, service `7ccdeb4f-69a6-46ea-861e-547e3afcdb29`. Initial deployment `f9369943-4814-4a74-91b0-157c5fa1040e` was SUCCESS, one replica, one Uvicorn process, persistent `/data` volume. Initial snapshot is `production-baseline-20261027.json`.
+
+The source was matched to the deployed SHA before changes. No replacement project, additional live bot or medical records were created. The unused repair gateway returned HTTP404; its obsolete scheduled repair was replaced by the production monitoring workflow, retaining manual repair dispatch.
+
+## Confirmed causes and changes
+
+| Defect | Cause | Final behavior |
+|---|---|---|
+| Webhook disconnect/retry storm | Synchronous model/CRM processing before HTTP acknowledgement; 183 HTTP499 in a capped201-request sample | Commit each unique delivery to SQLite before fast HTTP200; background bounded worker; per-chat FIFO; independent clients can proceed concurrently |
+| Duplicate/uncertain channel sends | Incoming claim alone did not cover the outgoing network boundary; legacy fallback could send again after timeout | Durable outgoing claim before POST; ambiguous delivery retained and never blindly repeated; later same-chat jobs quarantined for reconciliation |
+| Existing contacts admitted | Incomplete JSON assumed new; first number variant shadowed later matches; local admission lease could override returning CRM state | Every supported number format checked; explicit complete CRM classification; patient/history/booking exclusion; current CRM always authoritative |
+| Unsupported booking confirmation | POST success accepted without separate persisted-record verification | Appointment ID plus matching read-back of patient, doctor, date/time required; uncertain outcome retains claims and never promises success |
+| Different patients race for same slot | Original atomic claim included phone and did not coordinate different patients | Shared durable doctor/date/time claim plus per-patient idempotency; other systems still require CRM transactional uniqueness |
+| False human handoff | Local notification flag written before CRM acknowledgement | Confirmed escalation only; failed/unknown handoff has truthful RU/KK fallback |
+| Doctor/language inconsistencies | Previously prepared doctor selection remained on a separate branch; stale language lock and malformed outputs | Reviewed doctor-selection changes integrated; explicit clinician consent; RU/KK switch; malformed response guards and medical-advice fallback |
+| Patient data in diagnostics | Raw previews/identifiers and HTTP request URLs were logged; public diagnostics exposed state | All debug routes require existing admin token; HMAC refs; free text/secrets/URLs redacted; access query removed; observer exports technical telemetry only |
+| Webhook alias bypass | Only one alias enforced optional auth | Every alias shares auth. Existing direct Wazzup callback can be hardened with durable token only after provider read-back; foreign CRM/gateway destinations are not repointed |
+| Restart/operational blind spots | No durable ingress queue, false health-only reporting, obsolete gateway scheduler | Persistent inbox; interrupted jobs retained; worker/storage/backlog/uncertainty checks; verified SQLite checkpoint; external five-minute monitor and existing morning task |
+| Vulnerable pinned dependencies | Old multipart/JWT/Starlette/dotenv packages | Compatible pinned updates tested; pip-audit found zero known advisories in resolved production requirements |
+
+## Validation and limits
+
+See `validation-summary-20261027.json`, `dependency-audit-20261027.json` and `STABILIZATION_SCENARIOS.md`. All30 requested scenarios have expected/factual local results and honest media/live-provider limits. GitHub workflow Production Stabilization Tests publishes the complete JUnit and dependency report for the immutable reviewed revision.
+
+Before release, the existing production CRM answered a read-only availability query with41 slots and4 availability entries. A read-only identity query returned a real existing patient shape (`found:true,isNew:false,patient`); no identity or medical information is included here. These reads prove those contracts respond, not successful new-patient booking or channel delivery.
+
+Production Monitor runs around the clock every five minutes using GitHub OIDC restricted to this repository, main ref and exact workflow. Status is read-only. Push/manual validation also runs bounded synthetic RU/KK model and read-only CRM/channel probes. Callback hardening runs only on deployment/manual validation, only for the already configured direct callback, and preserves all subscriptions. No CRM appointments or patient messages are generated by probes. GitHub schedules may be delayed; alert delivery must be verified separately.
+
+The existing09:00 Asia/Almaty ChatGPT report is updated, not duplicated. Counters describe observed events; capped or incomplete coverage must be reported explicitly. Raw conversations, names, phones and medical complaints are never report output.
+
+Known acceptance limits: no dedicated approved test patient/channel destination was available; no live test appointment or patient message is sent. Main webhook intentionally does not interpret voice/photo/PDF. Unknown model phrasing and all free-form Kazakh quality are not proven by deterministic tests. Other CRM writers require server-side atomic slot protection. These limits must remain visible in the final report.
+
+## Release and rollback
+
+1. Require complete local suite, compile, dependency audit and immutable-commit GitHub CI. Confirm main has not moved before merging.
+2. Keep the same Railway service, one replica/process and persistent volume. Poll the new deployment until terminal SUCCESS; verify `/health.release_sha`, protected diagnostics, queue worker and provider probes. Observe bounded post-release logs and record actual time.
+3. At startup on the mounted production volume, `production_backup.checkpoint` uses SQLite's backup API before additive schema changes; verifies `PRAGMA quick_check`; stores a0600 checkpoint under the database's `backups` directory. A second restore into an isolated database is tested automatically. The checkpoint event contains a filename, never data.
+4. All schema additions are backwards compatible. If release fails, restore the previous Railway deployment `f9369943-4814-4a74-91b0-157c5fa1040e` (baseline SHA above) using Railway rollback and verify health. A callback query token is ignored by old routing, so the original callback still resolves after rollback. Baseline code's old security/behavior defects return with it; prefer a fixed forward release when possible.
+5. Restore clinical-state backup only if data restoration is actually necessary, after stopping writes and preserving the current database. Do not overwrite newer conversations automatically. Offline recipe: connect the verified checkpoint and a new destination with `sqlite3`, run `source.backup(destination)`, verify `quick_check`, then perform an explicit controlled file swap while stopped. No production restore was needed or performed in this run.
+6. Uncertain inbox/send/booking operations require read-only reconciliation with the provider. `production_inbox.resolve_uncertain` only resolves a verified outcome to done/failed; it never replays an operation. Preserve claims until outcome is proven. Monitor exposes quarantine counts without identifiers.

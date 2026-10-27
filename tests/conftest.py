@@ -2,6 +2,29 @@ from __future__ import annotations
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _isolated_sync_ingress(monkeypatch):
+    # Legacy pipeline contracts exercise the processor synchronously. Durable
+    # acknowledgement/worker behaviour has its own explicit enabled tests.
+    monkeypatch.setenv("DURABLE_WEBHOOK_ENABLED", "false")
+
+
+@pytest.fixture(autouse=True)
+def _authenticated_debug_clients(monkeypatch, request):
+    # HTTP diagnostic tests use an authenticated administrator by default;
+    # dedicated security tests exercise missing/wrong tokens explicitly.
+    if request.node.path.name in {"test_openai_production_status_contract.py", "test_stabilization_security.py", "test_stabilization_monitor.py"}:
+        return
+    import httpx
+    monkeypatch.setenv("OPENAI_DEBUG_ADMIN_TOKEN", "offline-test-admin")
+    original = httpx.Client.__init__
+    def initialize(self, *args, **kwargs):
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers.setdefault("Authorization", "Bearer offline-test-admin")
+        return original(self, *args, headers=headers, **kwargs)
+    monkeypatch.setattr(httpx.Client, "__init__", initialize)
+
 @pytest.fixture(autouse=True)
 def _new_leads_only_test_default(monkeypatch: pytest.MonkeyPatch):
     """Продакшен работает только с новыми лидами — тесты тоже.
@@ -85,6 +108,8 @@ def _clear_booking_claims():
         with state._connect() as conn:
             conn.execute(state._BOOKING_CLAIMS_DDL)
             conn.execute("DELETE FROM booking_claims")
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='outgoing_messages'").fetchone():
+                conn.execute("DELETE FROM outgoing_messages")
 
     _clear()
     yield

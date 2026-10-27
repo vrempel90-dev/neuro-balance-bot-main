@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     )
     webhook_secret: str = Field(default="", validation_alias=AliasChoices("WEBHOOK_SECRET", "webhook_secret"))
     sqlite_path: str = Field(default="bot.sqlite3", validation_alias=AliasChoices("SQLITE_PATH", "sqlite_path"))
+    durable_webhook_enabled: bool = Field(default=True, validation_alias=AliasChoices("DURABLE_WEBHOOK_ENABLED", "durable_webhook_enabled"))
 
     # Slots
     slot_search_days: int = Field(default=7, validation_alias=AliasChoices("SLOT_SEARCH_DAYS", "slot_search_days"))

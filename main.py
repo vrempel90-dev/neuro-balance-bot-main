@@ -7,6 +7,9 @@ import logging
 import uuid
 import mimetypes
 import re
+import hashlib
+import hmac
+import os
 from typing import Any
 from types import SimpleNamespace
 from datetime import datetime, timezone
@@ -14,6 +17,7 @@ from datetime import datetime, timezone
 import httpx
 
 from fastapi import FastAPI, Header, HTTPException, Request, UploadFile, File, Query
+from fastapi.responses import JSONResponse
 
 import state
 import crm
@@ -78,8 +82,40 @@ except Exception:
 app = FastAPI(title="Neuro Balance Hybrid WhatsApp Booking Bot")
 
 
+@app.middleware("http")
+async def protect_operational_routes(request: Request, call_next):
+    """Keep patient/session diagnostics private and authenticate every alias."""
+    path = request.url.path
+    token = ""
+    if path.startswith("/debug/"):
+        token = str(os.getenv("OPENAI_DEBUG_ADMIN_TOKEN") or "").strip()
+        if not token:
+            detail = "OpenAI diagnostics are disabled" if path == "/debug/openai/status" else "Diagnostics are disabled"
+            return JSONResponse({"detail": detail}, status_code=503, headers={"Cache-Control": "no-store"})
+    elif request.method == "POST" and path in WAZZUP_WEBHOOK_PATHS:
+        from production_webhook_auth import required_token
+        token = required_token()
+    if token:
+        parts = request.headers.get("authorization", "").split(None, 1)
+        valid_header = len(parts) == 2 and parts[0].lower() == "bearer" and hmac.compare_digest(parts[1], token)
+        valid_hook_query = path in WAZZUP_WEBHOOK_PATHS and hmac.compare_digest(request.query_params.get("hook_token", ""), token)
+        if not (valid_header or valid_hook_query):
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401,
+                                headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"})
+    response = await call_next(request)
+    if path.startswith("/debug/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 class _WebhookAccessLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
+        # Uvicorn logs the full query string unless it is removed here. Admin
+        # CRM lookups can contain a phone even though the endpoint is private.
+        if isinstance(record.args, tuple) and len(record.args) >= 3:
+            args = list(record.args)
+            args[2] = str(args[2]).split("?", 1)[0]
+            record.args = tuple(args)
         try:
             message = record.getMessage()
         except Exception:
@@ -303,9 +339,15 @@ def root() -> dict[str, Any]:
 
 
 @app.on_event("startup")
-def startup() -> None:
-    state.init_db()
+async def startup() -> None:
     settings = get_settings()
+    if os.getenv("RAILWAY_VOLUME_MOUNT_PATH"):
+        from production_backup import checkpoint
+        result = checkpoint(settings.sqlite_path, os.getenv("RAILWAY_GIT_COMMIT_SHA", "stabilization"))
+        state.init_db()
+        state.log_event("startup", "production_checkpoint", result)
+    else:
+        state.init_db()
     allowed_channel_ids = [c.strip() for c in str(getattr(settings, "wazzup_allowed_channel_ids", "") or "").split(",") if c.strip()]
     state.log_event("startup", "bot_runtime_config", {
         "timezone": getattr(settings, "bot_timezone", "Asia/Almaty"),
@@ -315,6 +357,18 @@ def startup() -> None:
         "new_leads_only": bool(getattr(settings, "new_leads_only", True)),
         "wazzup_allowed_channel_ids_count": len(allowed_channel_ids),
     })
+    if bool(getattr(settings, "durable_webhook_enabled", True)):
+        import production_inbox
+        app.state.inbox_worker = production_inbox.InboxWorker(_process_inbox_job)
+        app.state.inbox_worker.start()
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    worker = getattr(app.state, "inbox_worker", None)
+    if worker is not None:
+        await worker.stop(timeout=10)
+        app.state.inbox_worker = None
 
 
 def _time_debug_payload(now: datetime | None = None) -> dict[str, Any]:
@@ -358,6 +412,7 @@ def health() -> dict[str, Any]:
     payload = _time_debug_payload()
     return {
         "ok": True,
+        "release_sha": os.getenv("RAILWAY_GIT_COMMIT_SHA", "unknown"),
         "timezone": payload["timezone"],
         "utc_time": payload["utc_time"],
         "local_time": payload["local_time"],
@@ -916,31 +971,16 @@ async def _download_voice_bytes(message: dict[str, Any]) -> tuple[bytes, str, st
     if not url:
         raise ValueError("voice media url not found")
 
-    settings = get_settings()
-    api_key = (
-        getattr(settings, "wazzup_api_key", "")
-        or getattr(settings, "wazzup_token", "")
-        or getattr(settings, "wazzup_access_token", "")
-        or ""
-    )
-
-    headers: dict[str, str] = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-        headers["X-API-KEY"] = str(api_key)
-
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
-        response = await client.get(url, headers=headers, follow_redirects=True)
-        response.raise_for_status()
-
-    content_type = response.headers.get("content-type") or str(message.get("content_type") or "")
+    from wazzup import download_media
+    data, content_type = await download_media(media_url=url)
+    content_type = content_type or str(message.get("content_type") or "")
     filename = str(message.get("filename") or "")
 
     if not filename or "." not in filename:
         ext = mimetypes.guess_extension(content_type.split(";")[0].strip()) or ".ogg"
         filename = f"voice{ext}"
 
-    return response.content, filename, content_type
+    return data, filename, content_type
 
 
 async def _transcribe_voice_message(message: dict[str, Any]) -> str:
@@ -1143,6 +1183,7 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
     chat_type = str(message.get("chat_type") or "whatsapp")
     channel_id = message.get("channel_id") or None
     kind = str(message.get("kind") or "text")
+    send_attempted = False
 
     try:
         settings = get_settings()
@@ -1171,6 +1212,7 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
                 state.log_event(chat_id, "wazzup_send_blocked", {"phone": str(message.get("phone") or ""), "reason": session_after.get("no_reply_reason") or "empty_answer"})
                 return
 
+            send_attempted = True
             await _send_answer_parts(
                 chat_id=chat_id,
                 answer=answer,
@@ -1181,27 +1223,12 @@ async def _debounced_process_and_send(message: dict[str, Any]) -> None:
 
     except Exception as exc:
         state.log_event(chat_id, "background_processing_error", {"error": str(exc)[:1000]})
-        # Захват ключа снимаем: обработка не дошла до ответа, и повторная
-        # доставка того же вебхука должна получить второй шанс.
-        try:
+        # A timeout after a send may mean the provider accepted it. Never send
+        # a second fallback or release its dedupe claim in that case.
+        if not send_attempted:
             state.release_message(str(message.get("message_key") or message.get("message_id") or ""))
-        except Exception:
-            pass
-        try:
-            if kind == "voice" or _message_has_voice_url(message):
-                fallback_text = _voice_fallback_answer()
-            else:
-                fallback_text = "Передам Ваш вопрос администратору, она ответит Вам в ближайшее время."
-
-            fallback = _guard_answer(chat_id, fallback_text)
-            await send_text(
-                chat_id=chat_id,
-                chat_type=chat_type,
-                channel_id=channel_id,
-                text=fallback,
-            )
-        except Exception:
-            pass
+        else:
+            state.log_event(chat_id, "outgoing_delivery_uncertain", {"error_type": type(exc).__name__})
 
 
 def _dig_any(obj: Any, path: str) -> Any:
@@ -1360,12 +1387,15 @@ def _normalize_wazzup_message(payload: dict[str, Any], msg: dict[str, Any]) -> d
     phone = str(phone or "").strip()
     if not phone and chat_type in {"whatsapp", "viber"}:
         phone = chat_id
+    identity = str(message_id or json.dumps([message_timestamp, str(text or ""), message_type, direction], ensure_ascii=False))
+    scoped_key = hashlib.sha256(json.dumps([channel_id, chat_type, chat_id, identity], ensure_ascii=False).encode()).hexdigest()
     return {
         "source": "wazzup",
         "chat_id": chat_id,
         "phone": phone,
         "text": str(text or "").strip(),
         "message_id": str(message_id or "").strip(),
+        "message_key": scoped_key,
         "message_timestamp": str(message_timestamp or "").strip(),
         "timestamp": str(message_timestamp or "").strip(),
         "channel_id": channel_id,
@@ -1405,7 +1435,15 @@ def _result_should_send(result: Any, chat_id: str) -> bool:
 
 
 async def _safe_read_webhook_payload(request: Request) -> tuple[dict[str, Any], dict[str, Any]]:
-    raw_body = await request.body()
+    chunks = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > 262144:
+            raise HTTPException(status_code=413, detail="Webhook payload too large")
+        chunks.append(chunk)
+    raw_body = b"".join(chunks)
+    request._body = raw_body  # preserve Starlette's body-cache contract for admin replay tests
     content_type = request.headers.get("content-type", "")
     raw_preview = raw_body[:500].decode("utf-8", errors="replace")
     if not raw_body:
@@ -1576,11 +1614,19 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
 
     state.log_event(chat_id, "bot_processing_start", {"chat_id": chat_id, "phone": phone, "message_id": message["message_id"], "text_preview": _preview(message["text"], 160)})
 
+    if not message["chat_id"]:
+        return _finish_silent("empty_text")
+    if channel_id_mismatch_blocks:
+        return _finish_silent("channel_id_mismatch")
+
     if is_audio_message_payload(raw_msg):
         _ignore_voice_message(chat_id, message["message_id"], "webhook_payload")
         return _finish_silent("empty_text")
 
     if not message["is_incoming"]:
+        # A real staff reply must mute AI for this conversation. Delivery
+        # statuses and our own API echoes are excluded by the helper.
+        _mark_manual_admin_interventions({**payload, "messages": [raw_msg]})
         session = _get_session_safe(chat_id)
         session["no_reply_reason"] = "echo_or_outgoing_message"
         session["guard_decision"] = GuardDecision(False, "echo_or_outgoing_message", False, False, False).to_dict()
@@ -1608,7 +1654,7 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
         answer = _result_answer(result)
         should_send = _result_should_send(result, chat_id)
     except Exception as exc:
-        crm_error = str(exc)[:500]
+        crm_error = type(exc).__name__
         no_reply_reason = "crm_lookup_failed"
         state.log_event(chat_id, "crm_lookup_result", {"phone": phone, "chat_id": chat_id, "crm_lookup_ok": False, "crm_error": crm_error})
         state.log_event(chat_id, "bot_decision", _decision_payload(silent_reason=no_reply_reason, crm_error=crm_error))
@@ -1667,10 +1713,17 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
 
     if answer and should_send:
         if send_enabled:
+            outgoing_key = "reply:" + message["message_key"]
+            if not state.claim_outgoing_message(outgoing_key, chat_id):
+                return {"ok": True, "ignored": True, "answer": "", "should_send_wazzup": False,
+                        "no_reply_reason": "duplicate_message", "delivery_status": state.outgoing_message_status(outgoing_key)}
             state.log_event(chat_id, "wazzup_send_start", {"chat_id": chat_id, "channel_id": channel_id_from_payload, "text_preview": _preview(answer, 160)})
             try:
                 outbound_channel_id = channel_id_from_payload if (channel_id_from_payload and channel_id_match) else (channel_id_env or None)
                 send_result = await send_wazzup_message(chat_id=chat_id, text=answer, chat_type=message.get("chat_type") or "whatsapp", channel_id=outbound_channel_id)
+                if not isinstance(send_result, dict) or send_result.get("ok") is False or send_result.get("success") is False:
+                    raise ValueError("Invalid provider acknowledgement")
+                state.mark_outgoing_message(outgoing_key, "confirmed")
                 session_after = _get_session_safe(chat_id)
                 session_after["wazzup_send_called"] = True
                 session_after["last_sent_answer"] = answer
@@ -1679,9 +1732,11 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
                 state.log_event(chat_id, "wazzup_send_result", send_result_payload)
             except Exception as exc:
                 status_code = getattr(getattr(exc, "response", None), "status_code", None)
-                response_preview = _preview(getattr(getattr(exc, "response", None), "text", ""), 300)
-                silent_reason = "send_failed"
-                send_result_payload = {"status_code": status_code, "response_preview": response_preview or _preview(exc, 300), "success": False, "silent_reason": silent_reason}
+                rejected = status_code is not None and 400 <= status_code < 500
+                state.mark_outgoing_message(outgoing_key, "rejected" if rejected else "uncertain")
+                should_send = False
+                silent_reason = "send_failed" if rejected else "send_uncertain"
+                send_result_payload = {"status_code": status_code, "error_type": type(exc).__name__, "success": False, "silent_reason": silent_reason}
                 state.log_event(chat_id, "wazzup_send_result", send_result_payload)
                 state.log_event(chat_id, "bot_decision", _decision_payload(answer=answer, should_send_wazzup=False, silent_reason=silent_reason, crm_error=crm_error))
         else:
@@ -1690,7 +1745,7 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
         state.log_event(chat_id, "wazzup_send_start", {"chat_id": chat_id, "channel_id": channel_id_from_payload, "skipped": True, "silent_reason": silent_reason or "empty_text"})
         state.log_event(chat_id, "wazzup_send_result", {"status_code": None, "response_preview": "", "success": False, "skipped": True, "silent_reason": silent_reason or "empty_text"})
     state.log_event(chat_id, "bot_processing_finish", {"phone": phone, "chat_id": chat_id, "should_send_wazzup": bool(answer and should_send and send_enabled), "silent_reason": silent_reason, "send_result": send_result_payload})
-    return {"ok": True, "ignored": False, "answer": answer, "should_send_wazzup": bool(answer and should_send), "no_reply_reason": silent_reason}
+    return {"ok": silent_reason not in {"send_failed", "send_uncertain"}, "ignored": False, "answer": answer, "should_send_wazzup": bool(answer and should_send), "no_reply_reason": silent_reason}
 
 
 async def _process_wazzup_message(
@@ -1748,29 +1803,57 @@ async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) 
     return {"ok": True, "processed_count": processed_count, "ignored_count": ignored_count, "results": results}
 
 
+async def _process_inbox_job(job: dict[str, Any]) -> dict[str, Any]:
+    request = SimpleNamespace(url=SimpleNamespace(path=WAZZUP_PRIMARY_WEBHOOK_PATH), method="POST")
+    return await _process_wazzup_message(request, job["payload"], job["raw_msg"], job["parse_meta"])
+
+
+async def _dispatch_wazzup_webhook(request: Request) -> dict[str, Any]:
+    """Acknowledge only after a durable commit, without waiting for CRM/AI."""
+    if not bool(getattr(get_settings(), "durable_webhook_enabled", True)):
+        return await handle_wazzup_webhook(request)
+    import production_inbox
+    payload, parse_meta = await _safe_read_webhook_payload(request)
+    if not parse_meta.get("ok"):
+        _log_ignored_wazzup_webhook(request, parse_meta)
+        return {"ok": True, "ignored": True, "reason": parse_meta.get("reason")}
+    raw_messages = _raw_wazzup_messages(payload) or [_primary_payload_message(payload)]
+    if len(raw_messages) > 100:
+        raise HTTPException(status_code=413, detail="Too many webhook messages")
+    accepted = []
+    for raw_msg in raw_messages:
+        message = _normalize_wazzup_message(payload, raw_msg)
+        if not message["chat_id"]:
+            continue
+        # Store no full batch in each row, only this message and routing fields.
+        envelope = {k: v for k, v in payload.items() if k not in {"messages", "message"}}
+        accepted.append(production_inbox.enqueue(
+            message_key=message["message_key"], chat_id=message["chat_id"],
+            payload=envelope, raw_msg=raw_msg,
+            parse_meta={k: v for k, v in parse_meta.items() if k not in {"raw_preview", "error"}},
+        ))
+    return {"ok": True, "accepted_count": len(accepted),
+            "duplicate_count": sum(bool(x["duplicate"]) for x in accepted)}
+
+
 @app.post("/wazzup/webhook")
 async def wazzup_webhook_ingress(request: Request) -> dict[str, Any]:
-    return await handle_wazzup_webhook(request)
+    return await _dispatch_wazzup_webhook(request)
 
 
 @app.post("/webhook")
 async def webhook_ingress(request: Request) -> dict[str, Any]:
-    return await handle_wazzup_webhook(request)
+    return await _dispatch_wazzup_webhook(request)
 
 
 @app.post("/api/wazzup/webhook")
 async def api_wazzup_webhook_ingress(request: Request) -> dict[str, Any]:
-    return await handle_wazzup_webhook(request)
+    return await _dispatch_wazzup_webhook(request)
 
 
 @app.post("/webhook/wazzup")
 async def webhook_wazzup_ingress(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    settings = get_settings()
-    if settings.webhook_secret:
-        expected = f"Bearer {settings.webhook_secret}"
-        if authorization != expected:
-            raise HTTPException(status_code=401, detail="Bad webhook secret")
-    return await handle_wazzup_webhook(request)
+    return await _dispatch_wazzup_webhook(request)
 
 
 @app.get("/wazzup/webhook")

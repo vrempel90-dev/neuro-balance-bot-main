@@ -70,6 +70,8 @@ async def _process_wazzup_message_with_claude_observer(
 neuro._process_wazzup_message = _process_wazzup_message_with_claude_observer
 
 app = neuro.app
+from production_monitor import router as production_monitor_router
+app.include_router(production_monitor_router)
 
 
 def _openai_debug_admin_token() -> str:

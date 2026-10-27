@@ -35,7 +35,7 @@ ACTIVE_APPOINTMENT_STATUSES = (
 )
 
 # Статусы лида, которые означают «обращение ещё не в работе».
-NEW_LEAD_STATUSES = {"", "новая", "new"}
+NEW_LEAD_STATUSES = {"новая", "new"}
 
 # Часовой пояс клиники (Астана, UTC+5): «сегодня» считаем по нему, иначе
 # утренняя запись выглядела бы прошедшей для половины смены.
@@ -128,6 +128,20 @@ def classify(phone: str, crm_lookup: dict[str, Any] | None) -> Admission:
 
     lookup = crm_lookup if isinstance(crm_lookup, dict) else {}
     raw = _raw(lookup)
+    if raw.get("ok") is False or raw.get("success") is False or raw.get("error"):
+        return Admission(state=CRM_UNAVAILABLE, reason="crm_error", phone=normalized)
+    # CRM must explicitly certify a complete identity lookup. Missing fields
+    # must not be silently interpreted as "new client".
+    if not isinstance(raw.get("found"), bool) or not isinstance(raw.get("isNew"), bool):
+        return Admission(state=CRM_UNAVAILABLE, reason="incomplete_crm_lookup", phone=normalized)
+    if "hasActiveAppointment" in raw and not isinstance(raw["hasActiveAppointment"], bool):
+        return Admission(state=CRM_UNAVAILABLE, reason="incomplete_crm_lookup", phone=normalized)
+    for key in ("patient", "lead", "appointment", "lastAppointment", "activeAppointment"):
+        if raw.get(key) is not None and (not isinstance(raw[key], dict) or not raw[key]):
+            return Admission(state=CRM_UNAVAILABLE, reason="incomplete_crm_lookup", phone=normalized)
+    for key in ("appointments", "records", "items"):
+        if key in raw and (not isinstance(raw[key], list) or any(not isinstance(item, dict) for item in raw[key])):
+            return Admission(state=CRM_UNAVAILABLE, reason="incomplete_crm_lookup", phone=normalized)
 
     appointment = _active_appointment(lookup, raw)
     if appointment is not None or raw.get("hasActiveAppointment") is True:
@@ -147,11 +161,14 @@ def classify(phone: str, crm_lookup: dict[str, Any] | None) -> Admission:
     if last_appointment:
         # Запись есть, но она отменена или уже в прошлом: пациент не новый.
         return Admission(state=RETURNING, reason="past_or_cancelled_appointment", phone=normalized)
+    if lookup.get("appointments") or raw.get("appointments") or raw.get("records") or raw.get("items") or raw.get("appointment"):
+        # A finished/cancelled appointment is still proof of an existing patient.
+        return Admission(state=RETURNING, reason="appointment_history_exists", phone=normalized)
     if lead and _low(lead.get("status")) not in NEW_LEAD_STATUSES:
         return Admission(state=RETURNING, reason="lead_in_progress", phone=normalized)
     if raw.get("isNew") is False:
         return Admission(state=RETURNING, reason="crm_says_not_new", phone=normalized)
-    if raw.get("isNew") is not True and raw.get("found") is True:
+    if raw.get("found") is True and not (raw.get("isNew") is True and lead):
         return Admission(state=RETURNING, reason="crm_found_contact", phone=normalized)
 
     return Admission(state=NEW, reason="no_existing_contact", phone=normalized)

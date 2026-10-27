@@ -1,0 +1,57 @@
+name: Production Stabilization Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  full-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      OPENAI_API_KEY: ""
+      # The autouse CRM transport fixture forbids external requests. Positive
+      # booking contracts use isolated persisted responses; kill-switch cases
+      # explicitly set CRM_WRITE_ENABLED=false and assert no write is called.
+      DURABLE_WEBHOOK_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install exact application and test dependencies
+        run: python -m pip install -r requirements.txt -r tests/requirements-dev.txt
+      - name: Compile application
+        run: python -m compileall -q .
+      - name: Execute the complete isolated regression suite
+        run: python -m pytest -q --junitxml=validation-results.xml
+      - name: Preserve test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-stabilization-tests
+          path: validation-results.xml
+          retention-days: 30
+
+  dependency-security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Audit declared production dependencies
+        run: |
+          python -m pip install pip-audit
+          python -m pip_audit -r requirements.txt --format=json --output=dependency-audit.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-dependency-audit
+          path: dependency-audit.json
+          retention-days: 30

@@ -63,12 +63,12 @@ def should_auto_reply(
     if source_norm == "debug" and not force and not getattr(get_settings(), "bot_auto_reply_enabled", True):
         return GuardDecision(False, "bot_auto_reply_disabled", False, False, False)
 
-    support_active = _post_booking_support_active(session)
+    support_active = not bool(getattr(get_settings(), "new_leads_only", True)) and _post_booking_support_active(session)
     if (session.get("ai_muted") or session.get("manual_takeover") or session.get("manual_admin_intervention")) and not support_active:
         return GuardDecision(False, "manual_takeover", False, False, False)
     if session.get("escalated") or str(session.get("step") or "").lower() == "escalated":
         return GuardDecision(False, "manual_takeover", False, False, False)
-    if (session.get("booked") or str(session.get("step") or "").lower() in {"booked", "done", "confirmed", "appointment_confirmed"}) and not support_active:
+    if (session.get("booked") or session.get("booking_confirmed") or str(session.get("step") or "").lower() in {"booked", "done", "confirmed", "appointment_confirmed"}) and not support_active:
         return GuardDecision(False, "booked_session_ai_disabled", False, False, False)
 
     return GuardDecision(True, "", True, True, is_real)

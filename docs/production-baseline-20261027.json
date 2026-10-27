@@ -1,0 +1,32 @@
+{
+  "captured_at_utc": "2026-10-27T18:26:23Z",
+  "repo": "vrempel90-dev/neuro-balance-bot-main",
+  "branch": "main",
+  "commit": "60f438fb3aa5da174323441dc6990f9b781fdd3d",
+  "railway_project": "5e80bd3a-b128-40cc-99bf-47a8fc3d7ff2",
+  "environment": "ad8c9a26-7897-4430-8dbd-6c02f90dbe07",
+  "service": "7ccdeb4f-69a6-46ea-861e-547e3afcdb29",
+  "deployment": "f9369943-4814-4a74-91b0-157c5fa1040e",
+  "status": "SUCCESS",
+  "replicas": 1,
+  "volume_mount": "/data",
+  "volume_size_mb": 1024,
+  "start_command": "uvicorn live_main:app --host 0.0.0.0 --port ${PORT:-8080}",
+  "healthcheck": "/health",
+  "pending_changes": false,
+  "resource_samples": 121,
+  "memory_current_gb": 0.06561792,
+  "memory_peak_2h_gb": 0.182362112,
+  "http_sample": {
+    "200": 16,
+    "404": 1,
+    "499": 183,
+    "502": 1
+  },
+  "http_sample_limit": 200,
+  "http_coverage": "partial, truncated at retrieval limit",
+  "rollback_available": true,
+  "original_deployment_snapshot": "74c0bc8d-95bf-431c-9976-c871b55f8af1",
+  "secrets_in_snapshot": false,
+  "patient_data_in_snapshot": false
+}

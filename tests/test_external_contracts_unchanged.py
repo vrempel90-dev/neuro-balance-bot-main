@@ -74,7 +74,7 @@ def _payload(**overrides: Any) -> dict[str, Any]:
 
 def test_existing_webhook_paths_are_unchanged() -> None:
     """A new integration must never be required — these paths already exist."""
-    registered = {route.path for route in main.app.routes}
+    registered = set(main.app.openapi()["paths"])
     missing = EXPECTED_WEBHOOK_PATHS - registered
     assert not missing, f"production webhook paths disappeared: {sorted(missing)}"
 
@@ -365,7 +365,8 @@ def test_agent_booking_requires_a_crm_offered_slot() -> None:
 
 def test_crm_success_detection_rejects_error_shapes() -> None:
     assert agent._crm_booking_succeeded({"ok": True, "id": 1}) is True
-    assert agent._crm_booking_succeeded({"success": True}) is True
+    assert agent._crm_booking_succeeded({"success": True}) is False
+    assert agent._crm_booking_succeeded({"success": True, "id": 1}) is True
     assert agent._crm_booking_succeeded({"ok": False}) is False
     assert agent._crm_booking_succeeded({"error": "slot_taken"}) is False
     assert agent._crm_booking_succeeded({"status": "failed"}) is False
