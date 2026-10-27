@@ -313,7 +313,9 @@ def _doctor_name_matches(text: str, doctor_name: str) -> bool:
     # Two long name parts are stronger than an ambiguous common given name.
     matches = sum(any(w.startswith(token) or token.startswith(w) for w in words
                       if len(w) >= 5) for token in tokens)
-    return matches >= min(2, len(tokens))
+    # One name part is sufficient only if it identifies exactly one
+    # clinician in the caller's candidate list (checked by the callers).
+    return matches >= 1
 
 
 def _resolve_explicit_doctor_choice(session: dict[str, Any], user_text: str) -> dict[str, str] | None:
@@ -334,6 +336,11 @@ def _resolve_explicit_doctor_choice(session: dict[str, Any], user_text: str) -> 
     if len(candidates) != 1:
         return None
     chosen = candidates[0]
+    if session.get("preferred_doctor_login") != chosen["doctor_login"]:
+        for key in ("selected_slot", "selected_date", "selected_time",
+                    "selected_doctor_login", "selected_doctor_name"):
+            session.pop(key, None)
+        session["last_presented_slots"] = []
     session["preferred_doctor_login"] = chosen["doctor_login"]
     session["preferred_doctor_name"] = chosen["doctor_name"]
     return chosen
@@ -1295,8 +1302,6 @@ async def _tool_get_available_slots(
     # Do not resurrect morning slots when an afternoon-only preference had no
     # matching time. In that case honestly report no matching slots.
     slots = available[:_MAX_SLOTS_IN_TOOL_RESULT]
-    if doctor_login:
-        session["doctor_options"] = []  # clinician preference has been resolved
     _remember_offered_slots(session, slots)
     if slots:
         session["last_slots"] = [
