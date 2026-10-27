@@ -33,7 +33,12 @@ def _context_messages(
     }]
     # Read the canonical message log; do not create a second SDK SQLiteSession
     # or the same inbound text will be repeated on successive requests.
-    items.extend(legacy._history_messages(recent_history))
+    history = legacy._history_messages(recent_history)
+    # Be resilient to callers that accidentally include the current inbound
+    # message; otherwise a short answer can be treated as two separate turns.
+    if history and history[-1]["role"] == "user" and history[-1]["content"] == str(user_text)[:2000]:
+        history.pop()
+    items.extend(history)
     items.append({"role": "user", "content": str(user_text)[:2000]})
     return items
 
@@ -91,6 +96,13 @@ def _make_tools(chat_id: str, session: dict[str, Any], phone: str, result: legac
                     args = {}
             except (ValueError, TypeError):
                 args = {}
+            if tool_name in {"book_appointment", "reschedule_appointment", "cancel_appointment"} and (
+                session.get("manual_takeover") or session.get("escalated")
+            ):
+                return json.dumps({
+                    "ok": False, "error": "operator_owns_conversation",
+                    "message": "Диалог передан человеку, запись автоматически менять нельзя.",
+                }, ensure_ascii=False)
             try:
                 value = await legacy.execute_tool(
                     chat_id=chat_id, session=session, phone=phone,
