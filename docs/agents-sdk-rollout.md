@@ -72,6 +72,6 @@ current inbound message is deduplicated before delivery to the model.
   address, approved therapies and medical rules have not been independently
   verified with the clinic.
 - Dependency upgrade from `openai==1.59.7` to modern `openai` and
-  `openai-agents==0.24.0` must pass the legacy regression suite.
+  `openai-agents==0.17.8` must pass the legacy regression suite.
 
 **Do not merge or turn on the SDK until CI and staging validation pass.**
