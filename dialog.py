@@ -796,7 +796,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     _activate_ai_admission_lease(session)
     session["gate_reason"] = "new_lead"
     try:
-        result = await agent.run_agent_turn(
+        # SDK runtime is opt-in; no fallback to a second LLM after tool execution.
+        turn_runner = agent.run_agent_turn
+        if bool(getattr(get_settings(), "agents_sdk_enabled", False)):
+            from agents_sdk_runtime import run_agent_turn as turn_runner
+        result = await turn_runner(
             chat_id=chat_id,
             phone=effective_phone,
             session=session,
