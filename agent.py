@@ -1001,6 +1001,27 @@ def agent_system_prompt() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _answer_language_instruction(session: dict[str, Any]) -> str:
+    """Hard per-turn language instruction, independent of earlier chat text."""
+    if str(session.get("language") or "ru") == "kk":
+        return (
+            "ОБЯЗАТЕЛЬНЫЙ ЯЗЫК ИМЕННО ЭТОГО ОТВЕТА: казахский (қазақ тілі). "
+            "Отвечай естественным казахским языком, не русским, даже если "
+            "предыдущие сообщения или тексты CRM по-русски. "
+            "Имена врачей, адреса, точное время, ссылки и медицинские факты "
+            "сохраняй без искажений. Не добавляй диагнозов или противопоказаний. "
+            "При смене языка не теряй ранее собранные сведения о пациенте."
+        )
+    return (
+        "ОБЯЗАТЕЛЬНЫЙ ЯЗЫК ИМЕННО ЭТОГО ОТВЕТА: русский. "
+        "Отвечай естественным русским языком, не казахским, даже если "
+        "предыдущие сообщения или CRM-данные на казахском. "
+        "Имена врачей, адреса, точное время, ссылки и медицинские факты "
+        "сохраняй без искажений. Не добавляй диагнозов или противопоказаний. "
+        "При смене языка не теряй ранее собранные сведения о пациенте."
+    )
+
+
 def _clinic_today() -> date_cls:
     """Today in the clinic's timezone, not the Railway host's.
 
@@ -2773,7 +2794,7 @@ async def run_agent_turn(
     # from a patient must never carry the authority of a system instruction,
     # or a message crafted to look like an instruction would be weighted as one.
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": agent_system_prompt()},
+        {"role": "system", "content": agent_system_prompt() + "\\n\\n" + _answer_language_instruction(session)},
         {
             "role": "user",
             "content": (
