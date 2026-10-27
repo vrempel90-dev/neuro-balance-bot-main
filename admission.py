@@ -154,6 +154,8 @@ def classify(phone: str, crm_lookup: dict[str, Any] | None) -> Admission:
     if lookup.get("appointments") or raw.get("appointments") or raw.get("records"):
         # A finished/cancelled appointment is still proof of an existing patient.
         return Admission(state=RETURNING, reason="appointment_history_exists", phone=normalized)
+    if lead and _low(lead.get("status")) not in NEW_LEAD_STATUSES:
+        return Admission(state=RETURNING, reason="lead_in_progress", phone=normalized)
     if lead:
         # An existing CRM lead is not a genuinely unknown new number. Even
         # the status "новая" may belong to an old, unprocessed contact.
