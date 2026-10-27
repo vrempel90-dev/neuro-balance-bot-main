@@ -173,3 +173,20 @@ def test_repeated_question_is_blocked_but_requested_repeat_is_allowed():
     assert repeated_question("Сколько лет пациенту?", "Сколько лет пациенту?", "62") is True
     assert repeated_question("Сколько лет пациенту?", "Сколько лет пациенту?", "Повторите") is False
     assert repeated_question("Всё понял.", "Всё понял.", "Да") is False
+
+
+def test_real_sdk_accepts_the_existing_tool_adapter(monkeypatch):
+    """Import and instantiate the installed SDK, not a mocked replacement."""
+    _stub_legacy(monkeypatch)
+    from agents import Agent as SDKAgent, ModelSettings
+    tools = runtime._make_tools("synthetic", {}, "77001234567", agent.AgentResult())
+    assert len(tools) == 1
+    assert tools[0].name == "record_patient_facts"
+    instance = SDKAgent(
+        name="NeuroBalance acceptance smoke",
+        instructions="Use only approved clinic facts.",
+        model="gpt-4o-mini",
+        tools=tools,
+        model_settings=ModelSettings(parallel_tool_calls=False),
+    )
+    assert instance.tools[0].name == "record_patient_facts"
