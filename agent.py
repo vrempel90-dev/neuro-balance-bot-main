@@ -1077,7 +1077,7 @@ async def _ensure_reply_language(
     # Language-only rewrites must not silently change hard factual tokens.
     import re as _re
     critical = lambda value: sorted(_re.findall(
-        r"https?://\\S+|(?<!\\d)\\d{1,4}(?::\\d{2})?(?!\\d)", value
+        r"https?://\S+|(?<!\d)\d{1,4}(?::\d{2})?(?!\d)", value
     ))
     if critical(answer) != critical(fixed):
         _log(chat_id, "agent_language_correction_fact_mismatch", {"expected": expected})
