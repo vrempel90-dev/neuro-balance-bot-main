@@ -1,7 +1,8 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 httpx==0.28.1
-openai==1.59.7
+openai-agents==0.17.8
+openai>=2.36.0,<3.0.0
 python-dotenv==1.0.1
 pydantic-settings==2.7.1
 python-multipart==0.0.12

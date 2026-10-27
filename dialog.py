@@ -695,6 +695,24 @@ async def _finalize(chat_id: str, session: dict[str, Any], answer: str, result: 
     if not answer:
         return await _handoff(chat_id, session, _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK), "empty_answer")
 
+    # Block fabricated contact links, clinic addresses and CRM action confirmations.
+    # This is a deterministic fail-closed check independent of the LLM runtime.
+    from response_policy import violation as outbound_violation, repeated_question
+    policy_violation = outbound_violation(answer, result)
+    if not policy_violation and bool(getattr(get_settings(), "agents_sdk_enabled", False)) and repeated_question(
+        answer, str(session.get("last_assistant_answer") or ""),
+        str(session.get("last_user_text") or ""),
+    ):
+        policy_violation = "repeated_question"
+    if policy_violation:
+        _safe_log(chat_id, "unverified_fact_blocked", {
+            "chat_id": chat_id, "fact": policy_violation,
+        })
+        return await _handoff(
+            chat_id, session, _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK),
+            policy_violation,
+        )
+
     # 3. Дата, время или врач, которых не было ни в одном результате инструмента.
     unverified = _unverified_fact(chat_id, session, answer, result)
     if unverified:
@@ -796,7 +814,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     _activate_ai_admission_lease(session)
     session["gate_reason"] = "new_lead"
     try:
-        result = await agent.run_agent_turn(
+        # SDK runtime is opt-in; no fallback to a second LLM after tool execution.
+        turn_runner = agent.run_agent_turn
+        if bool(getattr(get_settings(), "agents_sdk_enabled", False)):
+            from agents_sdk_runtime import run_agent_turn as turn_runner
+        result = await turn_runner(
             chat_id=chat_id,
             phone=effective_phone,
             session=session,
