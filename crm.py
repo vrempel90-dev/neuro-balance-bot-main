@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from functools import lru_cache
 from typing import Any
 from datetime import date as date_cls, datetime, timedelta
@@ -114,6 +115,11 @@ def normalize_phone(phone: str | None) -> str:
     elif digits.startswith("8") and len(digits) == 11:
         digits = "7" + digits[1:]
     return digits
+
+
+def _mask_phone_for_log(phone: str | None) -> str:
+    digits = re.sub(r"\\D+", "", str(phone or ""))
+    return "***" + digits[-4:] if len(digits) >= 4 else "***"
 
 
 def phone_lookup_variants(phone: str | None) -> list[str]:
@@ -527,51 +533,89 @@ def _is_active_future_appointment(appt: dict[str, Any]) -> bool:
 
 class CRMClient:
     async def lookup_active_appointments_by_phone(self, phone: str) -> dict[str, Any]:
+        """Look up EVERY supported number representation before admitting a lead.
+
+        A 200/unknown response for +7 must not shadow an existing patient whose
+        CRM phone is saved as 8... or 10 digits. Never treat partial responses
+        as permission for an AI conversation.
+        """
         variants = phone_lookup_variants(phone)
-        errors: list[str] = []
-        last_status: int | None = None
+        if not variants:
+            raise CRMError("CRM lookup failed: invalid_phone")
         endpoint = _patient_lookup_url()
-        last_params: dict[str, Any] = {}
-        for variant in variants or [phone]:
-            last_params = {"phone": variant}
+
+        async def _one(variant: str) -> tuple[str, dict[str, Any] | None, str]:
             try:
+                # Some integrations intentionally override patient_lookup.
                 if getattr(patient_lookup, "__module__", "crm") != __name__:
                     data = await patient_lookup(variant)
                 else:
                     data = await patient_lookup_raw(variant)
-                last_status = 200
-            except CRMResponseError as exc:
-                last_status = exc.status_code
-                errors.append(str(exc))
-                logger.exception("CRM active appointment lookup response error endpoint=%s params=%s status_code=%s", endpoint, last_params, exc.status_code)
-                continue
+                if not isinstance(data, dict) or data.get("ok") is False or data.get("error"):
+                    return variant, None, "crm_invalid_response"
+                if not isinstance(data.get("found"), bool) or not isinstance(data.get("isNew"), bool):
+                    return variant, None, "crm_missing_identity_fields"
+                return variant, data, ""
             except Exception as exc:
-                errors.append(str(exc))
-                logger.exception("CRM active appointment lookup failed endpoint=%s params=%s", endpoint, last_params)
-                continue
-            appointments = _extract_appointments(data)
-            active = [a for a in appointments if _is_active_future_appointment(a)]
-            active.sort(key=lambda a: _appointment_datetime(a) or datetime.max)
-            return {
-                "ok": True,
-                "status_code": last_status or 200,
-                "phone_raw": phone,
-                "phone_normalized": normalize_phone(phone),
-                "phone_variants": variants,
-                "endpoint_url": endpoint,
-                "query_params": last_params,
-                "appointments_raw_count": len(appointments),
-                "appointments": active,
-                "appointment": active[0] if active else None,
-                "appointments_cache": active[1:],
-                "active_count": len(active),
-                "raw": data,
-            }
-        err = CRMError("CRM lookup failed: " + "; ".join(errors[-3:]))
-        setattr(err, "status_code", last_status)
-        setattr(err, "endpoint_url", endpoint)
-        setattr(err, "query_params", last_params)
-        raise err
+                logger.warning("CRM phone variant lookup failed variant=%s error=%s",
+                               _mask_phone_for_log(variant), type(exc).__name__)
+                return variant, None, type(exc).__name__
+
+        results = await asyncio.gather(*(_one(variant) for variant in variants))
+        successes = [(variant, data) for variant, data, error in results if data is not None]
+        failures = [(variant, error) for variant, _, error in results if error]
+        if not successes:
+            raise CRMError("CRM lookup failed for all phone formats")
+        if failures:
+            # Even one unresolved format could hide an already booked patient.
+            raise CRMError("CRM lookup incomplete for phone formats")
+
+        def _priority(payload: dict[str, Any]) -> int:
+            appointments = _extract_appointments(payload)
+            active = any(_is_active_future_appointment(x) for x in appointments)
+            if active or payload.get("hasActiveAppointment") is True:
+                return 6
+            if payload.get("patient") or payload.get("lastAppointment") or appointments:
+                return 5
+            if payload.get("lead"):
+                return 4
+            if payload.get("found") is True or payload.get("isNew") is False:
+                return 3
+            return 1
+
+        variant, data = max(successes, key=lambda item: _priority(item[1]))
+        all_appointments = [
+            a for _, item in successes for a in _extract_appointments(item)
+        ]
+        active = [a for a in all_appointments if _is_active_future_appointment(a)]
+        # De-duplicate cross-format CRM matches by appointment id.
+        deduped: dict[str, dict[str, Any]] = {}
+        for appt in active:
+            key = str(_appointment_id(appt) or "")
+            if key:
+                deduped[key] = appt
+        active = list(deduped.values())
+        active.sort(key=lambda a: _appointment_datetime(a) or datetime.max)
+        # If any format found an active appointment, admission must see it,
+        # even if the selected response contained only the patient record.
+        merged = dict(data)
+        if active:
+            merged["hasActiveAppointment"] = True
+        return {
+            "ok": True,
+            "status_code": 200,
+            "phone_raw": phone,
+            "phone_normalized": normalize_phone(phone),
+            "phone_variants": variants,
+            "endpoint_url": endpoint,
+            "query_params": {"phone": variant},
+            "appointments_raw_count": len(all_appointments),
+            "appointments": active,
+            "appointment": active[0] if active else None,
+            "appointments_cache": active[1:],
+            "active_count": len(active),
+            "raw": merged,
+        }
 
     async def lookup_appointment_by_id(self, appointment_id: str | int) -> dict[str, Any]:
         response = await _client().get(_url("/api/bot/appointment"), params={"appointmentId": appointment_id}, headers=_headers())
