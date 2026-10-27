@@ -128,6 +128,10 @@ def classify(phone: str, crm_lookup: dict[str, Any] | None) -> Admission:
 
     lookup = crm_lookup if isinstance(crm_lookup, dict) else {}
     raw = _raw(lookup)
+    # CRM must explicitly certify a complete identity lookup. Missing fields
+    # must not be silently interpreted as "new client".
+    if not isinstance(raw.get("found"), bool) or not isinstance(raw.get("isNew"), bool):
+        return Admission(state=CRM_UNAVAILABLE, reason="incomplete_crm_lookup", phone=normalized)
 
     appointment = _active_appointment(lookup, raw)
     if appointment is not None or raw.get("hasActiveAppointment") is True:
@@ -147,8 +151,12 @@ def classify(phone: str, crm_lookup: dict[str, Any] | None) -> Admission:
     if last_appointment:
         # Запись есть, но она отменена или уже в прошлом: пациент не новый.
         return Admission(state=RETURNING, reason="past_or_cancelled_appointment", phone=normalized)
-    if lead and _low(lead.get("status")) not in NEW_LEAD_STATUSES:
-        return Admission(state=RETURNING, reason="lead_in_progress", phone=normalized)
+    if lead:
+        # An existing CRM lead is not a genuinely unknown new number. Even
+        # the status "новая" may belong to an old, unprocessed contact.
+        # An AI conversation started while CRM explicitly reported no lead is
+        # allowed to continue under the separate short admission lease.
+        return Admission(state=RETURNING, reason="crm_lead_already_exists", phone=normalized)
     if raw.get("isNew") is False:
         return Admission(state=RETURNING, reason="crm_says_not_new", phone=normalized)
     if raw.get("isNew") is not True and raw.get("found") is True:
