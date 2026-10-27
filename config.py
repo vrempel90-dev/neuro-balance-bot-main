@@ -26,6 +26,11 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("CRM_WRITE_ENABLED", "crm_write_enabled"),
     )
 
+    # Opt-in Agents SDK runtime: disabled in production until shadow tests pass.
+    agents_sdk_enabled: bool = Field(default=False, validation_alias=AliasChoices("AGENTS_SDK_ENABLED", "agents_sdk_enabled"))
+    agents_sdk_max_turns: int = Field(default=8, ge=2, le=20, validation_alias=AliasChoices("AGENTS_SDK_MAX_TURNS", "agents_sdk_max_turns"))
+    agents_sdk_max_tool_calls: int = Field(default=8, ge=1, le=20, validation_alias=AliasChoices("AGENTS_SDK_MAX_TOOL_CALLS", "agents_sdk_max_tool_calls"))
+
     # OpenAI / AI
     # Main conversational agent: balanced GPT-5.6 tier for reliable tool use.
     # Cheap helper/humanize path: GPT-5.6 Luna.
