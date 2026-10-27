@@ -701,6 +701,9 @@ async def _finalize(chat_id: str, session: dict[str, Any], answer: str, result: 
         _safe_log(chat_id, "unverified_fact_blocked", {"chat_id": chat_id, "fact": unverified})
         return await _handoff(chat_id, session, _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK), "unverified_fact")
 
+    # Bind only CRM slots actually named to the patient. Otherwise a time
+    # shared by several doctors cannot be resolved safely on the next turn.
+    agent._remember_presented_slots(session, answer)
     session["last_assistant_answer"] = answer
     session["final_answer_preview"] = answer[:160]
     session["no_reply_reason"] = ""
