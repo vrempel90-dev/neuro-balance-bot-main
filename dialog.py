@@ -366,7 +366,7 @@ def _store_crm_lookup_debug(session: dict[str, Any], lookup: dict[str, Any] | No
 
 
 _AI_ADMISSION_LEASE_HOURS = 12
-_AI_CONTINUATION_REASONS = {"lead_in_progress", "crm_says_not_new", "crm_found_contact"}
+_AI_CONTINUATION_REASONS = {"lead_in_progress", "crm_lead_already_exists", "crm_says_not_new", "crm_found_contact"}
 
 
 def _ai_admission_lease_active(session: dict[str, Any]) -> bool:
@@ -544,6 +544,9 @@ def _known_doctor_names(session: dict[str, Any], result: Any) -> set[str]:
             _add(appointment.get("doctor_name"))
     for name in (session.get("crm_known_doctors") or {}).values() if isinstance(session.get("crm_known_doctors"), dict) else []:
         _add(name)
+    for option in session.get("doctor_options") or []:
+        if isinstance(option, dict):
+            _add(option.get("doctor_name"))
     for key in ("appointment_doctor_name", "selected_doctor_name"):
         _add(session.get(key))
     for tool_result in getattr(result, "tool_results", None) or []:
@@ -701,6 +704,9 @@ async def _finalize(chat_id: str, session: dict[str, Any], answer: str, result: 
         _safe_log(chat_id, "unverified_fact_blocked", {"chat_id": chat_id, "fact": unverified})
         return await _handoff(chat_id, session, _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK), "unverified_fact")
 
+    # Bind only CRM slots actually named to the patient. Otherwise a time
+    # shared by several doctors cannot be resolved safely on the next turn.
+    agent._remember_presented_slots(session, answer)
     session["last_assistant_answer"] = answer
     session["final_answer_preview"] = answer[:160]
     session["no_reply_reason"] = ""

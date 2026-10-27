@@ -63,11 +63,12 @@ def test_unknown_number_is_a_new_lead() -> None:
     assert verdict.bot_may_reply is True
 
 
-def test_new_lead_with_a_fresh_crm_lead_record() -> None:
-    """CRM уже завела лид со статусом «новая» — обращение всё ещё новое."""
+def test_existing_crm_lead_with_new_status_is_not_a_new_client() -> None:
+    """Даже лид «новая» может быть старым контактом: без доказательства отсутствия в CRM AI молчит."""
     verdict = admission.classify(PHONE, new_patient_lookup(found=True, lead={"id": "l1", "status": "НОВАЯ"}))
 
-    assert verdict.state == admission.NEW
+    assert verdict.state == admission.RETURNING
+    assert verdict.bot_may_reply is False
 
 
 def test_phone_formats_are_the_same_patient() -> None:
