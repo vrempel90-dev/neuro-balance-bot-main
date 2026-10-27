@@ -333,6 +333,19 @@ def _resolve_explicit_doctor_choice(session: dict[str, Any], user_text: str) -> 
         idx = int(number.group(1)) - 1
         if 0 <= idx < len(options):
             candidates = [options[idx]]
+    if not candidates:
+        ordinal_terms = {
+            1: ("первый", "первого", "первому", "бірінші"),
+            2: ("второй", "второго", "второму", "екінші"),
+            3: ("третий", "третьего", "третьему", "үшінші"),
+            4: ("четвертый", "четвертого", "төртінші"),
+        }
+        low = user.casefold()
+        for n, words in ordinal_terms.items():
+            if any(re.search(r"(?<!\\w)" + re.escape(w) + r"(?!\\w)", low) for w in words):
+                if n <= len(options):
+                    candidates = [options[n - 1]]
+                break
     if len(candidates) != 1:
         return None
     chosen = candidates[0]
@@ -1380,6 +1393,19 @@ async def _tool_get_available_slots(
 
     if not doctor_login and not session.get("preferred_doctor_login") and available:
         real_doctors = _real_doctor_options(available)
+        # The patient may already have requested a verified doctor by name.
+        # In that case honour their choice instead of asking again.
+        current_text = str(session.get("last_user_text") or "")
+        requested = [
+            opt for opt in real_doctors
+            if _doctor_name_matches(current_text, opt["doctor_name"])
+        ]
+        if len(requested) == 1:
+            doctor_login = requested[0]["doctor_login"]
+            session["preferred_doctor_login"] = doctor_login
+            session["preferred_doctor_name"] = requested[0]["doctor_name"]
+            available = [slot for slot in available if slot["doctor_login"] == doctor_login]
+            real_doctors = [requested[0]]
         if len(real_doctors) > 1:
             session["doctor_options"] = real_doctors
             session["pending_doctor_date_from"] = start.isoformat()
@@ -1404,6 +1430,9 @@ async def _tool_get_available_slots(
             only = real_doctors[0]
             session["preferred_doctor_login"] = only["doctor_login"]
             session["preferred_doctor_name"] = only["doctor_name"]
+    # Never present the internal "reserve" placeholder as a clinician.
+    valid_doctors = {d["doctor_login"] for d in _real_doctor_options(available)}
+    available = [slot for slot in available if slot["doctor_login"] in valid_doctors]
     # Do not resurrect morning slots when an afternoon-only preference had no
     # matching time. In that case honestly report no matching slots.
     slots = available[:_MAX_SLOTS_IN_TOOL_RESULT]
@@ -1483,6 +1512,13 @@ def _tool_select_booking_slot(
     doctor_login = str(args.get("doctor_login") or "").strip()
     date = str(args.get("date") or "").strip()[:10]
     time_start = str(args.get("time_start") or "").strip()[:5]
+    preferred = str(session.get("preferred_doctor_login") or "")
+    if len(session.get("doctor_options") or []) > 1 and not preferred:
+        return {"ok": False, "error": "doctor_not_selected",
+                "message": "Сначала попроси пациента выбрать конкретного врача."}
+    if preferred and doctor_login != preferred:
+        return {"ok": False, "error": "different_doctor_without_consent",
+                "message": "Это время другого врача. Нельзя подменять выбор пациента."}
     slot = _offered_slot(session, date, time_start, doctor_login)
     if slot is None:
         _log(
@@ -1613,6 +1649,13 @@ async def _tool_book_appointment(
     date = str(args.get("date") or "").strip()[:10]
     time_start = str(args.get("time_start") or "").strip()[:5]
     relation = str(args.get("patient_relation") or "").strip()
+    preferred = str(session.get("preferred_doctor_login") or "")
+    if len(session.get("doctor_options") or []) > 1 and not preferred:
+        return {"ok": False, "booking_success": False, "error": "doctor_not_selected",
+                "message": "Перед записью пациент должен выбрать врача."}
+    if preferred and doctor_login != preferred:
+        return {"ok": False, "booking_success": False, "error": "different_doctor_without_consent",
+                "message": "Выбран другой врач: запись без согласия пациента запрещена."}
 
     _log(
         chat_id,
