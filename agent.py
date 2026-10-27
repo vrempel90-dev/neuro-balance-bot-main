@@ -342,7 +342,7 @@ def _resolve_explicit_doctor_choice(session: dict[str, Any], user_text: str) -> 
         }
         low = user.casefold()
         for n, words in ordinal_terms.items():
-            if any(re.search(r"(?<!\\w)" + re.escape(w) + r"(?!\\w)", low) for w in words):
+            if any(re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", low) for w in words):
                 if n <= len(options):
                     candidates = [options[n - 1]]
                 break
