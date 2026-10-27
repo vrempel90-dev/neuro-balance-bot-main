@@ -57,8 +57,8 @@ def test_two_messages_at_once_do_not_produce_a_duplicate_reply(monkeypatch: pyte
     sent: list[str] = []
 
     async def fake_lookup(phone: str) -> dict[str, Any]:
-        return {"ok": True, "found": True, "isNew": True, "patient": None,
-                "lead": {"id": 1, "status": "НОВАЯ"}, "lastAppointment": None,
+        return {"ok": True, "found": False, "isNew": True, "patient": None,
+                "lead": None, "lastAppointment": None,
                 "hasActiveAppointment": False, "appointment": None, "appointments": []}
 
     async def fake_send_text(**kwargs: Any) -> dict[str, Any]:
