@@ -168,3 +168,61 @@ def test_language_rewrite_must_preserve_time_and_date(monkeypatch):
         chat_id="synthetic", answer=original,
     ))
     assert fixed == original  # Never silently alter CRM time.
+
+
+def test_initial_named_doctor_request_is_honored(monkeypatch):
+    monkeypatch.setattr(agent.crm, "check_slots", fake_slots)
+    monkeypatch.setattr(agent, "_log", lambda *_: None)
+    session = {"last_user_text": "Запишите маму к Бекболату после обеда"}
+    response = asyncio.run(agent._tool_get_available_slots("synthetic", session, {
+        "date_from": "2026-10-30", "time_preference": "после обеда",
+    }))
+    assert response.get("doctor_choice_required") is not True
+    assert session["preferred_doctor_login"] == "bekbolat"
+    assert {s["doctor_login"] for s in response["slots"]} == {"bekbolat"}
+
+
+def test_kazakh_ordinal_selects_offered_doctor():
+    session = {"doctor_options": [
+        {"doctor_login": "bekbolat", "doctor_name": "Бекболат Шуринбайулы"},
+        {"doctor_login": "kaisar_k", "doctor_name": "Куанышулы Кайсар Куанышулы"},
+    ]}
+    chosen = agent._resolve_explicit_doctor_choice(session, "Екінші дәрігерді таңдадым")
+    assert chosen["doctor_login"] == "kaisar_k"
+
+
+def test_cannot_select_or_book_different_doctor(monkeypatch):
+    slots = [
+        {"doctor_login": "bekbolat", "doctor_name": "Бекболат Шуринбайулы",
+         "date": "2026-10-30", "time_start": "15:20"},
+        {"doctor_login": "kaisar_k", "doctor_name": "Куанышулы Кайсар Куанышулы",
+         "date": "2026-10-30", "time_start": "15:20"},
+    ]
+    session = {
+        "doctor_options": [
+            {"doctor_login": "bekbolat", "doctor_name": "Бекболат Шуринбайулы"},
+            {"doctor_login": "kaisar_k", "doctor_name": "Куанышулы Кайсар Куанышулы"},
+        ],
+    }
+    agent._remember_offered_slots(session, slots)
+    args = {"doctor_login": "kaisar_k", "date": "2026-10-30", "time_start": "15:20"}
+    refused = agent._tool_select_booking_slot("synthetic", session, args)
+    assert refused["error"] == "doctor_not_selected"
+    session["preferred_doctor_login"] = "bekbolat"
+    refused = agent._tool_select_booking_slot("synthetic", session, args)
+    assert refused["error"] == "different_doctor_without_consent"
+    accepted = agent._tool_select_booking_slot(
+        "synthetic", session, dict(args, doctor_login="bekbolat")
+    )
+    assert accepted["selected"] is True
+    assert session["selected_doctor_login"] == "bekbolat"
+
+
+def test_internal_reserve_never_shown_as_doctor(monkeypatch):
+    monkeypatch.setattr(agent.crm, "check_slots", fake_slots)
+    monkeypatch.setattr(agent, "_log", lambda *_: None)
+    session = {"last_user_text": "Запишите к Бекболату"}
+    result = asyncio.run(agent._tool_get_available_slots("synthetic", session, {
+        "date_from": "2026-10-30"
+    }))
+    assert "reserve" not in {s["doctor_login"] for s in result["slots"]}
