@@ -1380,7 +1380,7 @@ async def _tool_get_available_slots(
 
     if not doctor_login and not session.get("preferred_doctor_login") and available:
         real_doctors = _real_doctor_options(available)
-        if real_doctors:
+        if len(real_doctors) > 1:
             session["doctor_options"] = real_doctors
             session["pending_doctor_date_from"] = start.isoformat()
             session["pending_doctor_time_preference"] = time_preference
@@ -1398,6 +1398,12 @@ async def _tool_get_available_slots(
                     "не называй конкретное время до его выбора."
                 ),
             }
+        if len(real_doctors) == 1:
+            # One real clinician available: include that clinician's real
+            # slots directly. The patient still selects a specific time.
+            only = real_doctors[0]
+            session["preferred_doctor_login"] = only["doctor_login"]
+            session["preferred_doctor_name"] = only["doctor_name"]
     # Do not resurrect morning slots when an afternoon-only preference had no
     # matching time. In that case honestly report no matching slots.
     slots = available[:_MAX_SLOTS_IN_TOOL_RESULT]
