@@ -134,6 +134,18 @@ async def secure_existing_webhook() -> dict[str, Any]:
             uri = current["webhooksUri"]
             destination = _safe_destination(uri)
             if not _owned_destination(uri, str(settings.public_base_url).rstrip("/")):
+                # Preserve the clinic's existing CRM gateway. It may already
+                # authenticate forwarding with the CRM integration secret;
+                # enable our verification only after a real matching request.
+                current_origin = urlsplit(uri)
+                crm_origin = urlsplit(str(getattr(settings, "crm_base_url", "")))
+                if (current_origin.scheme == crm_origin.scheme == "https"
+                    and current_origin.hostname == crm_origin.hostname
+                    and current_origin.port == crm_origin.port
+                    and current_origin.path == "/api/webhooks/wazzup"
+                    and not current_origin.username and not current_origin.password):
+                    import proxy_auth
+                    return {**proxy_auth.enable_if_observed(), "crm_gateway_preserved": True, **destination}
                 return {"ok": False, "auth_enabled": bool(required_token()), "reason": "existing_webhook_is_not_direct_production_destination", "changed": False, **destination}
             stored = _stored()
             explicit = str(getattr(settings, "webhook_secret", "") or "").strip()

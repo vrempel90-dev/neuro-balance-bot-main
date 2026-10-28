@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 from functools import lru_cache
 from typing import Any
-from datetime import date as date_cls, datetime, timedelta
+from datetime import date as date_cls, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import logging
+import math
 import time
 import re
+import weakref
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -168,14 +171,73 @@ def _normalize_patient_lookup_response(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+_LOOKUP_RETRY_STATUSES = frozenset({429, 502, 503, 504})
+_LOOKUP_RETRY_DELAY_SECONDS = 0.25
+_LOOKUP_MAX_RETRY_AFTER_SECONDS = 2.0
+# Each event loop shares a two-request limit across all clients and phone
+# variants. Both the key and value are weak: a contended Semaphore references
+# its loop, so storing a strong value would otherwise keep finished loops alive.
+_LOOKUP_LIMITERS: weakref.WeakKeyDictionary[Any, weakref.ReferenceType[asyncio.Semaphore]] = weakref.WeakKeyDictionary()
+
+
+def _lookup_limiter() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    reference = _LOOKUP_LIMITERS.get(loop)
+    limiter = reference() if reference is not None else None
+    if limiter is None:
+        limiter = asyncio.Semaphore(2)
+        _LOOKUP_LIMITERS[loop] = weakref.ref(limiter)
+    return limiter
+
+
+def _lookup_retry_delay(response: httpx.Response) -> float | None:
+    """Respect Retry-After, or fail closed when its wait exceeds our budget."""
+    header = response.headers.get("Retry-After")
+    if header is None:
+        return _LOOKUP_RETRY_DELAY_SECONDS
+    try:
+        delay = float(header)
+    except (TypeError, ValueError):
+        try:
+            parsed = parsedate_to_datetime(header)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            delay = (parsed - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if not math.isfinite(delay) or delay > _LOOKUP_MAX_RETRY_AFTER_SECONDS:
+        return None
+    return max(_LOOKUP_RETRY_DELAY_SECONDS, delay)
+
+
 async def patient_lookup_raw(phone_param: str) -> dict[str, Any]:
     endpoint = _patient_lookup_url()
     params = {"phone": phone_param}
-    logger.info("CRM patient-lookup request")
-    response = await _client().get(endpoint, params=params, headers=_headers())
-    _raise_for_crm(response, "patient-lookup")
-    data = _read_object(response, "patient-lookup")
-    return _normalize_patient_lookup_response(data)
+    # Only this read-only endpoint is retried. Booking POSTs retain their
+    # existing uncertain-outcome handling and are never replayed here.
+    async with _lookup_limiter():
+        for attempt in range(2):
+            logger.info("CRM patient-lookup request attempt=%s", attempt + 1)
+            try:
+                response = await _client().get(endpoint, params=params, headers=_headers())
+            except (httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+                logger.warning("CRM patient-lookup network error_type=%s retry=%s", type(exc).__name__, attempt == 0)
+                if attempt == 1:
+                    raise
+                await asyncio.sleep(_LOOKUP_RETRY_DELAY_SECONDS)
+                continue
+            if attempt == 0 and response.status_code in _LOOKUP_RETRY_STATUSES:
+                delay = _lookup_retry_delay(response)
+                logger.warning("CRM patient-lookup transient status=%s retry=%s", response.status_code, delay is not None)
+                if delay is not None:
+                    # Keep this permit during backoff to avoid replacing a
+                    # throttled variant with another immediate request burst.
+                    await asyncio.sleep(delay)
+                    continue
+            _raise_for_crm(response, "patient-lookup")
+            data = _read_object(response, "patient-lookup")
+            return _normalize_patient_lookup_response(data)
+    raise CRMError("CRM patient-lookup attempts exhausted")  # defensive only
 
 
 async def patient_lookup(phone: str) -> dict[str, Any]:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 import httpx
 from functools import lru_cache
 from config import get_settings
@@ -24,10 +24,11 @@ AUDIO_EXT_BY_MIME = {
     "audio/x-wav": "wav",
     "audio/mp4": "m4a",
     "audio/m4a": "m4a",
+    "audio/webm": "webm",
 }
 
 _AUDIO_MESSAGE_TYPES = {"audio", "voice", "ptt", "voice_message"}
-_AUDIO_FILE_EXTENSIONS = (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav")
+_AUDIO_FILE_EXTENSIONS = (".ogg", ".oga", ".opus", ".mp3", ".m4a", ".wav", ".webm", ".mpga", ".mpeg")
 
 
 def _iter_dicts(obj: Any):
@@ -45,41 +46,11 @@ def _text_value(msg: dict[str, Any]) -> str:
 
 
 def is_audio_message_payload(msg: dict[str, Any]) -> bool:
-    """True, если Wazzup payload похож на voice/audio без обычного текста.
+    """Classify current audio, never an attachment in a quoted old message.
 
-    Обычный непустой текст имеет приоритет: такие сообщения продолжают идти
-    в диалоговый обработчик, даже если рядом есть служебные media-поля.
+    A current nonempty text has priority for backwards-compatible routing.
     """
-    if _text_value(msg):
-        return False
-
-    for item in _iter_dicts(msg):
-        type_values = [
-            item.get("kind"),
-            item.get("type"),
-            item.get("messageType"),
-            item.get("contentType"),
-            item.get("payloadType"),
-        ]
-        if any(str(value or "").strip().lower() in _AUDIO_MESSAGE_TYPES for value in type_values):
-            return True
-
-        mime_values = [item.get("mimeType"), item.get("mime_type"), item.get("mime"), item.get("contentType")]
-        if any(str(value or "").strip().lower().startswith("audio/") for value in mime_values):
-            return True
-
-        media_type_values = [item.get("mediaType"), item.get("attachmentType"), item.get("type")]
-        if any("audio" in str(value or "").strip().lower() for value in media_type_values):
-            return True
-
-        filename_values = [
-            item.get("fileName"), item.get("filename"), item.get("name"),
-            item.get("url"), item.get("fileUrl"), item.get("mediaUrl"), item.get("downloadUrl"),
-        ]
-        if any(str(value or "").strip().lower().split("?", 1)[0].endswith(_AUDIO_FILE_EXTENSIONS) for value in filename_values):
-            return True
-
-    return False
+    return not _text_value(msg) and normalize_media_metadata(msg).get("kind") == "voice"
 
 
 
@@ -196,82 +167,103 @@ def _message_text(msg: dict[str, Any]) -> str:
     return str(text).strip()
 
 
-def _message_media(msg: dict[str, Any]) -> dict[str, str]:
-    """Пытается найти аудио/voice в разных вариантах webhook от Wazzup.
+def _media_leaf(value: Any) -> str:
+    return str(value).strip() if isinstance(value, (str, int)) and not isinstance(value, bool) else ""
 
-    Возвращает поля:
-    - media_url: если есть прямая ссылка;
-    - file_id: если есть ID файла/медиа;
-    - filename;
-    - mime_type.
+
+def normalize_media_metadata(msg: dict[str, Any]) -> dict[str, Any]:
+    """Normalize Wazzup v3 media metadata without downloading or interpreting it.
+
+    Official v3 webhooks use ``type`` and ``contentUri``. Only the current
+    message and its direct media fields are inspected; quotedMessage, avatars
+    and advertisements can contain unrelated attachment URLs.
     """
-    msg_type = str(
-        _dig(msg, "type")
-        or _dig(msg, "messageType")
-        or _dig(msg, "contentType")
-        or _dig(msg, "message.type")
-        or ""
-    ).lower()
-
-    # Частые места, где провайдеры кладут attachment/media.
-    media_obj = (
-        _dig(msg, "media")
-        or _dig(msg, "attachment")
-        or _dig(msg, "file")
-        or _dig(msg, "audio")
-        or _dig(msg, "voice")
-        or _dig(msg, "message.media")
-        or _dig(msg, "message.attachment")
-        or {}
-    )
-    if not isinstance(media_obj, dict):
-        media_obj = {}
-
-    media_url = str(
-        _dig(media_obj, "url")
-        or _dig(media_obj, "link")
-        or _dig(media_obj, "downloadUrl")
-        or _dig(media_obj, "download_url")
-        or _dig(msg, "mediaUrl")
-        or _dig(msg, "fileUrl")
-        or ""
-    ).strip()
-    file_id = str(
-        _dig(media_obj, "id")
-        or _dig(media_obj, "fileId")
-        or _dig(media_obj, "mediaId")
-        or _dig(msg, "fileId")
-        or _dig(msg, "mediaId")
-        or ""
-    ).strip()
-    mime_type = str(
-        _dig(media_obj, "mimeType")
-        or _dig(media_obj, "mime_type")
-        or _dig(media_obj, "contentType")
-        or _dig(msg, "mimeType")
-        or ""
-    ).strip()
-    filename = str(
-        _dig(media_obj, "filename")
-        or _dig(media_obj, "fileName")
-        or _dig(msg, "filename")
-        or "voice.ogg"
-    ).strip()
-
-    is_audio_type = any(x in msg_type for x in ["audio", "voice", "ptt"])
-    is_audio_mime = mime_type.startswith("audio/")
-    if not (is_audio_type or is_audio_mime or media_url or file_id):
-        return {}
-
-    if filename == "voice.ogg" and mime_type in AUDIO_EXT_BY_MIME:
-        filename = f"voice.{AUDIO_EXT_BY_MIME[mime_type]}"
-
+    if not isinstance(msg, dict):
+        return {"kind": "text", "media_requires_text": False}
+    nested = msg.get("message") if isinstance(msg.get("message"), dict) else {}
+    current = {**nested, **msg}
+    media_obj: dict[str, Any] = {}
+    for key in ("media", "attachment", "file", "audio", "voice"):
+        value = current.get(key)
+        if isinstance(value, dict):
+            media_obj = value
+            break
+    media_url = _media_leaf(_dig(current, "contentUri", "media_url", "mediaUrl", "file_url", "fileUrl", "downloadUrl")) or _media_leaf(_dig(media_obj, "contentUri", "url", "link", "downloadUrl", "download_url"))
+    file_id = _media_leaf(_dig(current, "file_id", "fileId", "mediaId")) or _media_leaf(_dig(media_obj, "id", "fileId", "mediaId"))
+    mime_type = (_media_leaf(_dig(current, "mime_type", "mimeType", "mime", "contentType")) or _media_leaf(_dig(media_obj, "mime_type", "mimeType", "mime", "contentType"))).split(";", 1)[0].lower()
+    filename = _media_leaf(_dig(current, "filename", "fileName")) or _media_leaf(_dig(media_obj, "filename", "fileName", "name"))
+    if not filename and media_url:
+        try:
+            parsed = urlsplit(media_url)
+            params = parse_qs(parsed.query, max_num_fields=30)
+            filename = _media_leaf((params.get("filename") or params.get("fileName") or [""])[0]) or unquote(parsed.path.rsplit("/", 1)[-1])
+        except ValueError:
+            filename = ""
+    # Only a filename hint is retained. It is never used as a local path.
+    filename = filename.replace("\\", "/").rsplit("/", 1)[-1][:160]
+    declared_type = (_media_leaf(_dig(current, "kind", "type", "messageType", "payloadType", "mediaType")) or _media_leaf(_dig(media_obj, "type", "kind"))).lower()
+    if declared_type in _AUDIO_MESSAGE_TYPES or declared_type.startswith("audio/"):
+        kind = "voice"
+    elif declared_type in {"image", "photo", "picture", "sticker"}:
+        kind = "image"
+    elif declared_type in {"document", "file"}:
+        kind = "document"
+    elif declared_type in {"video", "video_message"}:
+        kind = "video"
+    elif mime_type.startswith("audio/") or mime_type == "application/ogg":
+        kind = "voice"
+    elif mime_type.startswith("image/"):
+        kind = "image"
+    elif mime_type.startswith("video/"):
+        kind = "video"
+    elif filename.lower().endswith(_AUDIO_FILE_EXTENSIONS):
+        kind = "voice"
+    elif mime_type == "application/pdf" or filename.lower().endswith((".pdf", ".doc", ".docx", ".txt", ".xls", ".xlsx")):
+        kind = "document"
+    elif media_url or file_id or declared_type in {"unsupported", "unknown"}:
+        kind = "unsupported"
+    else:
+        kind = "text"
+    if kind == "text":
+        return {"kind": "text", "media_requires_text": False}
+    media_error = ""
+    if media_url:
+        try:
+            media_request_headers(media_url)
+        except ValueError:
+            media_url = ""
+            # Do not fall back to a second location supplied beside a bad URL.
+            file_id = ""
+            media_error = "untrusted_media_url"
+    if kind == "voice" and not filename:
+        filename = "voice." + AUDIO_EXT_BY_MIME.get(mime_type, "ogg")
+    unavailable = not bool(media_url or file_id)
     return {
+        "kind": kind,
         "media_url": media_url,
         "file_id": file_id,
         "filename": filename,
         "mime_type": mime_type,
+        "media_requires_text": kind != "voice" or unavailable,
+        "media_error": media_error or ("missing_media_location" if unavailable else ""),
     }
+
+
+def _message_media(msg: dict[str, Any]) -> dict[str, Any]:
+    media = normalize_media_metadata(msg)
+    return media if media.get("kind") != "text" else {}
+
+
+def media_text_request(kind: str, language: str | None = None) -> str:
+    """Truthful fallback; no invented image reading, diagnosis or handoff."""
+    kk = str(language or "").lower() == "kk"
+    if kind == "voice":
+        return "Дыбыстық хабарламаны түсіне алмадым. Өтініш, сұрағыңызды мәтінмен жазыңыз." if kk else "Не удалось распознать голосовое сообщение. Напишите, пожалуйста, Ваш вопрос текстом."
+    if kind == "image":
+        return "Суреттің мазмұнын оқи алмаймын. Өтініш, сұрағыңызды мәтінмен жазыңыз." if kk else "Не могу надёжно прочитать содержимое фотографии. Напишите, пожалуйста, Ваш вопрос текстом."
+    if kind == "document":
+        return "Құжаттың мазмұнын оқи алмаймын. Өтініш, сұрағыңызды мәтінмен жазыңыз." if kk else "Не могу надёжно прочитать содержимое документа. Напишите, пожалуйста, Ваш вопрос текстом."
+    return "Бұл тіркеменің мазмұнын оқи алмаймын. Өтініш, сұрағыңызды мәтінмен жазыңыз." if kk else "Не могу прочитать содержимое этого вложения. Напишите, пожалуйста, Ваш вопрос текстом."
 
 
 def media_request_headers(url: str) -> dict[str, str]:
@@ -383,7 +375,7 @@ def extract_incoming_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
         if text:
             result.append({"chat_id": chat_id, "text": text, "phone": phone, "chat_type": chat_type, "kind": "text", "channel_id": channel_id, "message_key": message_key, "message_id": message_key, "timestamp": timestamp, "direction": direction, "is_from_me": str(is_from_me).lower()})
         elif media:
-            item = {"chat_id": chat_id, "phone": phone, "chat_type": chat_type, "kind": "voice", "channel_id": channel_id, "message_key": message_key, "message_id": message_key, "timestamp": timestamp, "direction": direction, "is_from_me": str(is_from_me).lower()}
+            item = {"chat_id": chat_id, "phone": phone, "chat_type": chat_type, "kind": media.get("kind") or "unsupported", "channel_id": channel_id, "message_key": message_key, "message_id": message_key, "timestamp": timestamp, "direction": direction, "is_from_me": str(is_from_me).lower()}
             item.update(media)
             result.append(item)
 

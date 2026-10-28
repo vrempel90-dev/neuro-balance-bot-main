@@ -9,7 +9,7 @@ from fastapi import UploadFile
 from openai import AsyncOpenAI
 
 from config import get_settings
-from wazzup import MAX_MEDIA_BYTES, download_media
+from wazzup import MAX_MEDIA_BYTES, download_media, normalize_media_metadata
 
 
 VOICE_EXT_BY_MIME = {
@@ -44,7 +44,7 @@ def filename_from_content_type(content_type: str | None, fallback: str = "voice.
 async def transcribe_bytes(
     data: bytes,
     filename: str = "voice.ogg",
-    language: str = "ru",
+    language: str | None = None,
 ) -> VoiceTranscript:
     """Расшифровывает bytes аудио через OpenAI.
 
@@ -57,32 +57,37 @@ async def transcribe_bytes(
     if len(data) > MAX_MEDIA_BYTES:
         raise ValueError("Audio exceeds size limit")
 
+    language_hint = str(language or "").strip().lower()
+    if language_hint not in {"", "auto", "ru", "kk"}:
+        raise ValueError("Unsupported transcription language hint")
     settings = get_settings()
     client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=30.0, max_retries=0)
-
-    # OpenAI SDK стабильнее принимает файл с диска, чем tuple(bytes) на разных версиях.
-    suffix = os.path.splitext(filename)[1] or ".ogg"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-
+    tmp_path: str | None = None
     try:
-        with open(tmp_path, "rb") as f:
-            result = await client.audio.transcriptions.create(
-                model=settings.openai_voice_model,
-                file=f,
-                language=language,
-            )
-        return VoiceTranscript(text=(result.text or "").strip(), filename=filename)
+        # No language parameter means multilingual auto-detection. In
+        # particular, a Kazakh speaker must not be forced through Russian ASR.
+        kwargs: dict[str, Any] = {"model": settings.openai_voice_model}
+        if language_hint in {"ru", "kk"}:
+            kwargs["language"] = language_hint
+        suffix = os.path.splitext(filename)[1].lower()
+        if suffix not in {".flac", ".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".ogg", ".wav", ".webm"}:
+            suffix = ".ogg"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+        with open(tmp_path, "rb") as audio_file:
+            result = await client.audio.transcriptions.create(file=audio_file, **kwargs)
+        return VoiceTranscript(text=str(result.text or "").strip(), filename=filename)
     finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+        if tmp_path is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
         await client.close()
 
 
-async def transcribe_upload(file: UploadFile, language: str = "ru") -> VoiceTranscript:
+async def transcribe_upload(file: UploadFile, language: str | None = None) -> VoiceTranscript:
     data = await file.read(MAX_MEDIA_BYTES + 1)
     if len(data) > MAX_MEDIA_BYTES:
         raise ValueError("Audio exceeds size limit")
@@ -93,13 +98,19 @@ async def transcribe_upload(file: UploadFile, language: str = "ru") -> VoiceTran
     return result
 
 
-async def transcribe_wazzup_voice(message: dict[str, Any], language: str = "ru") -> VoiceTranscript:
+async def transcribe_wazzup_voice(message: dict[str, Any], language: str | None = None) -> VoiceTranscript:
     """Скачивает и расшифровывает голосовое из разобранного Wazzup-сообщения."""
-    media_url = message.get("media_url") or None
-    file_id = message.get("file_id") or None
-    filename = message.get("filename") or "voice.ogg"
+    metadata = normalize_media_metadata(message)
+    media_url = metadata.get("media_url") or None
+    file_id = metadata.get("file_id") or None
+    filename = metadata.get("filename") or "voice.ogg"
+    if metadata.get("kind") != "voice" or metadata.get("media_requires_text"):
+        raise ValueError("Voice attachment is unavailable")
 
     data, content_type = await download_media(media_url=media_url, file_id=file_id)
+    pure_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    if pure_type and not (pure_type.startswith("audio/") or pure_type in {"application/ogg", "application/octet-stream", "binary/octet-stream"}):
+        raise ValueError("Attachment is not audio")
     if (not filename or filename == "voice.ogg") and content_type:
         filename = filename_from_content_type(content_type, fallback="voice.ogg")
 

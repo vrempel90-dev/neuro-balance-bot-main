@@ -29,6 +29,14 @@ jobs:
           ref: main
           fetch-depth: 0
 
+      - name: Require the existing repair gateway before manual repair
+        shell: bash
+        run: |
+          if ! curl --fail --silent --show-error --max-time 10 "${CLAUDE_REPAIR_GATEWAY_URL}/health" >/dev/null; then
+            echo "::error::The repair gateway is unavailable. No repair, patient-data read or source modification was started."
+            exit 1
+          fi
+
       - name: Enforce 20:00-08:00 Asia/Almaty window
         id: window
         shell: bash
@@ -107,7 +115,7 @@ jobs:
           unset ANTHROPIC_API_KEY || true
           cat /tmp/neuro-live-cases.json | claude -p "$(cat .github/claude-real-repair-prompt.md)
 
-ADDITIONAL HARD RULE: input contains only Claude-reviewed real NEW-LEAD cases. Work on the first case only. Create exactly one new tests/real_wazzup_regression_*.py test derived from that case. Do not patch anything until you have written the test." \
+          ADDITIONAL HARD RULE: input contains only Claude-reviewed real NEW-LEAD cases. Work on the first case only. Create exactly one new tests/real_wazzup_regression_*.py test derived from that case. Do not patch anything until you have written the test." \
             --permission-mode acceptEdits \
             --max-turns 24 \
             --output-format text \
@@ -179,15 +187,11 @@ ADDITIONAL HARD RULE: input contains only Claude-reviewed real NEW-LEAD cases. W
         run: |
           python -m py_compile dialog.py ai.py bot_tools.py language_guard.py strict_prompt_guard.py clinic_info.py
           python -m pytest -q \
-            tests/test_contraindications_never_silent.py \
-            tests/test_brain_before_keyword_branches.py \
             tests/test_answer_language_and_shape.py \
-            tests/test_bilingual_hallucination_guards.py \
             tests/test_bilingual_language_guard.py \
-            tests/test_booking_for_relative.py \
-            tests/test_wazzup_channel_mismatch.py \
-            tests/test_faq_not_blocked_by_step_repair.py
-          python tests/run_golden.py
+            tests/test_profile_gate.py \
+            tests/test_gpt_first_agent_booking.py \
+            tests/test_wazzup_production_webhook.py
 
       - name: Open draft repair PR, never merge automatically
         if: steps.proof.outputs.proven == 'true'

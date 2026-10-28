@@ -8,6 +8,7 @@ def _isolated_sync_ingress(monkeypatch):
     # Legacy pipeline contracts exercise the processor synchronously. Durable
     # acknowledgement/worker behaviour has its own explicit enabled tests.
     monkeypatch.setenv("DURABLE_WEBHOOK_ENABLED", "false")
+    monkeypatch.setenv("PRODUCTION_PERIODIC_MONITOR_ENABLED", "false")
 
 
 @pytest.fixture(autouse=True)
