@@ -89,22 +89,37 @@ print(json.dumps({'context_restored': True, 'duplicate_blocked': True,
 def test_uncaptioned_attachment_never_invents_text_or_calls_ai(
     isolated_storage: Path, monkeypatch: pytest.MonkeyPatch, kind: str, mime: str,
 ) -> None:
-    """Unsupported attachment interpretation fails silently before AI/CRM."""
-    async def forbidden(*args: Any, **kwargs: Any) -> Any:
-        raise AssertionError("An unreadable attachment must not call AI, CRM or sender")
+    """New clients get a truthful text request, never a fabricated reading."""
+    calls = []
 
-    monkeypatch.setattr(main, "handle_incoming_message", forbidden)
-    monkeypatch.setattr(main, "send_wazzup_message", forbidden)
-    monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", forbidden)
-    payload = {"messageId": f"qa-unreadable-{kind}", "chatId": f"qa-media-{kind}",
+    async def forbidden(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("An unreadable attachment must not call the dialog/model")
+
+    async def lookup(phone: str) -> dict[str, Any]:
+        calls.append(("lookup", phone))
+        return {"ok": True, "raw": {"found": False, "isNew": True}, "appointments": []}
+
+    async def sender(**kwargs: Any) -> dict[str, Any]:
+        calls.append(("send", kwargs["text"]))
+        return {"ok": True, "status_code": 201}
+
+    monkeypatch.setattr(main, "handle_message", forbidden)
+    monkeypatch.setattr(main, "send_wazzup_message", sender)
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: True)
+    monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", lookup)
+    get_settings().wazzup_channel_id = ""
+    get_settings().wazzup_allowed_channel_ids = ""
+    payload = {"messageId": f"qa-unreadable-{kind}", "chatId": "77000000001",
                "chatType": "whatsapp", "type": kind, "mimeType": mime,
                "fromMe": False, "text": "", "fileUrl": "https://qa.invalid/synthetic"}
     result = asyncio.run(main._process_wazzup_message(
         _request(), payload, payload, {"ok": True, "content_type": "application/json"},
     ))
-    assert result["answer"] == ""
-    assert result["should_send_wazzup"] is False
-    assert result["no_reply_reason"] == "empty_text"
+    assert result["answer"]
+    assert result["should_send_wazzup"] is True
+    assert [kind for kind, _ in calls] == ["lookup", "send"]
+    assert state.get_session("77000000001")["attachment_not_read"] is True
+    assert "текст" in result["answer"].lower()
 
 
 def test_two_clients_run_concurrently_without_sharing_session_or_answer(

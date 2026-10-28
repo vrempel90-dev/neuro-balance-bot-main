@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 import main
 import state
+import crm
 from config import get_settings
 
 
@@ -61,10 +62,21 @@ def _prepare(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "send_text", fake_send_text)
     monkeypatch.setattr(main, "handle_message", fake_handle_message)
     monkeypatch.setattr(main, "is_bot_work_time", lambda: True)
+
+    async def existing_patient(_phone):
+        return {"ok": True, "raw": {"found": True, "isNew": False,
+                                    "patient": {"id": "synthetic-existing"}},
+                "appointments": []}
+
+    async def forbidden_asr(*args, **kwargs):
+        raise AssertionError("Existing patients must be excluded before ASR")
+
+    monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", existing_patient)
+    monkeypatch.setattr(main, "_transcribe_voice_message", forbidden_asr)
     return sent, handled
 
 
-def test_wazzup_audio_type_is_ignored(monkeypatch, tmp_path):
+def test_wazzup_audio_type_excludes_existing_patient_before_asr(monkeypatch, tmp_path):
     events = []
     monkeypatch.setattr(state, "log_event", lambda chat_id, event_type, payload: events.append(event_type))
     sent, handled = _prepare(monkeypatch, tmp_path)
@@ -73,10 +85,11 @@ def test_wazzup_audio_type_is_ignored(monkeypatch, tmp_path):
     assert response.status_code == 200
     assert sent == []
     assert handled == []
-    assert "ignored_voice_message" in events
+    assert "ignored_voice_message" not in events
+    assert state.get_session("77011234567")["crm_patient_state"] == "RETURNING_PATIENT_NO_ACTIVE_BOOKING"
 
 
-def test_wazzup_voice_type_is_ignored(monkeypatch, tmp_path):
+def test_wazzup_voice_type_excludes_existing_patient(monkeypatch, tmp_path):
     sent, handled = _prepare(monkeypatch, tmp_path)
     response = TestClient(main.app).post("/webhook/wazzup", json=_payload(type="voice"))
 
@@ -85,7 +98,7 @@ def test_wazzup_voice_type_is_ignored(monkeypatch, tmp_path):
     assert handled == []
 
 
-def test_wazzup_audio_mime_type_is_ignored(monkeypatch, tmp_path):
+def test_wazzup_audio_mime_type_excludes_existing_patient(monkeypatch, tmp_path):
     sent, handled = _prepare(monkeypatch, tmp_path)
     response = TestClient(main.app).post("/webhook/wazzup", json=_payload(mimeType="audio/ogg"))
 
@@ -94,7 +107,7 @@ def test_wazzup_audio_mime_type_is_ignored(monkeypatch, tmp_path):
     assert handled == []
 
 
-def test_wazzup_audio_filename_is_ignored(monkeypatch, tmp_path):
+def test_wazzup_audio_filename_excludes_existing_patient(monkeypatch, tmp_path):
     sent, handled = _prepare(monkeypatch, tmp_path)
     response = TestClient(main.app).post("/webhook/wazzup", json=_payload(fileName="voice.ogg"))
 

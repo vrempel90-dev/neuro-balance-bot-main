@@ -27,7 +27,7 @@ from guards import GuardDecision, should_auto_reply
 from ai import humanize_reply_with_openai
 from schedule import astana_now, is_bot_work_time, is_test_window_time, next_work_bounds, time_gate_status
 from voice import transcribe_wazzup_voice, transcribe_bytes, transcribe_upload, voice_text_for_bot
-from wazzup import extract_incoming_messages, is_audio_message_payload, send_text
+from wazzup import extract_incoming_messages, is_audio_message_payload, send_text, normalize_media_metadata, media_text_request
 
 # Public seam for production webhook tests/patches.
 async def send_wazzup_message(**kwargs: Any) -> dict[str, Any]:
@@ -87,6 +87,8 @@ async def protect_operational_routes(request: Request, call_next):
     """Keep patient/session diagnostics private and authenticate every alias."""
     path = request.url.path
     token = ""
+    proxy_required = False
+    proxy_valid = False
     if path.startswith("/debug/"):
         token = str(os.getenv("OPENAI_DEBUG_ADMIN_TOKEN") or "").strip()
         if not token:
@@ -94,12 +96,16 @@ async def protect_operational_routes(request: Request, call_next):
             return JSONResponse({"detail": detail}, status_code=503, headers={"Cache-Control": "no-store"})
     elif request.method == "POST" and path in WAZZUP_WEBHOOK_PATHS:
         from production_webhook_auth import required_token
+        import proxy_auth
+        proxy_auth.observe(request.headers)
+        proxy_required = proxy_auth.required()
+        proxy_valid = proxy_auth.valid(request.headers)
         token = required_token()
-    if token:
+    if token or proxy_required:
         parts = request.headers.get("authorization", "").split(None, 1)
-        valid_header = len(parts) == 2 and parts[0].lower() == "bearer" and hmac.compare_digest(parts[1], token)
-        valid_hook_query = path in WAZZUP_WEBHOOK_PATHS and hmac.compare_digest(request.query_params.get("hook_token", ""), token)
-        if not (valid_header or valid_hook_query):
+        valid_header = bool(token) and len(parts) == 2 and parts[0].lower() == "bearer" and hmac.compare_digest(parts[1].encode(), token.encode())
+        valid_hook_query = bool(token) and path in WAZZUP_WEBHOOK_PATHS and hmac.compare_digest(request.query_params.get("hook_token", "").encode(), token.encode())
+        if not (valid_header or valid_hook_query or (proxy_required and proxy_valid)):
             return JSONResponse({"detail": "Unauthorized"}, status_code=401,
                                 headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"})
     response = await call_next(request)
@@ -361,10 +367,18 @@ async def startup() -> None:
         import production_inbox
         app.state.inbox_worker = production_inbox.InboxWorker(_process_inbox_job)
         app.state.inbox_worker.start()
+    if bool(getattr(settings, "production_periodic_monitor_enabled", False)):
+        from production_monitor import PeriodicMonitor
+        app.state.production_monitor = PeriodicMonitor(worker_getter=lambda: getattr(app.state, "inbox_worker", None))
+        app.state.production_monitor.start()
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    monitor = getattr(app.state, "production_monitor", None)
+    if monitor is not None:
+        await monitor.stop()
+        app.state.production_monitor = None
     worker = getattr(app.state, "inbox_worker", None)
     if worker is not None:
         await worker.stop(timeout=10)
@@ -737,6 +751,14 @@ def _guard_answer(chat_id: str, answer: str) -> str:
     - ограничивает длинные ответы вне разрешённых шаблонов.
     """
     session = _get_session_safe(chat_id)
+    if session.get("attachment_not_read") is True and re.search(
+        r"(?:на\s+(?:ваш(?:ем|ей)\s+)?(?:снимке|фото|фотографии|изображении|мрт)\s+(?:я\s+)?(?:вижу|видно|обнаруж)|"
+        r"(?:я\s+)?(?:изучил[аи]?|просмотрел[аи]?|рассмотрел[аи]?)\s+(?:ваш[еу]?\s+)?(?:снимок|фото|документ)|"
+        r"(?:суреттен\s+(?:көріп\s+тұрмын|көрінеді)|құжатты\s+оқып\s+шықтым))",
+        str(answer or "").casefold(),
+    ):
+        state.log_event(chat_id, "unread_attachment_claim_blocked", {"kind": session.get("attachment_kind")})
+        return media_text_request(str(session.get("attachment_kind") or "image"), session.get("language"))
     if str(session.get("answer_source") or "") in {"gpt_agent", "python_template"}:
         # Текст агента — это результат, а не черновик: финальная проверка в
         # dialog.py либо пропустила его, либо заблокировала целиком. Подрезка и
@@ -779,10 +801,7 @@ def _guard_answer_language(chat_id: str, answer: str, session: dict[str, Any]) -
 
 
 def _voice_fallback_answer() -> str:
-    return (
-        "Спасибо за Ваше обращение 🌿 "
-        "Передам информацию врачу — он свяжется с Вами в ближайшее время."
-    )
+    return media_text_request("voice")
 
 
 
@@ -984,28 +1003,21 @@ async def _download_voice_bytes(message: dict[str, Any]) -> tuple[bytes, str, st
 
 
 async def _transcribe_voice_message(message: dict[str, Any]) -> str:
-    """Распознаёт голосовое максимально совместимо со старым кодом.
-
-    Сначала пробуем существующую функцию transcribe_wazzup_voice(message).
-    Если она не подходит под формат Wazzup — скачиваем файл и отправляем bytes в Whisper/OpenAI.
-    """
-    try:
-        transcript = await transcribe_wazzup_voice(message, language="ru")
-        text = str(getattr(transcript, "text", "") or "")
-        if text.strip():
-            return text.strip()
-    except Exception as exc:
-        state.log_event(str(message.get("chat_id") or "voice"), "voice_transcribe_wazzup_error", {"error": str(exc)[:1000]})
-
-    data, filename, _content_type = await _download_voice_bytes(message)
-    transcript = await transcribe_bytes(data, filename=filename, language="ru")
-    return str(getattr(transcript, "text", "") or "").strip()
+    """Один ограниченный вызов ASR с автоматическим определением языка."""
+    # One bounded ASR attempt; automatic language recognition supports RU/KK.
+    transcript = await transcribe_wazzup_voice(message, language=None)
+    text = str(getattr(transcript, "text", "") or "").strip()
+    if not text:
+        raise ValueError("Empty voice transcription")
+    return text
 
 
 async def _build_answer_for_message(message: dict[str, Any]) -> str:
     chat_id = str(message["chat_id"])
     phone = str(message.get("phone") or chat_id)
     kind = str(message.get("kind") or "text")
+    if kind == "text" and _message_has_voice_url(message):
+        kind = "voice"
 
     state.log_event(chat_id, "incoming_message_received", {"phone": phone, "kind": kind, "source": str(message.get("source") or "wazzup"), "text_preview": _preview(message.get("text"), 120)})
 
@@ -1042,19 +1054,54 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
         _apply_guard_block(decision, chat_id=chat_id, phone=phone, source=source, force=False, kind=kind, text=str(message.get("text") or ""))
         return ""
 
+    if kind in {"voice", "image", "document", "video", "unsupported"}:
+        # Never download a medical attachment, call ASR or send a media reply
+        # until the same real CRM admission gate has excluded existing clients.
+        import dialog as dialog_runtime
+        import admission
+        media_session = _get_session_safe(chat_id)
+        media_session.update(source=source, chat_type=str(message.get("chat_type") or ""),
+                             message_id=str(message.get("message_id") or ""),
+                             guard_decision=decision.to_dict(),
+                             attachment_not_read=kind != "voice", attachment_kind=kind)
+        outcome = await dialog_runtime._classify_lead(chat_id, phone, media_session)
+        if not outcome.bot_may_reply:
+            reason = "crm_lookup_failed" if outcome.state == admission.CRM_UNAVAILABLE else "old_lead_or_active_booking"
+            media_session["no_reply_reason"] = reason
+            media_session["guard_decision"] = GuardDecision(False, reason, False, False, False).to_dict()
+            state.save_session(chat_id, media_session)
+            return ""
+        media_session["no_reply_reason"] = ""
+        state.save_session(chat_id, media_session)
+        if kind != "voice" or message.get("media_requires_text"):
+            # Captions can be handled as text. The attachment itself is never
+            # treated as a medical finding or a source of patient facts.
+            if not str(message.get("text") or "").strip() or kind == "voice":
+                answer = media_text_request(kind, media_session.get("language"))
+                media_session.update(answer_source="python_template", attachment_not_read=True)
+                state.save_session(chat_id, media_session)
+                state.mark_processed_message(inbound_message_key, chat_id)
+                return answer
+
     if kind == "voice" or _message_has_voice_url(message):
         try:
             transcript_text = await _transcribe_voice_message(message)
-            user_text = voice_text_for_bot(transcript_text)
-            state.log_event(chat_id, "voice_transcribed", {"text": transcript_text[:500]})
+            user_text = transcript_text
+            state.log_event(chat_id, "voice_transcribed", {"transcript_present": True})
         except Exception as exc:
-            state.log_event(chat_id, "voice_transcription_failed_fallback_doctor", {"error": str(exc)[:1000]})
-            return _guard_answer(chat_id, _voice_fallback_answer())
+            state.log_event(chat_id, "voice_transcription_failed", {"error_type": type(exc).__name__})
+            session = _get_session_safe(chat_id)
+            session["answer_source"] = "python_template"
+            state.save_session(chat_id, session)
+            state.mark_processed_message(inbound_message_key, chat_id)
+            return media_text_request("voice", session.get("language"))
     else:
         user_text = str(message.get("text") or "")
 
     session = _get_session_safe(chat_id)
     session["source"] = source
+    session["attachment_not_read"] = kind in {"image", "document", "video", "unsupported"}
+    session["attachment_kind"] = kind if session["attachment_not_read"] else ""
     session["chat_type"] = str(message.get("chat_type") or "").strip().lower()
     session["channel_id"] = str(message.get("channel_id") or "").strip()
     session["inbound_channel"] = (
@@ -1387,7 +1434,9 @@ def _normalize_wazzup_message(payload: dict[str, Any], msg: dict[str, Any]) -> d
     phone = str(phone or "").strip()
     if not phone and chat_type in {"whatsapp", "viber"}:
         phone = chat_id
-    identity = str(message_id or json.dumps([message_timestamp, str(text or ""), message_type, direction], ensure_ascii=False))
+    media = normalize_media_metadata(merged)
+    identity = str(message_id or json.dumps([message_timestamp, str(text or ""), message_type, direction,
+                                           media.get("media_url"), media.get("file_id")], ensure_ascii=False))
     scoped_key = hashlib.sha256(json.dumps([channel_id, chat_type, chat_id, identity], ensure_ascii=False).encode()).hexdigest()
     return {
         "source": "wazzup",
@@ -1408,6 +1457,7 @@ def _normalize_wazzup_message(payload: dict[str, Any], msg: dict[str, Any]) -> d
         "is_incoming": is_incoming,
         "is_from_me": str(_wazzup_bool(from_me) or _wazzup_bool(is_echo)).lower(),
         "force": False,
+        **media,
     }
 
 
@@ -1619,10 +1669,6 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
     if channel_id_mismatch_blocks:
         return _finish_silent("channel_id_mismatch")
 
-    if is_audio_message_payload(raw_msg):
-        _ignore_voice_message(chat_id, message["message_id"], "webhook_payload")
-        return _finish_silent("empty_text")
-
     if not message["is_incoming"]:
         # A real staff reply must mute AI for this conversation. Delivery
         # statuses and our own API echoes are excluded by the helper.
@@ -1633,7 +1679,7 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
         state.save_session(chat_id, session)
         return _finish_silent("echo_or_outgoing_message")
 
-    if not message["text"]:
+    if not message["text"] and message.get("kind", "text") == "text":
         session = _get_session_safe(chat_id)
         session["no_reply_reason"] = "empty_text"
         session["guard_decision"] = GuardDecision(False, "empty_text", False, False, False).to_dict()
@@ -1832,8 +1878,11 @@ async def _dispatch_wazzup_webhook(request: Request) -> dict[str, Any]:
             payload=envelope, raw_msg=raw_msg,
             parse_meta={k: v for k, v in parse_meta.items() if k not in {"raw_preview", "error"}},
         ))
-    return {"ok": True, "accepted_count": len(accepted),
-            "duplicate_count": sum(bool(x["duplicate"]) for x in accepted)}
+    duplicate_count = sum(bool(x["duplicate"]) for x in accepted)
+    state.log_event("inbox", "inbox_webhook_accepted", {
+        "accepted_count": len(accepted), "duplicate_count": duplicate_count,
+    })
+    return {"ok": True, "accepted_count": len(accepted), "duplicate_count": duplicate_count}
 
 
 @app.post("/wazzup/webhook")

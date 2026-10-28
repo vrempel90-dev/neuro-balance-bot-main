@@ -22,7 +22,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     env:
       NEUROBALANCE_URL: https://neuro-balance-bot-main-production.up.railway.app
     steps:
@@ -51,26 +51,54 @@ jobs:
                       raise RuntimeError('unexpected_http_status')
                   return json.load(response)
 
-          try:
-              health = request(root + '/health', timeout=10)
-              expected = os.getenv('EXPECTED_RELEASE') or ''
-              # A push can precede Railway finishing its build. Poll a bounded
-              # four-minute interval; each request/sleep remains below 60 s.
-              if expected:
-                  deadline = time.monotonic() + 240
-                  while health.get('release_sha') != expected and time.monotonic() < deadline:
-                      time.sleep(10)
-                      health = request(root + '/health', timeout=10)
-                  if health.get('release_sha') != expected:
-                      failures.append('release_not_observed_within_240_seconds')
-              output['health'] = {
-                  k: health.get(k) for k in ('ok', 'release_sha', 'utc_time', 'timezone', 'new_leads_only')
-              }
-              if health.get('ok') is not True:
-                  failures.append('health_not_ok')
-          except Exception as exc:
-              output['health'] = {'ok': False, 'error_type': type(exc).__name__}
-              failures.append('health_request_failed')
+          def poll_health(url, expected, *, budget_seconds=240):
+              # Transient timeouts (including the FIRST request during deploy)
+              # do not bypass the bounded readiness/release polling loop.
+              deadline = time.monotonic() + budget_seconds
+              attempts, last_error, health = 0, None, {}
+              while True:
+                  attempts += 1
+                  remaining = max(0.1, deadline - time.monotonic())
+                  try:
+                      candidate = request(url, timeout=min(10, remaining))
+                      if not isinstance(candidate, dict):
+                          raise ValueError('invalid_health_document')
+                      health = candidate
+                      if health.get('ok') is True and (not expected or health.get('release_sha') == expected):
+                          return health, {'attempts': attempts, 'recovered_error_type': last_error}
+                  except Exception as exc:
+                      last_error = type(exc).__name__
+                  remaining = deadline - time.monotonic()
+                  if remaining <= 0:
+                      return health, {'attempts': attempts, 'last_error_type': last_error, 'deadline_exhausted': True}
+                  time.sleep(min(5, remaining))
+
+          def verify_unauthenticated_webhook(url, status):
+              # A body with no message cannot contact a patient or write CRM.
+              # Do not probe an unguarded endpoint; require verified ingress.
+              security = status.get('security', {})
+              if security.get('ok') is not True or security.get('provider_route_checked') is not True:
+                  return {'executed': False, 'ok': False, 'reason': 'ingress_auth_not_verified'}
+              req = urllib.request.Request(url, data=b'{}', headers={'Content-Type': 'application/json'}, method='POST')
+              try:
+                  with urllib.request.urlopen(req, timeout=10) as response:
+                      code = response.status
+              except urllib.error.HTTPError as exc:
+                  code = exc.code
+              return {'executed': True, 'ok': code == 401, 'http_status': code, 'message_payload_present': False}
+
+          expected = os.getenv('EXPECTED_RELEASE') or ''
+          health, polling = poll_health(root + '/health', expected, budget_seconds=240 if expected else 60)
+          output['health'] = {
+              k: health.get(k) for k in ('ok', 'release_sha', 'utc_time', 'timezone', 'new_leads_only')
+          }
+          output['health']['polling'] = polling
+          if not health:
+              failures.append('health_request_failed_after_bounded_retries')
+          elif health.get('ok') is not True:
+              failures.append('health_not_ok')
+          if expected and health.get('release_sha') != expected:
+              failures.append('release_not_observed_within_240_seconds')
 
           try:
               oidc_url = os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']
@@ -85,16 +113,28 @@ jobs:
                   if hardening.get('ok') is not True:
                       failures.append('webhook_auth_requires_attention')
               status = request(root + '/internal/monitor/status', token=token)
+              readiness_deadline = time.monotonic() + 45
+              while status.get('monitoring_attention_required') == 'internal_checks_not_completed' and time.monotonic() < readiness_deadline:
+                  time.sleep(3)
+                  status = request(root + '/internal/monitor/status', token=token, timeout=10)
               output['status'] = status
               if status.get('ok') is not True:
                   failures.append('runtime_status_requires_attention')
               if status.get('config', {}).get('new_leads_only') is not True:
                   failures.append('new_leads_gate_disabled')
               if os.environ.get('RUN_DEPENDENCY_PROBES') == 'true':
+                  ingress = verify_unauthenticated_webhook(root + '/webhook/wazzup', status)
+                  output['unauthenticated_empty_webhook'] = ingress
+                  if ingress.get('executed') is True and ingress.get('ok') is not True:
+                      failures.append('unauthenticated_webhook_not_rejected')
                   probe = request(root + '/internal/monitor/probe', token=token, method='POST', timeout=55)
                   output['dependency_probes'] = probe
                   if probe.get('ok') is not True:
                       failures.append('dependency_probe_failed')
+                  voice = request(root + '/internal/monitor/voice-probe', token=token, method='POST', timeout=70)
+                  output['synthetic_voice_probe'] = voice
+                  if voice.get('ok') is not True:
+                      failures.append('synthetic_voice_probe_failed')
           except Exception as exc:
               output['monitor_request'] = {'ok': False, 'error_type': type(exc).__name__}
               failures.append('authenticated_monitor_request_failed')
@@ -104,7 +144,7 @@ jobs:
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
               summary.write('### NeuroBalance production check\n\n')
               summary.write('Result: ' + ('FAILED' if failures else 'PASS') + '\n\n')
-              summary.write('This is periodic checking; GitHub scheduling may be delayed. No CRM writes or patient messages.\n\n')
+              summary.write('This run verifies one point in time. GitHub scheduling may be delayed or skipped; the cron expression alone does not prove five-minute coverage. No CRM writes or patient messages.\n\n')
               if failures:
                   summary.write('\n'.join('- ' + failure for failure in failures) + '\n')
           print(json.dumps({'ok': not failures, 'failures': failures}))
