@@ -989,6 +989,12 @@ pending_doctor_time_preference, если день и время уже изве�
 вызови escalate_to_operator. Придумывать запись, её дату, время или
 appointment_id запрещено.
 
+Дополнительные обязательные правила обработки обращений:
+1. ГОРОД ПАЦИЕНТА. Если пациент сообщил, что он из другого города (например, Костанай, Караганда), до следующего вопроса обязательно вызови get_clinic_info с topic="other_city", сообщи, что клиника находится в Астане, и уточни, сможет ли человек приехать. Даже при наличии профильной жалобы не игнорируй названный город.
+2. ПОДТВЕРЖДЕНИЕ ПЕРЕДАЧИ. Фразы «передадим запрос», «администратор свяжется», «Ваш вопрос передан» допустимы только ПОСЛЕ успешного результата escalate_to_operator с подтверждением доставки. Если результат delivered=false или инструмент не вызывался, честно сообщи, что передачу подтвердить нельзя, и предложи пациенту связаться с клиникой самостоятельно. Это относится в том числе к возвратам и претензиям.
+3. ПРОТИВОПОКАЗАНИЯ НА КАЗАХСКОМ. При перечислении противопоказаний на казахском языке обязательно назови ВСЕ пункты утверждённого списка, сохранив каждый отдельный вид импланта (кардиостимулятор, дефибриллятор, инсулиновая помпа, кохлеарный имплант), тромбофлебит/тромбозы и нарушения свёртывания, онкологию и подозрение, эпилепсию/судороги, диабет/тиреотоксикоз, беременность, температуру/острые инфекции, тяжёлые заболевания сердца/дыхания/психического состояния. Не сокращай список ради краткости и не заменяй отдельные группы общей категорией.
+4. ДАТЫ БЕЗ ПОВТОРОВ. Используй текущую дату из контекста для вычисления ближайшего дня недели, названного пациентом (например, пятницы). Уточнять «какую именно пятницу» нужно только при реальной неоднозначности. Прежде чем называть время, проверь CRM; при недоступности CRM прямо сообщи, что свободное время сейчас подтвердить нельзя.
+
 ЧЕГО НЕЛЬЗЯ ДЕЛАТЬ:
 - переспрашивать то, что пациент уже сказал (смотри known_facts и историю);
 - повторять дословно один и тот же вопрос два хода подряд;
@@ -3006,7 +3012,7 @@ async def run_agent_turn(
         client = ai._openai_client(settings.openai_api_key)
     except Exception as exc:
         _log(chat_id, "agent_openai_client_error", {"error_type": type(exc).__name__})
-        return AgentResult(used=False, skip_reason="openai_client_error", error=str(exc)[:200])
+        return AgentResult(used=False, skip_reason="openai_client_error", error=ai._safe_openai_error_message(exc, limit=200))
 
     iterations = 0
     rounds = 0
@@ -3036,12 +3042,12 @@ async def run_agent_turn(
             _log(
                 chat_id,
                 "agent_openai_error",
-                {"error_type": type(exc).__name__, "message_preview": str(exc)[:200], "iteration": iterations},
+                {"error_type": type(exc).__name__, "message_preview": ai._safe_openai_error_message(exc, limit=200), "iteration": iterations},
             )
             if result.tool_calls:
                 # Tools already ran (possibly a real booking). Never end silently.
                 return _finish_after_openai_failure(chat_id, session, result)
-            return AgentResult(used=False, skip_reason="openai_error", error=str(exc)[:200], tool_calls=result.tool_calls)
+            return AgentResult(used=False, skip_reason="openai_error", error=ai._safe_openai_error_message(exc, limit=200), tool_calls=result.tool_calls)
 
         try:
             ai_budget.record_usage(response, model=model, purpose=ai_budget.PURPOSE_BRAIN)

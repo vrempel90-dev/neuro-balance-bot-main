@@ -84,15 +84,24 @@ def _log_openai_config_missing_detail(detail: dict[str, Any]) -> None:
     if state is not None:
         state.log_event(str(detail.get("chat_id") or "system"), "openai_config_missing_detail", detail)
 
+_OPENAI_KEY_IN_ERROR = re.compile(r"(?i)\bsk-[a-z0-9_*\-]{8,}")
+
+
+def _safe_openai_error_message(exc: Exception, *, limit: int = 300) -> str:
+    """Keep diagnostics while preventing OpenAI keys from entering logs or session state."""
+    raw = str(exc).replace("\r", " ").replace("\n", " ").strip()
+    return _OPENAI_KEY_IN_ERROR.sub("[REDACTED_OPENAI_KEY]", raw)[:max(0, limit)]
+
+
 def _openai_error_detail(exc: Exception, model: str) -> dict[str, Any]:
-    message = str(exc)
+    message = _safe_openai_error_message(exc)
     status_code = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
     detail = {
         "openai_error_type": type(exc).__name__,
-        "openai_error_message_preview": message.replace("\n", " ").strip()[:300],
+        "openai_error_message_preview": message,
         "openai_error_detail": {
             "type": type(exc).__name__,
-            "message_preview": message.replace("\n", " ").strip()[:300],
+            "message_preview": message,
             "model": model or "",
             "status_code": status_code,
         },
