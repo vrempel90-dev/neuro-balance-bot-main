@@ -325,7 +325,8 @@ scenarios:
 
   # 14 ----------------------------------------------------------------------
   - name: "14_booking_for_a_relative"
-    description: "Записывается не на себя, а на родственника"
+    description: "Записывается проверенный CRM новый родственник"
+    session: {patient_relation: "мама", patient_subject: "relative", patient_identity_status: "verified_new"}
     crm:
       lookup: new
       slots: {"2026-09-08": ["12:00"]}
