@@ -44,6 +44,7 @@ import ai_budget
 import bot_tools
 import clinic_info
 import crm
+import patient_subject
 import services
 from config import get_settings
 
@@ -103,7 +104,7 @@ _SLOT_CONFLICT_MARKERS = (
 # Python before any CRM booking — the model is told about them too, but an
 # instruction is not a guarantee.
 MIN_PATIENT_AGE = 16
-MAX_PATIENT_AGE = 75
+MAX_PATIENT_AGE = 74
 
 _MAX_SLOTS_IN_TOOL_RESULT = 12
 _MAX_DAYS_AHEAD = 21
@@ -918,7 +919,7 @@ escalate_to_operator; до подтверждения доставки backend �
 запись), нужно СОХРАНЯТЬ через record_patient_facts сразу, как пациент это
 сказал. Иначе book_appointment будет отклонён, даже если пациент всё назвал.
 
-ВЫБОР ВРАЧА: после уточнения жалобы, возраста и противопоказаний проверь
+ВЫБОР ВРАЧА: после уточнения жалобы, возраста и пожеланий по времени проверь
 реальных врачей через get_available_slots. Если tool вернул
 doctor_choice_required=true, обязательно перечисли doctor_options по именам
 и спроси, к кому пациент хочет записаться. Не выбирай врача за него.
@@ -932,8 +933,8 @@ pending_doctor_time_preference, если день и время уже изве�
 сохранены в selected_doctor_login/selected_date/selected_time.
 
 ВОЗРАСТ ОБЯЗАТЕЛЕН: без сохранённого возраста запись невозможна. Автоматическая
-запись допустима с 16 до 75 лет включительно. Если пациенту 15 лет и меньше
-либо 76 лет и старше — не записывай, вызови escalate_to_operator и спокойно
+запись допустима с 16 до 74 лет включительно. Если пациенту 15 лет и меньше
+либо 75 лет и старше — не записывай, вызови escalate_to_operator и спокойно
 объясни пациенту.
 
 ЖЁСТКИЕ ПРАВИЛА ФАКТОВ:
@@ -955,9 +956,13 @@ pending_doctor_time_preference, если день и время уже изве�
    процедурный день, воскресенье — выходной. На субботу и воскресенье
    консультацию не предлагай, предоплату за такую запись не запрашивай.
 
-ПОРЯДОК ЗАПИСИ (медицинская безопасность, соблюдай его):
-жалоба → возраст → противопоказания → дата → реальные слоты CRM → выбор
-времени → select_booking_slot → имя пациента → book_appointment.
+ПОРЯДОК ЗАПИСИ (утверждённый регламент):
+имя отправителя (если неизвестно) → жалоба ПАЦИЕНТА → возраст ПАЦИЕНТА
+→ удобный день/время → реальные слоты CRM → выбор конкретного времени
+→ select_booking_slot → полный чек-лист противопоказаний ПАЦИЕНТА
+→ book_appointment. Не дублируй имя пациента, если оно уже известно.
+Перед вызовом book_appointment Python обязан проверить все медицинские гейты.
+Для родственника имя отправителя НЕ становится именем пациента.
 Если пациент выбрал «первый/второй/третий» или конкретное время из только что
 показанных CRM-вариантов, зафиксируй выбор через select_booking_slot и НЕ
 переспрашивай дату, врача или время. После получения имени backend проверит
@@ -966,10 +971,17 @@ pending_doctor_time_preference, если день и время уже изве�
 списка — стоп-факторы: вместо записи вызывай escalate_to_operator.
 
 ЗАПИСЬ ЗА ДРУГОГО ЧЕЛОВЕКА:
-Пациент часто пишет за родственника («запишите маму», «хочу записать сына»,
-«я не себе»). Тогда жалоба, возраст, противопоказания и имя относятся к
-ПАЦИЕНТУ, а не к отправителю. В book_appointment передавай имя пациента и
-заполняй patient_relation.
+Понимай по смыслу русский/казахский текст, даже без слов «родственник».
+«Меня зовут Виктор, хочу записать маму» означает: Виктор — отправитель,
+мама — пациент. Сохраняй отдельно имя отправителя и имя пациента.
+Жалоба, возраст и противопоказания — ТОЛЬКО пациента. При смене человека
+не переносить старые медицинские данные и ранее предложенные слоты.
+Сохрани patient_relation через record_patient_facts. Запроси имя пациента,
+если оно неизвестно, не подставляй имя отправителя.
+Техническая проверка identity_status необходима ДО создания записи:
+если CRM не подтверждает, что родственник — отдельный новый пациент,
+не пытайся обойти запрет; вызови escalate_to_operator.
+Не раскрывай историю, диагнозы или даты чужой записи отправителю.
 
 ПЕРЕНОС И ОТМЕНА СУЩЕСТВУЮЩЕЙ ЗАПИСИ:
 Если пациент пишет про уже существующую запись («перенесите», «отмените»,
@@ -1653,6 +1665,20 @@ async def _tool_book_appointment(
     date = str(args.get("date") or "").strip()[:10]
     time_start = str(args.get("time_start") or "").strip()[:5]
     relation = str(args.get("patient_relation") or "").strip()
+    stored_relation = str(session.get("patient_relation") or "").strip()
+    if relation and stored_relation and relation != stored_relation:
+        return {"ok": False, "booking_success": False, "error": "different_patient",
+                "message": "Сменился пациент: сначала сохрани данные нового пациента."}
+    relation = relation or stored_relation
+    # Sender-phone NEW status is not evidence that a relative is NEW.
+    # Existing CRM lookup identifies the contact number, not the patient.
+    if relation and session.get("patient_identity_status") != "verified_new":
+        _log(chat_id, "agent_relative_identity_unverified", {"has_relation": True})
+        return {"ok": False, "booking_success": False,
+                "error": "relative_identity_unverified",
+                "message": ("Нельзя автоматически записать родственника без проверки "
+                            "его отдельной личности и статуса в CRM. "
+                            "Вызови escalate_to_operator; не обещай запись.")}
     preferred = str(session.get("preferred_doctor_login") or "")
     if len(session.get("doctor_options") or []) > 1 and not preferred:
         return {"ok": False, "booking_success": False, "error": "doctor_not_selected",
@@ -2101,6 +2127,14 @@ def _crm_action_confirmed(response: Any, *success_flags: str) -> bool:
 async def _tool_find_my_appointment(
     chat_id: str, session: dict[str, Any], phone: str, args: dict[str, Any]
 ) -> dict[str, Any]:
+    # Never disclose an appointment found by the sender's phone as the
+    # relative's appointment. This transport does not prove proxy authority.
+    if session.get("patient_relation"):
+        return {"ok": False, "found": False, "appointments": [],
+                "error": "relative_identity_unverified",
+                "message": ("Историю и запись родственника нельзя раскрывать без "
+                            "подтверждения личности и полномочий. "
+                            "Вызови escalate_to_operator.")}
     sender_phone = crm.normalize_phone(phone or session.get("phone") or "")
     if not sender_phone:
         return {
@@ -2575,6 +2609,9 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
     gate a booking must live in state, not only in the transcript.
     """
     stored: list[str] = []
+    relation = str(args.get("patient_relation") or "").strip()
+    if relation:
+        patient_subject.set_subject(session, relation)
 
     complaint = str(args.get("complaint") or "").strip()
     profile_status = str(session.get("profile_status") or "").strip()
@@ -2649,9 +2686,7 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
         session["patient_name"] = patient_name
         stored.append("patient_name")
 
-    relation = str(args.get("patient_relation") or "").strip()
     if relation:
-        session["patient_relation"] = relation
         stored.append("patient_relation")
 
     facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
@@ -2887,6 +2922,8 @@ def agent_skip_reason(session: dict[str, Any], user_text: str) -> str:
         return "openai_key_missing"
     if ai.AsyncOpenAI is None:
         return "openai_package_missing"
+    if not ai._rendered_system_prompt().strip():
+        return "clinic_prompt_missing"
     allowed, block_reason = ai_budget.check_allowed(ai_budget.PURPOSE_BRAIN)
     if not allowed:
         return block_reason or "ai_budget_blocked"
@@ -2926,6 +2963,14 @@ async def run_agent_turn(
                 "time_start": resolved_slot["time_start"],
             },
         )
+
+    explicit = patient_subject.explicit_subject(user_text)
+    if explicit:
+        if patient_subject.set_subject(session, explicit):
+            _log(chat_id, "agent_patient_subject_changed", {
+                "patient_subject": session.get("patient_subject"),
+                "has_relation": bool(session.get("patient_relation")),
+            })
 
     name_candidate = _simple_patient_name_candidate(session, user_text)
     if name_candidate:
