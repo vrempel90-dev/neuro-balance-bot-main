@@ -60,7 +60,7 @@ def explicit_subject(text: str) -> str | None:
         token = rf"\b(?:{forms})\b"
         # The subject may precede or follow an explicit booking/symptom cue.
         before = rf"{_CUE_BEFORE}[^.!?]{{0,48}}{token}"
-        after = rf"{token}[^.!?]{{0,28}}{_CUE_AFTER}"
+        after = rf"{token}[^.!?]{{0,28}}(?:{_CUE_AFTER}|\\b\\d{{1,3}}\\b)"
         if re.search(before, value) or re.search(after, value):
             matches.append(relation)
     if len(matches) == 1 and not _SELF.search(value):
