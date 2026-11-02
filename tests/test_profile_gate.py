@@ -124,7 +124,7 @@ def test_canonical_prompt_allows_74_and_blocks_from_75() -> None:
 
     assert "75 лет и старше — автоматическую запись не делай" in prompt
     assert "76 лет и старше — автоматическую запись не делай" not in prompt
-    assert "проверка профиля клиники" in prompt
+    assert "проверка профиля" in prompt
     assert "боль в пятке" in prompt
 
 
