@@ -70,6 +70,17 @@ def explicit_subject(text: str) -> str | None:
     return None
 
 
+def explicit_sender_name(text: str) -> str:
+    """Only capture a clearly self-introduced sender name, not the patient."""
+    value = str(text or "").strip()
+    match = re.search(
+        r"(?:меня\s+зовут|мо[её]\s+имя|менің\s+атым)\s+"
+        r"([А-Яа-яЁёӘәҒғҚқҢңӨөҰұҮүҺһІіA-Za-z]{2,40})\b",
+        value, flags=re.IGNORECASE,
+    )
+    return match.group(1) if match else ""
+
+
 def set_subject(session: dict[str, Any], subject: str) -> bool:
     """Switch patient context; retain transport, sender and admission state.
 
