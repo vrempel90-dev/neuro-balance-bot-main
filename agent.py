@@ -1170,9 +1170,13 @@ def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls 
             "chat_type": session.get("chat_type") or "",
             "is_instagram": "instagram" in str(session.get("chat_type") or "").lower(),
         },
-        "sender": {"phone_masked": _mask_phone(phone or session.get("phone"))},
+        "sender": {
+            "phone_masked": _mask_phone(phone or session.get("phone")),
+            "name": _clip(session.get("sender_name"), "patient_name"),
+        },
         "patient": {
             "booking_for_self": not bool(session.get("patient_relation")),
+            "patient_identity_status": session.get("patient_identity_status") or "unknown",
             "relation": _clip(session.get("patient_relation"), "relation"),
             "patient_name": _clip(session.get("patient_name"), "patient_name"),
             "age": session.get("age"),
@@ -1670,6 +1674,11 @@ async def _tool_book_appointment(
         return {"ok": False, "booking_success": False, "error": "different_patient",
                 "message": "Сменился пациент: сначала сохрани данные нового пациента."}
     relation = relation or stored_relation
+    sender_name = str(session.get("sender_name") or "").strip()
+    if relation and sender_name and patient_name.casefold() == sender_name.casefold():
+        return {"ok": False, "booking_success": False,
+                "error": "sender_name_is_not_patient_name",
+                "message": "Уточни имя родственника — имя отправителя нельзя использовать как имя пациента."}
     # Sender-phone NEW status is not evidence that a relative is NEW.
     # Existing CRM lookup identifies the contact number, not the patient.
     if relation and session.get("patient_identity_status") != "verified_new":
@@ -2683,8 +2692,13 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
 
     patient_name = str(args.get("patient_name") or "").strip()
     if patient_name:
-        session["patient_name"] = patient_name
-        stored.append("patient_name")
+        sender_name = str(session.get("sender_name") or "").strip()
+        if session.get("patient_relation") and sender_name and patient_name.casefold() == sender_name.casefold():
+            # A proxy's name is NOT the named patient.
+            patient_name = ""
+        else:
+            session["patient_name"] = patient_name
+            stored.append("patient_name")
 
     if relation:
         stored.append("patient_relation")
@@ -2964,6 +2978,9 @@ async def run_agent_turn(
             },
         )
 
+    sender_name = patient_subject.explicit_sender_name(user_text)
+    if sender_name:
+        session["sender_name"] = sender_name
     explicit = patient_subject.explicit_subject(user_text)
     if explicit:
         if patient_subject.set_subject(session, explicit):
