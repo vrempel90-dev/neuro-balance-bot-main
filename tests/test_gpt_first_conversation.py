@@ -389,7 +389,7 @@ def test_booking_for_a_relative_sends_the_patient_not_the_sender(
         ],
     )
     chat_id = f"conv_relative_{relation}"
-    _session(chat_id)
+    _session(chat_id, patient_relation=relation, patient_subject="relative", patient_identity_status="verified_new")
 
     answer = _turn(chat_id, f"{message}, {DATE} в 16:40, зовут {patient_name}")
 

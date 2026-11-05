@@ -557,7 +557,7 @@ def test_relative_booking_uses_patient_name_not_sender(monkeypatch: pytest.Monke
         ],
     )
     chat_id = "agent_relative"
-    ready_session(chat_id)
+    ready_session(chat_id, patient_relation="мама", patient_subject="relative", patient_identity_status="verified_new")
 
     run_turn(chat_id, f"хочу записать маму на {DATE}")
     run_turn(chat_id, "09:20, её зовут Гульнара Сериковна")
@@ -839,7 +839,7 @@ def test_gpt_collected_facts_are_persisted_for_the_booking_gate(
 
 
 def test_age_boundaries_are_inclusive() -> None:
-    """Pin the exact comparison: 16 and 75 are allowed, 15 and 76 are not."""
+    """Pin approved comparison: 16 and 74 are allowed, 15 and 75 are not."""
     assert agent._age_block_reason(agent.MIN_PATIENT_AGE) == ""
     assert agent._age_block_reason(agent.MAX_PATIENT_AGE) == ""
     assert agent._age_block_reason(agent.MIN_PATIENT_AGE - 1) == "under_min_age"
@@ -920,7 +920,7 @@ def test_stale_age_cannot_pass_the_gate_after_a_rejected_value(monkeypatch: pyte
     assert answer.strip()
 
 
-@pytest.mark.parametrize("age", [12, 15, 76, 81])
+@pytest.mark.parametrize("age", [12, 15, 75, 76, 81])
 def test_age_outside_clinic_limits_blocks_the_crm_booking(
     monkeypatch: pytest.MonkeyPatch, age: int
 ) -> None:
@@ -1684,8 +1684,8 @@ def test_contraindications_guard_does_not_override_completed_gate() -> None:
 
 def test_system_prompt_forbids_patient_facing_checklist_wording() -> None:
     prompt = agent.agent_system_prompt().lower()
-    assert "76 лет и старше" in prompt
-    assert "75 лет и старше" not in prompt
+    assert "75 лет и старше" in prompt
+    assert "76 лет и старше" not in prompt
     assert "пациенту никогда не говори «чек-лист»" in prompt
     assert "кардиостимулятор, дефибриллятор, инсулиновая помпа" in prompt
     assert "тяжёлые проблемы с сердцем, дыханием или психическим состоянием" in prompt

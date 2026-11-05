@@ -69,7 +69,7 @@ def test_heel_plus_profile_joint_keeps_profile_complaint() -> None:
     assert classified["service"] == "суставы"
 
 
-def test_age_75_is_allowed_by_backend_boundary() -> None:
+def test_age_75_is_blocked_by_backend_boundary() -> None:
     session: dict = {}
 
     result = agent._tool_record_patient_facts(
@@ -79,8 +79,8 @@ def test_age_75_is_allowed_by_backend_boundary() -> None:
     )
 
     assert session["age"] == 75
-    assert result["age_outside_clinic_limits"] is False
-    assert agent._age_block_reason(75) == ""
+    assert result["age_outside_clinic_limits"] is True
+    assert agent._age_block_reason(75) == "over_max_age"
 
 
 def test_age_76_is_blocked_by_backend_boundary() -> None:
@@ -119,12 +119,12 @@ def test_classifier_unknown_stays_unknown() -> None:
     assert classified["can_help"] is None
 
 
-def test_canonical_prompt_allows_75_and_blocks_from_76() -> None:
+def test_canonical_prompt_allows_74_and_blocks_from_75() -> None:
     prompt = ai._rendered_system_prompt()
 
-    assert "76 лет и старше — автоматическую запись не делай" in prompt
-    assert "75 лет и старше — автоматическую запись не делай" not in prompt
-    assert "проверка профиля клиники" in prompt
+    assert "75 лет и старше — автоматическую запись не делай" in prompt
+    assert "76 лет и старше — автоматическую запись не делай" not in prompt
+    assert "проверка профиля" in prompt
     assert "боль в пятке" in prompt
 
 
