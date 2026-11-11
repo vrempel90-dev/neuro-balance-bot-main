@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import asyncio
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -39,6 +40,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 
+import agent
 import crm
 import dialog
 import state
@@ -104,6 +106,7 @@ class Fixture:
     sid: str
     lead_state: str
     bookings: list[dict[str, Any]]
+    tool_trace: list[dict[str, Any]] = field(default_factory=list)
 
 active_fixture: ContextVar[Fixture | None] = ContextVar("lab_fixture", default=None)
 fixtures: dict[str, Fixture] = {}
@@ -208,6 +211,21 @@ def install_isolated_crm() -> None:
     crm.clear_slots_cache = lambda date=None: None
 
 install_isolated_crm()
+
+_original_execute_tool = agent.execute_tool
+async def observed_execute_tool(**kwargs: Any) -> dict[str, Any]:
+    """Execute the REAL production tool and record its sanitized test-only result."""
+    result = await _original_execute_tool(**kwargs)
+    fixture = active_fixture.get()
+    if fixture is not None:
+        fixture.tool_trace.append({
+            "tool": str(kwargs.get("name") or ""),
+            "args": kwargs.get("args") or {},
+            "result": result,
+        })
+    return result
+
+agent.execute_tool = observed_execute_tool
 state.init_db()
 DB_PATH = os.environ["SQLITE_PATH"]
 
@@ -256,7 +274,7 @@ async def security_headers(request: Request, call_next):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "mode": "isolated-real-gpt", "production_crm_connected": False}
+    return {"status": "ok", "mode": "isolated-real-gpt", "production_crm_connected": False, "openai_key_present": bool(os.environ.get("OPENAI_API_KEY"))}
 
 def load_session(sid: str) -> dict[str, Any]:
     with db() as con:
@@ -316,6 +334,7 @@ async def process_turn(sid: str, user_text: str) -> dict[str, Any]:
         if len(obj["turns"]) >= 40:
             raise HTTPException(status_code=409, detail="Start a fresh session after 40 turns")
         cv = active_fixture.set(fixture)
+        trace_before = len(fixture.tool_trace)
         start = asyncio.get_running_loop().time()
         try:
             answer = await asyncio.wait_for(
@@ -328,6 +347,7 @@ async def process_turn(sid: str, user_text: str) -> dict[str, Any]:
                 "openai_used": bool(session.get("openai_used")),
                 "model": str(session.get("openai_brain_model") or os.getenv("AI_BRAIN_MODEL") or ""),
                 "tool_calls": session.get("agent_tool_calls") or [],
+                "tool_trace": fixture.tool_trace[trace_before:],
                 "crm_patient_state": session.get("crm_patient_state") or "",
                 "booking_confirmed": bool(session.get("booking_confirmed")),
                 "manual_takeover": bool(session.get("manual_takeover")),
@@ -341,6 +361,31 @@ async def process_turn(sid: str, user_text: str) -> dict[str, Any]:
         obj["turns"].append(entry)
         persist_turns(sid, obj["turns"])
         return {"sid": sid, "turn": entry, "issues": judgement(obj), "turns": obj["turns"]}
+
+@app.on_event("startup")
+async def one_time_real_gpt_probe() -> None:
+    """Optional smoke test using the actual OpenAI backend and production agent."""
+    if os.getenv("LAB_SELFTEST_ON_START", "").lower() != "true":
+        return
+
+    async def probe() -> None:
+        try:
+            obj = open_session("Real GPT startup probe", "new")
+            response = await process_turn(
+                obj["sid"],
+                "Здравствуйте. Подскажите адрес клиники, пожалуйста.",
+            )
+            row = response["turn"]
+            logging.warning(
+                "TEST_LAB_REAL_GPT_PROBE completed: openai_used=%s reply_present=%s "
+                "handoff=%s skip=%s duration_ms=%s",
+                row["openai_used"], bool(row["answer"]),
+                row["handoff_reason"], row["openai_skip_reason"], row["duration_ms"],
+            )
+        except Exception as exc:
+            logging.exception("TEST_LAB_REAL_GPT_PROBE failed: %s", type(exc).__name__)
+
+    asyncio.create_task(probe())
 
 class CreateRequest(BaseModel):
     name: str = Field(default="Ручная проверка", max_length=80)
@@ -469,7 +514,7 @@ async function send(){
  try{const d=await api('/api/sessions/'+sid+'/messages','POST',{text});
  const t=d.turn;add('bot',t.answer||'∅ Нет ответа',t.duration_ms+' мс · OpenAI: '+(t.openai_used?'Да':'Нет')+' · '+(t.model||'model n/a'));
  document.getElementById('outcome').textContent='CRM: '+t.crm_patient_state+' | Тестовых записей: '+t.fixture_bookings+' | Проблем: '+d.issues.length;
- document.getElementById('trace').textContent=JSON.stringify({tool_calls:t.tool_calls,no_reply_reason:t.no_reply_reason,handoff_reason:t.handoff_reason,openai_skip_reason:t.openai_skip_reason,issues:d.issues},null,2)}
+ document.getElementById('trace').textContent=JSON.stringify({tool_calls:t.tool_calls,tool_trace:t.tool_trace,no_reply_reason:t.no_reply_reason,handoff_reason:t.handoff_reason,openai_skip_reason:t.openai_skip_reason,issues:d.issues},null,2)}
  catch(e){add('bot','Ошибка запроса: '+e.message)}
  finally{busy=false;document.getElementById('send').disabled=false}
 }
