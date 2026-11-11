@@ -26,8 +26,8 @@ from uuid import uuid4
 # Fail closed BEFORE importing application modules.
 if os.environ.get("NEURO_TEST_LAB", "").lower() != "true":
     raise RuntimeError("Test Lab must run only with NEURO_TEST_LAB=true")
-if not os.environ.get("TEST_LAB_PASSWORD", "").strip():
-    raise RuntimeError("TEST_LAB_PASSWORD is required")
+if not os.environ.get("TEST_LAB_ACCESS_TOKEN", "").strip():
+    raise RuntimeError("TEST_LAB_ACCESS_TOKEN is required")
 os.environ["CRM_BASE_URL"] = "http://127.0.0.1:1/disabled"
 os.environ["CRM_BOT_SECRET"] = ""
 os.environ["EXTERNAL_BOOKING_API_SECRET"] = ""
@@ -37,7 +37,6 @@ os.environ["SQLITE_PATH"] = os.environ.get("SQLITE_PATH") or "/tmp/neuro_test_la
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 
 import agent
@@ -246,17 +245,43 @@ with db() as con:
     """)
 
 app = FastAPI(title="NeuroBalance Real Dialog Test Lab", docs_url=None, redoc_url=None, openapi_url=None)
-basic = HTTPBasic(auto_error=False)
 
-def authenticate(credentials: HTTPBasicCredentials | None = Depends(basic)) -> bool:
-    expected = os.environ["TEST_LAB_PASSWORD"]
-    if credentials is None or not (
-        hmac.compare_digest(credentials.username.encode(), b"admin") and
-        hmac.compare_digest(credentials.password.encode(), expected.encode())
-    ):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required",
-                            headers={"WWW-Authenticate": 'Basic realm="NeuroBalance Test Lab"'})
+LAB_COOKIE = "neuro_lab_session"
+
+def _expected_cookie() -> str:
+    """Derive the session value from an access token without exposing the token."""
+    return hmac.new(
+        os.environ["TEST_LAB_ACCESS_TOKEN"].encode("utf-8"),
+        b"neuro-test-lab-session-v1",
+        "sha256",
+    ).hexdigest()
+
+def authenticate(request: Request) -> bool:
+    session = str(request.cookies.get(LAB_COOKIE, ""))
+    if not session or not hmac.compare_digest(session, _expected_cookie()):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Open the private Test Lab link")
     return True
+
+class AccessLinkRequest(BaseModel):
+    token: str = Field(min_length=16, max_length=256)
+
+@app.post("/api/access-link")
+def access_by_link(data: AccessLinkRequest):
+    expected = os.environ["TEST_LAB_ACCESS_TOKEN"].encode("utf-8")
+    candidate = data.token.encode("utf-8")
+    if not hmac.compare_digest(candidate, expected):
+        raise HTTPException(status_code=401, detail="Invalid or expired access link")
+    response = JSONResponse({"ok": True})
+    response.set_cookie(
+        key=LAB_COOKIE,
+        value=_expected_cookie(),
+        max_age=60 * 60 * 24 * 30,
+        secure=True,
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    return response
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
@@ -505,7 +530,10 @@ async function fresh(){
  sid=d.sid;document.getElementById('chat').textContent='';document.getElementById('trace').textContent='';
  document.getElementById('sessionInfo').textContent='Диалог '+sid.slice(0,8)+' · '+d.lead_state;
  document.getElementById('outcome').textContent='Диалог готов. Введите первое сообщение.'}
- catch(e){alert(e.message)}
+ catch(e){
+   document.getElementById('sessionInfo').textContent =
+     e.message.includes('Open the private') ? 'Откройте личную ссылку на Test Lab из чата.' : 'Ошибка: '+e.message;
+ }
 }
 async function send(){
  if(busy)return;if(!sid){await fresh();if(!sid)return}
@@ -534,9 +562,23 @@ async function suite(){
  };await poll();}
  catch(e){info.textContent='Ошибка: '+e.message;btn.disabled=false}
 }
-fresh();
+async function bootstrap(){
+  const fragment=window.location.hash;
+  if(fragment.startsWith('#access=')){
+    const token=decodeURIComponent(fragment.slice('#access='.length));
+    try{
+      await api('/api/access-link','POST',{token});
+      window.history.replaceState(null,'',window.location.pathname+window.location.search);
+    }catch(e){
+      document.getElementById('sessionInfo').textContent='Ссылка доступа недействительна. Откройте новую ссылку из чата.';
+      return;
+    }
+  }
+  await fresh();
+}
+bootstrap();
 </script></body></html>"""
 
-@app.get("/", response_class=HTMLResponse, dependencies=[Depends(authenticate)])
+@app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(HTML)
