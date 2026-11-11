@@ -149,7 +149,7 @@ def _openai_production_status() -> dict[str, Any]:
         "openai_brain_enabled": brain_enabled,
         "ai_brain_model": brain_model,
         "ai_brain_temperature": brain_temperature,
-        "ai_brain_max_completion_tokens": int(getattr(settings, "ai_brain_max_completion_tokens", 2000) or 2000),
+        "ai_brain_max_completion_tokens": int(getattr(settings, "ai_brain_max_completion_tokens", 2000)),
         "openai_model": str(getattr(settings, "openai_model", "") or ""),
         "openai_humanize_replies": bool(getattr(settings, "openai_humanize_replies", True)),
         "monthly_ai_budget_usd": float(getattr(settings, "monthly_ai_budget_usd", 0.0) or 0.0),
