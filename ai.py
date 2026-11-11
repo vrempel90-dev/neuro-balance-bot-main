@@ -585,13 +585,15 @@ def brain_tool_call_kwargs(model: str) -> dict[str, Any]:
 
 
 def _brain_token_limit_kwargs(model: str) -> dict[str, int]:
-    """Потолок ответа брейна с учётом имени параметра для конкретной модели."""
+    """Optional per-response cap; 0 disables the application cap.
+
+    OpenAI still enforces each model's context/output limits. Leave safety
+    limits on tool-loop iterations, idempotency, and network timeouts intact.
+    """
     settings = get_settings()
     if _requires_max_completion_tokens(model):
-        # В max_completion_tokens входят токены рассуждения, поэтому лимит выше:
-        # иначе reasoning съедает бюджет и JSON приходит обрезанным.
-        limit = int(getattr(settings, "ai_brain_max_completion_tokens", 2000) or 2000)
-        return {"max_completion_tokens": limit}
+        limit = int(getattr(settings, "ai_brain_max_completion_tokens", 2000))
+        return {"max_completion_tokens": limit} if limit > 0 else {}
     return {"max_tokens": 700}
 
 
