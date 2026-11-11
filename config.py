@@ -46,8 +46,8 @@ class Settings(BaseSettings):
     openai_dialog_temperature: float = Field(default=0.2, validation_alias=AliasChoices("OPENAI_DIALOG_TEMPERATURE", "openai_dialog_temperature"))
     openai_humanize_temperature: float = Field(default=0.3, validation_alias=AliasChoices("OPENAI_HUMANIZE_TEMPERATURE", "openai_humanize_temperature"))
     openai_max_tokens: int = Field(default=700, validation_alias=AliasChoices("OPENAI_MAX_TOKENS", "openai_max_tokens"))
-    # Потолок ответа брейна для gpt-5.x: в max_completion_tokens входят и токены
-    # рассуждения, поэтому 700 может уйти на reasoning и обрезать JSON/tool call.
+    # Дополнительный потолок токенов для gpt-5.x (0 = не передавать
+    # max_completion_tokens, остаются только лимиты самой модели/OpenAI).
     ai_brain_max_completion_tokens: int = Field(default=2000, validation_alias=AliasChoices("AI_BRAIN_MAX_COMPLETION_TOKENS", "ai_brain_max_completion_tokens"))
 
     # Wazzup
