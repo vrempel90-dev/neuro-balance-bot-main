@@ -25,6 +25,14 @@ class CRMResponseError(CRMError):
         self.status_code = response.status_code
         self.response_text = response.text
         self.data = data or {}
+        # 429 retry guidance: seconds form only, strictly bounded. Never log
+        # response bodies or headers, which may contain patient identifiers.
+        retry_after = response.headers.get("Retry-After", "")
+        try:
+            suggested_delay = float(retry_after)
+        except (TypeError, ValueError):
+            suggested_delay = 0.5
+        self.retry_after_seconds = max(0.25, min(2.0, suggested_delay))
         code = str(self.data.get("code") or "")
         self.code = code if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code) else ""
         # Exceptions are logged by callers. Response bodies can contain patient
@@ -570,22 +578,43 @@ class CRMClient:
         endpoint = _patient_lookup_url()
 
         async def _one(variant: str) -> tuple[str, dict[str, Any] | None, str]:
-            try:
-                # Some integrations intentionally override patient_lookup.
-                if getattr(patient_lookup, "__module__", "crm") != __name__:
-                    data = await patient_lookup(variant)
-                else:
-                    data = await patient_lookup_raw(variant)
-                if not isinstance(data, dict) or data.get("ok") is False or data.get("error"):
-                    return variant, None, "crm_invalid_response"
-                if not isinstance(data.get("found"), bool) or not isinstance(data.get("isNew"), bool):
-                    return variant, None, "crm_missing_identity_fields"
-                return variant, data, ""
-            except Exception as exc:
-                logger.warning("CRM phone variant lookup failed error=%s", type(exc).__name__)
-                return variant, None, type(exc).__name__
+            # Patient lookup is read-only: allow only one bounded retry for 429.
+            # Never retry booking/cancellation POST calls here.
+            for attempt in range(2):
+                try:
+                    # Some integrations intentionally override patient_lookup.
+                    if getattr(patient_lookup, "__module__", "crm") != __name__:
+                        data = await patient_lookup(variant)
+                    else:
+                        data = await patient_lookup_raw(variant)
+                    if not isinstance(data, dict) or data.get("ok") is False or data.get("error"):
+                        return variant, None, "crm_invalid_response"
+                    if not isinstance(data.get("found"), bool) or not isinstance(data.get("isNew"), bool):
+                        return variant, None, "crm_missing_identity_fields"
+                    return variant, data, ""
+                except CRMResponseError as exc:
+                    if exc.status_code == 429:
+                        if attempt == 0:
+                            logger.warning("CRM phone variant lookup rate limited; retrying once")
+                            await asyncio.sleep(exc.retry_after_seconds)
+                            continue
+                        return variant, None, "crm_rate_limited"
+                    logger.warning("CRM phone variant lookup failed status=%s", exc.status_code)
+                    return variant, None, type(exc).__name__
+                except Exception as exc:
+                    logger.warning("CRM phone variant lookup failed error=%s", type(exc).__name__)
+                    return variant, None, type(exc).__name__
+            return variant, None, "crm_rate_limited"
 
-        results = await asyncio.gather(*(_one(variant) for variant in variants))
+        # Parallel alias lookups caused bursts (up to four simultaneous GETs per
+        # incoming chat). Probe aliases serially; partial identity evidence
+        # never authorizes a NEW lead.
+        results: list[tuple[str, dict[str, Any] | None, str]] = []
+        for variant in variants:
+            outcome = await _one(variant)
+            results.append(outcome)
+            if outcome[2] == "crm_rate_limited":
+                raise CRMError("CRM patient lookup rate limited; admission unavailable")
         successes = [(variant, data) for variant, data, error in results if data is not None]
         failures = [(variant, error) for variant, _, error in results if error]
         if not successes:
