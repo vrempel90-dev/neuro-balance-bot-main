@@ -595,19 +595,14 @@ class CRMClient:
             raise CRMError("CRM lookup incomplete for phone formats")
 
         def _priority(payload: dict[str, Any]) -> int:
-            appointments = _extract_appointments(payload)
-            active = any(_is_active_future_appointment(x) for x in appointments)
-            if active or payload.get("hasActiveAppointment") is True:
-                return 6
-            if payload.get("patient") or payload.get("lastAppointment") or appointments:
-                return 5
-            if payload.get("lead"):
-                return 4
-            if payload.get("found") is True or payload.get("isNew") is False:
-                return 3
-            return 1
+            # Use the same admission semantics as the dialogue. Identity-only
+            # existing contacts and malformed answers must outrank a NEW lead.
+            import admission
+            verdict = admission.classify(phone, payload)
+            return {admission.CRM_UNAVAILABLE: 4, admission.ACTIVE_BOOKING: 3,
+                    admission.RETURNING: 2, admission.NEW: 1}[verdict.state]
 
-        variant, data = max(successes, key=lambda item: _priority(item[1]))
+        variant, data = max(successes, key=lambda item: (_priority(item[1]), bool(item[1].get("lead"))))
         all_appointments = [
             a for _, item in successes for a in _extract_appointments(item)
         ]
@@ -639,6 +634,8 @@ class CRMClient:
             "appointments_cache": active[1:],
             "active_count": len(active),
             "raw": merged,
+            # Preserve every format's exclusion for provenance-bound continuation.
+            "identity_variants": [item for _, item in successes],
         }
 
     async def lookup_appointment_by_id(self, appointment_id: str | int) -> dict[str, Any]:

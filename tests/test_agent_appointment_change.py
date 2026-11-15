@@ -168,10 +168,16 @@ def install_openai(monkeypatch: pytest.MonkeyPatch, script: list[Any]) -> FakeOp
 
 
 def booked_patient_session(chat_id: str, **extra: Any) -> dict[str, Any]:
-    """A patient who already has an appointment and writes about it."""
+    """Precleared context for lower-level staff appointment utilities.
+
+    These direct agent tests do not grant existing patients production admission.
+    """
     state.reset_session(chat_id)
     session = state.get_session(chat_id)
     session.update({"phone": PHONE, "language": "ru", "ai_lead_started": True})
+    session.update({"complaint": "болит поясница", "complaint_gate": "COMPLAINT_OK",
+                    "profile_status": "profile", "age": 34, "contraindications_ok": True,
+                    "contraindications_verdict": "proceed", "contraindications_raw": "противопоказаний нет"})
     session.update(extra)
     state.save_session(chat_id, session)
     return session
@@ -224,7 +230,8 @@ def test_full_dialog_reschedules_the_real_appointment(monkeypatch: pytest.Monkey
         ],
     )
     chat_id = "agent_reschedule_ok"
-    session = booked_patient_session(chat_id)
+    # Staff utility keeps the existing appointment's explicitly chosen clinician.
+    session = booked_patient_session(chat_id, preferred_doctor_login=DOCTOR_LOGIN)
 
     first = run_turn(session, "Здравствуйте, хочу перенести запись", chat_id)
     assert tool_names(first) == ["find_my_appointment"]

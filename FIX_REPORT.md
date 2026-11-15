@@ -1,0 +1,24 @@
+# Исправления Neuro Balance
+
+База `4b8c928`, ветка `codex/neurobalance-full-audit-fix`. Реестр: **16 локальных дефектов исправлены; 3 эксплуатационных проблемы остаются за владельцем**. Итоговые gates и ограничения — в TEST_REPORT и REMAINING_ISSUES. Production не изменялся.
+
+| Дефекты | Что изменено | Регрессионное доказательство |
+|---|---|---|
+| A01 | `medical_rules.py` проверяет активные/отрицаемые жалобы, родство не является исключением; mixed scope → UNCLEAR. Удаление непрофильной части при извлечении моделью не открывает gate. Травмы/операции не расширяют профиль вне позвоночника/суставов. | 35 literal complaint cases RU/KK, source-scope adversarial cases, post-operative rehab review cases, multi-turn complaint scenarios. |
+| A02 | record_patient_facts хранит возраст, жалобу, отношение, имя, подтверждения и предпочтения дня/времени сразу. Хранение отделено от разрешения продолжить. | UNCLEAR → уточнение без потери уже полученных фактов; обновлённые старые profile tests требуют закрытого gate вместо потери данных. |
+| A03 | Нормализация родства; явный переход на self; сброс медицинских данных, имени и выбора при смене пациента; patient_context_version защищает SQLite от восстановления чужого допуска. | self→mother/father/wife; alias mother/мама; self reset; SQLite roundtrip/reset и сохранение фактов того же пациента. |
+| A04/A05 | Availability и booking проверяют профиль, возраст и противопоказания; 16–18 включительно требуют подтверждённое сопровождение. Отрицание сопровождения в текущем тексте перевешивает boolean модели. | Никаких CRM availability calls до допуска; 6 guardian dialogues + adversarial flag cases; границы 12/15/16/17/18/75/76/79. |
+| A06 | Отдельная полярность каждого противопоказания RU/KK; положительное сообщение перевешивает прошлое clearance и ошибочный флаг модели. Определение термина не считается наличием; отрицание одного пункта не равно отсутствию всего списка. | Positive/negative/question/uncertain evidence, противоречивые notes/booleans, вопрос рядом с реальным противопоказанием, exact KK word order. |
+| A07/A08/A09 | Убран POST до обработки текущего сообщения и между фактами одного ответа модели; факты обрабатываются до записывающих инструментов. Ранний emergency triage. Отказ/вопрос о времени не разрешает даже явный model book tool. | Прямой adversarial tool вызов; ready state + отказ; negative-time/time-question; emergency не достигает агента; сохранён affirmative «Давайте на 14:00». |
+| A10 | Durable patient-wide claim удерживает пациента при timeout/unconfirmed/readback error, включая другое время и новую сессию. Атомарная проверка legacy phone-slot claims закрывает окно обновления. | Timeout → другое время → один POST; legacy pending/uncertain/confirmed → ноль новых POST. Явный конфликт освобождает разрешённую попытку. |
+| A11 | Каждый формат телефона может запретить NEW; provenance continuation ограничена тем же реальным lead ID/телефоном и открытым диалогом до 12 часов без пациента/истории/staff takeover. | Conflicting-format identity, malformed answers, сохранённая provenance и veto любого варианта, существующий отправитель за отца остаётся silent. |
+| A12 | Сохранённое или переданное родство блокирует автоматический POST до отдельной проверки пациента. `self` в booking args не ослабляет сохранённую mother. | 11 relative dialogues; no-post assertions, сохранены факты пациента/контакт отправителя; adversarial self/я/өзім. |
+| A13/A14 | Общий полный RU/KK список восьми утверждённых групп; FAQ/имена врачей/объяснение термина сохраняются перед списком. Overrides согласованы с возрастом/профилем/new-only и запретом неподтверждённого relative booking. | Полнота обоих списков, MRI/Каспи FAQ resume, doctors + medical next step; первичный промпт неизменен. |
+| A15 | Обычный monitor workflow больше не вызывает provider configuration migration. Отдельный явно разрешённый процесс миграции не удалён. | Настоящий Python workflow выполнен с synthetic HTTP: до исправления обнаружен secure-webhook request, после — только monitor/read-only probes. |
+| A16 | Backup/checkpoint закрывает SQLite handles до rename и проверок повторного checkpoint. | Исходный WinError32 воспроизведён; corrupt-backup test проходит. Windows POSIX-mode assertion остаётся видимой отдельно. |
+
+Дополнительно `.gitignore` исключает WAL/SHM sidecars: медицинское состояние не должно попадать в коммит вместе с изменениями кода.
+
+## Изменения тестовых предпосылок
+
+Существующие тесты не удалены и не отключены. У тестов расписания/врачей добавлена явная уже пройденная медицинская проверка. У relative scenarios прежний небезопасный успех заменён на проверку отсутствия POST и сохранения личности пациента. Учитывается дополнительный model turn перед автоматическим завершением вместо старого preflight. Старые operator-only utilities проверяются в изолированном подготовленном контексте; production new-leads admission не ослаблен.
