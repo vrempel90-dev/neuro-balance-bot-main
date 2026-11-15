@@ -534,14 +534,18 @@ def test_doctor_without_free_slots_offers_real_alternatives(monkeypatch: pytest.
     assert stub.book_calls == []
 
 
-def test_relative_booking_uses_patient_name_not_sender(monkeypatch: pytest.MonkeyPatch) -> None:
-    """"Запиши маму" — the CRM record must carry the patient, not the sender."""
+def test_relative_booking_preserves_patient_identity_but_requires_manual_verification(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sender contact cannot certify a distinct relative's NEW CRM identity."""
     stub = install_crm(monkeypatch, CRMStub())
-    install_openai(
+    client = install_openai(
         monkeypatch,
         [
+            assistant_tool_call("record_patient_facts", {"patient_relation": "мама", "complaint": "болит поясница",
+                                "age": 62, "contraindications_clear": True, "contraindications_note": "противопоказаний нет"}),
             assistant_tool_call("get_available_slots", {"date_from": DATE}),
             assistant_text("Свободно 09:20, 14:00 и 15:40. Какое время удобно маме?"),
+            assistant_tool_call(
+                "record_patient_facts", {"patient_name": "Гульнара Сериковна"}),
             assistant_tool_call(
                 "book_appointment",
                 {
@@ -553,22 +557,26 @@ def test_relative_booking_uses_patient_name_not_sender(monkeypatch: pytest.Monke
                 },
                 call_id="call_book",
             ),
+            assistant_tool_call("escalate_to_operator", {"reason": "Статус родственника в CRM требует проверки"}),
             assistant_text(f"Записала маму на {DATE} в 09:20 🌿"),
         ],
     )
     chat_id = "agent_relative"
     ready_session(chat_id)
 
-    run_turn(chat_id, f"хочу записать маму на {DATE}")
-    run_turn(chat_id, "09:20, её зовут Гульнара Сериковна")
+    run_turn(chat_id, f"хочу записать маму на {DATE}, у неё болит поясница, ей 62, противопоказаний нет")
+    answer = run_turn(chat_id, "09:20, её зовут Гульнара Сериковна")
 
-    assert len(stub.book_calls) == 1
-    payload = stub.book_calls[0]
-    assert payload["patient_name"] == "Гульнара Сериковна"
-    assert payload["phone"] == PHONE, "the sender's phone stays the CRM contact"
-    assert "мама" in payload["notes"]
+    assert stub.book_calls == []
+    rejected = [item for item in client.tool_results() if item.get("error") == "relative_identity_unverified"]
+    assert rejected and rejected[0]["booking_success"] is False
     session = state.get_session(chat_id)
-    assert session["patient_relation"] == "мама"
+    assert session["patient_relation"] == "mother"
+    assert session["patient_name"] == "Гульнара Сериковна"
+    assert session["phone"] == PHONE
+    assert session.get("booking_confirmed") is not True
+    assert session.get("escalated") is True
+    assert "записала маму" not in answer.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -771,7 +779,7 @@ def test_booking_without_a_phone_is_refused_before_crm(monkeypatch: pytest.Monke
 def test_wide_search_stops_early_instead_of_hammering_crm(monkeypatch: pytest.MonkeyPatch) -> None:
     """A 21-day search is 21 sequential CRM calls; it must stop once it has enough."""
     stub = install_crm(monkeypatch, CRMStub())
-    session: dict[str, Any] = {}
+    session = ready_session("agent_wide")
 
     result = asyncio.run(
         agent._tool_get_available_slots(
@@ -860,7 +868,14 @@ def test_rejected_age_is_reported_back_to_the_model() -> None:
     assert result["age_rejected"] == "out_of_plausible_range"
     assert result["age_known"] is False
     assert "age" not in result["stored"]
-    assert "Переспроси возраст" in result["message"]
+    assert result["profile_status"] == "unclear"
+    assert "уточняющий вопрос" in result["message"]
+
+    profiled = agent._tool_record_patient_facts("agent_bad_age", session, {"complaint": "болит поясница"})
+    assert profiled["age_known"] is False
+    assert profiled["profile_status"] == "profile"
+    reply = agent._enforce_profile_gate_reply(session, agent.AgentResult(), "болит поясница", "Сколько Вам лет?")
+    assert reply == "Сколько Вам лет?"
 
     text_result = agent._tool_record_patient_facts("agent_bad_age", session, {"age": "сорок"})
     assert text_result["age_rejected"] == "not_a_number"
@@ -1460,7 +1475,7 @@ def test_all_empty_period_is_bounded_by_request_count(monkeypatch: pytest.Monkey
     monkeypatch.setattr(crm, "check_slots", empty)
 
     result = asyncio.run(
-        agent._tool_get_available_slots("agent_empty_wide", {}, {"date_from": DATE, "days_ahead": 21})
+        agent._tool_get_available_slots("agent_empty_wide", ready_session("agent_empty_wide"), {"date_from": DATE, "days_ahead": 21})
     )
 
     assert result["slot_count"] == 0
@@ -1498,6 +1513,8 @@ def test_first_option_then_name_is_booked_even_if_model_does_not_call_booking(
             # Deliberately NO select_booking_slot/book_appointment call here.
             # The deterministic resolver must persist "Первый" itself.
             assistant_text("Вы выбрали первый вариант. Для оформления записи подскажите, пожалуйста, Ваше имя."),
+            # Consume the current turn before the backend can finish booking.
+            assistant_text("Секунду, оформляю запись."),
         ],
     )
     chat_id = "regression_first_then_name"
@@ -1527,8 +1544,8 @@ def test_first_option_then_name_is_booked_even_if_model_does_not_call_booking(
     assert "вернусь к вам" not in third.lower()
     assert DATE in third
     assert SLOT_TIMES[0] in third
-    # Third turn is completed before another LLM request is needed.
-    assert len(client.calls) == 3
+    # The name turn is checked for current facts/refusal before any CRM POST.
+    assert len(client.calls) == 4
 
 
 def test_vague_wait_reply_becomes_real_operator_handoff(

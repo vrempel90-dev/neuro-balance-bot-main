@@ -375,6 +375,53 @@ def _close_ai_admission_lease(session: dict[str, Any], reason: str) -> None:
     session["ai_admission_closed_reason"] = str(reason or "terminal")
 
 
+def _same_new_lead_identity(phone: str, lookup: dict[str, Any], lead_id: str) -> bool:
+    """Only the same still-NEW card can continue; every phone variant can veto."""
+    raw = lookup.get("raw") if isinstance(lookup.get("raw"), dict) else lookup
+    variants = lookup.get("identity_variants") or [raw]
+    for payload in variants:
+        verdict = admission.classify(phone, payload)
+        if verdict.state != admission.NEW and verdict.reason != "crm_says_not_new":
+            return False
+        if any(payload.get(key) for key in ("patient", "appointment", "activeAppointment",
+                "lastAppointment", "appointments", "records", "items", "hasActiveAppointment")):
+            return False
+        lead = payload.get("lead") or {}
+        if (str(lead.get("id") or "") != lead_id
+                or str(lead.get("status") or "").strip().lower() not in admission.NEW_LEAD_STATUSES):
+            return False
+        if any(payload.get(key) or lead.get(key) for key in (
+                "assignedTo", "assigned_to", "managerId", "operatorId", "staffId",
+                "manualTakeover", "staffTakeover", "closedAt")):
+            return False
+    return True
+
+
+def _can_continue_new_lead(phone: str, lookup: dict[str, Any], session: dict[str, Any]) -> bool:
+    if any(session.get(key) for key in ("ai_admission_closed_at", "manual_takeover",
+            "manual_admin_intervention", "escalated", "booking_confirmed", "ai_muted")):
+        return False
+    if session.get("ai_admission_phone") != phone or not session.get("ai_admission_lead_id"):
+        return False
+    try:
+        started = datetime.fromisoformat(str(session.get("ai_admission_started_at") or ""))
+        age_seconds = (datetime.now(timezone.utc) - started).total_seconds()
+    except (TypeError, ValueError):
+        return False
+    # One night-window funnel, never an indefinitely renewable admission lease.
+    return 0 <= age_seconds <= 12 * 60 * 60 and _same_new_lead_identity(
+        phone, lookup, str(session["ai_admission_lead_id"]))
+
+
+def _record_initial_new_lead(phone: str, lookup: dict[str, Any], session: dict[str, Any]) -> None:
+    raw = lookup.get("raw") if isinstance(lookup.get("raw"), dict) else lookup
+    lead_id = str((raw.get("lead") or {}).get("id") or "")
+    if lead_id and _same_new_lead_identity(phone, lookup, lead_id):
+        session["ai_admission_phone"] = phone
+        session["ai_admission_lead_id"] = lead_id
+        session["ai_admission_started_at"] = datetime.now(timezone.utc).isoformat()
+
+
 async def _classify_lead(chat_id: str, phone: str, session: dict[str, Any]) -> admission.Admission:
     """Спрашивает CRM про пациента и отдаёт классификацию admission.py.
 
@@ -395,9 +442,10 @@ async def _classify_lead(chat_id: str, phone: str, session: dict[str, Any]) -> a
         lookup = None
 
     verdict = admission.classify(normalized, lookup)
-    # The fresh CRM verdict is authoritative on EVERY message. A local
-    # admission timestamp cannot turn an existing or staff-owned lead into a
-    # new patient; genuinely fresh CRM leads already classify as NEW.
+    if verdict.state == admission.NEW and not session.get("ai_admission_started_at"):
+        _record_initial_new_lead(normalized, lookup, session)
+    elif verdict.reason == "crm_says_not_new" and _can_continue_new_lead(normalized, lookup, session):
+        verdict = admission.Admission(state=admission.NEW, reason="verified_initial_new_lead", phone=normalized)
 
     session["crm_patient_state"] = _CRM_PATIENT_STATE[verdict.state]
     session["crm_state_reason"] = verdict.reason
@@ -847,6 +895,11 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
     session["ai_lead_started"] = True
     _activate_ai_admission_lease(session)
     session["gate_reason"] = "new_lead"
+    # Triage before any model/tool execution: finalization alone is too late
+    # because the agent can already have created an appointment.
+    if _has_red_flag(text):
+        _safe_log(chat_id, "red_flag_detected", {"chat_id": chat_id})
+        return await _handoff(chat_id, session, _tr(session, EMERGENCY_103_RU, EMERGENCY_103_KK), "red_flag")
     try:
         result = await agent.run_agent_turn(
             chat_id=chat_id,

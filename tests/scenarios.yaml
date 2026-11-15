@@ -33,10 +33,10 @@ scenarios:
           - tool: record_patient_facts
             args: {age: 34}
           - text: "Спасибо. Нет ли у Вас кардиостимулятора, беременности, онкологии, эпилепсии или металла в зоне лечения?"
-      - user: "нет, ничего такого"
+      - user: "противопоказаний нет"
         model:
           - tool: record_patient_facts
-            args: {contraindications_clear: true, contraindications_note: "нет, ничего такого"}
+            args: {contraindications_clear: true, contraindications_note: "противопоказаний нет"}
           - text: "Хорошо. На какой день Вам удобно прийти?"
       - user: "во вторник, 8 сентября"
         model:
@@ -154,6 +154,8 @@ scenarios:
   - name: "06_reschedule_existing_appointment"
     description: "Просит перенести существующую запись"
     mode: agent
+    # Lower-level staff utility; production dialog still excludes existing patients.
+    session: {complaint: "болит поясница", profile_status: "profile", complaint_gate: "COMPLAINT_OK", age: 34, contraindications_ok: true, contraindications_verdict: "proceed", contraindications_raw: "противопоказаний нет"}
     crm:
       lookup: active
       slots: {"2026-09-10": ["11:00", "16:00"]}
@@ -325,7 +327,7 @@ scenarios:
 
   # 14 ----------------------------------------------------------------------
   - name: "14_booking_for_a_relative"
-    description: "Записывается не на себя, а на родственника"
+    description: "Родственник требует отдельной проверки CRM, факты пациента сохранены"
     crm:
       lookup: new
       slots: {"2026-09-08": ["12:00"]}
@@ -345,10 +347,15 @@ scenarios:
         model:
           - tool: book_appointment
             args: {patient_name: "Гульнара", doctor_login: "zhuma_md", date: "2026-09-08", time_start: "12:00", patient_relation: "мама"}
-          - text: "Готово 🌿 Мама записана на 8 сентября, 12:00."
+          - tool: escalate_to_operator
+            args: {reason: "Статус пациента-родственника отдельно не проверен CRM"}
+          - text: "Для проверки записи мамы подключаю администратора."
     expect:
-      outcome: booked
-      crm_book_calls: 1
+      outcome: escalated
+      no_booking: true
+      crm_book_calls: 0
+      no_crm_calls: ["book"]
+      crm_calls: ["escalate"]
 
   # 15 ----------------------------------------------------------------------
   - name: "15_crm_fails_on_book_appointment"

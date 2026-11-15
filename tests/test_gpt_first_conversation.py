@@ -366,13 +366,19 @@ def test_no_slots_offers_another_period_without_inventing_one(agent_env, monkeyp
         ("муж", "Бауыржан", "пишу за мужа"),
     ],
 )
-def test_booking_for_a_relative_sends_the_patient_not_the_sender(
+def test_booking_for_a_relative_preserves_patient_but_requires_staff_verification(
     agent_env, relation: str, patient_name: str, message: str
 ) -> None:
     calls, monkeypatch = agent_env
-    _script(
+    async def escalate(**kwargs):
+        return {"ok": True}
+    monkeypatch.setattr(crm, "escalate_to_operator", escalate)
+    client = _script(
         monkeypatch,
         [
+            assistant_tool_call("record_patient_facts", {"patient_name": patient_name, "patient_relation": relation,
+                                "complaint": "болит поясница", "age": 34, "contraindications_clear": True,
+                                "contraindications_note": "противопоказаний нет"}),
             assistant_tool_call("get_available_slots", {"date_from": DATE}),
             assistant_tool_call(
                 "book_appointment",
@@ -385,18 +391,23 @@ def test_booking_for_a_relative_sends_the_patient_not_the_sender(
                 },
                 call_id="b1",
             ),
+            assistant_tool_call("escalate_to_operator", {"reason": "Статус родственника в CRM требует проверки"}),
             assistant_text(f"Записала {relation} на {DATE} в 16:40 🌿"),
         ],
     )
     chat_id = f"conv_relative_{relation}"
     _session(chat_id)
 
-    answer = _turn(chat_id, f"{message}, {DATE} в 16:40, зовут {patient_name}")
+    answer = _turn(chat_id, f"{message}, болит поясница, 34 года, противопоказаний нет, {DATE} в 16:40, зовут {patient_name}")
 
-    assert len(calls["book"]) == 1
-    payload = calls["book"][0]
-    assert payload["patient_name"] == patient_name, "the CRM record must carry the patient's name"
-    assert payload["phone"] == PHONE, "the sender's phone stays the contact number"
-    assert relation in payload["notes"]
-    assert state.get_session(chat_id)["patient_relation"] == relation
+    assert calls["book"] == []
+    rejected = [item for item in client.tool_results() if item.get("error") == "relative_identity_unverified"]
+    assert rejected and rejected[0]["booking_success"] is False
+    actual = state.get_session(chat_id)
+    assert actual["patient_name"] == patient_name
+    assert actual["phone"] == PHONE
+    assert actual["patient_relation"] == {"мама": "mother", "сын": "son", "муж": "husband"}[relation]
+    assert actual.get("booking_confirmed") is not True
+    assert actual.get("escalated") is True
+    assert "записала" not in answer.lower()
     assert answer.strip()

@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 import clinic_info
+import services
 import state
 
 COMPLAINT_OK = "COMPLAINT_OK"
@@ -94,6 +95,16 @@ def booking_gate_status(session: dict[str, Any]) -> tuple[bool, str]:
     """Return whether book_appointment may execute, mirroring the old gates."""
     if session.get("complaint_gate") != COMPLAINT_OK or not session.get("complaint"):
         return False, "complaint"
+    if services.classify_by_keywords(str(session["complaint"]))["can_help"] is not True:
+        return False, "complaint"
+    try:
+        age = int(session.get("age") or 0)
+    except (TypeError, ValueError):
+        age = 0
+    if 16 <= age <= 18 and session.get("guardian_accompaniment_confirmed") is not True:
+        return False, "guardian_accompaniment_required"
+    if services.contraindication_evidence(str(session.get("contraindications_raw") or "")) in {"present", "unclear"}:
+        return False, "contra_refuse"
     if session.get("contraindications_verdict") in {CONTRA_REFUSE, "stop"}:
         return False, "contra_refuse"
     if session.get("contraindications_verdict") != CONTRA_PROCEED or session.get("contraindications_ok") is not True:
