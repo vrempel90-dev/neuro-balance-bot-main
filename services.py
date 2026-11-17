@@ -1,82 +1,10 @@
-from __future__ import annotations
-
-PROFILE_KEYWORDS = {
-    "боль в спине": ["спин", "поясниц", "позвоноч", "грыж", "протруз", "остеохонд", "радикул", "ишиас", "защем", "седалищ", "арқа", "белім", "бел ау", "омыртқа", "arkam", "arqam", "belim"],
-    "боль в шее": ["шея", "шейн", "затыл", "онемение рук", "мойын", "желке", "moynym"],
-    "суставы": ["сустав", "колен", "тазобед", "плеч", "локоть", "артроз", "артрит", "буын", "тізе", "иық", "шынтақ", "жамбас", "tizem"],
-    "реабилитация": ["реабилитац", "после операции", "после травм", "травм", "оңалту", "жарақат", "операциядан кейін"],
-    "неврология": ["невролог", "нерв", "головокруж", "онемение", "мурашк", "жүйке", "бас айнал", "ұйып", "ұю"],
-}
-
-IRRELEVANT_KEYWORDS = [
-    "зуб", "стоматолог", "лор", "ухо", "горло", "гинеколог", "беременность", "кожа", "дерматолог",
-    "онколог", "психиатр", "ребенок", "педиатр", "температура 40", "аппендицит", "перелом открытый",
-]
-
-HEEL_NON_PROFILE_KEYWORDS = ["пятк", "пяточ", "шпор", "подошв", "фасциит", "өкше"]
-
-SERVICE_TO_CONTRAINDICATION_HINTS = {
-    "default": [
-        "возраст",
-        "кардиостимулятор или металлические импланты",
-        "беременность",
-        "онкология",
-        "эпилепсия",
-        "тромбозы или кровотечения",
-        "температура / острая инфекция",
-        "тяжёлые сердечно-сосудистые или дыхательные заболевания",
-        "психические расстройства в обострении",
-    ]
-}
-
-
-def classify_by_keywords(text: str) -> dict:
-    low = (text or "").lower()
-    if any(k in low for k in IRRELEVANT_KEYWORDS):
-        return {
-            "can_help": False,
-            "service": "непрофильный запрос",
-            "confidence": 0.75,
-            "reason": "По ключевым словам запрос может быть вне профиля клиники.",
-        }
-    best_service = None
-    best_score = 0
-    for service, keys in PROFILE_KEYWORDS.items():
-        score = sum(1 for k in keys if k in low)
-        if score > best_score:
-            best_service = service
-            best_score = score
-    if best_service:
-        return {
-            "can_help": True,
-            "service": best_service,
-            "confidence": min(0.95, 0.55 + best_score * 0.2),
-            "reason": "Похоже на профиль Neuro Balance: неврология, спина, суставы, реабилитация.",
-        }
-    if any(k in low for k in HEEL_NON_PROFILE_KEYWORDS):
-        return {
-            "can_help": False,
-            "service": "непрофильная жалоба на пятку",
-            "confidence": 0.95,
-            "reason": "Изолированная жалоба на пятку не входит в утверждённый профиль клиники.",
-        }
-    return {
-        "can_help": None,
-        "service": "не определено",
-        "confidence": 0.0,
-        "reason": "Нужен короткий уточняющий вопрос.",
-    }
-
-
-def contraindication_checklist_text(lang: str = "ru") -> str:
-    if lang == "kk":
-        return (
-            "Жазбас бұрын қарсы көрсетілім жоқ екенін растаңызшы🙏🏻\n"
-            "Кардиостимулятор, жүктілік, онкология, емдеу аймағында металл, эпилепсия жоқ па?\n\n"
-            "Егер жоқ болса: «Растаймын» деп жазыңыз. Біреуі бар болса — соны жазыңыз."
-        )
-    return (
-        "Перед записью подтвердите, пожалуйста, что нет противопоказаний🙏🏻\n"
-        "Кардиостимулятор, беременность, онкология, металл в зоне лечения, эпилепсия — ничего из этого нет?\n\n"
-        "Если всё в порядке, напишите: «Подтверждаю». Если что-то есть — укажите это."
-    )
+"""Compatibility exports for the clinic's conservative backend medical rules."""
+from medical_rules import (
+    PROFILE_KEYWORDS,
+    IRRELEVANT_KEYWORDS,
+    HEEL_NON_PROFILE_KEYWORDS,
+    classify_by_keywords,
+    contraindication_checklist_text,
+    contraindication_evidence,
+    normalize_patient_relation,
+)

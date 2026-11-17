@@ -147,7 +147,9 @@ def test_long_agent_answer_reaches_the_patient_unchanged(monkeypatch: pytest.Mon
         [assistant_tool_call("get_available_slots", {"date_from": DATE}), assistant_text(reply)],
     )
     chat_id = "dialog_agent_long"
-    fresh_chat(chat_id)
+    fresh_chat(chat_id, complaint="болит поясница", complaint_gate="COMPLAINT_OK",
+               profile_status="profile", age=34, contraindications_ok=True,
+               contraindications_verdict="proceed", contraindications_raw="противопоказаний нет")
 
     answer = asyncio.run(main._maybe_humanize_answer(chat_id, "хочу записаться", turn(chat_id, "хочу записаться")))
     answer = main._guard_answer(chat_id, answer)
@@ -252,7 +254,9 @@ def test_time_from_a_tool_result_reaches_the_patient(monkeypatch: pytest.MonkeyP
         ],
     )
     chat_id = "dialog_real_time"
-    fresh_chat(chat_id)
+    fresh_chat(chat_id, complaint="болит поясница", complaint_gate="COMPLAINT_OK",
+               profile_status="profile", age=34, contraindications_ok=True,
+               contraindications_verdict="proceed", contraindications_raw="противопоказаний нет")
 
     answer = turn(chat_id, "когда можно прийти?")
 

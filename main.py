@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 
 import state
 import crm
+import media
 from config import get_settings
 from dialog import handle_message
 from guards import GuardDecision, should_auto_reply
@@ -990,7 +991,7 @@ async def _transcribe_voice_message(message: dict[str, Any]) -> str:
     Если она не подходит под формат Wazzup — скачиваем файл и отправляем bytes в Whisper/OpenAI.
     """
     try:
-        transcript = await transcribe_wazzup_voice(message, language="ru")
+        transcript = await transcribe_wazzup_voice(message, language=None)
         text = str(getattr(transcript, "text", "") or "")
         if text.strip():
             return text.strip()
@@ -998,7 +999,7 @@ async def _transcribe_voice_message(message: dict[str, Any]) -> str:
         state.log_event(str(message.get("chat_id") or "voice"), "voice_transcribe_wazzup_error", {"error": str(exc)[:1000]})
 
     data, filename, _content_type = await _download_voice_bytes(message)
-    transcript = await transcribe_bytes(data, filename=filename, language="ru")
+    transcript = await transcribe_bytes(data, filename=filename, language=None)
     return str(getattr(transcript, "text", "") or "").strip()
 
 
@@ -1042,7 +1043,22 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
         _apply_guard_block(decision, chat_id=chat_id, phone=phone, source=source, force=False, kind=kind, text=str(message.get("text") or ""))
         return ""
 
-    if kind == "voice" or _message_has_voice_url(message):
+    if message.get("attachments"):
+        # Never disclose media to an external processor until fresh CRM
+        # admission, time and staff-ownership checks have succeeded.
+        import dialog
+        media_session = _get_session_safe(chat_id)
+        verdict = await dialog._classify_lead(chat_id, phone, media_session)
+        state.save_session(chat_id, media_session)
+        if not verdict.bot_may_reply:
+            return await dialog._mute_lead(chat_id, media_session, phone, verdict.state)
+        user_text = await media.prepare_message(message, language=str(media_session.get("lang") or "ru"))
+        current = _get_session_safe(chat_id)
+        current["media_status"] = message.get("media_status")
+        current["media_errors"] = message.get("media_errors", [])
+        current["current_user_consent_text"] = str(message.get("patient_speech_text") or "")
+        state.save_session(chat_id, current)
+    elif kind == "voice" or _message_has_voice_url(message):
         try:
             transcript_text = await _transcribe_voice_message(message)
             user_text = voice_text_for_bot(transcript_text)
@@ -1054,6 +1070,10 @@ async def _build_answer_for_message(message: dict[str, Any]) -> str:
         user_text = str(message.get("text") or "")
 
     session = _get_session_safe(chat_id)
+    if not message.get("attachments"):
+        session["current_user_consent_text"] = user_text
+        session.pop("media_status", None)
+        session.pop("media_errors", None)
     session["source"] = source
     session["chat_type"] = str(message.get("chat_type") or "").strip().lower()
     session["channel_id"] = str(message.get("channel_id") or "").strip()
@@ -1261,6 +1281,9 @@ def _ignore_voice_message(chat_id: str, message_key: str, source: str) -> None:
 
 
 def _looks_like_outgoing_message(msg: dict[str, Any]) -> bool:
+    # A delivery receipt is not evidence that a human took ownership.
+    if not (msg.get("text") or msg.get("body") or media.extract_attachments(msg)):
+        return False
     return bool(
         msg.get("isEcho") is True
         or msg.get("fromMe") is True
@@ -1296,7 +1319,14 @@ def _looks_like_api_bot_message(msg: dict[str, Any], session: dict[str, Any]) ->
 
 
 def _mark_manual_admin_interventions(payload: dict[str, Any]) -> None:
-    for msg in _raw_wazzup_messages(payload):
+    for msg in (_raw_wazzup_messages(payload) or [_primary_payload_message(payload)]):
+        normalized = _normalize_wazzup_message(payload, msg)
+        configured = get_settings()
+        allowed = {c.strip() for c in configured.wazzup_allowed_channel_ids.split(",") if c.strip()}
+        if not allowed and configured.wazzup_channel_id:
+            allowed = {configured.wazzup_channel_id}
+        if allowed and normalized["channel_id"] not in allowed:
+            continue
         if not _looks_like_outgoing_message(msg):
             continue
         chat_id = str(msg.get("chatId") or msg.get("chat_id") or msg.get("from") or "").strip()
@@ -1387,13 +1417,16 @@ def _normalize_wazzup_message(payload: dict[str, Any], msg: dict[str, Any]) -> d
     phone = str(phone or "").strip()
     if not phone and chat_type in {"whatsapp", "viber"}:
         phone = chat_id
-    identity = str(message_id or json.dumps([message_timestamp, str(text or ""), message_type, direction], ensure_ascii=False))
+    attachments = media.extract_attachments(msg)
+    identity = str(message_id or json.dumps([message_timestamp, str(text or ""), message_type, direction, attachments], ensure_ascii=False, sort_keys=True))
     scoped_key = hashlib.sha256(json.dumps([channel_id, chat_type, chat_id, identity], ensure_ascii=False).encode()).hexdigest()
     return {
         "source": "wazzup",
         "chat_id": chat_id,
         "phone": phone,
         "text": str(text or "").strip(),
+        "attachments": attachments,
+        "kind": attachments[0]["kind"] if attachments else "text",
         "message_id": str(message_id or "").strip(),
         "message_key": scoped_key,
         "message_timestamp": str(message_timestamp or "").strip(),
@@ -1619,10 +1652,6 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
     if channel_id_mismatch_blocks:
         return _finish_silent("channel_id_mismatch")
 
-    if is_audio_message_payload(raw_msg):
-        _ignore_voice_message(chat_id, message["message_id"], "webhook_payload")
-        return _finish_silent("empty_text")
-
     if not message["is_incoming"]:
         # A real staff reply must mute AI for this conversation. Delivery
         # statuses and our own API echoes are excluded by the helper.
@@ -1633,12 +1662,16 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
         state.save_session(chat_id, session)
         return _finish_silent("echo_or_outgoing_message")
 
-    if not message["text"]:
+    if not message["text"] and not message["attachments"]:
         session = _get_session_safe(chat_id)
         session["no_reply_reason"] = "empty_text"
         session["guard_decision"] = GuardDecision(False, "empty_text", False, False, False).to_dict()
         state.save_session(chat_id, session)
-        return _finish_silent("empty_text")
+        result = _finish_silent("empty_text")
+        if is_audio_message_payload(raw_msg) or message["message_type"] in {"image", "photo", "document", "file"}:
+            result["inbox_status"] = "handoff_pending"
+            result["no_reply_reason"] = "media_reference_missing"
+        return result
 
     gate = time_gate_status()
     work_time_now = bool(gate["bot_work_time_now"])
@@ -1713,6 +1746,12 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
 
     if answer and should_send:
         if send_enabled:
+            live_session = _get_session_safe(chat_id)
+            if (not is_bot_work_time() or not get_settings().bot_auto_reply_enabled
+                    or live_session.get("manual_admin_intervention")):
+                reason = "manual_takeover" if live_session.get("manual_admin_intervention") else "outside_work_time"
+                return {"ok": True, "answer": "", "should_send_wazzup": False,
+                        "no_reply_reason": reason, "inbox_status": "handoff_confirmed" if reason == "manual_takeover" else "handoff_pending"}
             outgoing_key = "reply:" + message["message_key"]
             if not state.claim_outgoing_message(outgoing_key, chat_id):
                 return {"ok": True, "ignored": True, "answer": "", "should_send_wazzup": False,
@@ -1727,6 +1766,8 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
                 session_after = _get_session_safe(chat_id)
                 session_after["wazzup_send_called"] = True
                 session_after["last_sent_answer"] = answer
+                import medical_rules
+                medical_rules.mark_checklist_presented(session_after, answer)
                 state.save_session(chat_id, session_after)
                 send_result_payload = {"status_code": send_result.get("status_code"), "response_preview": _preview(send_result, 300), "success": True}
                 state.log_event(chat_id, "wazzup_send_result", send_result_payload)
@@ -1745,7 +1786,15 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
         state.log_event(chat_id, "wazzup_send_start", {"chat_id": chat_id, "channel_id": channel_id_from_payload, "skipped": True, "silent_reason": silent_reason or "empty_text"})
         state.log_event(chat_id, "wazzup_send_result", {"status_code": None, "response_preview": "", "success": False, "skipped": True, "silent_reason": silent_reason or "empty_text"})
     state.log_event(chat_id, "bot_processing_finish", {"phone": phone, "chat_id": chat_id, "should_send_wazzup": bool(answer and should_send and send_enabled), "silent_reason": silent_reason, "send_result": send_result_payload})
-    return {"ok": silent_reason not in {"send_failed", "send_uncertain"}, "ignored": False, "answer": answer, "should_send_wazzup": bool(answer and should_send), "no_reply_reason": silent_reason}
+    result = {"ok": silent_reason not in {"send_failed", "send_uncertain"}, "ignored": False, "answer": answer, "should_send_wazzup": bool(answer and should_send), "no_reply_reason": silent_reason}
+    current = _get_session_safe(chat_id)
+    if silent_reason not in {"send_failed", "send_uncertain"}:
+        if current.get("operator_handoff_confirmed") or current.get("manual_admin_intervention"):
+            result["inbox_status"] = "handoff_confirmed"
+        elif (current.get("operator_handoff_error") or current.get("media_status") == "needs_attention"
+              or silent_reason in {"outside_work_time", "auto_reply_disabled", "working_hours_ai_disabled", "bot_auto_reply_disabled", "crm_lookup_failed"}):
+            result["inbox_status"] = "handoff_pending"
+    return result
 
 
 async def _process_wazzup_message(
@@ -1784,6 +1833,7 @@ async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) 
 
     _LAST_WAZZUP_WEBHOOK_PAYLOAD = payload
     _LAST_WAZZUP_PARSE_META = dict(parse_meta)
+    _mark_manual_admin_interventions(payload)
     raw_messages = _raw_wazzup_messages(payload) or [_primary_payload_message(payload)]
     results = []
     processed_count = 0
@@ -1817,6 +1867,9 @@ async def _dispatch_wazzup_webhook(request: Request) -> dict[str, Any]:
     if not parse_meta.get("ok"):
         _log_ignored_wazzup_webhook(request, parse_meta)
         return {"ok": True, "ignored": True, "reason": parse_meta.get("reason")}
+    # Authentication has run in middleware. Staff ownership must be durable
+    # immediately, even when the conversation FIFO is quarantined.
+    _mark_manual_admin_interventions(payload)
     raw_messages = _raw_wazzup_messages(payload) or [_primary_payload_message(payload)]
     if len(raw_messages) > 100:
         raise HTTPException(status_code=413, detail="Too many webhook messages")

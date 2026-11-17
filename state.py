@@ -417,7 +417,13 @@ def save_session(chat_id: str, data: dict[str, Any]) -> None:
                 previous = json.loads(row["data_json"])
             except Exception:
                 previous = {}
-            if previous.get("contraindications_ok") is True and cleaned.get("contraindications_ok") is not True:
+            # A concurrent AI turn must not erase authenticated staff ownership.
+            # Explicit reset_session advances patient_context_version.
+            if (previous.get("manual_admin_intervention") is True
+                    and previous.get("patient_context_version", 0) == cleaned.get("patient_context_version", 0)):
+                cleaned.update(manual_admin_intervention=True, manual_takeover=True, ai_muted=True)
+            same_patient = previous.get("patient_context_version", 0) == cleaned.get("patient_context_version", 0)
+            if same_patient and previous.get("contraindications_ok") is True and cleaned.get("contraindications_ok") is not True:
                 verdict = str(cleaned.get("contraindications_verdict") or "")
                 # contraindications_ok=True is sticky unless the patient explicitly reports a real contraindication.
                 if verdict not in {"stop", "refuse", "admin_contact", "need_details"}:
@@ -429,7 +435,7 @@ def save_session(chat_id: str, data: dict[str, Any]) -> None:
             same_preferred_date = (previous.get("preferred_date") or "") == (cleaned.get("preferred_date") or "")
             booking_not_selected = not (cleaned.get("selected_time") or cleaned.get("selected_slot") or cleaned.get("booked"))
             still_choosing_time = str(cleaned.get("step") or previous.get("step") or "") in {"time", "select_slot"}
-            if previous_slots and not current_slots and same_preferred_date and booking_not_selected and still_choosing_time and not cleaned.get("manual_takeover") and not cleaned.get("escalated"):
+            if same_patient and previous_slots and not current_slots and same_preferred_date and booking_not_selected and still_choosing_time and not cleaned.get("manual_takeover") and not cleaned.get("escalated"):
                 cleaned["last_slots"] = previous_slots
                 cleaned["last_slots_preserved_reason"] = "prevent_lost_slots_between_messages"
         conn.execute(
@@ -442,7 +448,9 @@ def save_session(chat_id: str, data: dict[str, Any]) -> None:
 
 
 def reset_session(chat_id: str) -> None:
-    save_session(chat_id, deepcopy(DEFAULT_SESSION))
+    replacement = deepcopy(DEFAULT_SESSION)
+    replacement["patient_context_version"] = int(get_session(chat_id).get("patient_context_version") or 0) + 1
+    save_session(chat_id, replacement)
 
 
 def count_events_since(event_type: str, since_iso: str) -> int:
@@ -534,6 +542,35 @@ def claim_booking(claim_key: str, chat_id: str) -> bool:
     init_db()
     with _connect() as conn:
         conn.execute(_BOOKING_CLAIMS_DDL)
+        if claim_key.startswith(("patient:", "slot:")):
+            # Upgrade safety: the previous release recorded canonical
+            # date|time|doctor|phone claims but no patient-wide reservation.
+            # Check and insert atomically; do not erase or release old evidence.
+            conn.execute("BEGIN IMMEDIATE")
+            identity = claim_key.partition(":")[2]
+            if claim_key.startswith("patient:"):
+                fragment = "|" + identity
+                predicate = "substr(claim_key,-?)=?"
+            else:
+                fragment = identity + "|"
+                predicate = "substr(claim_key,1,?)=?"
+            legacy = conn.execute(
+                "SELECT claim_key,chat_id,status,created_at FROM booking_claims WHERE " + predicate +
+                " AND claim_key NOT LIKE 'slot:%' "
+                "AND length(claim_key)-length(replace(claim_key,'|',''))=3 "
+                "AND status IN ('pending','uncertain','confirmed')",
+                (len(fragment), fragment),
+            ).fetchall()
+            for row in legacy:
+                slot_identity, legacy_phone = row["claim_key"].rsplit("|", 1)
+                status = "confirmed" if row["status"] == "confirmed" else "uncertain"
+                for protected in ("slot:" + slot_identity, "patient:" + legacy_phone):
+                    conn.execute(
+                        "INSERT OR IGNORE INTO booking_claims(claim_key,chat_id,status,created_at) VALUES (?,?,?,?)",
+                        (protected, row["chat_id"], status, row["created_at"]),
+                    )
+            if legacy:
+                return False
         cur = conn.execute(
             "INSERT OR IGNORE INTO booking_claims(claim_key, chat_id, status, created_at) VALUES (?, ?, ?, ?)",
             (claim_key, chat_id, "pending", now_iso()),

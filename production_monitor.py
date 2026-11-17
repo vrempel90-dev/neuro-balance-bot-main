@@ -199,6 +199,9 @@ def status_snapshot(*, worker: Any = None) -> dict[str, Any]:
         if counts.get("uncertain", 0) or counts.get("failed", 0):
             result["ok"] = False
             result["attention_required"] = "inbox_failed_or_uncertain"
+        if counts.get("handoff_pending", 0):
+            result["ok"] = False
+            result["attention_required"] = "inbox_handoff_pending"
         if result["inbox"].get("oldest_pending_seconds", 0) > 180 and not result["inbox"].get("pending_blocked_by_uncertain", 0):
             result["ok"] = False
             result["attention_required"] = "inbox_pending_over_180_seconds"

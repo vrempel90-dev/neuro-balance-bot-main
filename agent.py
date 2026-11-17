@@ -33,6 +33,7 @@ existing functions in ``crm.py``.
 from __future__ import annotations
 
 import json
+import medical_rules
 import re
 import time
 from dataclasses import dataclass, field
@@ -284,6 +285,7 @@ _SIMPLE_NAME_STOPWORDS = {
     "пятый", "шестой", "сегодня", "завтра", "утром", "вечером", "обед", "адрес",
     "цена", "стоимость", "сколько", "когда", "где", "мама", "папа", "сын", "дочь",
     "бірінші", "екінші", "үшінші", "төртінші", "бесінші", "иә", "жоқ", "рахмет",
+    "стоп", "пока", "позже", "отмена", "подождите", "тоқта", "кейін", "сау",
 }
 
 
@@ -460,7 +462,11 @@ def _resolve_explicit_slot_choice(session: dict[str, Any], user_text: str) -> di
     if chosen is None:
         time_matches = re.findall(r"(?<!\d)([01]?\d|2[0-3])[:.]([0-5]\d)(?!\d)", low)
         wanted_times = {f"{int(hour):02d}:{minute}" for hour, minute in time_matches}
-        if len(wanted_times) == 1:
+        affirmative = bool(re.fullmatch(
+            r"(?:да[, ]+)?(?:(?:давайте|выбираю|запишите|мне удобно|хочу|можно|келемін|таңдаймын)\s+)?(?:(?:в|на)\s+)?(?:[01]?\d|2[0-3])[:.]([0-5]\d)(?:-ге|-ке)?(?:\s+(?:подходит|удобно|пожалуйста|жазыңыз|ыңғайлы))?[.!]*",
+            low,
+        ))
+        if len(wanted_times) == 1 and affirmative:
             wanted = next(iter(wanted_times))
             matches = [slot for slot in slots if slot["time_start"] == wanted]
             if len(matches) == 1:
@@ -815,8 +821,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "description": (
                 "Сохранить факты, которые сообщил пациент: жалобу, возраст, "
                 "отсутствие противопоказаний, имя, за кого запись. Жалоба сначала "
-                "проверяется backend по утверждённому профилю клиники. Возраст и "
-                "следующие шаги разрешены только если profile_status=profile. "
+                "проверяется backend по утверждённому профилю клиники. Сохраняй все "
+                "сообщённые факты сразу, но следующие шаги разрешены только если profile_status=profile. "
                 "Неизвестная или непрофильная жалоба не может автоматически "
                 "продолжить воронку записи."
             ),
@@ -834,6 +840,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "description": "Дословно то, что пациент сказал про противопоказания.",
                     },
                     "patient_name": {"type": "string", "description": "Имя ПАЦИЕНТА."},
+                    "guardian_accompaniment_confirmed": {
+                        "type": "boolean",
+                        "description": "Для пациента 16–18 лет включительно: true только при явном подтверждении сопровождения родителя/законного представителя.",
+                    },
+                    "preferred_date_text": {"type": "string", "description": "Уже названный пациентом день, без повторного вопроса."},
+                    "time_preference": {"type": "string", "description": "Уже названное пожелание по времени."},
                     "patient_relation": {
                         "type": "string",
                         "description": "Кем пациент приходится отправителю (мама, сын, муж...). Пусто, если пациент — сам отправитель.",
@@ -932,7 +944,10 @@ pending_doctor_time_preference, если день и время уже изве�
 сохранены в selected_doctor_login/selected_date/selected_time.
 
 ВОЗРАСТ ОБЯЗАТЕЛЕН: без сохранённого возраста запись невозможна. Автоматическая
-запись допустима с 16 до 75 лет включительно. Если пациенту 15 лет и меньше
+запись допустима с 16 до 75 лет включительно; с 16 до 18 лет включительно
+только с подтверждённым сопровождением родителя/законного представителя.
+Сохрани guardian_accompaniment_confirmed через record_patient_facts.
+Если пациенту 15 лет и меньше
 либо 76 лет и старше — не записывай, вызови escalate_to_operator и спокойно
 объясни пациенту.
 
@@ -956,7 +971,7 @@ pending_doctor_time_preference, если день и время уже изве�
    консультацию не предлагай, предоплату за такую запись не запрашивай.
 
 ПОРЯДОК ЗАПИСИ (медицинская безопасность, соблюдай его):
-жалоба → возраст → противопоказания → дата → реальные слоты CRM → выбор
+жалоба → подтверждение profile → возраст → противопоказания → дата → реальные слоты CRM → выбор
 времени → select_booking_slot → имя пациента → book_appointment.
 Если пациент выбрал «первый/второй/третий» или конкретное время из только что
 показанных CRM-вариантов, зафиксируй выбор через select_booking_slot и НЕ
@@ -970,25 +985,18 @@ pending_doctor_time_preference, если день и время уже изве�
 «я не себе»). Тогда жалоба, возраст, противопоказания и имя относятся к
 ПАЦИЕНТУ, а не к отправителю. В book_appointment передавай имя пациента и
 заполняй patient_relation.
+Сохраняй patient_relation сразу вместе с остальными фактами. При смене пациента
+backend сбрасывает предыдущие медицинские данные; не переноси их из истории.
+Текущий CRM-контракт проверяет телефон отправителя, а не отдельную личность
+родственника. Для родственника автоматическая запись запрещена до ручной
+проверки статуса пациента: объясни ограничение и вызови escalate_to_operator.
 
-ПЕРЕНОС И ОТМЕНА СУЩЕСТВУЮЩЕЙ ЗАПИСИ:
-Если пациент пишет про уже существующую запись («перенесите», «отмените»,
-«не смогу прийти», «когда я записан»), это НЕ новая анкета: жалобу, возраст и
-противопоказания заново не спрашивай.
-1. НАЙТИ ЗАПИСЬ. Всегда начинай с find_my_appointment. Дату, время, врача и
-   appointment_id бери только из его результата.
-2. ПЕРЕНЕСТИ. После find_my_appointment вызови get_available_slots на нужный
-   день (с doctor_login врача из записи), предложи пациенту только реальные
-   окошки и дождись, пока он выберет конкретное. Затем reschedule_appointment
-   с appointment_id из find_my_appointment и датой/временем выбранного слота.
-   Пока reschedule_success не true — нельзя писать, что запись перенесена.
-3. ОТМЕНИТЬ. cancel_appointment с appointment_id из find_my_appointment и
-   короткой причиной словами пациента. Пока cancel_success не true — нельзя
-   писать, что запись отменена.
-Если find_my_appointment не нашёл активной записи — спокойно скажи об этом и
-вызови escalate_to_operator. Придумывать запись, её дату, время или
-appointment_id запрещено.
-
+ПЕРЕНОС И ОТМЕНА СУЩЕСТВУЮЩЕЙ ЗАПИСИ (ТОЛЬКО ОПЕРАТОР):
+Действует первичное правило «только новые лиды». Существующие пациенты и
+подтверждённые записи остаются за контакт-центром. Наличие низкоуровневого
+инструмента не разрешает его использовать для обхода допуска. Не начинай
+самостоятельный перенос/отмену, используй escalate_to_operator.
+Справочное описание низкоуровневых контрактов для проверки данных:
 Дополнительные обязательные правила обработки обращений:
 1. ГОРОД ПАЦИЕНТА. Если пациент сообщил, что он из другого города (например, Костанай, Караганда), до следующего вопроса обязательно вызови get_clinic_info с topic="other_city", сообщи, что клиника находится в Астане, и уточни, сможет ли человек приехать. Даже при наличии профильной жалобы не игнорируй названный город.
 2. ПОДТВЕРЖДЕНИЕ ПЕРЕДАЧИ. Фразы «передадим запрос», «администратор свяжется», «Ваш вопрос передан» допустимы только ПОСЛЕ успешного результата escalate_to_operator с подтверждением доставки. Если результат delivered=false или инструмент не вызывался, честно сообщи, что передачу подтвердить нельзя, и предложи пациенту связаться с клиникой самостоятельно. Это относится в том числе к возвратам и претензиям.
@@ -1177,6 +1185,8 @@ def build_agent_context(*, session: dict[str, Any], phone: str, today: date_cls 
         "booking_state": {
             "step": session.get("step") or "start",
             "contraindications_confirmed_clear": session.get("contraindications_ok") is True,
+            "guardian_accompaniment_confirmed": session.get("guardian_accompaniment_confirmed") is True,
+            "preferred_date_text": session.get("preferred_date_text") or "",
             "preferred_date": session.get("preferred_date") or "",
             "time_preference": _clip(session.get("time_preference"), "time_preference"),
             "selected_doctor_login": session.get("selected_doctor_login") or "",
@@ -1285,9 +1295,34 @@ def _filter_by_time_preference(slots: list[dict[str, str]], preference: str) -> 
     return slots
 
 
+def _medical_gate_error(session: dict[str, Any]) -> str:
+    if not medical_rules.approved_rules_version():
+        return "medical_rules_unavailable"
+    if not session.get("age"):
+        return "missing_age"
+    age = session.get("age")
+    if isinstance(age, bool) or not str(age).strip().isdigit() or not 0 < int(age) < 130:
+        return "missing_age"
+    age_block = _age_block_reason(age)
+    if age_block:
+        return "age_" + age_block
+    allowed, reason = bot_tools.booking_gate_status(session)
+    if not allowed:
+        return reason
+    if not medical_rules.checklist_was_presented(session):
+        return "contraindications_checklist_not_presented"
+    if not medical_rules.clearance_is_current(session):
+        return "contraindications_confirmation_required"
+    return ""
+
+
 async def _tool_get_available_slots(
     chat_id: str, session: dict[str, Any], args: dict[str, Any]
 ) -> dict[str, Any]:
+    gate_error = _medical_gate_error(session)
+    if gate_error:
+        return {"ok": False, "error": gate_error, "slots": [],
+                "message": "Сначала пройди профиль, возраст, сопровождение 16–18 лет и противопоказания. Не предлагай время до допуска."}
     start = _parse_iso_date(args.get("date_from"))
     if start is None:
         return {
@@ -1659,6 +1694,22 @@ async def _tool_book_appointment(
     date = str(args.get("date") or "").strip()[:10]
     time_start = str(args.get("time_start") or "").strip()[:5]
     relation = str(args.get("patient_relation") or "").strip()
+    relation = services.normalize_patient_relation(relation)
+    stored_relation = services.normalize_patient_relation(str(session.get("patient_relation") or ""))
+    if stored_relation or relation:
+        return {"ok": False, "booking_success": False, "error": "relative_identity_unverified",
+                "message": "Статус пациента-родственника отдельно не проверен CRM. Не используй статус отправителя; вызови escalate_to_operator для проверки."}
+    if session.get("booking_write_blocked_this_turn"):
+        return {"ok": False, "booking_success": False, "error": "current_turn_requires_clarification",
+                "message": "Текущее сообщение содержит отказ, вопрос или медицинское исправление. Не создавай запись без уточнения."}
+    if session.get("booking_uncertain"):
+        return {"ok": False, "booking_success": False, "error": "booking_already_in_progress",
+                "message": "Результат предыдущей записи неизвестен. Любая новая запись, включая другое время, запрещена до проверки сотрудником."}
+    age_value = session.get("age")
+    age_number = int(age_value) if not isinstance(age_value, bool) and str(age_value).isdigit() else 0
+    if 16 <= age_number <= 18 and session.get("guardian_accompaniment_confirmed") is not True:
+        return {"ok": False, "booking_success": False, "error": "guardian_accompaniment_required",
+                "message": "Нужно явное подтверждение сопровождения родителем/законным представителем."}
     preferred = str(session.get("preferred_doctor_login") or "")
     if len(session.get("doctor_options") or []) > 1 and not preferred:
         return {"ok": False, "booking_success": False, "error": "doctor_not_selected",
@@ -1750,7 +1801,7 @@ async def _tool_book_appointment(
 
     # --- medical safety gates stay deterministic ---
     if session.get("complaint") and not session.get("complaint_gate"):
-        bot_tools.record_chief_complaint(session, str(session.get("complaint") or ""), is_in_profile=True)
+        _tool_record_patient_facts(chat_id, session, {"complaint": str(session["complaint"])})
     if session.get("contraindications_ok") is True and not session.get("contraindications_verdict"):
         bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, str(session.get("contraindications_raw") or "нет"))
     age_block = _age_block_reason(session.get("age"))
@@ -1765,7 +1816,7 @@ async def _tool_book_appointment(
                 "Запись невозможна — вызови escalate_to_operator и объясни это пациенту."
             ),
         }
-    if not session.get("age"):
+    if _medical_gate_error(session) == "missing_age":
         _log(chat_id, "agent_booking_blocked_missing_age", {})
         return {
             "ok": False,
@@ -1778,6 +1829,9 @@ async def _tool_book_appointment(
         }
 
     gate_ok, gate_reason = bot_tools.booking_gate_status(session)
+    if gate_ok:
+        gate_reason = _medical_gate_error(session)
+        gate_ok = not gate_reason
     if not gate_ok:
         _log(chat_id, "agent_booking_blocked_by_gate", {"gate_reason": gate_reason})
         return {
@@ -1808,6 +1862,14 @@ async def _tool_book_appointment(
     # Atomically reserve BOTH the clinician's slot across all patients and
     # this patient's idempotent operation. Phone-only claims allow two clients
     # to race for one doctor/time when the CRM's own atomicity is unknown.
+    patient_claim_key = "patient:" + normalized_phone
+    try:
+        patient_acquired = state is not None and state.claim_booking(patient_claim_key, str(chat_id or ""))
+    except Exception:
+        patient_acquired = False
+    if not patient_acquired:
+        return {"ok": False, "booking_success": False, "error": "booking_already_in_progress",
+                "message": "Для пациента уже выполнялась запись с подтверждённым либо неизвестным результатом. Не повторяй POST, нужна ручная сверка."}
     global_slot_key = "slot:" + _slot_key(date, time_start, doctor_login)
     global_acquired = False
     claim_acquired = False
@@ -1830,6 +1892,12 @@ async def _tool_book_appointment(
                     pass
             claim_acquired = False
     if not global_acquired or not claim_acquired:
+        # We have not called CRM. Release only this operation's patient claim
+        # when another patient's global slot reservation stopped it.
+        if not global_acquired and state is not None:
+            state.release_booking_claim(patient_claim_key)
+        elif state is not None:
+            state.mark_booking_claim(patient_claim_key, "uncertain")
         same_patient_pending = False
         if state is not None:
             try:
@@ -2052,6 +2120,7 @@ def _settle_booking_claim(chat_id: str, claim_key: str, *, rejected: bool, confi
     # operational keys without that shape retain their existing contract.
     if str(claim_key).count("|") == 3 and not str(claim_key).startswith("slot:"):
         keys.append("slot:" + str(claim_key).rsplit("|", 1)[0])
+        keys.append("patient:" + str(claim_key).rsplit("|", 1)[1])
     for key in keys:
         try:
             if confirmed:
@@ -2572,156 +2641,135 @@ async def _tool_cancel_appointment(
     }
 
 
+def _reset_patient_context(session: dict[str, Any]) -> None:
+    """Keep transport/admission/uncertain operations; discard a different patient's facts."""
+    keys = {
+        "contraindication_presentation", "contraindication_clearance",
+        "complaint", "profile_status", "complaint_gate", "irrelevant", "age",
+        "patient_name", "patient_relation", "known_user_facts",
+        "guardian_accompaniment_confirmed", "preferred_date", "preferred_date_text",
+        "time_preference", "last_slots", "last_presented_slots", "crm_offered_slots",
+        "doctor_options", "preferred_doctor_login", "preferred_doctor_name",
+        "pending_doctor_date_from", "pending_doctor_time_preference",
+    }
+    for key in list(session):
+        if key in keys or key.startswith("contraindications_") or key.startswith("selected_"):
+            session.pop(key, None)
+    session["patient_context_version"] = int(session.get("patient_context_version") or 0) + 1
+    session["step"] = "complaint"
+
+
+def _guardian_evidence(text: str, previous_question: str = "") -> bool | None:
+    low = str(text).lower().replace("ё", "е").strip(" .!")
+    if re.search(r"без\s+(?:родител|мам|пап|сопровожд)|(?:приду|приеду|буду)\s+од(?:ин|на)|жалғыз|өзім ғана", low):
+        return False
+    if re.search(r"(?:с|со)\s+(?:мамой|папой|родител\w*|законным представителем)|анаммен|әкеммен|ата-анаммен|заңды өкіліммен", low):
+        return True
+    if low in {"да", "подтверждаю", "иә", "ия", "растаймын"} and re.search(r"родител|сопровожд|ата-ана|заңды", previous_question.lower()):
+        return True
+    return None
+
+
 def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
-    """Persist what the patient told GPT into the structured session state.
-
-    Without this the GPT-first path had the complaint/age/contraindication
-    answers only as chat history, so ``booking_gate_status`` saw an empty
-    session and the deterministic age limits had nothing to check. Facts that
-    gate a booking must live in state, not only in the transcript.
-    """
+    """Store all supplied patient facts; storage never grants permission to book."""
     stored: list[str] = []
-
-    complaint = str(args.get("complaint") or "").strip()
-    profile_status = str(session.get("profile_status") or "").strip()
-    profile_reason = ""
-    if complaint:
-        classification = services.classify_by_keywords(complaint)
-        can_help = classification.get("can_help")
-        profile_reason = str(classification.get("reason") or "")
-        session["complaint"] = complaint
-        if can_help is True:
-            bot_tools.record_chief_complaint(session, complaint, is_in_profile=True)
-            session.pop("irrelevant", None)
-            profile_status = "profile"
-        elif can_help is False:
-            bot_tools.record_chief_complaint(session, complaint, is_in_profile=False)
-            bot_tools.mark_irrelevant(session, "non_profile_complaint")
-            profile_status = "non_profile"
-        else:
-            session["profile_status"] = "unclear"
-            session["complaint_gate"] = "PROFILE_UNCLEAR"
-            bot_tools.mark_tool(
-                session,
-                "record_chief_complaint",
-                complaint=complaint,
-                is_in_profile=None,
-            )
-            profile_status = "unclear"
-        stored.append("complaint")
-
-    profile_allows_booking = profile_status == "profile"
-
-    age_value = args.get("age")
-    age: int | None = None
-    age_rejected = ""
-    if age_value is not None:
-        try:
-            age = int(age_value)
-        except (TypeError, ValueError):
-            age = None
-            age_rejected = "not_a_number"
-    if age is not None:
-        if not (0 < age < 130):
-            age_rejected = "out_of_plausible_range"
-        elif not profile_allows_booking:
-            age_rejected = "profile_not_approved"
-        else:
-            session["age"] = age
-            stored.append("age")
-    if age_rejected:
-        # Drop whatever age was stored before. Keeping it would report
-        # ``age_known: true`` for a value the patient just contradicted, and the
-        # deterministic medical gate would then clear a booking on the previous
-        # patient's age — the exact case of "запиши маму" after the son gave 40.
-        session.pop("age", None)
-
-    note = str(args.get("contraindications_note") or "").strip()
-    if not profile_allows_booking:
-        pass
-    elif args.get("contraindications_clear") is True:
-        session["contraindications_raw"] = note or str(session.get("contraindications_raw") or "нет")
-        bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, session["contraindications_raw"])
-        stored.append("contraindications_clear")
-    elif args.get("contraindications_clear") is False:
-        session["contraindications_ok"] = False
-        session["contraindications_verdict"] = "need_details"
-        if note:
-            session["contraindications_raw"] = note
-        stored.append("contraindications_present")
-
-    patient_name = str(args.get("patient_name") or "").strip()
-    if patient_name:
-        session["patient_name"] = patient_name
-        stored.append("patient_name")
-
-    relation = str(args.get("patient_relation") or "").strip()
-    if relation:
+    if "patient_relation" in args:
+        relation = services.normalize_patient_relation(str(args.get("patient_relation") or ""))
+        previous = services.normalize_patient_relation(str(session.get("patient_relation") or ""))
+        if relation != previous:
+            _reset_patient_context(session)
         session["patient_relation"] = relation
         stored.append("patient_relation")
 
-    facts = session.get("known_user_facts") if isinstance(session.get("known_user_facts"), dict) else {}
-    for key in ("complaint", "age", "patient_name", "patient_relation"):
-        if session.get(key):
-            facts[key] = session.get(key)
+    complaint = str(args.get("complaint") or "").strip()
+    source_scope = services.classify_by_keywords(str(session.get("last_user_text") or ""))
+    if source_scope["can_help"] is False or source_scope["service"] == "смешанные жалобы":
+        # An extracted shorthand must not erase an explicitly excluded part.
+        complaint = str(session.get("last_user_text") or "")
+    profile_status = str(session.get("profile_status") or "unclear")
+    profile_reason = ""
+    if complaint:
+        classification = services.classify_by_keywords(complaint)
+        profile_status = classification["profile_status"]
+        profile_reason = classification["reason"]
+        session["complaint"] = complaint
+        session["profile_status"] = profile_status
+        session["complaint_gate"] = {"profile": bot_tools.COMPLAINT_OK, "non_profile": "NON_PROFILE", "unclear": "PROFILE_UNCLEAR"}[profile_status]
+        session["irrelevant"] = profile_status == "non_profile"
+        bot_tools.mark_tool(session, "record_chief_complaint", complaint=complaint, is_in_profile=classification["can_help"])
+        stored.append("complaint")
+
+    age_rejected = ""
+    if args.get("age") is not None:
+        value = args["age"]
+        # bool/float are not a patient's integer age; int(16.9) must not admit a minor.
+        if isinstance(value, bool) or not str(value).strip().isdigit():
+            age_rejected = "not_a_number"
+        elif not 0 < int(value) < 130:
+            age_rejected = "out_of_plausible_range"
+        else:
+            session["age"] = int(value)
+            stored.append("age")
+        if age_rejected:
+            session.pop("age", None)
+
+    consent_text = str(session.get("current_user_consent_text", session.get("last_user_text")) or "")
+    guardian_evidence = _guardian_evidence(consent_text, str(session.get("last_assistant_answer") or ""))
+    if guardian_evidence is False or args.get("guardian_accompaniment_confirmed") is False:
+        session["guardian_accompaniment_confirmed"] = False
+        stored.append("guardian_accompaniment_confirmed")
+    elif args.get("guardian_accompaniment_confirmed") is True and guardian_evidence is True:
+        session["guardian_accompaniment_confirmed"] = True
+        stored.append("guardian_accompaniment_confirmed")
+
+    note = str(args.get("contraindications_note") or "").strip()
+    source = consent_text
+    evidence = services.contraindication_evidence(note or source)
+    # The original current message wins over a contradictory extraction.
+    if services.contraindication_evidence(source) in {"present", "unclear"}:
+        evidence = services.contraindication_evidence(source)
+    if services.contraindication_evidence(complaint) in {"present", "unclear"}:
+        evidence = services.contraindication_evidence(complaint)
+    if evidence in {"present", "unclear"} or args.get("contraindications_clear") is False:
+        session.pop("contraindication_clearance", None)
+        bot_tools.verify_contraindications(session, "need_details", note or source)
+        stored.append("contraindications_present")
+    elif args.get("contraindications_clear") is True and evidence == "clear" and medical_rules.mark_clearance(session, source):
+        session["contraindications_raw"] = note or source or "нет"
+        bot_tools.verify_contraindications(session, bot_tools.CONTRA_PROCEED, session["contraindications_raw"])
+        stored.append("contraindications_clear")
+
+    for key in ("patient_name", "preferred_date_text", "time_preference"):
+        value = str(args.get(key) or "").strip()
+        if value:
+            session[key] = value
+            stored.append(key)
+    facts = dict(session.get("known_user_facts") or {})
+    for key in ("complaint", "age", "patient_name", "patient_relation", "guardian_accompaniment_confirmed", "preferred_date_text", "time_preference"):
+        if key in session:
+            facts[key] = session[key]
     if age_rejected:
-        # The context sent to GPT is built from these facts, so a stale entry
-        # here would keep telling the model the age is already known and it
-        # would never re-ask.
         facts.pop("age", None)
     session["known_user_facts"] = facts
-
-    # Report the age verdict back so the model can escalate instead of trying
-    # to book a patient the clinic cannot treat.
     age_block = _age_block_reason(session.get("age"))
-
-    _log(
-        chat_id,
-        "agent_facts_recorded",
-        {
-            "stored": stored,
-            "has_age": bool(session.get("age")),
-            "age_block": age_block,
-            "age_rejected": age_rejected,
-        },
-    )
-
     if profile_status == "non_profile":
-        message = (
-            "Жалоба не относится к утверждённому профилю Neuro Balance. "
-            "Останови воронку записи: не спрашивай возраст, противопоказания, день "
-            "и не предлагай свободное время."
-        )
-    elif profile_status == "unclear":
-        message = (
-            "Профиль жалобы не подтверждён. Задай один конкретный уточняющий вопрос "
-            "о жалобе. До подтверждения profile не спрашивай возраст, противопоказания "
-            "или день и не предлагай запись."
-        )
+        message = "Жалоба непрофильная: не спрашивай возраст, противопоказания или день; не предлагай запись. Уже сообщённые факты сохранены."
+    elif profile_status != "profile":
+        message = "Профиль не подтверждён: задай один конкретный уточняющий вопрос о жалобе. Не спрашивай возраст, противопоказания или день до profile. Уже сообщённые факты сохранены."
     elif age_block:
-        message = (
-            f"Возраст пациента вне правил клиники ({MIN_PATIENT_AGE}–{MAX_PATIENT_AGE} лет включительно). "
-            "Записывать нельзя — вызови escalate_to_operator."
-        )
-    elif age_rejected and age_rejected != "profile_not_approved":
-        message = (
-            "Возраст не сохранён: значение не похоже на возраст. "
-            "Переспроси возраст пациента числом полных лет."
-        )
+        message = "Возраст вне правил автоматической записи. Вызови escalate_to_operator."
+    elif session.get("patient_relation"):
+        message = "Факты пациента сохранены. CRM проверяет отправителя, статус родственника не подтверждён. Автоматическую запись не создавай; нужна проверка сотрудником."
+    elif 16 <= int(session.get("age") or 0) <= 18 and session.get("guardian_accompaniment_confirmed") is not True:
+        message = "Для 16–18 лет обязательно уточни сопровождение родителя/законного представителя до предложения времени."
     else:
-        message = "Факты сохранены. profile_status=profile."
-
-    return {
-        "ok": profile_status == "profile" and not bool(age_rejected),
-        "stored": stored,
-        "profile_status": profile_status or "unclear",
-        "profile_reason": profile_reason,
-        "booking_gate": dict(zip(("allowed", "reason"), bot_tools.booking_gate_status(session))),
-        "age_outside_clinic_limits": bool(age_block),
-        "age_rejected": age_rejected,
-        "age_known": session.get("age") is not None and bool(session.get("age")),
-        "message": message,
-    }
+        message = "Факты сохранены; соблюдай недостающие обязательные шаги."
+    _log(chat_id, "agent_facts_recorded", {"stored": stored, "has_age": bool(session.get("age")), "age_block": age_block, "age_rejected": age_rejected})
+    return {"ok": profile_status == "profile" and not bool(age_rejected), "stored": stored,
+            "profile_status": profile_status, "profile_reason": profile_reason,
+            "booking_gate": dict(zip(("allowed", "reason"), bot_tools.booking_gate_status(session))),
+            "age_outside_clinic_limits": bool(age_block), "age_rejected": age_rejected,
+            "age_known": bool(session.get("age")), "message": message}
 
 
 def _age_block_reason(age: Any) -> str:
@@ -2918,6 +2966,19 @@ async def run_agent_turn(
         _log(chat_id, "agent_skipped", {"reason": skip_reason, "step": session.get("step") or "start"})
         return AgentResult(used=False, skip_reason=skip_reason)
 
+    session["last_user_text"] = str(user_text)
+    user_low = str(user_text).lower().replace("ё", "е")
+    if _guardian_evidence(user_text) is False:
+        session["guardian_accompaniment_confirmed"] = False
+    session["booking_write_blocked_this_turn"] = bool(
+        re.search(r"не\s+(?:запис|брони|надо|нужно|могу|подходит)|не\s+(?:в|на)\s+\d|пока не|отмен|передум|подума|отлож|жазба|болмай|ыңғайсыз", user_low)
+        or ("?" in user_low and re.search(r"\d{1,2}[:.]\d{2}", user_low))
+        or user_low.strip(" .!") in {"стоп", "пока", "позже", "отмена", "подождите", "тоқта", "кейін"}
+        or services.contraindication_evidence(user_text) in {"present", "unclear"}
+    )
+    current_scope = services.classify_by_keywords(user_text)
+    if current_scope["can_help"] is False or current_scope["service"] == "смешанные жалобы":
+        _tool_record_patient_facts(chat_id, session, {"complaint": user_text})
     chosen_doctor = _resolve_explicit_doctor_choice(session, user_text)
     if chosen_doctor:
         _log(chat_id, "agent_doctor_selected", {"doctor_login": chosen_doctor["doctor_login"]})
@@ -2938,30 +2999,7 @@ async def run_agent_turn(
         _tool_record_patient_facts(chat_id, session, {"patient_name": name_candidate})
         _log(chat_id, "agent_patient_name_captured_for_booking", {"captured": True})
 
-    preflight_booking = await _try_auto_complete_booking(chat_id, session, phone)
-    if preflight_booking and preflight_booking.get("booking_success") is True:
-        result = AgentResult(
-            used=True,
-            booking=preflight_booking,
-            tool_results=[preflight_booking],
-            tool_calls=[{"tool": "book_appointment", "ok": True, "args": {"automatic": True}}],
-            outcome=OUTCOME_SUCCESS,
-        )
-        result.reply = _safety_net_reply(session, result)
-        _log(
-            chat_id,
-            "agent_turn_finished",
-            {
-                "outcome": result.outcome,
-                "iterations": 0,
-                "tool_calls": ["book_appointment"],
-                "has_reply": True,
-                "booking_success": True,
-                "error": "",
-                "automatic_completion": True,
-            },
-        )
-        return result
+    preflight_booking = None
 
     settings = get_settings()
     model = getattr(settings, "ai_brain_model", "") or getattr(settings, "openai_model", "")
@@ -3065,7 +3103,19 @@ async def run_agent_turn(
         content = str(getattr(message, "content", "") or "").strip()
 
         if not tool_calls:
-            result.reply = content
+            # Only complete after the model has consumed the WHOLE turn and
+            # every fact update. A ready stale session alone is not a trigger.
+            progressed = bool(name_candidate) or any(
+                call["tool"] in {"record_patient_facts", "select_booking_slot"} and call["ok"]
+                for call in result.tool_calls
+            )
+            if progressed and not result.booking and not session.get("booking_write_blocked_this_turn"):
+                automatic = await _try_auto_complete_booking(chat_id, session, phone)
+                if automatic is not None:
+                    result.booking = automatic
+                    result.tool_results.append(automatic)
+                    result.tool_calls.append({"tool": "book_appointment", "ok": automatic.get("booking_success") is True, "args": {"automatic": True}})
+            result.reply = _safety_net_reply(session, result) if result.booked else content
             result.iterations = iterations
             break
 
@@ -3119,6 +3169,7 @@ async def run_agent_turn(
                 }
             )
 
+        executable = sorted(executable, key=lambda call: 0 if call.function.name == "record_patient_facts" else (2 if call.function.name == "book_appointment" else 1))
         for call in executable:
             iterations += 1
             name = call.function.name
@@ -3141,13 +3192,6 @@ async def run_agent_turn(
                     "error": "tool_failed",
                     "message": "Инструмент временно недоступен. Не выдумывай данные, предложи эскалацию.",
                 }
-
-            if name in {"record_patient_facts", "select_booking_slot"}:
-                automatic_booking = await _try_auto_complete_booking(chat_id, session, phone)
-                if automatic_booking is not None:
-                    tool_result = dict(tool_result)
-                    tool_result["automatic_booking"] = automatic_booking
-                    result.booking = automatic_booking
 
             result.tool_calls.append({"tool": name, "ok": bool(tool_result.get("ok")), "args": _safe_args(args)})
             result.tool_results.append(tool_result)
@@ -3312,18 +3356,7 @@ def _operator_handoff_reply(session: dict[str, Any]) -> str:
     return "Запрос требует участия сотрудника клиники. Передача обращения пока не подтверждена."
 
 
-_APPROVED_CONTRAINDICATIONS_RU = """Перед записью нужно уточнить противопоказания. Скажите, есть ли у Вас сейчас или были раньше:
-
-— кардиостимулятор, дефибриллятор, инсулиновая помпа или кохлеарный имплант;
-— тромбофлебит, тромбозы или серьёзные нарушения свёртываемости крови;
-— активное онкологическое заболевание или подозрение на него, которое ещё не исключено;
-— эпилепсия или судороги;
-— декомпенсированный сахарный диабет или тиреотоксикоз;
-— беременность;
-— высокая температура, ОРВИ, грипп или другая острая инфекция;
-— тяжёлые проблемы с сердцем, дыханием или психическим состоянием.
-
-Есть ли у Вас что-либо из перечисленного?"""
+_APPROVED_CONTRAINDICATIONS_RU = services.contraindication_checklist_text("ru")
 
 
 def _must_use_approved_contraindications_reply(
@@ -3335,8 +3368,6 @@ def _must_use_approved_contraindications_reply(
     the contraindications that gate a booking. If the turn is about this gate,
     Russian patients receive the clinic-approved list verbatim.
     """
-    if str(session.get("language") or "ru") == "kk":
-        return False
     if session.get("contraindications_ok") is True or session.get("contraindications_clear") is True:
         return False
     try:
@@ -3351,14 +3382,14 @@ def _must_use_approved_contraindications_reply(
     previous_low = str(session.get("last_assistant_answer") or "").strip().lower()
 
     explicit_question = (
-        "противопоказ" in user_low
+        ("противопоказ" in user_low or "қарсы көрсет" in user_low)
         or (
             user_low in {"а какие", "а какие?", "какие", "какие?", "что именно", "что именно?"}
             and "противопоказ" in previous_low
         )
     )
     model_started_gate = (
-        "противопоказ" in reply_low
+        ("противопоказ" in reply_low or "қарсы көрсет" in reply_low or "жүктілік" in reply_low)
         or any(
             term in reply_low
             for term in (
@@ -3379,7 +3410,20 @@ def _enforce_approved_contraindications_reply(
     session: dict[str, Any], user_text: str, reply: str
 ) -> str:
     if _must_use_approved_contraindications_reply(session, user_text, reply):
-        return _APPROVED_CONTRAINDICATIONS_RU
+        checklist = services.contraindication_checklist_text(str(session.get("language") or "ru"))
+        if services.contraindication_evidence(user_text) == "question" and reply.strip():
+            return reply.strip() + "\n\n" + checklist
+        # Replace only the medical-gate suffix; keep the preceding FAQ/doctor
+        # answer. Replacing the whole reply loses the patient's actual question.
+        gate = re.search(
+            r"(?:перед записью|(?:есть ли|скажите|подскажите|уточните)[^.!?\n]*противопоказ|противопоказания|кардиостимулятор|жазбас бұрын|қарсы көрсетілім|жүктілік)",
+            reply, re.I,
+        )
+        prefix = reply[:gate.start()].strip() if gate else ""
+        if prefix and not re.search(r"[.!?]$", prefix):
+            boundary = max(prefix.rfind("."), prefix.rfind("!"), prefix.rfind("?"))
+            prefix = prefix[:boundary + 1] if boundary >= 0 else ""
+        return (prefix + "\n\n" if prefix else "") + checklist
     return reply
 
 

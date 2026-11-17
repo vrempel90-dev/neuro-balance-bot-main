@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import UploadFile
 from openai import AsyncOpenAI
 
+import ai_budget
 from config import get_settings
 from wazzup import MAX_MEDIA_BYTES, download_media
 
@@ -22,6 +23,7 @@ VOICE_EXT_BY_MIME = {
     "audio/mp4": "m4a",
     "audio/m4a": "m4a",
     "audio/webm": "webm",
+    "audio/flac": "flac",
 }
 
 
@@ -44,7 +46,7 @@ def filename_from_content_type(content_type: str | None, fallback: str = "voice.
 async def transcribe_bytes(
     data: bytes,
     filename: str = "voice.ogg",
-    language: str = "ru",
+    language: str | None = None,
 ) -> VoiceTranscript:
     """Расшифровывает bytes аудио через OpenAI.
 
@@ -57,32 +59,51 @@ async def transcribe_bytes(
     if len(data) > MAX_MEDIA_BYTES:
         raise ValueError("Audio exceeds size limit")
 
+    # MIME and filename are supplied by the sender and cannot authenticate the
+    # content. This is a container check, not a claim of successful decoding.
+    valid_container = (
+        (data.startswith(b"OggS") and len(data) >= 27)
+        or (data.startswith(b"RIFF") and data[8:12] == b"WAVE")
+        or data.startswith(b"ID3")
+        or (len(data) >= 2 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0)
+        or (len(data) >= 12 and data[4:8] == b"ftyp")
+        or data.startswith(b"\x1a\x45\xdf\xa3")
+        or data.startswith(b"fLaC")
+    )
+    if not valid_container:
+        raise ValueError("Unsupported audio container")
+
+    allowed, _ = ai_budget.check_allowed("voice_transcription")
+    if not allowed:
+        raise ValueError("Audio transcription budget exhausted")
+
     settings = get_settings()
     client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=30.0, max_retries=0)
 
     # OpenAI SDK стабильнее принимает файл с диска, чем tuple(bytes) на разных версиях.
     suffix = os.path.splitext(filename)[1] or ".ogg"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(data)
-        tmp_path = tmp.name
-
+    tmp_path = None
     try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            tmp.write(data)
         with open(tmp_path, "rb") as f:
-            result = await client.audio.transcriptions.create(
-                model=settings.openai_voice_model,
-                file=f,
-                language=language,
-            )
+            arguments = {"model": settings.openai_voice_model, "file": f}
+            if language:
+                arguments["language"] = language
+            result = await client.audio.transcriptions.create(**arguments)
+        ai_budget.record_usage(result, model=settings.openai_voice_model, purpose="voice_transcription")
         return VoiceTranscript(text=(result.text or "").strip(), filename=filename)
     finally:
         try:
-            os.remove(tmp_path)
+            if tmp_path:
+                os.remove(tmp_path)
         except OSError:
             pass
         await client.close()
 
 
-async def transcribe_upload(file: UploadFile, language: str = "ru") -> VoiceTranscript:
+async def transcribe_upload(file: UploadFile, language: str | None = None) -> VoiceTranscript:
     data = await file.read(MAX_MEDIA_BYTES + 1)
     if len(data) > MAX_MEDIA_BYTES:
         raise ValueError("Audio exceeds size limit")
@@ -93,7 +114,7 @@ async def transcribe_upload(file: UploadFile, language: str = "ru") -> VoiceTran
     return result
 
 
-async def transcribe_wazzup_voice(message: dict[str, Any], language: str = "ru") -> VoiceTranscript:
+async def transcribe_wazzup_voice(message: dict[str, Any], language: str | None = None) -> VoiceTranscript:
     """Скачивает и расшифровывает голосовое из разобранного Wazzup-сообщения."""
     media_url = message.get("media_url") or None
     file_id = message.get("file_id") or None

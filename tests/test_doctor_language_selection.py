@@ -9,6 +9,12 @@ import dialog
 import pytest
 
 
+def medically_cleared_session(**extra):
+    return {"complaint": "болит поясница", "complaint_gate": "COMPLAINT_OK",
+            "profile_status": "profile", "age": 34, "contraindications_ok": True,
+            "contraindications_verdict": "proceed", "contraindications_raw": "противопоказаний нет", **extra}
+
+
 async def fake_slots(date: str, doctor_login: str | None = None) -> dict:
     availability = [
         {"doctorLogin": "bekbolat", "doctorName": "Бекболат Шуринбайулы",
@@ -26,7 +32,7 @@ async def fake_slots(date: str, doctor_login: str | None = None) -> dict:
 def test_doctor_choice_required_when_patient_has_not_selected(monkeypatch):
     monkeypatch.setattr(agent.crm, "check_slots", fake_slots)
     monkeypatch.setattr(agent, "_log", lambda *_: None)
-    session = {"last_user_text": "В пятницу после обеда"}
+    session = medically_cleared_session(last_user_text="В пятницу после обеда")
     result = asyncio.run(agent._tool_get_available_slots("synthetic", session, {
         "date_from": "2026-10-30", "time_preference": "после обеда",
         "doctor_login": "bekbolat",  # Model cannot choose on patient's behalf.
@@ -41,7 +47,7 @@ def test_doctor_choice_required_when_patient_has_not_selected(monkeypatch):
 def test_selected_doctor_and_time_are_persisted(monkeypatch):
     monkeypatch.setattr(agent.crm, "check_slots", fake_slots)
     monkeypatch.setattr(agent, "_log", lambda *_: None)
-    session = {"last_user_text": "В пятницу после обеда"}
+    session = medically_cleared_session(last_user_text="В пятницу после обеда")
     doctor_options = asyncio.run(agent._tool_get_available_slots(
         "synthetic", session, {"date_from": "2026-10-30", "time_preference": "после обеда"}))
     assert doctor_options["doctor_choice_required"] is True
@@ -173,7 +179,7 @@ def test_language_rewrite_must_preserve_time_and_date(monkeypatch):
 def test_initial_named_doctor_request_is_honored(monkeypatch):
     monkeypatch.setattr(agent.crm, "check_slots", fake_slots)
     monkeypatch.setattr(agent, "_log", lambda *_: None)
-    session = {"last_user_text": "Запишите маму к Бекболату после обеда"}
+    session = medically_cleared_session(last_user_text="Запишите маму к Бекболату после обеда")
     response = asyncio.run(agent._tool_get_available_slots("synthetic", session, {
         "date_from": "2026-10-30", "time_preference": "после обеда",
     }))
@@ -221,7 +227,7 @@ def test_cannot_select_or_book_different_doctor(monkeypatch):
 def test_internal_reserve_never_shown_as_doctor(monkeypatch):
     monkeypatch.setattr(agent.crm, "check_slots", fake_slots)
     monkeypatch.setattr(agent, "_log", lambda *_: None)
-    session = {"last_user_text": "Запишите к Бекболату"}
+    session = medically_cleared_session(last_user_text="Запишите к Бекболату")
     result = asyncio.run(agent._tool_get_available_slots("synthetic", session, {
         "date_from": "2026-10-30"
     }))

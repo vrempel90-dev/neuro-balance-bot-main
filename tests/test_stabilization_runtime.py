@@ -260,7 +260,7 @@ def test_voice_timeout_closes_client_and_removes_temporary_audio(monkeypatch):
 
     monkeypatch.setattr(voice, "AsyncOpenAI", client)
     with pytest.raises(TimeoutError):
-        asyncio.run(voice.transcribe_bytes(b"synthetic audio"))
+        asyncio.run(voice.transcribe_bytes(b"OggS" + b"\x00" * 24))
     assert observed["client_config"]["timeout"] == 30.0
     assert observed["client_config"]["max_retries"] == 0
     assert observed["closed"] is True

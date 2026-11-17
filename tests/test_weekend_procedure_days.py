@@ -61,7 +61,11 @@ class SlotsStub:
 
 def run_tool(monkeypatch: pytest.MonkeyPatch, stub: SlotsStub, args: dict[str, Any]) -> dict[str, Any]:
     monkeypatch.setattr(crm, "check_slots", stub.check_slots)
-    return asyncio.run(agent._tool_get_available_slots("weekend_chat", {}, args))
+    # Availability behavior is exercised after the actual medical prerequisites.
+    session = {"complaint": "болит поясница", "complaint_gate": "COMPLAINT_OK",
+               "profile_status": "profile", "age": 34, "contraindications_ok": True,
+               "contraindications_verdict": "proceed", "contraindications_raw": "противопоказаний нет"}
+    return asyncio.run(agent._tool_get_available_slots("weekend_chat", session, args))
 
 
 def test_saturday_request_is_answered_with_the_next_working_day(monkeypatch: pytest.MonkeyPatch) -> None:

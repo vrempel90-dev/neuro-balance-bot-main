@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import hashlib
+import hmac
 import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
@@ -36,7 +38,13 @@ CREATE INDEX IF NOT EXISTS idx_webhook_inbox_status
 CREATE INDEX IF NOT EXISTS idx_webhook_inbox_chat
     ON webhook_inbox(chat_id, sequence);
 """
-_TERMINAL_STATUSES = {"done", "failed", "uncertain"}
+_TERMINAL_STATUSES = {"done", "failed", "uncertain", "handoff_pending", "handoff_confirmed"}
+_LIFECYCLE_STATES = {
+    "pending": "PERSISTED", "processing": "PROCESSING", "done": "COMPLETED",
+    "failed": "FAILED_NEEDS_ATTENTION", "uncertain": "FAILED_NEEDS_ATTENTION",
+    "handoff_pending": "HUMAN_HANDOFF_PENDING",
+    "handoff_confirmed": "HUMAN_HANDOFF_CONFIRMED",
+}
 
 
 def init_db() -> None:
@@ -120,7 +128,9 @@ def finish(job_id: str, status: str = "done", *, error_type: str = "") -> None:
         raise ValueError("invalid inbox terminal status")
     # A successful job no longer needs a duplicate copy of the sensitive body.
     # Keep its stable key for deduplication; failed/uncertain jobs retain their
-    # body for authorized reconciliation and are never auto-retried.
+    # body for authorized reconciliation and are never auto-retried. Staff
+    # acknowledgment is not completion of the request: keep its body until
+    # the operator explicitly resolves it, including daytime-only messages.
     with state._connect() as conn:
         conn.execute(
             "UPDATE webhook_inbox SET status=?,updated_at=?,error_type=?, "
@@ -160,6 +170,62 @@ def purge_completed(*, retention_days: int = 7) -> int:
     return cursor.rowcount
 
 
+def _require_operator(operator_token: str) -> None:
+    """Local operator functions never inherit the monitor's GitHub OIDC access.
+
+    Monitor credentials authorize aggregates, not patient records. A separate
+    application administrator must explicitly supply the existing admin secret.
+    These functions are not registered as HTTP routes.
+    """
+    expected = str(os.getenv("OPENAI_DEBUG_ADMIN_TOKEN") or "").strip()
+    supplied = str(operator_token or "")
+    if not expected or not hmac.compare_digest(expected.encode(), supplied.encode()):
+        raise PermissionError("Operator authorization required")
+
+
+def get_for_operator(job_id: str, *, operator_token: str) -> dict[str, Any] | None:
+    """Read one retained request by opaque ID after explicit authorization.
+
+    The returned content is sensitive: callers must not log it, return it to
+    public diagnostics, or include it in monitor alerts.
+    """
+    _require_operator(operator_token)
+    with state._connect() as conn:
+        row = conn.execute(
+            "SELECT job_id,chat_id,status,error_type,payload_json FROM webhook_inbox WHERE job_id=?",
+            (str(job_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"job_id": row["job_id"], "chat_id": row["chat_id"],
+            "status": row["status"], "error_type": row["error_type"],
+            **json.loads(row["payload_json"])}
+
+
+def resolve_attention(job_id: str, *, resolution: str, operator_token: str) -> bool:
+    """Record an operator's reconciliation, never replay a remote operation.
+
+    done means staff completed the request and removes the retained body.
+    handoff_confirmed means staff acknowledged ownership, keeping the body.
+    An ambiguous CRM/provider outcome must be checked remotely by the operator
+    before either transition; this function does not infer success.
+    """
+    _require_operator(operator_token)
+    if resolution not in {"done", "handoff_confirmed"}:
+        raise ValueError("attention requires completion or confirmed staff ownership")
+    with state._connect() as conn:
+        cursor = conn.execute(
+            "UPDATE webhook_inbox SET status=?,updated_at=?, "
+            "payload_json=CASE WHEN ?='done' THEN '{}' ELSE payload_json END "
+            "WHERE job_id=? AND status IN ('failed','uncertain','handoff_pending','handoff_confirmed') "
+            "AND status<>?",
+            (resolution, state.now_iso(), resolution, str(job_id), resolution),
+        )
+    if cursor.rowcount:
+        state.log_event("inbox", "inbox_operator_resolution", {"job_id": str(job_id), "status": resolution})
+    return cursor.rowcount == 1
+
+
 def status_summary() -> dict[str, Any]:
     """Return aggregate operational metrics, never chat IDs or message text."""
     init_db()
@@ -176,12 +242,17 @@ def status_summary() -> dict[str, Any]:
             " SELECT 1 FROM webhook_inbox previous WHERE previous.chat_id=j.chat_id "
             " AND previous.sequence<j.sequence AND previous.status='uncertain')",
         ).fetchone()["count"]
-    counts = {status: 0 for status in ("pending", "processing", "done", "failed", "uncertain")}
+    counts = {status: 0 for status in _LIFECYCLE_STATES}
     counts.update({row["status"]: row["count"] for row in rows})
+    lifecycle_counts: dict[str, int] = {}
+    for status, lifecycle in _LIFECYCLE_STATES.items():
+        lifecycle_counts[lifecycle] = lifecycle_counts.get(lifecycle, 0) + counts[status]
     age = max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(oldest)).total_seconds()) if oldest else 0.0
     return {
         "counts": counts, "oldest_pending_seconds": round(age, 1),
         "quarantined_chats": quarantined, "pending_blocked_by_uncertain": blocked,
+        "lifecycle_counts": lifecycle_counts,
+        "attention_required_count": sum(counts[s] for s in ("failed", "uncertain", "handoff_pending")),
     }
 
 
@@ -251,8 +322,12 @@ class InboxWorker:
             reason = str(result.get("no_reply_reason") or "")
             if explicit in _TERMINAL_STATUSES:
                 status = str(explicit)
+            elif explicit is not None:
+                raise ValueError("unsupported inbox processor outcome")
             elif reason in {"send_failed", "send_uncertain", "delivery_uncertain"}:
                 status = "uncertain"
+            elif reason in {"outside_work_time", "working_hours_ai_disabled", "operator_handoff_failed", "media_processing_failed"}:
+                status = "handoff_pending"
             elif reason in {"crm_lookup_failed", "processing_failed"} or result.get("ok") is False:
                 status = "failed"
             else:

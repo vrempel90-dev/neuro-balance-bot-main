@@ -16,7 +16,7 @@ import ai
 import services
 
 
-def test_isolated_heel_complaint_is_non_profile_and_age_is_not_stored() -> None:
+def test_isolated_heel_retains_supplied_age_without_advancing_profile_gate() -> None:
     session: dict = {}
 
     result = agent._tool_record_patient_facts(
@@ -28,8 +28,8 @@ def test_isolated_heel_complaint_is_non_profile_and_age_is_not_stored() -> None:
     assert result["profile_status"] == "non_profile"
     assert session["profile_status"] == "non_profile"
     assert session["complaint_gate"] == "NON_PROFILE"
-    assert "age" not in session
-    assert result["age_known"] is False
+    assert session["age"] == 70
+    assert result["age_known"] is True
     assert "не спрашивай возраст" in result["message"]
 
 
@@ -44,7 +44,8 @@ def test_unknown_complaint_does_not_become_profile_automatically() -> None:
 
     assert result["profile_status"] == "unclear"
     assert session["complaint_gate"] == "PROFILE_UNCLEAR"
-    assert "age" not in session
+    assert session["age"] == 44
+    assert result["age_known"] is True
     assert "уточняющий вопрос" in result["message"]
 
 
@@ -62,11 +63,15 @@ def test_joint_complaint_is_profile_and_can_advance_to_age() -> None:
     assert session["age"] == 70
 
 
-def test_heel_plus_profile_joint_keeps_profile_complaint() -> None:
+def test_heel_plus_profile_joint_requires_scope_clarification() -> None:
     classified = services.classify_by_keywords("Болит пятка и колено")
 
-    assert classified["can_help"] is True
-    assert classified["service"] == "суставы"
+    assert classified["can_help"] is None
+    session = {}
+    result = agent._tool_record_patient_facts("mixed_scope", session, {"complaint": "Болит пятка и колено"})
+    assert result["profile_status"] == "unclear"
+    assert session["complaint_gate"] == "PROFILE_UNCLEAR"
+    assert "уточняющий вопрос" in result["message"]
 
 
 def test_age_75_is_allowed_by_backend_boundary() -> None:

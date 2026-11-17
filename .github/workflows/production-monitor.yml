@@ -79,11 +79,8 @@ jobs:
               token = oidc['value']
               print('::add-mask::' + token)
               # The token is never printed, uploaded, or persisted.
-              if os.environ.get('RUN_DEPENDENCY_PROBES') == 'true':
-                  hardening = request(root + '/internal/monitor/secure-webhook', token=token, method='POST', timeout=55)
-                  output['webhook_auth_hardening'] = hardening
-                  if hardening.get('ok') is not True:
-                      failures.append('webhook_auth_requires_attention')
+              # Provider configuration migrations require separate owner approval.
+              # Routine monitoring must never PATCH the live Wazzup webhook.
               status = request(root + '/internal/monitor/status', token=token)
               output['status'] = status
               if status.get('ok') is not True:
