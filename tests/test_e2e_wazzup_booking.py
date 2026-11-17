@@ -173,6 +173,9 @@ def _prepare_session(chat_id: str) -> None:
             "step": "date",
         }
     )
+    from screened_patient import accept_checklist
+    if session.get("contraindications_ok") is True:
+        accept_checklist(session)
     state.save_session(chat_id, session)
 
 

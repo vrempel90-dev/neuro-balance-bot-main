@@ -119,6 +119,11 @@ class Conversation:
         answer = asyncio.run(dialog.handle_message(self.chat, PHONE, text))
         assert not client.exhausted, "unplanned model call hidden by production exception handling"
         assert not client.completions._script, "script not consumed: real agent loop did not execute"
+        # This dialog harness models a provider-accepted reply.
+        import medical_rules
+        saved = self.session
+        if medical_rules.mark_checklist_presented(saved, answer):
+            state.save_session(self.chat, saved)
         self.clients.append(client)
         self.answers.append(answer)
         self.decisions.append(list(self.session.get("agent_tool_calls") or []))
@@ -144,6 +149,8 @@ class Conversation:
         return matches[-1]
 
     def ready(self, **extra):
+        import medical_rules
+        self.turn("Какие противопоказания?", assistant_text(medical_rules.APPROVED_CONTRAINDICATIONS_RU))
         text = f"Мне {extra.get('age', 34)}, болит поясница, противопоказаний нет"
         if extra.get("patient_name"):
             text += f", меня зовут {extra['patient_name']}"
@@ -211,7 +218,7 @@ def test_relative_patient_identity_never_uses_sender_admission(conv, text, relat
     assert conv.session["patient_relation"] == relation
     assert conv.session["profile_status"] == status
     assert conv.session.get("age") == age if age is not None else not conv.session.get("age")
-    assert bool(conv.session.get("contraindications_ok")) is ("противопоказаний нет" in text)
+    assert not conv.session.get("contraindications_ok")  # No prior accepted checklist.
     if "я уже был" in text:
         conv.crm.existing = True
         answer = conv.turn("Точно для папы, не для меня")
@@ -249,7 +256,7 @@ def test_complaint_context_restricts_medical_progress(conv, first, complaint, st
                        "contraindications_note": "нет"}, reply)
     assert conv.session["profile_status"] == status
     assert conv.session["age"] == 40
-    assert conv.session["contraindications_ok"] is True
+    assert conv.session.get("contraindications_ok") is not True
     if status != "profile":
         conv.available("Можно уже выбрать день?", reply="Сначала уточним жалобу.")
         assert conv.result("error")["error"]
@@ -298,6 +305,8 @@ def test_outside_age_limits_does_not_reach_crm_availability(conv, age):
         "kk-pacemaker", "kk-pregnancy", "term-question-not-diagnosis", "explicit-negation-clear"])
 def test_contraindication_evidence_cannot_be_overruled_by_model_boolean(conv, text, note, expected):
     conv.facts("Болит спина, мне 34", {"complaint": "болит спина", "age": 34})
+    import medical_rules
+    conv.turn("Какие противопоказания?", assistant_text(medical_rules.APPROVED_CONTRAINDICATIONS_RU))
     answer = conv.facts(text, {"contraindications_clear": True, "contraindications_note": note},
                         "Кардиостимулятор — устройство для поддержания ритма сердца. Есть ли что-либо из перечисленного?"
                         if expected is None else KK_REPLY if "бар" in text else "Спасибо, уточним медицинские ограничения.")
@@ -324,6 +333,8 @@ def test_faq_answers_preserve_the_unfinished_booking_step(conv, topic, question,
     if stage != "age":
         facts["age"] = 34
     if stage == "choice":
+        import medical_rules
+        conv.turn("Какие противопоказания?", assistant_text(medical_rules.APPROVED_CONTRAINDICATIONS_RU))
         facts.update(contraindications_clear=True, contraindications_note="нет")
     source = {"age": "Болит поясница", "contra": "Мне 34, болит поясница",
               "choice": "Мне 34, болит поясница, противопоказаний нет"}[stage]

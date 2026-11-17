@@ -10,9 +10,12 @@ import pytest
 
 
 def medically_cleared_session(**extra):
-    return {"complaint": "болит поясница", "complaint_gate": "COMPLAINT_OK",
+    session = {"complaint": "болит поясница", "complaint_gate": "COMPLAINT_OK",
             "profile_status": "profile", "age": 34, "contraindications_ok": True,
             "contraindications_verdict": "proceed", "contraindications_raw": "противопоказаний нет", **extra}
+
+    from screened_patient import accept_checklist
+    return accept_checklist(session)
 
 
 async def fake_slots(date: str, doctor_login: str | None = None) -> dict:

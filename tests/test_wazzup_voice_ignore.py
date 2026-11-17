@@ -64,7 +64,7 @@ def _prepare(monkeypatch, tmp_path):
     return sent, handled
 
 
-def test_wazzup_audio_type_is_ignored(monkeypatch, tmp_path):
+def test_wazzup_audio_without_reference_needs_attention(monkeypatch, tmp_path):
     events = []
     monkeypatch.setattr(state, "log_event", lambda chat_id, event_type, payload: events.append(event_type))
     sent, handled = _prepare(monkeypatch, tmp_path)
@@ -73,7 +73,8 @@ def test_wazzup_audio_type_is_ignored(monkeypatch, tmp_path):
     assert response.status_code == 200
     assert sent == []
     assert handled == []
-    assert "ignored_voice_message" in events
+    assert "ignored_voice_message" not in events
+    assert response.json()["results"][0]["inbox_status"] == "handoff_pending"
 
 
 def test_wazzup_voice_type_is_ignored(monkeypatch, tmp_path):

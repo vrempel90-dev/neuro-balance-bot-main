@@ -1329,7 +1329,7 @@ def _mark_manual_admin_interventions(payload: dict[str, Any]) -> None:
             continue
         if not _looks_like_outgoing_message(msg):
             continue
-        chat_id = str(msg.get("chatId") or msg.get("chat_id") or msg.get("from") or "").strip()
+        chat_id = normalized["chat_id"]
         if not chat_id:
             continue
         session = _get_session_safe(chat_id)
@@ -1420,11 +1420,19 @@ def _normalize_wazzup_message(payload: dict[str, Any], msg: dict[str, Any]) -> d
     attachments = media.extract_attachments(msg)
     identity = str(message_id or json.dumps([message_timestamp, str(text or ""), message_type, direction, attachments], ensure_ascii=False, sort_keys=True))
     scoped_key = hashlib.sha256(json.dumps([channel_id, chat_type, chat_id, identity], ensure_ascii=False).encode()).hexdigest()
+    provider_chat_id = chat_id
+    settings = get_settings()
+    allowed_channels = {c.strip() for c in settings.wazzup_allowed_channel_ids.split(",") if c.strip()}
+    # Preserve the primary channel's existing sessions. Secondary allowed
+    # channels start isolated; never reuse medical consent from the primary.
+    if channel_id in allowed_channels and channel_id != settings.wazzup_channel_id:
+        chat_id = "channel:" + hashlib.sha256(json.dumps([channel_id, chat_type, provider_chat_id]).encode()).hexdigest()
     return {
         "source": "wazzup",
         "chat_id": chat_id,
         "phone": phone,
         "text": str(text or "").strip(),
+        "provider_chat_id": provider_chat_id,
         "attachments": attachments,
         "kind": attachments[0]["kind"] if attachments else "text",
         "message_id": str(message_id or "").strip(),
@@ -1759,7 +1767,7 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
             state.log_event(chat_id, "wazzup_send_start", {"chat_id": chat_id, "channel_id": channel_id_from_payload, "text_preview": _preview(answer, 160)})
             try:
                 outbound_channel_id = channel_id_from_payload if (channel_id_from_payload and channel_id_match) else (channel_id_env or None)
-                send_result = await send_wazzup_message(chat_id=chat_id, text=answer, chat_type=message.get("chat_type") or "whatsapp", channel_id=outbound_channel_id)
+                send_result = await send_wazzup_message(chat_id=message.get("provider_chat_id") or chat_id, text=answer, chat_type=message.get("chat_type") or "whatsapp", channel_id=outbound_channel_id)
                 if not isinstance(send_result, dict) or send_result.get("ok") is False or send_result.get("success") is False:
                     raise ValueError("Invalid provider acknowledgement")
                 state.mark_outgoing_message(outgoing_key, "confirmed")

@@ -108,3 +108,11 @@ def test_stale_ai_session_cannot_erase_staff_takeover():
     state.save_session('synthetic-race', human)
     state.save_session('synthetic-race', stale)
     assert state.get_session('synthetic-race')['manual_admin_intervention'] is True
+
+
+def test_secondary_channel_has_separate_session_but_preserves_provider_identity():
+    primary = main._normalize_wazzup_message({}, payload(text="one"))
+    secondary = main._normalize_wazzup_message({}, payload(text="two", channelId="second-channel"))
+    assert primary["chat_id"] != secondary["chat_id"]
+    assert secondary["provider_chat_id"] == "77010000009"
+    assert secondary["phone"] == "77010000009"

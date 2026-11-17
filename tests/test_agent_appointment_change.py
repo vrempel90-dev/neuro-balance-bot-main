@@ -179,6 +179,8 @@ def booked_patient_session(chat_id: str, **extra: Any) -> dict[str, Any]:
                     "profile_status": "profile", "age": 34, "contraindications_ok": True,
                     "contraindications_verdict": "proceed", "contraindications_raw": "противопоказаний нет"})
     session.update(extra)
+    from screened_patient import accept_checklist
+    accept_checklist(session)
     state.save_session(chat_id, session)
     return session
 

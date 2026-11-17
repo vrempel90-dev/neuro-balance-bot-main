@@ -86,14 +86,16 @@ print(json.dumps({'context_restored': True, 'duplicate_blocked': True,
 
 
 @pytest.mark.parametrize("kind,mime", [("image", "image/jpeg"), ("document", "application/pdf")])
-def test_uncaptioned_attachment_never_invents_text_or_calls_ai(
+def test_attachment_processing_failure_never_invents_text_or_sends_reply(
     isolated_storage: Path, monkeypatch: pytest.MonkeyPatch, kind: str, mime: str,
 ) -> None:
-    """Unsupported attachment interpretation fails silently before AI/CRM."""
+    """A routed attachment processing failure keeps an explicit failed outcome."""
     async def forbidden(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("An unreadable attachment must not call AI, CRM or sender")
 
-    monkeypatch.setattr(main, "handle_incoming_message", forbidden)
+    async def unavailable(*args, **kwargs):
+        raise TimeoutError("Synthetic processor unavailable")
+    monkeypatch.setattr(main, "handle_incoming_message", unavailable)
     monkeypatch.setattr(main, "send_wazzup_message", forbidden)
     monkeypatch.setattr(crm, "lookup_active_appointments_by_phone", forbidden)
     payload = {"messageId": f"qa-unreadable-{kind}", "chatId": f"qa-media-{kind}",
@@ -104,7 +106,7 @@ def test_uncaptioned_attachment_never_invents_text_or_calls_ai(
     ))
     assert result["answer"] == ""
     assert result["should_send_wazzup"] is False
-    assert result["no_reply_reason"] == "empty_text"
+    assert result["no_reply_reason"] == "crm_lookup_failed"
 
 
 def test_two_clients_run_concurrently_without_sharing_session_or_answer(

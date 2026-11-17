@@ -138,6 +138,7 @@ def test_observer_does_not_export_personal_or_medical_free_text():
 def test_staff_outgoing_message_mutes_ai_while_own_echo_does_not(monkeypatch):
     settings = get_settings()
     settings.wazzup_allowed_channel_ids = "allowed"
+    settings.wazzup_channel_id = "allowed"  # This contract exercises the primary channel.
     request = SimpleNamespace(url=SimpleNamespace(path="/webhook/wazzup"), method="POST")
     human = {"chatId": "synthetic-human", "messageId": "human", "channelId": "allowed",
              "text": "Здравствуйте, это сотрудник клиники", "fromMe": True, "status": "outbound"}

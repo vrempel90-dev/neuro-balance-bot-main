@@ -106,6 +106,9 @@ def _session(chat_id: str, **extra: Any) -> None:
         }
     )
     session.update(extra)
+    from screened_patient import accept_checklist
+    if session.get("contraindications_ok") is True:
+        accept_checklist(session)
     state.save_session(chat_id, session)
 
 

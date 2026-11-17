@@ -123,6 +123,8 @@ def test_agent_availability_and_booking_reach_the_crm_functions(monkeypatch: pyt
         "crm_known_doctors": {"d1": "Doctor"},
     }
 
+    from screened_patient import accept_checklist
+    accept_checklist(session)
     availability = asyncio.run(
         agent._tool_get_available_slots("smoke", session, {"date_from": "2026-09-10"})
     )

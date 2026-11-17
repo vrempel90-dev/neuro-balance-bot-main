@@ -126,6 +126,8 @@ def _ready_booking_session():
         "doctor_login": "doctor_test", "doctor_name": "Тестовый Врач",
         "date": "2026-11-02", "time_start": "14:00",
     }])
+    from screened_patient import accept_checklist
+    accept_checklist(session)
     return session
 
 

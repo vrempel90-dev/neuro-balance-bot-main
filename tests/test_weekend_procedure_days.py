@@ -65,6 +65,8 @@ def run_tool(monkeypatch: pytest.MonkeyPatch, stub: SlotsStub, args: dict[str, A
     session = {"complaint": "болит поясница", "complaint_gate": "COMPLAINT_OK",
                "profile_status": "profile", "age": 34, "contraindications_ok": True,
                "contraindications_verdict": "proceed", "contraindications_raw": "противопоказаний нет"}
+    from screened_patient import accept_checklist
+    accept_checklist(session)
     return asyncio.run(agent._tool_get_available_slots("weekend_chat", session, args))
 
 

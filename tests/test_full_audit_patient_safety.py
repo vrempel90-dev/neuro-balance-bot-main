@@ -78,6 +78,8 @@ def ready_session(age=34):
         {"doctor_login": "qa_doc", "doctor_name": "Тестовый Врач", "date": "2031-03-07", "time_start": "15:00"},
     ])
     session["last_slots"] = list(session["crm_offered_slots"].values())
+    from screened_patient import accept_checklist
+    accept_checklist(session)
     return session
 
 
@@ -101,11 +103,11 @@ def test_unclear_complaint_keeps_supplied_facts_but_gate_stays_closed():
     })
     assert result["profile_status"] == "unclear"
     assert session["age"] == 62
-    assert session["contraindications_ok"] is True
+    assert session.get("contraindications_ok") is not True
     assert session["preferred_date_text"] == "в пятницу"
     assert bot_tools.booking_gate_status(session)[0] is False
     agent._tool_record_patient_facts("qa", session, {"complaint": "Болит поясница"})
-    assert session["age"] == 62 and session["contraindications_ok"] is True
+    assert session["age"] == 62 and session.get("contraindications_ok") is not True
 
 
 def test_patient_switch_clears_medical_facts_name_and_selected_slot():

@@ -176,8 +176,6 @@ _CONTRA_PHRASES = [r"инсулин\w*\s+помп", r"декомпенс\w*.*д�
 def contraindication_evidence(text: str) -> str:
     """Explicit presence overrides a boolean; questions/uncertainty never clear."""
     low = _low(text)
-    if "?" in low:
-        return "unclear"
     question = False
     uncertain = bool(re.search(r"не знаю|не уверен|возможно|подозрен|білмей|мүмкін|күдік", low))
     for sentence in re.split(r"[,;.!\n]|\b(?:но|а|бірақ)\b", low):
@@ -211,6 +209,8 @@ def contraindication_evidence(text: str) -> str:
         return "unclear"
     if question:
         return "question"
+    if "?" in low:
+        return "unclear"
     if re.search(r"(?:противопоказани\w*\s+(?:(?:у\s+\w+\s+){0,2})?нет|нет\s+противопоказани|ничего\s+из\s+(?:этого|перечисленного)\s+нет|(?:все|всё)\s+(?:это\s+)?отсутствует|қарсы көрсетілім\w*\s+жоқ|аталғандардың\s+ешқайсысы\s+жоқ)", low):
         return "clear"
     if low.strip(" .!") in {"нет", "ничего нет", "жоқ", "жок", "подтверждаю", "растаймын"}:

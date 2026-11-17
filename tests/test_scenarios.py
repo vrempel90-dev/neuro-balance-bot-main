@@ -283,6 +283,9 @@ def prepare_session(chat_id: str, scenario: dict[str, Any]) -> dict[str, Any]:
     session = state.get_session(chat_id)
     session.update({"phone": PHONE, "language": scenario.get("language") or "ru"})
     session.update(scenario.get("session") or {})
+    if session.get("contraindications_ok") is True:
+        from screened_patient import accept_checklist
+        accept_checklist(session)
     state.save_session(chat_id, session)
     return session
 
@@ -338,6 +341,11 @@ def run_scenario(scenario: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> N
             answers.append(result.reply if result.used else "")
         else:
             answers.append(asyncio.run(dialog.handle_message(chat_id, phone, text)))
+        # This harness models acceptance by the outbound provider after each reply.
+        import medical_rules
+        accepted = state.get_session(chat_id)
+        if medical_rules.mark_checklist_presented(accepted, answers[-1]):
+            state.save_session(chat_id, accepted)
 
     session = state.get_session(chat_id)
     assert_outcome(name, scenario, answers, session, stub)

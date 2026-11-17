@@ -181,6 +181,8 @@ def ready_session(chat_id: str, **extra: Any) -> dict[str, Any]:
         }
     )
     session.update(extra)
+    from screened_patient import accept_checklist
+    accept_checklist(session)
     state.save_session(chat_id, session)
     return session
 
@@ -834,6 +836,8 @@ def test_gpt_collected_facts_are_persisted_for_the_booking_gate(
     state.reset_session(chat_id)
     session = state.get_session(chat_id)
     session.update({"ai_lead_started": True, "gate_reason": "active_ai_lead", "phone": PHONE, "step": "complaint"})
+    import medical_rules
+    assert medical_rules.mark_checklist_presented(session, medical_rules.APPROVED_CONTRAINDICATIONS_RU)
     state.save_session(chat_id, session)
 
     answer = run_turn(chat_id, f"болит поясница, мне 34, противопоказаний нет, хочу {DATE} в 14:00, я Асель")
@@ -1177,6 +1181,8 @@ def test_concurrent_turns_create_only_one_booking(monkeypatch: pytest.MonkeyPatc
             session,
             [{"doctor_login": DOCTOR_LOGIN, "doctor_name": DOCTOR_NAME, "date": DATE, "time_start": "14:00"}],
         )
+        from screened_patient import accept_checklist
+        accept_checklist(session)
         return session
 
     args = {"patient_name": "Асель", "doctor_login": DOCTOR_LOGIN, "date": DATE, "time_start": "14:00"}
