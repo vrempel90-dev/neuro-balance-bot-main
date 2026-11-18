@@ -113,6 +113,7 @@ def test_two_clients_run_concurrently_without_sharing_session_or_answer(
     isolated_storage: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Per-chat serialization must not become a global lock or leak state."""
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: True)  # Synthetic night shift.
     settings = get_settings()
     settings.wazzup_channel_id = ""
     settings.wazzup_allowed_channel_ids = ""

@@ -277,6 +277,7 @@ def _real_inbound_message(**overrides):
 
 
 def test_real_wazzup_inbound_text_is_processed_not_blocked(monkeypatch):
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: True)  # Synthetic night shift.
     calls = {"handler": [], "sender": []}
 
     async def handler(message):

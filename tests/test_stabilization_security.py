@@ -92,6 +92,7 @@ def test_foreign_channel_never_calls_crm_or_ai(monkeypatch):
 
 
 def test_uncertain_send_is_attempted_once_and_not_reported_success(monkeypatch):
+    monkeypatch.setattr(main, "is_bot_work_time", lambda: True)  # Synthetic night shift.
     monkeypatch.setenv("WAZZUP_ALLOWED_CHANNEL_IDS", "allowed")
     get_settings.cache_clear()
     sends = []
