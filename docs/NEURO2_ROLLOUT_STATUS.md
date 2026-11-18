@@ -17,7 +17,7 @@
 - Исправлен синтаксис существующего manual repair workflow. Source push больше не считается разрешённым deployment: SHA в Production Monitor проверяется только по явному expected_release. Реальные runtime ошибки не подавляются.
 
 ## Подтверждённые проверки
-Предыдущая опубликованная версия a96e8d3: Linux CI 1057/1057 passed. Текущая расширенная версия проходит новый общий прогон; окончательное число и SHA берутся из CI/итогового отчёта, а не из этого документа.
+Код aa6ba87722d8b263505d1c798295f7dfa75f245c: Linux CI 1131 passed, 1 skipped (локальный FFmpeg отсутствует на runner), 0 failed; core booking 155 passed; dashboard 8 passed; dependency-security success. Run 44230308483, contract run 44230308375. Локальный FFmpeg-тест выполнен успешно. На Windows остаются шесть платформенных проверок POSIX mode 0600; они проходят на Linux. Подробные команды, доказательства и ограничения: NEURO2_FINAL_REPORT_RU.md.
 
 Реальная модель, синтетические данные:
 - live_final/report.json: 11/11 — RU/KK/mixed/noise, OGG/Opus с decode, PNG/PDF/нечитаемое изображение, три семантических случая.
