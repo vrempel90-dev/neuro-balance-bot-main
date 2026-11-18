@@ -98,7 +98,7 @@ def test_verified_initial_new_lead_can_complete_same_funnel(monkeypatch):
     assert classify(monkeypatch, fresh(), session).bot_may_reply
     state.save_session('continuation', session)
     restored = state.get_session('continuation')
-    assert classify(monkeypatch, fresh(isNew=False), restored).bot_may_reply
+    assert classify(monkeypatch, fresh(isNew=False, lead={"id": "synthetic-lead", "status": "IN_PROGRESS", "aiSessionId": restored["ai_admission_session_id"]}), restored).bot_may_reply
 
 
 @pytest.mark.parametrize('change', [
@@ -141,10 +141,15 @@ def test_initial_new_without_lead_id_does_not_create_a_continuation_lease(monkey
 
 
 def test_continuation_roundtrip_through_real_dialog(monkeypatch):
-    responses = iter([fresh(), fresh(isNew=False)])
+    count = 0
     turns = []
     async def lookup(phone):
-        return next(responses)
+        nonlocal count
+        count += 1
+        if count == 1:
+            return fresh()
+        session = state.get_session('roundtrip')
+        return fresh(isNew=False, lead={"id": "synthetic-lead", "status": "IN_PROGRESS", "aiSessionId": session["ai_admission_session_id"]})
     async def model(**kwargs):
         turns.append(kwargs['user_text'])
         return agent.AgentResult(used=True, reply='Подскажите, что беспокоит?')
@@ -153,7 +158,7 @@ def test_continuation_roundtrip_through_real_dialog(monkeypatch):
     assert asyncio.run(dialog.handle_message('roundtrip', PHONE, 'Здравствуйте'))
     assert asyncio.run(dialog.handle_message('roundtrip', PHONE, 'Болит спина'))
     assert len(turns) == 2
-    assert state.get_session('roundtrip')['crm_state_reason'] == 'verified_initial_new_lead'
+    assert state.get_session('roundtrip')['crm_state_reason'] == 'crm_session_provenance_verified'
 
 
 def test_existing_sender_requesting_relative_remains_silent(monkeypatch):

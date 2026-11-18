@@ -195,6 +195,10 @@ def status_snapshot(*, worker: Any = None) -> dict[str, Any]:
         import production_inbox
         result["inbox"] = production_inbox.status_summary()
         result["ok"] = bool(result["sqlite_quick_check_ok"])
+        result["provider_delivery"] = state.delivery_status_summary()
+        if result["provider_delivery"].get("FAILED_NEEDS_ATTENTION", 0):
+            result["ok"] = False
+            result["attention_required"] = "provider_delivery_failed"
         counts = result["inbox"].get("counts", {})
         if counts.get("uncertain", 0) or counts.get("failed", 0):
             result["ok"] = False

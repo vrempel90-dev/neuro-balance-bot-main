@@ -46,6 +46,7 @@ import bot_tools
 import clinic_info
 import crm
 import services
+import semantic_router
 from config import get_settings
 
 try:
@@ -829,6 +830,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "semantic_route": semantic_router.ROUTE_SCHEMA,
                     "complaint": {"type": "string", "description": "Жалоба ПАЦИЕНТА своими словами."},
                     "age": {"type": "integer", "description": "Возраст ПАЦИЕНТА полными годами."},
                     "contraindications_clear": {
@@ -1296,6 +1298,8 @@ def _filter_by_time_preference(slots: list[dict[str, str]], preference: str) -> 
 
 
 def _medical_gate_error(session: dict[str, Any]) -> str:
+    if session.get("profile_status") == "urgent":
+        return "urgent_requires_handoff"
     if not medical_rules.approved_rules_version():
         return "medical_rules_unavailable"
     if not session.get("age"):
@@ -2644,6 +2648,7 @@ async def _tool_cancel_appointment(
 def _reset_patient_context(session: dict[str, Any]) -> None:
     """Keep transport/admission/uncertain operations; discard a different patient's facts."""
     keys = {
+        "semantic_route_evidence",
         "contraindication_presentation", "contraindication_clearance",
         "complaint", "profile_status", "complaint_gate", "irrelevant", "age",
         "patient_name", "patient_relation", "known_user_facts",
@@ -2689,12 +2694,22 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
     profile_status = str(session.get("profile_status") or "unclear")
     profile_reason = ""
     if complaint:
-        classification = services.classify_by_keywords(complaint)
+        interpretation = args.get("semantic_route")
+        saved_route = session.get("semantic_route_evidence") or {}
+        evidence_source = str(session.get("last_user_text") or "")
+        if interpretation is None and saved_route.get("complaint") == complaint:
+            interpretation = saved_route.get("interpretation")
+            evidence_source += "\n" + str(saved_route.get("source") or "")
+        classification = semantic_router.classify(complaint, evidence_source, interpretation)
+        if classification.get("semantic_evidence"):
+            session["semantic_route_evidence"] = {"complaint": complaint, "interpretation": interpretation, "source": classification["semantic_evidence"]}
+        else:
+            session.pop("semantic_route_evidence", None)
         profile_status = classification["profile_status"]
         profile_reason = classification["reason"]
         session["complaint"] = complaint
         session["profile_status"] = profile_status
-        session["complaint_gate"] = {"profile": bot_tools.COMPLAINT_OK, "non_profile": "NON_PROFILE", "unclear": "PROFILE_UNCLEAR"}[profile_status]
+        session["complaint_gate"] = {"profile": bot_tools.COMPLAINT_OK, "non_profile": "NON_PROFILE", "unclear": "PROFILE_UNCLEAR", "urgent": "URGENT"}[profile_status]
         session["irrelevant"] = profile_status == "non_profile"
         bot_tools.mark_tool(session, "record_chief_complaint", complaint=complaint, is_in_profile=classification["can_help"])
         stored.append("complaint")
@@ -2752,7 +2767,10 @@ def _tool_record_patient_facts(chat_id: str, session: dict[str, Any], args: dict
         facts.pop("age", None)
     session["known_user_facts"] = facts
     age_block = _age_block_reason(session.get("age"))
-    if profile_status == "non_profile":
+    if profile_status == "urgent":
+        session["booking_write_blocked_this_turn"] = True
+        message = "Возможное неотложное состояние: прекрати обычную запись, рекомендуй срочную помощь 103/112 и вызови escalate_to_operator. Не ставь диагноз."
+    elif profile_status == "non_profile":
         message = "Жалоба непрофильная: не спрашивай возраст, противопоказания или день; не предлагай запись. Уже сообщённые факты сохранены."
     elif profile_status != "profile":
         message = "Профиль не подтверждён: задай один конкретный уточняющий вопрос о жалобе. Не спрашивай возраст, противопоказания или день до profile. Уже сообщённые факты сохранены."
@@ -3445,6 +3463,10 @@ def _enforce_profile_gate_reply(
     a model that forgets the tool still cannot ask age/contraindications after
     an explicitly non-profile complaint such as heel pain.
     """
+    if session.get("profile_status") == "urgent":
+        return ("Бұл белгілер шұғыл медициналық бағалауды қажет етуі мүмкін. 103 немесе 112 нөміріне хабарласыңыз."
+                if session.get("language") == "kk" else
+                "Эти симптомы могут требовать срочной медицинской оценки. Обратитесь за неотложной помощью по 103 или 112.")
     status = _current_turn_profile_status(result)
     complaint_text = str(session.get("complaint") or "").strip()
 

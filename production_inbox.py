@@ -358,6 +358,8 @@ class InboxWorker:
                 try:
                     if self._last_heartbeat - self._last_purge >= 3600:
                         purge_completed()
+                        import data_retention
+                        data_retention.purge_expired()
                         self._last_purge = self._last_heartbeat
                     while len(self._active) < self.concurrency and not self._stopping:
                         job = claim_next()

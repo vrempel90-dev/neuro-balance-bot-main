@@ -1771,6 +1771,10 @@ async def _process_wazzup_message_unlocked(request: Request, payload: dict[str, 
                 if not isinstance(send_result, dict) or send_result.get("ok") is False or send_result.get("success") is False:
                     raise ValueError("Invalid provider acknowledgement")
                 state.mark_outgoing_message(outgoing_key, "confirmed")
+                state.bind_provider_message(outgoing_key,
+                    provider_id=str(send_result.get("messageId") or send_result.get("id") or ""),
+                    channel_id=str(outbound_channel_id or ""),
+                    provider_chat_id=str(message.get("provider_chat_id") or chat_id))
                 session_after = _get_session_safe(chat_id)
                 session_after["wazzup_send_called"] = True
                 session_after["last_sent_answer"] = answer
@@ -1832,6 +1836,15 @@ async def _process_wazzup_message(
         )
 
 
+def _receive_delivery_statuses(payload: dict[str, Any]) -> int:
+    statuses = payload.get("statuses")
+    if not isinstance(statuses, list):
+        return 0
+    if len(statuses) > 100:
+        raise HTTPException(status_code=413, detail="Too many delivery statuses")
+    return sum(state.record_delivery_receipt(item) for item in statuses if isinstance(item, dict))
+
+
 async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) -> dict[str, Any]:
     global _LAST_WAZZUP_WEBHOOK_PAYLOAD, _LAST_WAZZUP_PARSE_META
     payload, parse_meta = await _safe_read_webhook_payload(request)
@@ -1839,6 +1852,9 @@ async def handle_wazzup_webhook(request: Request, *, send_enabled: bool = True) 
         _log_ignored_wazzup_webhook(request, parse_meta)
         return {"ok": True, "ignored": True, "reason": parse_meta.get("reason") or "invalid_json"}
 
+    receipt_count = _receive_delivery_statuses(payload)
+    if "statuses" in payload and not payload.get("messages") and not payload.get("message"):
+        return {"ok": True, "receipt_count": receipt_count}
     _LAST_WAZZUP_WEBHOOK_PAYLOAD = payload
     _LAST_WAZZUP_PARSE_META = dict(parse_meta)
     _mark_manual_admin_interventions(payload)
@@ -1875,6 +1891,9 @@ async def _dispatch_wazzup_webhook(request: Request) -> dict[str, Any]:
     if not parse_meta.get("ok"):
         _log_ignored_wazzup_webhook(request, parse_meta)
         return {"ok": True, "ignored": True, "reason": parse_meta.get("reason")}
+    receipt_count = _receive_delivery_statuses(payload)
+    if "statuses" in payload and not payload.get("messages") and not payload.get("message"):
+        return {"ok": True, "receipt_count": receipt_count}
     # Authentication has run in middleware. Staff ownership must be durable
     # immediately, even when the conversation FIFO is quarantined.
     _mark_manual_admin_interventions(payload)

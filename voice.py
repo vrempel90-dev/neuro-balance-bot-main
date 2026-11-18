@@ -89,7 +89,13 @@ async def transcribe_bytes(
             tmp.write(data)
         with open(tmp_path, "rb") as f:
             arguments = {"model": settings.openai_voice_model, "file": f}
-            if language:
+            if settings.openai_voice_model == "whisper-1":
+                arguments["response_format"] = "verbose_json"
+            if settings.openai_voice_model == "gpt-transcribe":
+                # SDK versions predating this model forward its documented
+                # multilingual hints through extra_body. Never force RU.
+                arguments["extra_body"] = {"languages": [language] if language else ["ru", "kk"]}
+            elif language:
                 arguments["language"] = language
             result = await client.audio.transcriptions.create(**arguments)
         ai_budget.record_usage(result, model=settings.openai_voice_model, purpose="voice_transcription")

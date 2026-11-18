@@ -19,6 +19,7 @@ config.py, но нигде не использовались — реально�
 from __future__ import annotations
 
 from typing import Any
+import math
 
 from config import get_settings
 from schedule import astana_now
@@ -222,6 +223,19 @@ def record_usage(response: Any, *, model: str, purpose: str) -> dict[str, Any]:
             completion_tokens=tokens["completion_tokens"],
             cached_tokens=tokens["cached_tokens"],
         )
+        # Whisper is billed per minute, not per token. verbose_json carries
+        # measured duration; without this, successful audio was charged zero.
+        if model == "whisper-1" and purpose == "voice_transcription":
+            duration = response.get("duration", 0) if isinstance(response, dict) else getattr(response, "duration", 0)
+            seconds = float(duration or 0)
+            if math.isfinite(seconds) and seconds > 0:
+                cost = round(seconds / 60.0 * 0.006, 8)
+        if model == "gpt-transcribe" and purpose == "voice_transcription":
+            usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+            seconds = usage.get("seconds", 0) if isinstance(usage, dict) else getattr(usage, "seconds", 0)
+            seconds = float(seconds or 0)
+            if math.isfinite(seconds) and seconds > 0:
+                cost = round(seconds / 60.0 * 0.0045, 8)
         month = current_month()
         budget = monthly_budget_usd()
         spent_before = float(state.ai_usage_month_cost_usd(month))

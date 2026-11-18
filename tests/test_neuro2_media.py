@@ -52,12 +52,18 @@ def test_voice_auto_language_and_client_closed(monkeypatch):
     assert closed == [True]
 
 
-def test_voice_explicit_language_and_cleanup_on_api_failure(monkeypatch):
+@pytest.mark.parametrize("model", ["whisper-1", "gpt-transcribe"])
+def test_voice_explicit_language_and_cleanup_on_api_failure(monkeypatch, model):
     import voice
+    from config import get_settings
+    monkeypatch.setattr(get_settings(), "openai_voice_model", model)
     seen, closed = fake_client(monkeypatch, voice, "", fail=True)
     with pytest.raises(RuntimeError):
         asyncio.run(voice.transcribe_bytes(b"OggS" + b"\x00" * 24, language="kk"))
-    assert seen[0]["language"] == "kk"
+    if model == "whisper-1":
+        assert seen[0]["language"] == "kk"
+    else:
+        assert seen[0]["extra_body"]["languages"] == ["kk"]
     assert seen[0]["file"].closed
     assert closed == [True]
 
@@ -278,3 +284,36 @@ def test_voice_consent_is_separate_from_document_evidence(monkeypatch):
     message = {"text": "", "attachments": [{"kind": "voice"}, {"kind": "document"}]}
     asyncio.run(media.prepare_message(message))
     assert message.get("patient_speech_text") == "Нет"
+
+
+def test_document_output_contract_requires_string_text(monkeypatch):
+    import media
+    monkeypatch.setenv("MEDICAL_DOCUMENT_PROCESSING_ENABLED", "true")
+    async def download(**kwargs):
+        return png_bytes(), "image/png"
+    monkeypatch.setattr(media, "download_media", download)
+    async def create(**kwargs):
+        typed = kwargs.get("response_format", {}).get("type") == "json_schema"
+        text = "No fracture. L4-L5 3 mm." if typed else ["No fracture.", "L4-L5 3 mm."]
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({"kind":"report", "text":text})))])
+    async def close():
+        pass
+    monkeypatch.setattr(media, "AsyncOpenAI", lambda **kwargs: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)), close=close))
+    result = asyncio.run(media.extract_document({"file_id":"synthetic-report"}))
+    assert result == "No fracture. L4-L5 3 mm."
+
+
+def test_transcribe_requests_both_clinic_languages_without_forcing_russian(monkeypatch):
+    import voice
+    from config import get_settings
+    monkeypatch.setattr(get_settings(), "openai_voice_model", "gpt-transcribe")
+    async def create(**kwargs):
+        bilingual = kwargs.get("extra_body", {}).get("languages") == ["ru", "kk"]
+        return SimpleNamespace(text="Мен қырық екі жастамын" if bilingual else "Unspecified input language")
+    async def close():
+        pass
+    monkeypatch.setattr(voice, "AsyncOpenAI", lambda **kwargs: SimpleNamespace(
+        audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create)), close=close))
+    transcript = asyncio.run(voice.transcribe_bytes(b"OggS" + b"\x00" * 24))
+    assert transcript.text == "Мен қырық екі жастамын"

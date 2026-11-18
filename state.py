@@ -789,3 +789,88 @@ def outgoing_message_status(message_key: str) -> str:
         conn.execute(_OUTGOING_MESSAGES_DDL)
         row = conn.execute("SELECT status FROM outgoing_messages WHERE message_key=?", (message_key,)).fetchone()
     return str(row["status"]) if row else ""
+
+# Wazzup v3 statuses contain globally unique messageId, often no routing fields.
+# Preserve early callbacks until the send acknowledgement binds the local claim.
+_DELIVERY_DDL = """
+CREATE TABLE IF NOT EXISTS provider_deliveries (
+ message_key TEXT PRIMARY KEY, provider_id TEXT NOT NULL UNIQUE,
+ channel_id TEXT NOT NULL, provider_chat_hash TEXT NOT NULL,
+ lifecycle TEXT NOT NULL, rank INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS provider_receipts (
+ receipt_key TEXT PRIMARY KEY, provider_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+ provider_chat_hash TEXT NOT NULL, lifecycle TEXT NOT NULL, rank INTEGER NOT NULL,
+ created_at TEXT NOT NULL
+);
+"""
+_DELIVERY_STATES = {'accepted':('PROVIDER_ACCEPTED',0), 'sent':('PROVIDER_ACCEPTED',1),
+                   'error':('FAILED_NEEDS_ATTENTION',2), 'failed':('FAILED_NEEDS_ATTENTION',2),
+                   'delivered':('DELIVERED',3), 'read':('READ',4)}
+
+
+def _apply_provider_receipts(conn, provider_id: str) -> None:
+    row = conn.execute('SELECT * FROM provider_deliveries WHERE provider_id=?',(provider_id,)).fetchone()
+    if not row:
+        return
+    receipts = conn.execute('SELECT * FROM provider_receipts WHERE provider_id=? ORDER BY rank DESC',(provider_id,)).fetchall()
+    for receipt in receipts:
+        if receipt['channel_id'] and receipt['channel_id'] != row['channel_id']:
+            continue
+        if receipt['provider_chat_hash'] and receipt['provider_chat_hash'] != row['provider_chat_hash']:
+            continue
+        if receipt['rank'] > row['rank']:
+            conn.execute('UPDATE provider_deliveries SET lifecycle=?,rank=? WHERE provider_id=?',
+                         (receipt['lifecycle'],receipt['rank'],provider_id))
+            break
+
+
+def bind_provider_message(message_key: str, *, provider_id: str, channel_id: str, provider_chat_id: str) -> None:
+    if not provider_id or not message_key:
+        return
+    with _connect() as conn:
+        conn.executescript(_DELIVERY_DDL)
+        conn.execute('BEGIN IMMEDIATE')
+        if not conn.execute('SELECT 1 FROM outgoing_messages WHERE message_key=?',(message_key,)).fetchone():
+            raise ValueError('Missing outgoing claim')
+        conn.execute('INSERT OR IGNORE INTO provider_deliveries VALUES (?,?,?,?,?,?)',
+                     (message_key,provider_id,channel_id,anonymize_identifier(provider_chat_id),'PROVIDER_ACCEPTED',0))
+        row=conn.execute('SELECT message_key FROM provider_deliveries WHERE provider_id=?',(provider_id,)).fetchone()
+        if not row or row['message_key'] != message_key:
+            raise ValueError('Provider message identity conflict')
+        _apply_provider_receipts(conn,provider_id)
+
+
+def record_delivery_receipt(receipt: dict[str, Any]) -> bool:
+    provider_id=str(receipt.get('messageId') or '')
+    stage=_DELIVERY_STATES.get(str(receipt.get('status') or '').lower())
+    if not provider_id or len(provider_id)>256 or stage is None:
+        return False
+    channel=str(receipt.get('channelId') or '')
+    chat=anonymize_identifier(str(receipt['chatId'])) if receipt.get('chatId') else ''
+    key=hashlib.sha256(json.dumps([provider_id,channel,chat,stage]).encode()).hexdigest()
+    with _connect() as conn:
+        conn.executescript(_DELIVERY_DDL)
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute('INSERT OR IGNORE INTO provider_receipts VALUES (?,?,?,?,?,?,?)',
+                     (key,provider_id,channel,chat,stage[0],stage[1],now_iso()))
+        _apply_provider_receipts(conn,provider_id)
+    return True
+
+
+def outgoing_delivery_status(message_key: str) -> str:
+    with _connect() as conn:
+        conn.executescript(_DELIVERY_DDL)
+        row=conn.execute('SELECT lifecycle FROM provider_deliveries WHERE message_key=?',(message_key,)).fetchone()
+    if row:
+        return str(row['lifecycle'])
+    return {'sending':'SEND_PENDING','uncertain':'FAILED_NEEDS_ATTENTION',
+            'rejected':'FAILED_NEEDS_ATTENTION','confirmed':'PROVIDER_ACCEPTED'}.get(outgoing_message_status(message_key),'')
+
+
+def delivery_status_summary() -> dict[str, int]:
+    """Aggregate receipt states for monitoring without provider/chat identities."""
+    with _connect() as conn:
+        conn.executescript(_DELIVERY_DDL)
+        rows = conn.execute('SELECT lifecycle,COUNT(*) AS count FROM provider_deliveries GROUP BY lifecycle').fetchall()
+    return {str(row['lifecycle']): int(row['count']) for row in rows}

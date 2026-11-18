@@ -10,6 +10,12 @@ on:
       - "requirements.txt"
       - ".github/workflows/production-monitor.yml"
   workflow_dispatch:
+    inputs:
+      expected_release:
+        description: "Optional SHA of an explicitly authorized deployment to verify"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -29,7 +35,7 @@ jobs:
       - name: Verify health, storage, queues and read-only dependencies
         env:
           RUN_DEPENDENCY_PROBES: ${{ github.event_name != 'schedule' }}
-          EXPECTED_RELEASE: ${{ github.event_name == 'push' && github.sha || '' }}
+          EXPECTED_RELEASE: ${{ inputs.expected_release || '' }}
         run: |
           python - <<'PY'
           import json, os, time, urllib.request, urllib.error

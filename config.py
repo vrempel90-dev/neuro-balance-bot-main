@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     ai_brain_model: str = Field(default="gpt-5.6-terra", validation_alias=AliasChoices("AI_BRAIN_MODEL", "ai_brain_model"))
     ai_brain_temperature: float = Field(default=0.2, validation_alias=AliasChoices("AI_BRAIN_TEMPERATURE", "ai_brain_temperature"))
     ai_humanize_model: str = Field(default="gpt-5.6-luna", validation_alias=AliasChoices("AI_HUMANIZE_MODEL", "ai_humanize_model"))
-    openai_voice_model: str = Field(default="whisper-1", validation_alias=AliasChoices("OPENAI_VOICE_MODEL", "openai_voice_model"))
+    openai_voice_model: str = Field(default="gpt-transcribe", validation_alias=AliasChoices("OPENAI_VOICE_MODEL", "openai_voice_model"))
     ai_enabled: bool = Field(default=True, validation_alias=AliasChoices("AI_ENABLED", "ai_enabled"))
     bot_auto_reply_enabled: bool = Field(default=True, validation_alias=AliasChoices("BOT_AUTO_REPLY_ENABLED", "bot_auto_reply_enabled"))
     bot_activated_at: str = Field(default="2026-07-02T00:00:00+05:00", validation_alias=AliasChoices("BOT_ACTIVATED_AT", "bot_activated_at"))

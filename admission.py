@@ -22,6 +22,7 @@ import crm
 
 
 NEW = "NEW"
+NEW_LEAD_IN_PROGRESS = "NEW_LEAD_IN_PROGRESS"
 RETURNING = "RETURNING"
 ACTIVE_BOOKING = "ACTIVE_BOOKING"
 CRM_UNAVAILABLE = "CRM_UNAVAILABLE"
@@ -50,11 +51,12 @@ class Admission:
     reason: str
     phone: str = ""
     appointment: dict[str, Any] | None = None
+    lead_id: str = ""
 
     @property
     def bot_may_reply(self) -> bool:
         """Отвечает бот только новому лиду. Всё остальное — молчание."""
-        return self.state == NEW
+        return self.state in {NEW, NEW_LEAD_IN_PROGRESS}
 
 
 def _low(value: Any) -> str:
@@ -172,3 +174,58 @@ def classify(phone: str, crm_lookup: dict[str, Any] | None) -> Admission:
         return Admission(state=RETURNING, reason="crm_found_contact", phone=normalized)
 
     return Admission(state=NEW, reason="no_existing_contact", phone=normalized)
+
+
+def classify_session(phone: str, crm_lookup: dict[str, Any] | None, session: dict[str, Any]) -> Admission:
+    """Continue only an authenticated CRM card bound to this random AI session.
+
+    Optional CRM field lead.aiSessionId must originate from the CRM integration,
+    never from messages or model extraction. Legacy CRM responses fail closed.
+    No new endpoint or timing-based attribution is implied by this extension.
+    """
+    base = classify(phone, crm_lookup)
+    if base.state == CRM_UNAVAILABLE or base.reason not in {"lead_in_progress", "crm_says_not_new"}:
+        return base
+    if any(session.get(k) for k in ("ai_admission_closed_at", "manual_takeover", "manual_admin_intervention", "escalated", "booking_confirmed", "ai_muted")):
+        return base
+    token = session.get("ai_admission_session_id")
+    if not isinstance(token, str) or len(token) < 32 or session.get("ai_admission_phone") != base.phone:
+        return base
+    try:
+        started = datetime.fromisoformat(str(session.get("ai_admission_started_at") or ""))
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+    except (ValueError, TypeError):
+        return base
+    if not 0 <= elapsed <= 12 * 3600:
+        return base
+    lookup = crm_lookup or {}
+    variants = [lookup, _raw(lookup), *(lookup.get("identity_variants") or [])]
+    expected_id = str(session.get("ai_admission_lead_id") or "")
+    observed = set()
+    for payload in variants:
+        if not isinstance(payload, dict):
+            return base
+        raw = _raw(payload)
+        lead = raw.get("lead")
+        # Normalized wrappers may have no identity fields; the raw envelope
+        # remains mandatory and is checked separately.
+        if payload is lookup and isinstance(lookup.get("raw"), dict):
+            if lookup.get("appointments"):
+                return base
+            continue
+        if not isinstance(lead, dict) or lead.get("aiSessionId") != token:
+            return base
+        lead_id = str(lead.get("id") or "")
+        if not lead_id or (expected_id and expected_id != lead_id):
+            return base
+        observed.add(lead_id)
+        if str(lead.get("status") or "").strip().lower() not in NEW_LEAD_STATUSES | {"in_progress", "in progress", "в работе"}:
+            return base
+        if any(raw.get(k) or lead.get(k) for k in ("assignedTo", "assigned_to", "managerId", "operatorId", "staffId", "manualTakeover", "staffTakeover", "closedAt")):
+            return base
+        candidate = dict(raw, isNew=True, lead=dict(lead, status="NEW"))
+        if classify(phone, candidate).state != NEW:
+            return base
+    if len(observed) != 1:
+        return base
+    return Admission(state=NEW_LEAD_IN_PROGRESS, reason="crm_session_provenance_verified", phone=base.phone, lead_id=next(iter(observed)))

@@ -15,11 +15,11 @@
 - Every received event has a durable controlled result; uncertain side effects are never blindly retried.
 
 ## Tasks
-1. [ ] Audit and reproduce: run current suite, retain evidence, import prior audit regression tests and observe failures before reusing the reviewed fixes from aa5d0c0. Preserve original backup.
-2. [ ] Medical rules and dialog: validate canonical source integrity, checklist presentation/clearance, patient separation and existing booking guards. Record CRM provenance limitation if current contract cannot prove ownership.
-3. [ ] Media: TDD voice language auto-detection; secure bounded image/PDF ingestion; preserve caption/all parts; gate external medical processing on operator configuration and keep failures visible.
-4. [ ] Ingress/reliability: TDD attachment dedupe, voice/document routing, daytime retention, immediate staff takeover and final send gate; expose retained attention states.
-5. [ ] Review: independent reviewer evaluates safety, specification and integration diff. Fix actionable findings with regression tests.
+1. [x] Audit and reproduce: run current suite, retain evidence, import prior audit regression tests and observe failures before reusing the reviewed fixes from aa5d0c0. Preserve original backup.
+2. [x] Medical rules and dialog: validate canonical source integrity, checklist presentation/clearance, patient separation and existing booking guards. Record CRM provenance limitation if current contract cannot prove ownership.
+3. [x] Media: TDD voice language auto-detection; secure bounded image/PDF ingestion; preserve caption/all parts; gate external medical processing on operator configuration and keep failures visible.
+4. [x] Ingress/reliability: TDD attachment dedupe, voice/document routing, daytime retention, immediate staff takeover and final send gate; expose retained attention states.
+5. [x] Review: independent reviewer evaluates safety, specification and integration diff. Fix actionable findings with regression tests.
 6. [ ] Verification/delivery: full suite, compile, dependency audit, synthetic integration contracts, sanitized diff. Document all unavailable real-provider checks and rollout/rollback steps. Commit tested work on main; push only after autodeploy isolation verified.
 
 ## Review focus
@@ -27,3 +27,6 @@ Voice-only and caption+document events; takeover while an AI call is awaiting; d
 
 ## Decisions and evidence
 The user explicitly instructed autonomous implementation beyond audit/planning, so execution proceeds without an extra design approval. Previous PR work is source material only; no PR is being created or merged. Baseline test execution and each red/green cycle are captured under outputs/neurobalance_2_2026-11-17 outside the repository.
+
+## Completion continuation — 2026-11-18
+Semantic routing, trusted optional CRM provenance, durable provider receipts, medical-history retention, current bilingual transcription with duration billing, strict vision schema and workflow repairs implemented. External CRM provenance is unconfirmed: user explicitly requires fail-closed/staff handling and a documented integration contract. Actual synthetic OpenAI acceptance: 11/11 final cases, plus separate multiple-questions case. Final full suite/CI and publication remain Task 6 until fresh results are inspected. Production deployment remains outside authorization.

@@ -107,7 +107,7 @@ jobs:
           unset ANTHROPIC_API_KEY || true
           cat /tmp/neuro-live-cases.json | claude -p "$(cat .github/claude-real-repair-prompt.md)
 
-ADDITIONAL HARD RULE: input contains only Claude-reviewed real NEW-LEAD cases. Work on the first case only. Create exactly one new tests/real_wazzup_regression_*.py test derived from that case. Do not patch anything until you have written the test." \
+          ADDITIONAL HARD RULE: input contains only Claude-reviewed real NEW-LEAD cases. Work on the first case only. Create exactly one new tests/real_wazzup_regression_*.py test derived from that case. Do not patch anything until you have written the test." \
             --permission-mode acceptEdits \
             --max-turns 24 \
             --output-format text \

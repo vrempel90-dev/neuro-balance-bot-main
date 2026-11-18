@@ -30,6 +30,7 @@ guard сверял ответ со своим ``step``, не соглашалс�
 from __future__ import annotations
 
 import json
+import secrets
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -112,6 +113,7 @@ SILENT_SKIP_REASONS = {"empty_text", "manual_takeover", "old_chat_ai_disabled"}
 # выдачи main.py, поэтому имена состояний admission.py переводятся в них.
 _CRM_PATIENT_STATE = {
     admission.NEW: "NEW_PATIENT",
+    admission.NEW_LEAD_IN_PROGRESS: "NEW_PATIENT",
     admission.RETURNING: "RETURNING_PATIENT_NO_ACTIVE_BOOKING",
     admission.ACTIVE_BOOKING: "ACTIVE_BOOKING",
     admission.CRM_UNAVAILABLE: "CRM_UNAVAILABLE",
@@ -397,22 +399,6 @@ def _same_new_lead_identity(phone: str, lookup: dict[str, Any], lead_id: str) ->
     return True
 
 
-def _can_continue_new_lead(phone: str, lookup: dict[str, Any], session: dict[str, Any]) -> bool:
-    if any(session.get(key) for key in ("ai_admission_closed_at", "manual_takeover",
-            "manual_admin_intervention", "escalated", "booking_confirmed", "ai_muted")):
-        return False
-    if session.get("ai_admission_phone") != phone or not session.get("ai_admission_lead_id"):
-        return False
-    try:
-        started = datetime.fromisoformat(str(session.get("ai_admission_started_at") or ""))
-        age_seconds = (datetime.now(timezone.utc) - started).total_seconds()
-    except (TypeError, ValueError):
-        return False
-    # One night-window funnel, never an indefinitely renewable admission lease.
-    return 0 <= age_seconds <= 12 * 60 * 60 and _same_new_lead_identity(
-        phone, lookup, str(session["ai_admission_lead_id"]))
-
-
 def _record_initial_new_lead(phone: str, lookup: dict[str, Any], session: dict[str, Any]) -> None:
     raw = lookup.get("raw") if isinstance(lookup.get("raw"), dict) else lookup
     lead_id = str((raw.get("lead") or {}).get("id") or "")
@@ -441,12 +427,19 @@ async def _classify_lead(chat_id: str, phone: str, session: dict[str, Any]) -> a
         _safe_log(chat_id, "crm_lookup_failed", {"chat_id": chat_id, "error_type": type(exc).__name__})
         lookup = None
 
-    verdict = admission.classify(normalized, lookup)
+    verdict = admission.classify_session(normalized, lookup, session)
     if verdict.state == admission.NEW and not session.get("ai_admission_started_at"):
         _record_initial_new_lead(normalized, lookup, session)
-    elif verdict.reason == "crm_says_not_new" and _can_continue_new_lead(normalized, lookup, session):
-        verdict = admission.Admission(state=admission.NEW, reason="verified_initial_new_lead", phone=normalized)
 
+
+    if verdict.state == admission.NEW:
+        # Generated locally, durable, and never extracted from user/model text.
+        session.setdefault("ai_admission_session_id", secrets.token_hex(32))
+        session.setdefault("ai_admission_phone", normalized)
+        _activate_ai_admission_lease(session)
+    elif verdict.state == admission.NEW_LEAD_IN_PROGRESS:
+        session["ai_admission_lead_id"] = verdict.lead_id
+    session["lead_admission_state"] = verdict.state
     session["crm_patient_state"] = _CRM_PATIENT_STATE[verdict.state]
     session["crm_state_reason"] = verdict.reason
     _store_crm_lookup_debug(session, lookup)
@@ -454,7 +447,7 @@ async def _classify_lead(chat_id: str, phone: str, session: dict[str, Any]) -> a
     session["active_appointment_count"] = len([
         a for a in (lookup or {}).get("appointments") or [] if isinstance(a, dict)
     ]) if verdict.state == admission.ACTIVE_BOOKING else 0
-    session["crm_patient_is_new"] = verdict.state == admission.NEW
+    session["crm_patient_is_new"] = verdict.bot_may_reply
     session["crm_patient_found"] = verdict.state in {admission.RETURNING, admission.ACTIVE_BOOKING}
     _safe_log(chat_id, "lead_admission", {"chat_id": chat_id, "state": verdict.state, "reason": verdict.reason})
     return verdict
@@ -940,6 +933,13 @@ async def handle_message(chat_id: str, phone: str, user_text: str) -> str:
         result.reply = _tr(session, OPERATOR_HANDOFF_RU, OPERATOR_HANDOFF_KK) if delivered else _tr(session, HANDOFF_UNAVAILABLE_RU, HANDOFF_UNAVAILABLE_KK)
     elif result.booked:
         _close_ai_admission_lease(session, "booking_confirmed")
+    # Emergency instructions are independent of staff handoff availability.
+    # Escalation may replace ordinary model text, but must never erase 103/112.
+    if session.get("profile_status") == "urgent":
+        emergency = _tr(session,
+            "Эти симптомы могут требовать срочной медицинской оценки. Обратитесь за неотложной помощью по 103 или 112.",
+            "Бұл белгілер шұғыл медициналық бағалауды қажет етуі мүмкін. 103 немесе 112 нөміріне хабарласыңыз.")
+        result.reply = emergency + ("\n\n" + result.reply if result.escalate else "")
     session["openai_used"] = True
     session["openai_brain_used"] = True
     session["answer_source"] = "gpt_agent"

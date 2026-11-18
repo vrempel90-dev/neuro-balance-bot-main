@@ -1,47 +1,36 @@
-# Neuro Balance 2: integration and rollout status (2026-11-18)
+# Neuro Balance 2 — состояние реализации 2026-11-18
 
-Development is on main. This is an implementation checkpoint, not production acceptance.
-Original SHA: 4b8c928e3d3ef369b07debec96cb81f8db49d5d9.
-Backup tag: backup/neurobalance-before-2-2026-11-17 (local until explicitly pushed).
-Production deployment must remain unchanged.
+Разработка ведётся непосредственно в main. Production deployment запрещён без отдельного разрешения; действующая версия не заменялась. Исходный SHA 4b8c928e3d3ef369b07debec96cb81f8db49d5d9; опубликованная метка backup/neurobalance-before-2-2026-11-17.
 
-## Changes
-- Reused prior patient isolation/age/guardian/CRM idempotency fixes after reproducing the regression (216 existing audit tests passed before the new medical gate).
-- Voice language auto-detection, bounded audio validation, provider cleanup.
-- Caption + ordered image/PDF/audio ingestion. PDF rasterization is bounded to 8 pages, images to 20M pixels, batches to 8 attachments, media to the existing 25MB limit. Larger inputs require staff review; they are not silently truncated.
-- Medical document processing defaults off until the clinic establishes the legal/data-processing basis for its provider. Set MEDICAL_DOCUMENT_PROCESSING_ENABLED=true only after that review. OPENAI_DOCUMENT_MODEL defaults to gpt-4o-mini; real OCR/ASR/LLM quality remains unverified.
-- Canonical eight contraindications validated against SYSTEM_PROMPT_rendered.md. Missing or modified source closes automatic booking. Provider-accepted full checklist and subsequent patient-specific explicit absence are required. Legacy boolean clearance no longer grants booking.
-- Staff takeover saved before FIFO processing, retained across stale session writes. Final work-time/ownership send check.
-- Durable handoff_pending/handoff_confirmed outcomes retain the original request. Monitor exposes aggregate attention counts. Authorized local operator retrieval/resolution never blindly replays requests.
+## Реализованные программные блоки
+- Сохранены существующие Wazzup provider/API/channel variables, webhook aliases, CRM endpoints, утверждённые сведения клиники и график 20:00–08:00 Asia/Almaty.
+- Долговременный inbox: commit до HTTP ack, дедупликация, FIFO диалога, восстановление, карантин неопределённых side effects; retained handoff_pending/handoff_confirmed с операторским разрешением без слепого replay.
+- Тексты, подписи, несколько голосовых/документов обрабатываются по порядку. Дополнительные разрешённые каналы изолированы от истории основного; исходный provider chatId сохранён для внешнего API.
+- Staff takeover сохраняется до очереди, не стирается старым AI-state; перед отправкой проверяются актуальное время, switch и staff flag.
+- Provider messageId и receipts сохраняются долговременно. Настоящие statuses callbacks обрабатываются отдельно от диалога/FIFO. PROVIDER_ACCEPTED отличается от DELIVERED/READ; callback-before-response поддержан. Поздние ошибки видны в мониторинге.
+- Один разговорный агент получает структурированную смысловую маршрутизацию PROFILE/NON_PROFILE/UNCLEAR/URGENT. Направления ограничены утверждённым перечнем, нужны дословные доказательства; исключённые/смешанные жалобы и неизвестная локализация не становятся допуском по извлечённому диагнозу. URGENT блокирует запись и сохраняет 103/112 даже при неудачной передаче.
+- Канонические восемь противопоказаний валидируются против утверждённого источника. Его отсутствие/искажение закрывает запись. Нужны предъявление полного списка, принятие ответа провайдером и последующее явное подтверждение отсутствия для того же пациента. Вопросы, документы и один legacy boolean не заменяют согласие.
+- Раздельные сведения отправителя и пациента, возраст 16–75, сопровождение 16–18, reset пациента, подтверждённые CRM slots/booking readback и durable idempotency. Неопределённую запись нельзя повторить даже на другое время.
+- ASR по умолчанию gpt-transcribe с ru+kk hints; явно заданный whisper-1 совместим. Фактический duration расход учитывается по $0.0045/min/$0.006/min соответственно. Бюджет и предельное число вызовов сохранены.
+- Изображения JPG/PNG/WEBP и многостраничные PDF декодируются и ограничиваются до отправки. Vision использует строгую JSON-схему; извлекается текст заключения, снимок без заключения не диагностируется. Ошибка загрузки/чтения остаётся под контролем.
+- Терминальные старые медицинские истории минимизируются по policy; активные/неразрешённые обращения, ownership и uncertain claims сохраняются. Orphan receipts ограничены retention. Первые 500 активных историй не блокируют purge терминальных.
+- Исправлен синтаксис существующего manual repair workflow. Source push больше не считается разрешённым deployment: SHA в Production Monitor проверяется только по явному expected_release. Реальные runtime ошибки не подавляются.
 
-## Safe rollout (requires separate user authorization)
-1. Keep Railway autodeploy disabled. Verify the dedicated serviceInstanceAutoDeployStatus before any main push.
-2. Retain the current deployment and take a database backup using production_backup through the established authorized operations path. Never expose its contents in logs.
-3. Run one replica and one Uvicorn worker, live_main:app, persistent /data volume, SQLITE_PATH=/data/bot.sqlite3, Asia/Almaty 20:00–08:00.
-4. Install requirements and apply idempotent state.init_db()/production_inbox.init_db() initialization. Existing tables/data stay in place; added status values use the existing TEXT column.
-5. Establish webhook authentication through the existing reconciliation workflow; do not enable a secret before the provider configuration is confirmed.
-6. Verify staging with synthetic media/messages, real-provider test credentials and controlled test contacts before enabling CRM writes. Never test against patients.
-7. Reconcile uncertain provider/CRM claims manually before allowing those chats to resume.
-8. Roll back to the backup SHA/deployment on failure, preserve the database and unresolved claims. A code rollback does not authorize replaying uncertain operations. Do not automatically re-enable GitHub autodeploy.
+## Подтверждённые проверки
+Предыдущая опубликованная версия a96e8d3: Linux CI 1057/1057 passed. Текущая расширенная версия проходит новый общий прогон; окончательное число и SHA берутся из CI/итогового отчёта, а не из этого документа.
 
-## Outstanding acceptance work
-- Full regression results and fixture migration for the stricter checklist gate; no failed check may be called passing.
-- Actual RU/KK/mixed/noisy audio and image/PDF model quality, real provider roundtrip, validated model access/pricing, clinical approval of Kazakh terminology.
-- CRM provenance for initially absent contacts that become in-progress leads. Timing alone is insufficient proof; until the CRM supplies trusted session provenance, ambiguous leads require staff.
-- Semantic routing remains conservative keyword-assisted classification, not a fully verified semantic router.
-- Secondary allowed channels now have separate internal state while preserving provider chat IDs. Legacy secondary-channel history is not copied; previously uncertain operations still require operator reconciliation.
-- Provider acceptance is not a DELIVERED receipt; receipt mapping/reconciliation still needs implementation.
-- Automated end-to-end acceptance matrix, sensitive-data retention policy/legal review and production webhook/CRM availability remain release blockers.
+Реальная модель, синтетические данные:
+- live_final/report.json: 11/11 — RU/KK/mixed/noise, OGG/Opus с decode, PNG/PDF/нечитаемое изображение, три семантических случая.
+- live_remaining/report.json: 2/2, включая ответ одновременно на цену и адрес без повторного вопроса о сохранённом возрасте. Повтор OGG не считается дополнительным уникальным случаем.
+- Проверена доступность настроенных OpenAI моделей в существующем аккаунте; новые ключи/сервисы не создавались.
+- Wazzup GET channels: 200, configured_channel_found=true. CRM GET doctors и check-slots: 200. Это подтверждает чтение API, не отправку сообщения/создание записи.
+- Независимые review findings устранены с RED/GREEN регрессиями: сохранение экстренной инструкции при escalation, starvation retention, расплывчатая локализация, schema OCR. Реальные неуспешные промежуточные прогоны сохранены, а не выданы за успешные.
 
-No real patient messages or bookings were created. No production deploy is authorized by this checkpoint.
+## Внешние границы приёмки
+CRM provenance НЕ подтверждён. Локальный lead_id/телефон/время/статус NEW не доказывают происхождение новой карточки. Реализован optional trusted contract; без него событие сохраняется/передаётся сотруднику. По уточнению пользователя исходники CRM отсутствуют; требуемое изменение API описано в CRM_SESSION_PROVENANCE_CONTRACT.md, endpoint не выдуман.
 
-## Resume verification evidence
-- Prior interrupted work retained in local main checkpoint fd01f23.
-- Fresh first full suite: 955 passed / 97 failed (intermediate tree, resume-full1.xml).
-- Updated booking/integration subset: 400 passed / 2 failed; the two named-positive/question parsing regressions were then fixed.
-- Medical follow-up: 47 passed. Webhook/channel follow-up: 35 passed. Previously failing FAQ/scenario follow-up: 27 passed.
-- pip check: no broken requirements. pip-audit: no known vulnerabilities in declared requirements. Compile and git diff --check passed.
-- Final full suite evidence is saved outside the repository at outputs/neurobalance_2_2026-11-17/resume-final.xml. Its result must be inspected before a main push.
+Настоящие сообщения пациентам и booking POST запрещены и не выполнялись. Нет доказательства фактического delivery roundtrip или реальной записи от mock-тестов/read-only probes. До запуска нужен отдельный согласованный стенд/контакт и условия обработки медицинских данных. MEDICAL_DOCUMENT_PROCESSING_ENABLED остаётся false по умолчанию для настоящих документов.
 
-- Final full execution: 1044 passed / 13 failed / 1057 total. Seven failures reflected fixture revisions made after collection; rerunning all 13 failed nodes on the corrected tree produced 7 passed / 6 failed. All six remaining failures are POSIX mode 0600 assertions on Windows (backup, runtime storage and four webhook-auth cases), not hidden or skipped. Linux CI is required before claiming a green full suite.
-- Independent review found no further actionable regressions in the final production-code delta. Production deployment remains 1a4d7d51-ca7c-4f0d-b03f-aad66d6d349f; autodeploy independently rechecked disabled on 2026-11-18.
+Натуральная казахская речь, клинический перевод и применимые правовые основания требуют проверки клиники; синтетическое TTS не заменяет её. Production webhook authentication и существующие unresolved операции должны быть сверены в согласованной процедуре до deployment. Никакие production секреты, переменные и записи для этого автоматически не менялись.
+
+Матрица всех 60 сценариев: NEURO2_ACCEPTANCE_MATRIX_RU.md. Запуск, миграции и откат: NEURO2_DEPLOYMENT_RUNBOOK_RU.md.
